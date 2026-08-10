@@ -32,7 +32,10 @@ use paykit_server::{
     },
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     config::{BitcoinNetwork, Config, ConfigEnvironment},
-    domain::locks::{CreatorPubky, parse_addressed_lock_resource, parse_bundle_id, parse_reader},
+    domain::{
+        invoice::CriterionPaymentWindowHours,
+        locks::{CreatorPubky, parse_addressed_lock_resource, parse_bundle_id, parse_reader},
+    },
     http::{auth::SignedLocksAuth, invoices::invoices_router},
     persistence::{AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, PersistenceError},
 };
@@ -58,6 +61,7 @@ fn request() -> CreateInvoiceRequest {
         bundle_id: parse_bundle_id(BUNDLE).unwrap(),
         lock_resource: parse_addressed_lock_resource(LOCK_RESOURCE).unwrap(),
         reader: parse_reader(&reader()).unwrap(),
+        payment_in: CriterionPaymentWindowHours::parse(&serde_json::json!(24)).unwrap(),
     }
 }
 
@@ -70,7 +74,7 @@ fn valid_lock() -> ContentLock {
         criteria: vec![Criterion {
             criterion_id: "payment".into(),
             verifier_type: VerifierType::PaykitPayment,
-            params: serde_json::json!({"recipient_pubky":CREATOR,"amount":"50000","asset":"BTC"}),
+            params: serde_json::json!({"recipient_pubky":CREATOR,"amount":"50000","asset":"BTC","payment_in":24}),
         }],
         lock_logic: LockLogic::All {
             criteria: vec!["payment".into()],
@@ -151,6 +155,7 @@ struct FakeStore {
     preflight: Mutex<InvoicePreflight>,
     preflight_calls: AtomicUsize,
     create_calls: AtomicUsize,
+    payment_bindings: Mutex<Vec<Vec<u8>>>,
 }
 
 impl FakeStore {
@@ -159,6 +164,7 @@ impl FakeStore {
             preflight: Mutex::new(preflight),
             preflight_calls: AtomicUsize::default(),
             create_calls: AtomicUsize::default(),
+            payment_bindings: Mutex::new(vec![]),
         }
     }
 }
@@ -169,9 +175,13 @@ impl InvoicePersistence for FakeStore {
         &self,
         _creator: &CreatorPubky,
         _bundle_binding: &[u8],
-        _payment_binding: &[u8],
+        payment_binding: &[u8],
     ) -> Result<InvoicePreflight, PersistenceError> {
         self.preflight_calls.fetch_add(1, Ordering::SeqCst);
+        self.payment_bindings
+            .lock()
+            .unwrap()
+            .push(payment_binding.to_vec());
         Ok(*self.preflight.lock().unwrap())
     }
 
@@ -331,6 +341,107 @@ async fn invalid_locks_policy_never_persists_an_invoice() {
     assert_eq!(session.calls.load(Ordering::SeqCst), 1);
     assert_eq!(locks.calls.load(Ordering::SeqCst), 1);
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn malformed_canonical_lock_payment_window_never_persists_an_invoice() {
+    let out_of_range = serde_json::Value::Number(
+        serde_json::Number::from_f64(18_446_744_073_709_551_616.0).unwrap(),
+    );
+    for payment_in in [
+        None,
+        Some(serde_json::json!(0)),
+        Some(serde_json::json!("24")),
+        Some(serde_json::json!(1.5)),
+        Some(out_of_range),
+    ] {
+        let mut lock = valid_lock();
+        let params = lock.criteria[0].params.as_object_mut().unwrap();
+        if let Some(payment_in) = payment_in {
+            params.insert("payment_in".into(), payment_in);
+        } else {
+            params.remove("payment_in");
+        }
+        let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+        assert_eq!(
+            service(
+                Arc::new(FakeSession {
+                    result: Ok(()),
+                    calls: AtomicUsize::default(),
+                    creators: Mutex::new(vec![]),
+                }),
+                Arc::new(FakeLocks {
+                    result: Ok(lock),
+                    calls: AtomicUsize::default(),
+                }),
+                store.clone(),
+            )
+            .create(request())
+            .await,
+            Err(CreateInvoiceError::InvalidRequest)
+        );
+        assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn payment_window_mismatch_never_persists_an_invoice() {
+    let session = Arc::new(FakeSession {
+        result: Ok(()),
+        calls: AtomicUsize::default(),
+        creators: Mutex::new(vec![]),
+    });
+    let locks = Arc::new(FakeLocks {
+        result: Ok(valid_lock()),
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let mut mismatched = request();
+    mismatched.payment_in = CriterionPaymentWindowHours::parse(&serde_json::json!(12)).unwrap();
+
+    assert_eq!(
+        service(session, locks, store.clone())
+            .create(mismatched)
+            .await,
+        Err(CreateInvoiceError::InvalidRequest)
+    );
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn payment_window_is_part_of_the_exact_request_binding() {
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::Conflict));
+    for hours in [12, 24] {
+        let mut invoice = request();
+        invoice.payment_in = CriterionPaymentWindowHours::parse(&serde_json::json!(hours)).unwrap();
+        assert_eq!(
+            service(
+                Arc::new(FakeSession {
+                    result: Ok(()),
+                    calls: AtomicUsize::default(),
+                    creators: Mutex::new(vec![]),
+                }),
+                Arc::new(FakeLocks {
+                    result: Ok(valid_lock()),
+                    calls: AtomicUsize::default(),
+                }),
+                store.clone(),
+            )
+            .create(invoice)
+            .await,
+            Err(CreateInvoiceError::Conflict)
+        );
+    }
+    let bindings = store.payment_bindings.lock().unwrap();
+    assert_ne!(bindings[0], bindings[1]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bindings[0]).unwrap()["payment_in"],
+        serde_json::json!(12)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bindings[1]).unwrap()["payment_in"],
+        serde_json::json!(24)
+    );
 }
 
 #[tokio::test]
@@ -528,6 +639,7 @@ async fn signed_router_maps_deadline_exhaustion_to_dependency_timeout() {
     let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
         "bundle_id": BUNDLE,
         "lock_resource": LOCK_RESOURCE,
+        "payment_in": 24,
         "reader": reader()
     }))
     .unwrap();
@@ -615,6 +727,7 @@ async fn signed_router_parses_canonical_invoice_and_derives_creator_from_lock_re
     let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
         "bundle_id": BUNDLE,
         "lock_resource": LOCK_RESOURCE,
+        "payment_in": 24,
         "reader": reader()
     }))
     .unwrap();
@@ -625,6 +738,79 @@ async fn signed_router_parses_canonical_invoice_and_derives_creator_from_lock_re
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(session.creators.lock().unwrap().as_slice(), [CREATOR]);
+}
+
+#[tokio::test]
+async fn signed_router_rejects_invalid_payment_window_shapes_before_persistence() {
+    let key = SigningKey::from_bytes(&[13; 32]);
+    for payment_in in [
+        None,
+        Some(serde_json::json!(0)),
+        Some(serde_json::json!("24")),
+        Some(serde_json::json!(1.5)),
+    ] {
+        let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+        let router = invoices_router(Arc::new(service(
+            Arc::new(FakeSession {
+                result: Ok(()),
+                calls: AtomicUsize::default(),
+                creators: Mutex::new(vec![]),
+            }),
+            Arc::new(FakeLocks {
+                result: Ok(valid_lock()),
+                calls: AtomicUsize::default(),
+            }),
+            store.clone(),
+        )))
+        .layer(Extension(signed_auth(&key)));
+        let mut value = serde_json::json!({
+            "bundle_id": BUNDLE,
+            "lock_resource": LOCK_RESOURCE,
+            "reader": reader()
+        });
+        if let Some(payment_in) = payment_in {
+            value["payment_in"] = payment_in;
+        }
+        let body = serde_json_canonicalizer::to_vec(&value).unwrap();
+        assert_eq!(
+            router
+                .oneshot(signed_invoice_request(&key, body))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+    }
+
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let router = invoices_router(Arc::new(service(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        store.clone(),
+    )))
+    .layer(Extension(signed_auth(&key)));
+    let body = format!(
+        r#"{{"bundle_id":"{BUNDLE}","lock_resource":"{LOCK_RESOURCE}","payment_in":18446744073709551616,"reader":"{}"}}"#,
+        reader()
+    )
+    .into_bytes();
+    assert_eq!(
+        router
+            .oneshot(signed_invoice_request(&key, body))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -652,6 +838,7 @@ async fn signed_router_maps_session_invalid_and_unavailable_and_rejects_bad_iden
         let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
             "bundle_id": BUNDLE,
             "lock_resource": LOCK_RESOURCE,
+            "payment_in": 24,
             "reader": reader()
         }))
         .unwrap();
@@ -680,6 +867,7 @@ async fn signed_router_maps_session_invalid_and_unavailable_and_rejects_bad_iden
     let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
         "bundle_id": BUNDLE,
         "lock_resource": "not-a-lock-resource",
+        "payment_in": 24,
         "reader": reader()
     }))
     .unwrap();

@@ -8,10 +8,14 @@ use axum::{
     routing::post,
 };
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::{
     application::create_invoice::{CreateInvoiceError, CreateInvoiceRequest, CreateInvoiceService},
-    domain::locks::{parse_addressed_lock_resource, parse_bundle_id, parse_reader},
+    domain::{
+        invoice::CriterionPaymentWindowHours,
+        locks::{parse_addressed_lock_resource, parse_bundle_id, parse_reader},
+    },
     http::{auth::AuthenticatedJson, error::ApiError},
 };
 
@@ -20,6 +24,7 @@ struct InvoiceBody {
     bundle_id: String,
     lock_resource: String,
     reader: String,
+    payment_in: Value,
 }
 
 pub fn invoices_router(service: Arc<CreateInvoiceService>) -> Router {
@@ -48,6 +53,8 @@ fn parse(body: InvoiceBody) -> Result<CreateInvoiceRequest, ApiError> {
         lock_resource: parse_addressed_lock_resource(&body.lock_resource)
             .map_err(|_| ApiError::InvalidRequest)?,
         reader: parse_reader(&body.reader).map_err(|_| ApiError::InvalidRequest)?,
+        payment_in: CriterionPaymentWindowHours::parse(&body.payment_in)
+            .map_err(|_| ApiError::InvalidRequest)?,
     })
 }
 

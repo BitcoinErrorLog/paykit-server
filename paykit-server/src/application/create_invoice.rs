@@ -26,7 +26,7 @@ use crate::{
     application::{reader_marker::select_reader_marker, semantic_intent::DeliveryIntentV1},
     config::ReceiverPathPriority,
     domain::{
-        invoice::{CriterionAmount, CriterionAsset},
+        invoice::{CriterionAmount, CriterionAsset, CriterionPaymentWindowHours},
         locks::{BundleId, CreatorPubky, PubkyLockResource, ReaderPubky},
     },
     persistence::{
@@ -42,6 +42,7 @@ pub struct CreateInvoiceRequest {
     pub bundle_id: BundleId,
     pub lock_resource: PubkyLockResource,
     pub reader: ReaderPubky,
+    pub payment_in: CriterionPaymentWindowHours,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -480,7 +481,7 @@ impl CreateInvoiceService {
 }
 
 fn request_binding(request: &CreateInvoiceRequest) -> Result<Vec<u8>, CreateInvoiceError> {
-    serde_json_canonicalizer::to_vec(&serde_json::json!({"bundle_id":request.bundle_id.to_string(),"lock_resource":request.lock_resource.to_string(),"reader":request.reader.to_string()})).map_err(|_| CreateInvoiceError::InvalidRequest)
+    serde_json_canonicalizer::to_vec(&serde_json::json!({"bundle_id":request.bundle_id.to_string(),"lock_resource":request.lock_resource.to_string(),"reader":request.reader.to_string(),"payment_in":request.payment_in.get()})).map_err(|_| CreateInvoiceError::InvalidRequest)
 }
 fn remaining(start: Instant, now: Instant) -> Result<Duration, CreateInvoiceError> {
     let remaining = REQUEST_DEADLINE
@@ -514,22 +515,17 @@ fn validate_lock(
         .iter()
         .find(|criterion| criterion.verifier_type == VerifierType::PaykitPayment)
         .ok_or(CreateInvoiceError::InvalidRequest)?;
-    CriterionAsset::parse(
-        criterion
-            .params
-            .get("asset")
-            .and_then(Value::as_str)
-            .ok_or(CreateInvoiceError::InvalidRequest)?,
-    )
-    .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-    CriterionAmount::parse(
-        criterion
-            .params
-            .get("amount")
-            .and_then(Value::as_str)
-            .ok_or(CreateInvoiceError::InvalidRequest)?,
-    )
-    .map_err(|_| CreateInvoiceError::InvalidRequest)?;
+    let params = criterion
+        .paykit_payment_params()
+        .map_err(|_| CreateInvoiceError::InvalidRequest)?
+        .ok_or(CreateInvoiceError::InvalidRequest)?;
+    CriterionAsset::parse(params.asset()).map_err(|_| CreateInvoiceError::InvalidRequest)?;
+    CriterionAmount::parse(params.amount()).map_err(|_| CreateInvoiceError::InvalidRequest)?;
+    let payment_in = CriterionPaymentWindowHours::new(params.payment_in())
+        .map_err(|_| CreateInvoiceError::InvalidRequest)?;
+    if payment_in != request.payment_in {
+        return Err(CreateInvoiceError::InvalidRequest);
+    }
     Ok(())
 }
 fn extract_terms(lock: &ContentLock) -> Result<CriterionAmount, CreateInvoiceError> {
@@ -538,20 +534,10 @@ fn extract_terms(lock: &ContentLock) -> Result<CriterionAmount, CreateInvoiceErr
         .iter()
         .find(|criterion| criterion.verifier_type == VerifierType::PaykitPayment)
         .ok_or(CreateInvoiceError::InvalidRequest)?;
-    CriterionAsset::parse(
-        criterion
-            .params
-            .get("asset")
-            .and_then(Value::as_str)
-            .ok_or(CreateInvoiceError::InvalidRequest)?,
-    )
-    .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-    CriterionAmount::parse(
-        criterion
-            .params
-            .get("amount")
-            .and_then(Value::as_str)
-            .ok_or(CreateInvoiceError::InvalidRequest)?,
-    )
-    .map_err(|_| CreateInvoiceError::InvalidRequest)
+    let params = criterion
+        .paykit_payment_params()
+        .map_err(|_| CreateInvoiceError::InvalidRequest)?
+        .ok_or(CreateInvoiceError::InvalidRequest)?;
+    CriterionAsset::parse(params.asset()).map_err(|_| CreateInvoiceError::InvalidRequest)?;
+    CriterionAmount::parse(params.amount()).map_err(|_| CreateInvoiceError::InvalidRequest)
 }

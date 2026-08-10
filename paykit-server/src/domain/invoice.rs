@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use serde_json::Value;
 use thiserror::Error;
 
 use super::locks::{BundleId, CreatorPubky, PubkyLockResource};
@@ -130,4 +131,82 @@ pub enum CriterionAmountError {
     /// The value did not fit in `u64`.
     #[error("criterion amount exceeds u64")]
     OutOfRange,
+}
+
+/// A positive Locks payment window expressed as whole JSON hours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct CriterionPaymentWindowHours(u64);
+
+impl CriterionPaymentWindowHours {
+    /// Validates an already-decoded whole-hour value.
+    pub fn new(hours: u64) -> Result<Self, CriterionPaymentWindowHoursError> {
+        if hours == 0 {
+            Err(CriterionPaymentWindowHoursError::Invalid)
+        } else {
+            Ok(Self(hours))
+        }
+    }
+
+    /// Parses a required positive JSON `u64`.
+    pub fn parse(value: &Value) -> Result<Self, CriterionPaymentWindowHoursError> {
+        let hours = value
+            .as_u64()
+            .ok_or(CriterionPaymentWindowHoursError::Invalid)?;
+        Self::new(hours)
+    }
+
+    /// Parses an optional JSON field while preserving missing-field diagnostics.
+    pub fn parse_optional(value: Option<&Value>) -> Result<Self, CriterionPaymentWindowHoursError> {
+        Self::parse(value.ok_or(CriterionPaymentWindowHoursError::Missing)?)
+    }
+
+    /// Returns the positive whole-hour value.
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Error returned while parsing a Locks payment window.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum CriterionPaymentWindowHoursError {
+    /// The required `payment_in` field was absent.
+    #[error("payment window hours are required")]
+    Missing,
+    /// The field was not a positive whole-hour JSON `u64`.
+    #[error("payment window must be a positive whole-hour JSON u64")]
+    Invalid,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::{CriterionPaymentWindowHours, CriterionPaymentWindowHoursError};
+
+    #[test]
+    fn payment_window_hours_accepts_exact_positive_json_u64() {
+        let hours = CriterionPaymentWindowHours::parse(&json!(24)).unwrap();
+        assert_eq!(hours.get(), 24);
+    }
+
+    #[test]
+    fn payment_window_hours_rejects_missing_zero_string_fraction_and_out_of_range() {
+        for (value, expected) in [
+            (None, CriterionPaymentWindowHoursError::Missing),
+            (Some(json!(0)), CriterionPaymentWindowHoursError::Invalid),
+            (Some(json!("24")), CriterionPaymentWindowHoursError::Invalid),
+            (Some(json!(1.5)), CriterionPaymentWindowHoursError::Invalid),
+            (
+                Some(Value::Number(
+                    serde_json::Number::from_f64(18_446_744_073_709_551_616.0).unwrap(),
+                )),
+                CriterionPaymentWindowHoursError::Invalid,
+            ),
+        ] {
+            assert_eq!(
+                CriterionPaymentWindowHours::parse_optional(value.as_ref()),
+                Err(expected)
+            );
+        }
+    }
 }

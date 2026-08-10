@@ -2584,7 +2584,7 @@ dependencies = [
 [[package]]
 name = "locks-core"
 version = "0.1.0"
-source = "git+https://github.com/pubky/locks.git?rev=df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a#df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a"
+source = "git+https://github.com/pubky/locks.git?rev=a4c27f53310cba2eb66ac35cb8441a55b45fb78c#a4c27f53310cba2eb66ac35cb8441a55b45fb78c"
 dependencies = [
  "base32",
  "blake3",

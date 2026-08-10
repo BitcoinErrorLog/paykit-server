@@ -168,7 +168,8 @@ fn content_lock(creator: &CreatorPubky, amount_sats: u64) -> ContentLock {
             params: serde_json::json!({
                 "recipient_pubky": creator.to_string(),
                 "amount": amount_sats.to_string(),
-                "asset": "BTC"
+                "asset": "BTC",
+                "payment_in": 24
             }),
         }],
         lock_logic: LockLogic::All {
@@ -410,7 +411,7 @@ fn invoice_request(
         Method::POST,
         "/invoices",
         format!(
-            r#"{{"bundle_id":"{bundle}","lock_resource":"{}","reader":"{reader}"}}"#,
+            r#"{{"bundle_id":"{bundle}","lock_resource":"{}","payment_in":24,"reader":"{reader}"}}"#,
             fixture.lock_resource
         ),
     )
