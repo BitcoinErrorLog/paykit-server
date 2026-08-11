@@ -207,6 +207,7 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             new_reader_payloads: &payloads,
             payment_request_intent: common::payment_intent(&reader),
             required_sats: 100,
+            payment_in_hours: 24,
         })
         .await
         .unwrap();
@@ -686,6 +687,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             },
             payment_request_intent: common::payment_intent(&reader),
             required_sats: 100,
+            payment_in_hours: 24,
         })
         .await
         .unwrap();

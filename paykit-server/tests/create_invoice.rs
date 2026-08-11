@@ -11,7 +11,7 @@ use std::{
 use async_trait::async_trait;
 use axum::{
     Extension,
-    body::Body,
+    body::{Body, to_bytes},
     http::{Method, Request, StatusCode},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -199,6 +199,8 @@ impl InvoicePersistence for FakeStore {
             None,
             uuid::Uuid::nil(),
             0,
+            time::OffsetDateTime::UNIX_EPOCH,
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(24),
             true,
         ))
     }
@@ -214,6 +216,8 @@ impl InvoicePersistence for FakeStore {
             None,
             uuid::Uuid::nil(),
             0,
+            time::OffsetDateTime::UNIX_EPOCH,
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(24),
             true,
         ))
     }
@@ -736,8 +740,63 @@ async fn signed_router_parses_canonical_invoice_and_derives_creator_from_lock_re
         .oneshot(signed_invoice_request(&key, body))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        response_body,
+        serde_json::json!({
+            "invoice_created_at": "1970-01-01T00:00:00Z",
+            "payment_deadline": "1970-01-02T00:00:00Z"
+        })
+    );
     assert_eq!(session.creators.lock().unwrap().as_slice(), [CREATOR]);
+}
+
+#[tokio::test]
+async fn signed_router_exact_replay_returns_original_timestamps_without_mutable_dependencies() {
+    let key = SigningKey::from_bytes(&[12; 32]);
+    let session = Arc::new(FakeSession {
+        result: Ok(()),
+        calls: AtomicUsize::default(),
+        creators: Mutex::new(vec![]),
+    });
+    let locks = Arc::new(FakeLocks {
+        result: Ok(valid_lock()),
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::ExactReplay));
+    let router = invoices_router(Arc::new(service(
+        session.clone(),
+        locks.clone(),
+        store.clone(),
+    )))
+    .layer(Extension(signed_auth(&key)));
+    let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "bundle_id": BUNDLE,
+        "lock_resource": LOCK_RESOURCE,
+        "payment_in": 24,
+        "reader": reader()
+    }))
+    .unwrap();
+
+    let response = router
+        .oneshot(signed_invoice_request(&key, body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        response_body,
+        serde_json::json!({
+            "invoice_created_at": "1970-01-01T00:00:00Z",
+            "payment_deadline": "1970-01-02T00:00:00Z"
+        })
+    );
+    assert_eq!(session.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(locks.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -938,6 +997,8 @@ impl InvoicePersistence for CapturingIntentStore {
             Some(uuid::Uuid::nil()),
             uuid::Uuid::nil(),
             0,
+            time::OffsetDateTime::UNIX_EPOCH,
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(24),
             false,
         ))
     }

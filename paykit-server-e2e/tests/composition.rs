@@ -340,6 +340,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             },
             payment_request_intent: payment_intent(&reader, &marker),
             required_sats: 100,
+            payment_in_hours: 24,
         })
         .await
         .unwrap();
@@ -356,6 +357,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             },
             payment_request_intent: payment_intent(&reader, &marker),
             required_sats: 200,
+            payment_in_hours: 24,
         })
         .await
         .unwrap();
@@ -374,6 +376,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             },
             payment_request_intent: payment_intent(&unreachable_reader, &marker),
             required_sats: 300,
+            payment_in_hours: 24,
         })
         .await
         .unwrap();

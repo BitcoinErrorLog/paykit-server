@@ -262,8 +262,10 @@ async fn startup_rejects_corrupt_encrypted_payment_records_before_readiness() {
          (id, creator_id, reader_lookup_hash, bundle_lookup_hash,
           payment_request_lookup_hash, invoice_envelope, payment_status,
           payment_record_envelope, bitcoin_address_lookup_hash,
-          derivation_index_lookup_hash)
-         VALUES ($1, $2, $3, $4, $5, $6, 'undetected', $7, $8, $9)",
+           derivation_index_lookup_hash, invoice_created_at, payment_deadline,
+           payment_in_hours)
+          VALUES ($1, $2, $3, $4, $5, $6, 'undetected', $7, $8, $9,
+                  NOW(), NOW() + INTERVAL '1 hour', 1)",
     )
     .bind(invoice_id)
     .bind(creator_id)
@@ -649,7 +651,7 @@ async fn boot_scan_rejects_corrupt_creator_sdk_and_missing_state_without_histori
         )
         .await
         .unwrap();
-    sqlx::query("INSERT INTO invoices (creator_id, reader_lookup_hash, bundle_lookup_hash, payment_request_lookup_hash, invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)")
+    sqlx::query("INSERT INTO invoices (creator_id, reader_lookup_hash, bundle_lookup_hash, payment_request_lookup_hash, invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status, invoice_created_at, payment_deadline, payment_in_hours) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW() + INTERVAL '1 hour', 1)")
         .bind(persisted.id()).bind(b"poison-reader".as_slice()).bind(b"poison-bundle".as_slice()).bind(b"poison-request".as_slice()).bind(b"poison-invoice".as_slice()).bind(b"poison-payment-record".as_slice()).bind(b"poison-address-hash".as_slice()).bind(b"poison-index-hash".as_slice()).bind("undetected").execute(database.pool()).await.unwrap();
     sqlx::query("INSERT INTO outbox (creator_id, intent_envelope, status) VALUES ($1, $2, $3)")
         .bind(persisted.id())

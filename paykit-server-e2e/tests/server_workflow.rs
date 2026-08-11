@@ -648,6 +648,7 @@ async fn assert_persisted_workflow_inputs(
         uuid::Uuid,
         Vec<u8>,
         uuid::Uuid,
+        time::OffsetDateTime,
         Vec<u8>,
         Vec<u8>,
         uuid::Uuid,
@@ -658,7 +659,7 @@ async fn assert_persisted_workflow_inputs(
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT c.creator_lookup_hash, c.next_child_index,
                 r.id, r.assignment_envelope,
-                i.id, i.invoice_envelope, i.payment_record_envelope,
+                i.id, i.payment_deadline, i.invoice_envelope, i.payment_record_envelope,
                 endpoint.id, endpoint.intent_envelope,
                 payment.id, payment.intent_envelope
          FROM creators c
@@ -680,6 +681,7 @@ async fn assert_persisted_workflow_inputs(
         assignment_id,
         assignment_envelope,
         invoice_id,
+        payment_deadline,
         invoice_envelope,
         payment_record_envelope,
         endpoint_id,
@@ -758,6 +760,9 @@ async fn assert_persisted_workflow_inputs(
             fixture.amount_sats / 100_000_000,
             fixture.amount_sats % 100_000_000
         );
+        let payment_deadline = payment_deadline
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
         assert!(matches!(
             payment.operation(),
             DeliveryOperationV1::PaymentRequestProposal { terms }
@@ -767,7 +772,7 @@ async fn assert_persisted_workflow_inputs(
                         .is_ok_and(|reference| reference.get_version_num() == 4
                             && reference.get_variant() == uuid::Variant::RFC4122
                             && terms.payment_reference == reference.hyphenated().to_string())
-                    && terms.proposal_expires_at.is_none()
+                    && terms.proposal_expires_at.as_deref() == Some(payment_deadline.as_str())
                     && terms.accepted_endpoint_identifiers == ["btc-bitcoin-p2wpkh"]
                     && terms.metadata.get("bundle_id") == Some(&serde_json::json!(bundle))
                     && terms.metadata.get("lock_resource")
@@ -879,16 +884,31 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     );
     assert_eq!(
         invoice_a.status,
-        StatusCode::NO_CONTENT,
+        StatusCode::OK,
         "Creator A invoice body: {}",
         String::from_utf8_lossy(&invoice_a.body)
     );
     assert_eq!(
         invoice_b.status,
-        StatusCode::NO_CONTENT,
+        StatusCode::OK,
         "Creator B invoice body: {}",
         String::from_utf8_lossy(&invoice_b.body)
     );
+    for response in [&invoice_a, &invoice_b] {
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let object = body.as_object().unwrap();
+        assert_eq!(object.len(), 2);
+        for field in ["invoice_created_at", "payment_deadline"] {
+            time::OffsetDateTime::parse(
+                object
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap(),
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap();
+        }
+    }
     assert_persisted_workflow_inputs(
         &first_pool,
         &crypto,

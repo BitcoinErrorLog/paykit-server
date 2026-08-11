@@ -474,6 +474,7 @@ impl CreateInvoiceService {
                 new_reader_payloads: &new_reader_payloads,
                 payment_request_intent,
                 required_sats: extract_terms(&lock)?.as_sats(),
+                payment_in_hours: request.payment_in.get(),
             })
             .await
             .map_err(map_store)
@@ -495,6 +496,7 @@ fn remaining(start: Instant, now: Instant) -> Result<Duration, CreateInvoiceErro
 fn map_store(error: PersistenceError) -> CreateInvoiceError {
     match error {
         PersistenceError::Conflict => CreateInvoiceError::Conflict,
+        PersistenceError::InvalidInput => CreateInvoiceError::InvalidRequest,
         PersistenceError::Unavailable => CreateInvoiceError::Unavailable,
         _ => CreateInvoiceError::Unavailable,
     }

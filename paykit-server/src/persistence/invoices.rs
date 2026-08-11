@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -42,6 +43,8 @@ pub struct AtomicInvoiceInput<'a> {
     pub payment_request_intent: DeliveryIntentV1,
     /// Settlement-authoritative integer satoshi amount captured from the lock.
     pub required_sats: u64,
+    /// Positive whole-hour payment window bound into the signed request.
+    pub payment_in_hours: u64,
 }
 
 /// Private payloads for a newly allocated `(creator, reader)` assignment.
@@ -87,6 +90,8 @@ pub struct AtomicInvoiceResult {
     endpoint_publication_outbox_id: Option<Uuid>,
     reader_assignment_id: Uuid,
     reader_child_index: i64,
+    invoice_created_at: OffsetDateTime,
+    payment_deadline: OffsetDateTime,
     replayed: bool,
 }
 
@@ -104,12 +109,15 @@ impl AtomicInvoiceResult {
     /// This is public because [`crate::application::create_invoice::InvoicePersistence`]
     /// is an injected port; alternate adapters must be able to report a completed
     /// allocation without depending on this module's private fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         invoice_id: Uuid,
         payment_request_outbox_id: Uuid,
         endpoint_publication_outbox_id: Option<Uuid>,
         reader_assignment_id: Uuid,
         reader_child_index: i64,
+        invoice_created_at: OffsetDateTime,
+        payment_deadline: OffsetDateTime,
         replayed: bool,
     ) -> Self {
         Self {
@@ -118,6 +126,8 @@ impl AtomicInvoiceResult {
             endpoint_publication_outbox_id,
             reader_assignment_id,
             reader_child_index,
+            invoice_created_at,
+            payment_deadline,
             replayed,
         }
     }
@@ -142,6 +152,14 @@ impl AtomicInvoiceResult {
 
     pub fn reader_child_index(&self) -> i64 {
         self.reader_child_index
+    }
+
+    pub fn invoice_created_at(&self) -> OffsetDateTime {
+        self.invoice_created_at
+    }
+
+    pub fn payment_deadline(&self) -> OffsetDateTime {
+        self.payment_deadline
     }
 
     pub fn replayed(&self) -> bool {
@@ -339,8 +357,8 @@ impl InvoiceStore {
         let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
         let bundle_hash = self.crypto.lookup_hash(bundle_binding);
         let payment_hash = self.crypto.lookup_hash(payment_request_binding);
-        let existing = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT invoices.id, invoices.payment_request_lookup_hash FROM invoices \
+        let existing = sqlx::query_as::<_, PreflightInvoice>(
+            "SELECT invoices.payment_request_lookup_hash FROM invoices \
              JOIN creators ON creators.id = invoices.creator_id \
              WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
         )
@@ -389,7 +407,7 @@ impl InvoiceStore {
             return Err(PersistenceError::CorruptOrMissing);
         }
         let existing = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT id, payment_request_lookup_hash FROM invoices \
+            "SELECT id, payment_request_lookup_hash, invoice_created_at, payment_deadline, payment_in_hours FROM invoices \
              WHERE creator_id = $1 AND bundle_lookup_hash = $2 FOR UPDATE",
         )
         .bind(creator.id)
@@ -423,6 +441,8 @@ impl InvoiceStore {
             endpoint_publication_outbox_id: payment_outbox.depends_on_id,
             reader_assignment_id: assignment.id,
             reader_child_index: assignment.child_index,
+            invoice_created_at: existing.invoice_created_at,
+            payment_deadline: existing.payment_deadline,
             replayed: true,
         })
     }
@@ -716,7 +736,7 @@ impl InvoiceStore {
     /// reader, persists an invoice, and inserts ordered encrypted outbox work.
     pub async fn create_atomic(
         &self,
-        input: AtomicInvoiceInput<'_>,
+        mut input: AtomicInvoiceInput<'_>,
     ) -> Result<AtomicInvoiceResult, PersistenceError> {
         let creator_hash = self
             .crypto
@@ -725,11 +745,37 @@ impl InvoiceStore {
         let bundle_hash = self.crypto.lookup_hash(input.bundle_binding);
         let payment_request_hash = self.crypto.lookup_hash(input.payment_request_binding);
 
+        let payment_in_hours =
+            i64::try_from(input.payment_in_hours).map_err(|_| PersistenceError::InvalidInput)?;
+        if payment_in_hours == 0 {
+            return Err(PersistenceError::InvalidInput);
+        }
+        let payment_duration = Duration::seconds(
+            payment_in_hours
+                .checked_mul(60 * 60)
+                .ok_or(PersistenceError::InvalidInput)?,
+        );
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
+        let invoice_created_at: OffsetDateTime =
+            sqlx::query_scalar("SELECT transaction_timestamp()")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+        let payment_deadline = invoice_created_at
+            .checked_add(payment_duration)
+            .ok_or(PersistenceError::InvalidInput)?;
+        input
+            .payment_request_intent
+            .set_proposal_expires_at(
+                payment_deadline
+                    .format(&Rfc3339)
+                    .map_err(|_| PersistenceError::InvalidInput)?,
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
         let creator = sqlx::query_as::<_, CreatorRow>(
             "SELECT id, creator_lookup_hash, next_child_index \
              FROM creators WHERE creator_lookup_hash = $1 FOR UPDATE",
@@ -744,7 +790,7 @@ impl InvoiceStore {
         }
 
         if let Some(existing) = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT id, payment_request_lookup_hash FROM invoices \
+            "SELECT id, payment_request_lookup_hash, invoice_created_at, payment_deadline, payment_in_hours FROM invoices \
              WHERE creator_id = $1 AND bundle_lookup_hash = $2 FOR UPDATE",
         )
         .bind(creator.id)
@@ -753,7 +799,9 @@ impl InvoiceStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?
         {
-            if existing.payment_request_lookup_hash != payment_request_hash.as_bytes() {
+            if existing.payment_request_lookup_hash != payment_request_hash.as_bytes()
+                || existing.payment_in_hours != payment_in_hours
+            {
                 return Err(PersistenceError::Conflict);
             }
             let assignment = self
@@ -779,6 +827,8 @@ impl InvoiceStore {
                 endpoint_publication_outbox_id: payment_request_outbox.depends_on_id,
                 reader_assignment_id: assignment.id,
                 reader_child_index: assignment.child_index,
+                invoice_created_at: existing.invoice_created_at,
+                payment_deadline: existing.payment_deadline,
                 replayed: true,
             });
         }
@@ -892,8 +942,8 @@ impl InvoiceStore {
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         sqlx::query(
             "INSERT INTO invoices \
-             (id, creator_id, reader_lookup_hash, bundle_lookup_hash, payment_request_lookup_hash, invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'undetected')",
+             (id, creator_id, reader_lookup_hash, bundle_lookup_hash, payment_request_lookup_hash, invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status, invoice_created_at, payment_deadline, payment_in_hours) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'undetected', $10, $11, $12)",
         )
         .bind(invoice_id)
         .bind(creator.id)
@@ -904,6 +954,9 @@ impl InvoiceStore {
         .bind(payment_record_envelope.as_bytes())
         .bind(bitcoin_address_lookup_hash.as_bytes().as_slice())
         .bind(derivation_index_lookup_hash.as_bytes().as_slice())
+        .bind(invoice_created_at)
+        .bind(payment_deadline)
+        .bind(payment_in_hours)
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Conflict)?;
@@ -946,6 +999,8 @@ impl InvoiceStore {
             endpoint_publication_outbox_id,
             reader_assignment_id: assignment.id,
             reader_child_index: assignment.child_index,
+            invoice_created_at,
+            payment_deadline,
             replayed: false,
         })
     }
@@ -1124,6 +1179,14 @@ struct ObservationTargetRow {
 #[derive(sqlx::FromRow)]
 struct ExistingInvoice {
     id: Uuid,
+    payment_request_lookup_hash: Vec<u8>,
+    invoice_created_at: OffsetDateTime,
+    payment_deadline: OffsetDateTime,
+    payment_in_hours: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct PreflightInvoice {
     payment_request_lookup_hash: Vec<u8>,
 }
 

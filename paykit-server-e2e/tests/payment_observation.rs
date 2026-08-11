@@ -102,6 +102,7 @@ async fn invoice_for(
             new_reader_payloads: &PAYLOADS,
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
+            payment_in_hours: 24,
         })
         .await
         .unwrap();
@@ -149,6 +150,7 @@ async fn other_creator_invoice(
             new_reader_payloads: &FixedPayloads(address),
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
+            payment_in_hours: 24,
         })
         .await
         .unwrap()
@@ -206,6 +208,7 @@ async fn batch_invoice(database: &TestDatabase) -> (InvoiceStore, uuid::Uuid) {
             new_reader_payloads: &FixedPayloads(REGTEST_ADDRESS),
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
+            payment_in_hours: 24,
         })
         .await
         .unwrap()

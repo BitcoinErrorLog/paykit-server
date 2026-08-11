@@ -90,4 +90,7 @@ pub enum PersistenceError {
     /// A requested idempotent binding conflicts with a durable record.
     #[error("persisted state conflicts with the request")]
     Conflict,
+    /// A typed caller value cannot be represented by the persistence contract.
+    #[error("persistence input is invalid")]
+    InvalidInput,
 }

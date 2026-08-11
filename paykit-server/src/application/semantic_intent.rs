@@ -13,6 +13,7 @@ use paykit_lib::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// Server-owned delivery intent stored inside the Creator-bound outbox AEAD envelope.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -84,6 +85,22 @@ pub enum DeliveryIntentError {
 }
 
 impl DeliveryIntentV1 {
+    /// Sets the transaction-authoritative proposal expiry before persistence.
+    pub fn set_proposal_expires_at(
+        &mut self,
+        proposal_expires_at: String,
+    ) -> Result<(), DeliveryIntentError> {
+        OffsetDateTime::parse(&proposal_expires_at, &Rfc3339)
+            .map_err(|_| DeliveryIntentError::Invalid)?;
+        match &mut self.operation {
+            DeliveryOperationV1::PaymentRequestProposal { terms } => {
+                terms.proposal_expires_at = Some(proposal_expires_at);
+                self.validate()
+            }
+            DeliveryOperationV1::EndpointPublication { .. } => Err(DeliveryIntentError::Invalid),
+        }
+    }
+
     pub fn fingerprint(marker: &PaykitReceiverMarker) -> Result<[u8; 32], DeliveryIntentError> {
         let canonical =
             serialize_paykit_receiver_marker(marker).map_err(|_| DeliveryIntentError::Marker)?;
@@ -206,7 +223,10 @@ impl DeliveryIntentV1 {
                 if reference.get_version_num() != 4
                     || reference.get_variant() != uuid::Variant::RFC4122
                     || terms.payment_reference != reference.hyphenated().to_string()
-                    || terms.proposal_expires_at.is_some()
+                    || terms
+                        .proposal_expires_at
+                        .as_ref()
+                        .is_some_and(|value| OffsetDateTime::parse(value, &Rfc3339).is_err())
                 {
                     return Err(DeliveryIntentError::Invalid);
                 }

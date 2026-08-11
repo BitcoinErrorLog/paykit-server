@@ -11,12 +11,13 @@ use paykit_server::{
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
     persistence::{
-        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
+        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePreflight, InvoiceStore,
         NewReaderPayloadFactory, NewReaderPayloads, PersistenceError, run_migrations,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::Row;
+use time::format_description::well_known::Rfc3339;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 
@@ -170,6 +171,7 @@ fn input<'a>(
         new_reader_payloads: &TEST_PAYLOADS,
         payment_request_intent: payment_intent(),
         required_sats: 100,
+        payment_in_hours: 24,
     }
 }
 
@@ -179,6 +181,13 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
     let store = invoice_store(&database).await;
     let creator = creator();
     let reader = reader();
+    assert_eq!(
+        store
+            .preflight(&creator, b"bundle-one", b"request-one")
+            .await
+            .unwrap(),
+        InvoicePreflight::New
+    );
 
     let first = store
         .create_atomic(input(&creator, &reader, b"bundle-one", b"request-one"))
@@ -186,6 +195,55 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
         .unwrap();
     assert!(!first.replayed());
     assert_eq!(first.reader_child_index(), 0);
+    assert!(first.payment_deadline() > first.invoice_created_at());
+    assert_eq!(
+        first.payment_deadline() - first.invoice_created_at(),
+        time::Duration::hours(24)
+    );
+    let persisted_times = sqlx::query(
+        "SELECT invoice_created_at, payment_deadline, payment_in_hours FROM invoices WHERE id = $1",
+    )
+    .bind(first.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        persisted_times.get::<time::OffsetDateTime, _>("invoice_created_at"),
+        first.invoice_created_at()
+    );
+    assert_eq!(
+        persisted_times.get::<time::OffsetDateTime, _>("payment_deadline"),
+        first.payment_deadline()
+    );
+    assert_eq!(persisted_times.get::<i64, _>("payment_in_hours"), 24);
+    assert_eq!(
+        store
+            .preflight(&creator, b"bundle-one", b"request-one")
+            .await
+            .unwrap(),
+        InvoicePreflight::ExactReplay
+    );
+    assert_eq!(
+        store
+            .preflight(&creator, b"bundle-one", b"changed-request")
+            .await
+            .unwrap(),
+        InvoicePreflight::Conflict
+    );
+    let preflight_replay = store
+        .exact_replay(&creator, &reader, b"bundle-one", b"request-one")
+        .await
+        .unwrap();
+    assert!(preflight_replay.replayed());
+    assert_eq!(preflight_replay.invoice_id(), first.invoice_id());
+    assert_eq!(
+        preflight_replay.invoice_created_at(),
+        first.invoice_created_at()
+    );
+    assert_eq!(
+        preflight_replay.payment_deadline(),
+        first.payment_deadline()
+    );
     let endpoint_id = first
         .endpoint_publication_outbox_id()
         .expect("new reader must enqueue endpoint publication");
@@ -286,7 +344,14 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
         .unwrap();
     let original_intent = DeliveryIntentV1::decode(&original_plaintext).unwrap();
     let original_reference = match original_intent.operation() {
-        DeliveryOperationV1::PaymentRequestProposal { terms } => terms.payment_reference.clone(),
+        DeliveryOperationV1::PaymentRequestProposal { terms } => {
+            let deadline = first.payment_deadline().format(&Rfc3339).unwrap();
+            assert_eq!(
+                terms.proposal_expires_at.as_deref(),
+                Some(deadline.as_str())
+            );
+            terms.payment_reference.clone()
+        }
         DeliveryOperationV1::EndpointPublication { .. } => {
             panic!("payment row had endpoint intent")
         }
@@ -300,6 +365,8 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
         .unwrap();
     assert!(replay.replayed());
     assert_eq!(replay.invoice_id(), first.invoice_id());
+    assert_eq!(replay.invoice_created_at(), first.invoice_created_at());
+    assert_eq!(replay.payment_deadline(), first.payment_deadline());
     assert_eq!(
         replay.payment_request_outbox_id(),
         first.payment_request_outbox_id()
@@ -372,6 +439,12 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
             .await,
         Err(PersistenceError::Conflict)
     );
+    let mut changed_window = input(&creator, &reader, b"bundle-one", b"request-one");
+    changed_window.payment_in_hours = 12;
+    assert_eq!(
+        store.create_atomic(changed_window).await,
+        Err(PersistenceError::Conflict)
+    );
 
     let second = store
         .create_atomic(input(&creator, &reader, b"bundle-two", b"request-two"))
@@ -409,6 +482,44 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
         .await
         .unwrap(),
         second.endpoint_publication_outbox_id()
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn unrepresentable_payment_deadline_rolls_back_all_invoice_side_effects() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    for (suffix, payment_in_hours) in [
+        ("u64", u64::MAX),
+        ("duration", i64::MAX as u64),
+        ("rfc3339", 100_000_000_u64),
+    ] {
+        let bundle = format!("overflow-bundle-{suffix}");
+        let request = format!("overflow-request-{suffix}");
+        let mut invalid = input(&creator, &reader, bundle.as_bytes(), request.as_bytes());
+        invalid.payment_in_hours = payment_in_hours;
+        assert_eq!(
+            store.create_atomic(invalid).await,
+            Err(PersistenceError::InvalidInput)
+        );
+    }
+    for table in ["reader_assignments", "invoices", "outbox"] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "unexpected {table} write");
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
     );
 
     database.cleanup().await;
@@ -629,6 +740,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             new_reader_payloads: &first_payloads,
             payment_request_intent: payment_intent(),
             required_sats: 100,
+            payment_in_hours: 24,
         }),
         second_store.create_atomic(AtomicInvoiceInput {
             creator: &second_creator,
@@ -638,6 +750,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             new_reader_payloads: &second_payloads,
             payment_request_intent: payment_intent(),
             required_sats: 100,
+            payment_in_hours: 24,
         })
     );
     let first = first.unwrap();

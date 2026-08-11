@@ -7,8 +7,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use time::format_description::well_known::Rfc3339;
 
 use crate::{
     application::create_invoice::{CreateInvoiceError, CreateInvoiceRequest, CreateInvoiceService},
@@ -27,6 +28,12 @@ struct InvoiceBody {
     payment_in: Value,
 }
 
+#[derive(Serialize)]
+struct InvoiceResponse {
+    invoice_created_at: String,
+    payment_deadline: String,
+}
+
 pub fn invoices_router(service: Arc<CreateInvoiceService>) -> Router {
     Router::new()
         .route("/invoices", post(create))
@@ -42,9 +49,25 @@ async fn create(
         Err(error) => return error.into_response(),
     };
     match service.create(request).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(result) => match response(result) {
+            Ok(body) => (StatusCode::OK, axum::Json(body)).into_response(),
+            Err(error) => error.into_response(),
+        },
         Err(error) => invoice_error(error),
     }
+}
+
+fn response(result: crate::persistence::AtomicInvoiceResult) -> Result<InvoiceResponse, ApiError> {
+    Ok(InvoiceResponse {
+        invoice_created_at: result
+            .invoice_created_at()
+            .format(&Rfc3339)
+            .map_err(|_| ApiError::InternalError)?,
+        payment_deadline: result
+            .payment_deadline()
+            .format(&Rfc3339)
+            .map_err(|_| ApiError::InternalError)?,
+    })
 }
 
 fn parse(body: InvoiceBody) -> Result<CreateInvoiceRequest, ApiError> {
