@@ -55,7 +55,46 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, vec![1, 2]);
+    assert_eq!(applied_versions, vec![1, 2, 3]);
+
+    let observation_lifecycle_columns: Vec<(String, String)> = sqlx::query_as(
+        "SELECT column_name, is_nullable
+         FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'invoices'
+           AND column_name IN ('first_amount_matched_observed_at', 'payment_expired_at')
+         ORDER BY column_name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        observation_lifecycle_columns,
+        vec![
+            ("first_amount_matched_observed_at".into(), "YES".into()),
+            ("payment_expired_at".into(), "YES".into()),
+        ]
+    );
+    let lifecycle_constraints: Vec<String> = sqlx::query_scalar(
+        "SELECT conname FROM pg_constraint
+         WHERE conrelid = 'invoices'::regclass
+           AND conname IN (
+               'invoices_first_amount_matched_window_check',
+               'invoices_payment_expired_deadline_check',
+               'invoices_payment_lifecycle_terminal_check'
+           )
+         ORDER BY conname",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        lifecycle_constraints,
+        vec![
+            "invoices_first_amount_matched_window_check",
+            "invoices_payment_expired_deadline_check",
+            "invoices_payment_lifecycle_terminal_check",
+        ]
+    );
 
     let plaintext_creator_pubky_columns: Vec<String> = sqlx::query_scalar(
         "SELECT table_name \

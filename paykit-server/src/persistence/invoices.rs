@@ -256,6 +256,30 @@ impl InvoiceStore {
 
     /// Loads every non-final invoice as an authenticated Electrum observation target.
     pub async fn observation_targets(&self) -> Result<Vec<ObservationTarget>, PersistenceError> {
+        self.observation_targets_at(OffsetDateTime::now_utc()).await
+    }
+
+    /// Loads observation targets after durably expiring invoices whose inclusive
+    /// payment deadline has passed without an amount-matched observation.
+    pub async fn observation_targets_at(
+        &self,
+        observed_at: OffsetDateTime,
+    ) -> Result<Vec<ObservationTarget>, PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        sqlx::query(
+            "UPDATE invoices SET payment_expired_at = $1, updated_at = NOW()
+             WHERE payment_expired_at IS NULL
+               AND first_amount_matched_observed_at IS NULL
+               AND payment_deadline < $1",
+        )
+        .bind(observed_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
         let rows = sqlx::query_as::<_, ObservationTargetRow>(
             "SELECT invoices.id AS invoice_id, creators.creator_lookup_hash, \
                     invoices.payment_record_envelope, invoices.bitcoin_address_lookup_hash, \
@@ -264,13 +288,17 @@ impl InvoiceStore {
              FROM invoices JOIN creators ON creators.id = invoices.creator_id \
              LEFT JOIN bitcoin_observations AS observations \
                ON observations.invoice_id = invoices.id AND observations.active \
-             WHERE NOT (invoices.payment_status = 'confirmed' \
+             WHERE invoices.payment_expired_at IS NULL \
+               AND NOT (invoices.payment_status = 'confirmed' \
                         AND invoices.confirmation_count = 6 AND invoices.amount_matched) \
              ORDER BY invoices.id",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
 
         rows.into_iter()
             .map(|row| {
@@ -482,6 +510,26 @@ impl InvoiceStore {
         confirmations: u32,
         present: bool,
     ) -> Result<bool, PersistenceError> {
+        self.apply_bitcoin_observation_at(
+            address,
+            outpoint,
+            observed_sats,
+            confirmations,
+            present,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+    }
+
+    pub async fn apply_bitcoin_observation_at(
+        &self,
+        address: &str,
+        outpoint: &BitcoinOutpoint,
+        observed_sats: u64,
+        confirmations: u32,
+        present: bool,
+        observed_at: OffsetDateTime,
+    ) -> Result<bool, PersistenceError> {
         let mut tx = self
             .pool
             .begin()
@@ -490,12 +538,17 @@ impl InvoiceStore {
         let applied = self
             .apply_bitcoin_observation_in_tx(
                 &mut tx,
-                address,
-                outpoint,
-                observed_sats,
-                confirmations,
-                present,
+                &BitcoinObservationInput {
+                    address: address.to_owned(),
+                    outpoint: outpoint.clone(),
+                    observed_sats,
+                    confirmations,
+                    present,
+                },
+                observed_at,
             )
+            .await?;
+        self.expire_unmatched_at_deadline_in_tx(&mut tx, address, observed_at)
             .await?;
         tx.commit()
             .await
@@ -503,9 +556,10 @@ impl InvoiceStore {
         Ok(applied)
     }
 
-    pub(crate) async fn apply_bitcoin_observation_batch(
+    pub(crate) async fn apply_bitcoin_observation_batch_at(
         &self,
         observations: &[BitcoinObservationInput],
+        observed_at: OffsetDateTime,
     ) -> Result<usize, PersistenceError> {
         if observations.is_empty() {
             return Ok(0);
@@ -518,18 +572,15 @@ impl InvoiceStore {
         let mut applied = 0;
         for observation in observations {
             if self
-                .apply_bitcoin_observation_in_tx(
-                    &mut tx,
-                    &observation.address,
-                    &observation.outpoint,
-                    observation.observed_sats,
-                    observation.confirmations,
-                    observation.present,
-                )
+                .apply_bitcoin_observation_in_tx(&mut tx, observation, observed_at)
                 .await?
             {
                 applied += 1;
             }
+        }
+        for observation in observations {
+            self.expire_unmatched_at_deadline_in_tx(&mut tx, &observation.address, observed_at)
+                .await?;
         }
         tx.commit()
             .await
@@ -540,12 +591,20 @@ impl InvoiceStore {
     async fn apply_bitcoin_observation_in_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
-        address: &str,
-        outpoint: &BitcoinOutpoint,
-        observed_sats: u64,
-        confirmations: u32,
-        present: bool,
+        observation: &BitcoinObservationInput,
+        observed_at: OffsetDateTime,
     ) -> Result<bool, PersistenceError> {
+        let BitcoinObservationInput {
+            address,
+            outpoint,
+            observed_sats,
+            confirmations,
+            present,
+        } = observation;
+        let address = address.as_str();
+        let observed_sats = *observed_sats;
+        let confirmations = *confirmations;
+        let present = *present;
         let incoming_confirmations = confirmations;
         let confirmations = i32::try_from(incoming_confirmations)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
@@ -555,6 +614,8 @@ impl InvoiceStore {
             "SELECT invoices.id, invoices.payment_record_envelope,
                     invoices.bitcoin_address_lookup_hash, invoices.payment_status,
                     invoices.confirmation_count, invoices.amount_matched,
+                    invoices.payment_deadline, invoices.first_amount_matched_observed_at,
+                    invoices.payment_expired_at,
                     creators.creator_lookup_hash
              FROM invoices JOIN creators ON creators.id = invoices.creator_id
              WHERE invoices.bitcoin_address_lookup_hash = $1 FOR UPDATE OF invoices",
@@ -584,6 +645,26 @@ impl InvoiceStore {
             return Err(PersistenceError::CorruptOrMissing);
         }
         let required = payment_record.required_sats;
+        let amount_matched = present && observed_sats >= required;
+        if invoice.payment_expired_at.is_some() {
+            return Ok(true);
+        }
+        if invoice.first_amount_matched_observed_at.is_none()
+            && observed_at > invoice.payment_deadline
+        {
+            sqlx::query(
+                "UPDATE invoices SET payment_expired_at = $1, updated_at = NOW()
+                 WHERE id = $2 AND payment_expired_at IS NULL
+                   AND first_amount_matched_observed_at IS NULL",
+            )
+            .bind(observed_at)
+            .bind(invoice.id)
+            .execute(&mut **tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(true);
+        }
+
         // Final matching outputs are no longer monitored. Keep their persisted
         // six-confirmation fact immutable even if a stale observer reports later.
         if invoice.payment_status == "confirmed"
@@ -711,7 +792,6 @@ impl InvoiceStore {
         if observation_write.rows_affected() != 1 {
             return Err(PersistenceError::Conflict);
         }
-        let amount_matched = present && observed_sats >= required;
         let reported_confirmations = if amount_matched {
             incoming_confirmations.min(6)
         } else if present {
@@ -726,10 +806,38 @@ impl InvoiceStore {
         } else {
             "confirmed"
         };
-        sqlx::query("UPDATE invoices SET payment_status = $1, confirmation_count = $2, amount_matched = $3, updated_at = NOW() WHERE id = $4")
-            .bind(status).bind(i32::try_from(reported_confirmations).map_err(|_| PersistenceError::CorruptOrMissing)?).bind(amount_matched).bind(invoice.id)
+        let first_amount_matched_observed_at = (amount_matched
+            && invoice.first_amount_matched_observed_at.is_none())
+        .then_some(observed_at);
+        sqlx::query("UPDATE invoices SET payment_status = $1, confirmation_count = $2, amount_matched = $3,
+                     first_amount_matched_observed_at = COALESCE(first_amount_matched_observed_at, $4),
+                     updated_at = NOW() WHERE id = $5")
+            .bind(status).bind(i32::try_from(reported_confirmations).map_err(|_| PersistenceError::CorruptOrMissing)?).bind(amount_matched)
+            .bind(first_amount_matched_observed_at).bind(invoice.id)
             .execute(&mut **tx).await.map_err(|_| PersistenceError::Unavailable)?;
         Ok(true)
+    }
+
+    async fn expire_unmatched_at_deadline_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        address: &str,
+        observed_at: OffsetDateTime,
+    ) -> Result<(), PersistenceError> {
+        let address_lookup_hash = self.crypto.bitcoin_address_lookup_hash(address.as_bytes());
+        sqlx::query(
+            "UPDATE invoices SET payment_expired_at = $1, updated_at = NOW()
+             WHERE bitcoin_address_lookup_hash = $2
+               AND payment_deadline = $1
+               AND first_amount_matched_observed_at IS NULL
+               AND payment_expired_at IS NULL",
+        )
+        .bind(observed_at)
+        .bind(address_lookup_hash.as_bytes().as_slice())
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(())
     }
 
     /// Atomically resolves the creator, checks replay, allocates/reuses a
@@ -1151,6 +1259,9 @@ struct BitcoinInvoiceRow {
     payment_status: String,
     confirmation_count: i32,
     amount_matched: bool,
+    payment_deadline: OffsetDateTime,
+    first_amount_matched_observed_at: Option<OffsetDateTime>,
+    payment_expired_at: Option<OffsetDateTime>,
     creator_lookup_hash: Vec<u8>,
 }
 
