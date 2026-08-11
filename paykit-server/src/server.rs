@@ -8,6 +8,8 @@ use crate::{
             CreateInvoiceError, CreateInvoiceService, LockFetchError, LockFetcher, MarkerDiscovery,
             PaykitIntentBuilder, SessionValidationError, SessionValidator,
         },
+        payment_drain::{PaymentDrainError, PaymentDrainOperations, PaymentDrainSummary},
+        payment_request_status::PaymentRequestStatusOperations,
         payment_status::PaymentStatusService,
     },
     bitkit_setup::BitkitAuthStarter,
@@ -17,8 +19,8 @@ use crate::{
     http::{self, auth::SignedLocksAuth},
     paykit::{CreatorSessionProvider, PaykitAdapter},
     persistence::{
-        CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PaymentRequestLifecycleStore,
-        PersistenceError, PostgresStorageAdapter, SdkStateStore,
+        CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PaymentDrainStore,
+        PaymentRequestLifecycleStore, PersistenceError, PostgresStorageAdapter, SdkStateStore,
     },
     real_setup::RealSetupCompleter,
     runtime::{PostgresDependency, Runtime, operational_router},
@@ -137,6 +139,7 @@ impl Server {
         let invoices = InvoiceStore::new(&pool, crypto.clone());
         let outbox = OutboxStore::new(&pool, crypto.clone());
         let payment_request_lifecycles = PaymentRequestLifecycleStore::new(&pool, crypto.clone());
+        let payment_drains = PaymentDrainStore::new(&pool, crypto.clone());
 
         let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone());
         let relay = Arc::new(PubkyCompanionRelay::new(pubky.client().clone()));
@@ -190,10 +193,28 @@ impl Server {
             Arc::new(PaykitIntentBuilder),
         ));
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
+        let payment_drain_operations: Arc<dyn PaymentDrainOperations> =
+            Arc::new(ProductionPaymentDrainOperations {
+                pool: pool.clone(),
+                crypto: crypto.clone(),
+                creators: creators.clone(),
+                lifecycles: payment_request_lifecycles.clone(),
+                drains: payment_drains,
+                pubky: pubky.clone(),
+                paykit: config.paykit.clone(),
+            });
+        let payment_request_status_operations: Arc<dyn PaymentRequestStatusOperations> =
+            Arc::new(invoices.clone());
         let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
         let business_routes = http::setup::setup_router(setup).merge(
             http::invoices::invoices_router(invoice_service)
                 .merge(http::status::status_router(status_service))
+                .merge(http::payment_drains::payment_drains_router(
+                    payment_drain_operations,
+                ))
+                .merge(http::payment_requests::payment_requests_router(
+                    payment_request_status_operations,
+                ))
                 .layer(Extension(signed_auth)),
         );
 
@@ -330,6 +351,69 @@ fn outbox_batch_size(config: &OutboxConfig) -> i64 {
 enum AdapterBuildError {
     Permanent,
     Unavailable,
+}
+
+#[derive(Clone)]
+struct ProductionPaymentDrainOperations {
+    pool: PgPool,
+    crypto: Arc<Crypto>,
+    creators: CreatorStore,
+    lifecycles: PaymentRequestLifecycleStore,
+    drains: PaymentDrainStore,
+    pubky: Pubky,
+    paykit: PaykitConfig,
+}
+
+#[async_trait]
+impl PaymentDrainOperations for ProductionPaymentDrainOperations {
+    async fn create(
+        &self,
+        lock_resource: &PubkyLockResource,
+    ) -> Result<PaymentDrainSummary, PaymentDrainError> {
+        if let Some(replay) = self
+            .drains
+            .exact_replay(lock_resource)
+            .await
+            .map_err(|_| PaymentDrainError::Unavailable)?
+        {
+            return Ok(PaymentDrainSummary::from(replay));
+        }
+        let (creator_id, credentials) = self
+            .creators
+            .load_with_id(lock_resource.creator())
+            .await
+            .map_err(|_| PaymentDrainError::Unavailable)?;
+        if credentials.creator() != lock_resource.creator() {
+            return Err(PaymentDrainError::Unavailable);
+        }
+        SdkStateStore::new(&self.pool, self.crypto.clone())
+            .load(lock_resource.creator())
+            .await
+            .map_err(|_| PaymentDrainError::Unavailable)?;
+        let storage = PostgresStorageAdapter::new(&self.pool, self.crypto.clone(), creator_id);
+        let sessions = CreatorSessionProvider::with_pubky(
+            self.creators.clone(),
+            lock_resource.creator().clone(),
+            self.pubky.clone(),
+        );
+        let adapter = PaykitAdapter::new(storage, sessions, &self.paykit)
+            .map_err(|_| PaymentDrainError::Unavailable)?;
+        adapter
+            .reconcile_and_create_payment_drain(&self.lifecycles, &self.drains, lock_resource)
+            .await
+            .map(PaymentDrainSummary::from)
+    }
+
+    async fn lookup(
+        &self,
+        lock_resource: &PubkyLockResource,
+    ) -> Result<Option<PaymentDrainSummary>, PaymentDrainError> {
+        self.drains
+            .exact_replay(lock_resource)
+            .await
+            .map(|snapshot| snapshot.map(PaymentDrainSummary::from))
+            .map_err(|_| PaymentDrainError::Unavailable)
+    }
 }
 
 async fn creator_adapter(

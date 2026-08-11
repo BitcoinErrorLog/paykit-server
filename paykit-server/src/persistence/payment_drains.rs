@@ -458,10 +458,14 @@ fn snapshot(
         "completed" => true,
         _ => return Err(PersistenceError::CorruptOrMissing),
     };
+    let accepted_count = count(row.accepted_count)?;
+    if completed == (accepted_count > 0) {
+        return Err(PersistenceError::CorruptOrMissing);
+    }
     Ok(PaymentDrainSnapshot {
         drain_id: row.id,
         created_at: row.created_at,
-        accepted_count: count(row.accepted_count)?,
+        accepted_count,
         terminal_count: count(row.terminal_count)?,
         cancellation_enqueued_count: count(row.cancellation_enqueued_count)?,
         completed,
@@ -478,4 +482,29 @@ fn lookup_hash(bytes: &[u8]) -> Result<LookupHash, PersistenceError> {
         .try_into()
         .map_err(|_| PersistenceError::CorruptOrMissing)?;
     Ok(LookupHash::from_bytes(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(status: &str, accepted_count: i64) -> ExistingDrainRow {
+        ExistingDrainRow {
+            id: Uuid::nil(),
+            lock_resource_envelope: Vec::new(),
+            accepted_count,
+            terminal_count: 0,
+            cancellation_enqueued_count: 0,
+            status: status.to_owned(),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn snapshot_rejects_status_that_disagrees_with_accepted_count() {
+        assert!(snapshot(row("active", 0), true).is_err());
+        assert!(snapshot(row("completed", 1), true).is_err());
+        assert!(snapshot(row("active", 1), true).is_ok());
+        assert!(snapshot(row("completed", 0), true).is_ok());
+    }
 }

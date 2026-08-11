@@ -1,5 +1,11 @@
 use std::{sync::Arc, time::Duration};
 
+use axum::{
+    body::{Body, to_bytes},
+    http::{Method, Request, StatusCode},
+};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::{Signer, SigningKey};
 use paykit_lib::{
     PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount,
     PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference, PaymentRequestId,
@@ -24,6 +30,7 @@ use paykit_server::{
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
+use tower::ServiceExt;
 use uuid::Uuid;
 
 #[path = "fixtures/sdk.rs"]
@@ -188,13 +195,21 @@ fn payment_intent(reader: &ReaderPubky, marker: &PaykitReceiverMarker) -> Delive
 }
 
 fn config(database_url: &str, electrum_endpoint: &str) -> Config {
+    config_with_trusted_key(database_url, electrum_endpoint, TRUSTED_KEY)
+}
+
+fn config_with_trusted_key(
+    database_url: &str,
+    electrum_endpoint: &str,
+    trusted_key: &str,
+) -> Config {
     let toml = format!(
         r#"
 [http]
 listen_addr = "127.0.0.1:0"
 
 [locks]
-trusted_public_key = "{TRUSTED_KEY}"
+trusted_public_key = "{trusted_key}"
 
 [setup]
 allowed_origins = ["https://app.example"]
@@ -228,6 +243,96 @@ retry_max = "2s"
         },
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn production_composition_registers_all_task_six_routes_as_signed() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let electrum_endpoint = format!("tcp://{}", unavailable.local_addr().unwrap());
+    drop(unavailable);
+    let signing_key = SigningKey::from_bytes(&[7; 32]);
+    let trusted_key = pubky::PublicKey::from(
+        pubky::pkarr::PublicKey::try_from(signing_key.verifying_key().as_bytes()).unwrap(),
+    )
+    .to_string();
+    let server = Server::build_with_pubky(
+        config_with_trusted_key(database.database_url(), &electrum_endpoint, &trusted_key),
+        database.pool().clone(),
+        pubky::Pubky::testnet().unwrap(),
+    )
+    .await
+    .unwrap();
+
+    for path in [
+        "/payment-request-drains",
+        "/payment-request-drain-lookups",
+        "/payment-requests/status",
+    ] {
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+
+    for (path, body) in [
+        (
+            "/payment-request-drain-lookups",
+            br#"{"lock_resource":"pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"}"#
+                .as_slice(),
+        ),
+        (
+            "/payment-requests/status",
+            br#"{"bundle_id":"000G40R40M30E209185GR38E1W","creator":"pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy"}"#
+                .as_slice(),
+        ),
+    ] {
+        let response = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header(
+                        "X-Paykit-Signature",
+                        URL_SAFE_NO_PAD.encode(signing_key.sign(body).to_bytes()),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+
+    let body = br#"{"lock_resource":"pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"}"#;
+    let response = server
+        .router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/payment-request-drains")
+                .header(
+                    "X-Paykit-Signature",
+                    URL_SAFE_NO_PAD.encode(signing_key.sign(body).to_bytes()),
+                )
+                .body(Body::from(body.as_slice()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    database.cleanup().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -327,13 +432,16 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
         .next_outbound_private_message_id;
     assert_ne!(before_a, before_b);
 
-    let invoices = InvoiceStore::new(database.pool(), crypto);
+    let lock_resource_a = format!(
+        "{creator_a}/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+    );
+    let invoices = InvoiceStore::new(database.pool(), crypto.clone());
     let invoice_a = invoices
         .create_atomic(AtomicInvoiceInput {
             creator: &creator_a,
             reader: &reader,
             bundle_binding: b"composition-bundle-a",
-            lock_resource_binding: b"composition-lock-a",
+            lock_resource_binding: lock_resource_a.as_bytes(),
             payment_request_binding: b"composition-request-a",
             new_reader_payloads: &Payloads {
                 reader: reader.clone(),
@@ -407,14 +515,20 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
     let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let electrum_endpoint = format!("tcp://{}", unavailable.local_addr().unwrap());
     drop(unavailable);
+    let signing_key = SigningKey::from_bytes(&[7; 32]);
+    let trusted_key = pubky::PublicKey::from(
+        pubky::pkarr::PublicKey::try_from(signing_key.verifying_key().as_bytes()).unwrap(),
+    )
+    .to_string();
     let server = Server::build_with_pubky(
-        config(database.database_url(), &electrum_endpoint),
+        config_with_trusted_key(database.database_url(), &electrum_endpoint, &trusted_key),
         database.pool().clone(),
         pubky.clone(),
     )
     .await
     .unwrap();
     let runtime = server.runtime();
+    let router = server.router();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_task = tokio::spawn(server.run(listener));
 
@@ -545,6 +659,72 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+
+    let drain_body = format!(r#"{{"lock_resource":"{lock_resource_a}"}}"#).into_bytes();
+    let drain_request = || {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/payment-request-drains")
+            .header(
+                "X-Paykit-Signature",
+                URL_SAFE_NO_PAD.encode(signing_key.sign(&drain_body).to_bytes()),
+            )
+            .body(Body::from(drain_body.clone()))
+            .unwrap()
+    };
+    let first = router.clone().oneshot(drain_request()).await.unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = to_bytes(first.into_body(), 16 * 1024).await.unwrap();
+    assert_eq!(
+        first_body.as_ref(),
+        br#"{"status":"active","accepted_count":1,"terminal_count":0,"cancellation_enqueued_count":0}"#
+    );
+
+    let creator_id: Uuid = sqlx::query_scalar("SELECT creator_id FROM invoices WHERE id = $1")
+        .bind(invoice_a.invoice_id())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    let credential_envelope: Vec<u8> =
+        sqlx::query_scalar("SELECT credential_envelope FROM creators WHERE id = $1")
+            .bind(creator_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    let state_envelope: Vec<u8> =
+        sqlx::query_scalar("SELECT state_envelope FROM sdk_states WHERE creator_id = $1")
+            .bind(creator_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    sqlx::query("UPDATE creators SET credential_envelope = $1 WHERE id = $2")
+        .bind(b"corrupt".as_slice())
+        .bind(creator_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sdk_states SET state_envelope = $1 WHERE creator_id = $2")
+        .bind(b"corrupt".as_slice())
+        .bind(creator_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let replay = router.clone().oneshot(drain_request()).await.unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay_body = to_bytes(replay.into_body(), 16 * 1024).await.unwrap();
+    assert_eq!(replay_body, first_body);
+    sqlx::query("UPDATE creators SET credential_envelope = $1 WHERE id = $2")
+        .bind(credential_envelope)
+        .bind(creator_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sdk_states SET state_envelope = $1 WHERE creator_id = $2")
+        .bind(state_envelope)
+        .bind(creator_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
 
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     let health = runtime.readiness().await;

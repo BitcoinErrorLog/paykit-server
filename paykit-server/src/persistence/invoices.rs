@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Postgres, Transaction};
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
@@ -13,12 +14,21 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    application::payment_status::PersistedPaymentStatus,
-    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    application::{
+        payment_request_status::{
+            PaymentRequestStatusError, PaymentRequestStatusOperations, PaymentRequestStatusSummary,
+            PaymentState,
+        },
+        payment_status::PersistedPaymentStatus,
+        semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    },
     bitcoin::{DirectBinding, ObservationAction, ObservationTarget, TrackedOutput},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
-    domain::locks::{CreatorPubky, ReaderPubky},
-    domain::payment::BitcoinOutpoint,
+    domain::{
+        locks::{BundleId, CreatorPubky, ReaderPubky},
+        payment::BitcoinOutpoint,
+        payment_request_lifecycle::PaymentRequestLifecycleState,
+    },
     persistence::PersistenceError,
 };
 
@@ -500,6 +510,31 @@ impl InvoiceStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         row.map(PersistedPaymentStatus::try_from).transpose()
+    }
+
+    async fn payment_request_status(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<PaymentRequestStatusSummary>, PersistenceError> {
+        let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        let bundle_hash = self.crypto.lookup_hash(bundle_id.to_string().as_bytes());
+        let row = sqlx::query_as::<_, PaymentRequestStatusRow>(
+            "SELECT lifecycle.request_state, invoices.payment_status,
+                    invoices.confirmation_count, invoices.amount_matched,
+                    invoices.invoice_created_at, invoices.payment_deadline,
+                    invoices.payment_expired_at
+             FROM invoices
+             JOIN creators ON creators.id = invoices.creator_id
+             LEFT JOIN payment_request_lifecycles AS lifecycle ON lifecycle.invoice_id = invoices.id
+             WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
+        )
+        .bind(creator_hash.as_bytes().as_slice())
+        .bind(bundle_hash.as_bytes().as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        row.map(PaymentRequestStatusSummary::try_from).transpose()
     }
 
     /// Records one direct, invoice-address-specific output observation. The
@@ -1208,6 +1243,19 @@ impl InvoiceStore {
     }
 }
 
+#[async_trait]
+impl PaymentRequestStatusOperations for InvoiceStore {
+    async fn lookup(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<PaymentRequestStatusSummary>, PaymentRequestStatusError> {
+        self.payment_request_status(creator, bundle_id)
+            .await
+            .map_err(|_| PaymentRequestStatusError::Unavailable)
+    }
+}
+
 struct OutboxInsert<'a> {
     id: Uuid,
     creator_id: Uuid,
@@ -1366,6 +1414,49 @@ impl TryFrom<PaymentStatusRow> for PersistedPaymentStatus {
             }),
             _ => Err(PersistenceError::CorruptOrMissing),
         }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PaymentRequestStatusRow {
+    request_state: Option<String>,
+    payment_status: String,
+    confirmation_count: i32,
+    amount_matched: bool,
+    invoice_created_at: OffsetDateTime,
+    payment_deadline: OffsetDateTime,
+    payment_expired_at: Option<OffsetDateTime>,
+}
+
+impl TryFrom<PaymentRequestStatusRow> for PaymentRequestStatusSummary {
+    type Error = PersistenceError;
+
+    fn try_from(row: PaymentRequestStatusRow) -> Result<Self, Self::Error> {
+        let request_state = row
+            .request_state
+            .as_deref()
+            .and_then(PaymentRequestLifecycleState::parse)
+            .ok_or(PersistenceError::CorruptOrMissing)?;
+        let payment_state = if row.payment_expired_at.is_some() {
+            PaymentState::Expired
+        } else {
+            match row.payment_status.as_str() {
+                "undetected" => PaymentState::Undetected,
+                "detected" => PaymentState::Detected,
+                "confirmed" => PaymentState::Confirmed,
+                _ => return Err(PersistenceError::CorruptOrMissing),
+            }
+        };
+        let confirmations = u32::try_from(row.confirmation_count)
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        Ok(PaymentRequestStatusSummary::new(
+            request_state,
+            payment_state,
+            row.invoice_created_at,
+            row.payment_deadline,
+            confirmations,
+            row.amount_matched,
+        ))
     }
 }
 

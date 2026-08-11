@@ -14,6 +14,8 @@ pub enum ApiError {
     CreatorSessionInvalid,
     CreatorSessionUnavailable,
     DependencyTimeout,
+    Conflict,
+    Unavailable,
     InvoiceConflict,
     InvoiceNotFound,
     InternalError,
@@ -68,6 +70,16 @@ impl ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "dependency_timeout",
                 "request deadline exceeded",
+            ),
+            Self::Conflict => (
+                StatusCode::CONFLICT,
+                "conflict",
+                "request conflicts with persisted payment state",
+            ),
+            Self::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "payment request state is unavailable",
             ),
             Self::InvoiceConflict => (
                 StatusCode::CONFLICT,

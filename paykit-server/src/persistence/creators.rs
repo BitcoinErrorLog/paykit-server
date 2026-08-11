@@ -266,6 +266,18 @@ impl CreatorStore {
         self.decrypt_credentials(&row)
     }
 
+    /// Loads authenticated Creator authority together with its opaque internal
+    /// row identity for production SDK adapter composition.
+    pub(crate) async fn load_with_id(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<(Uuid, CreatorCredentials), PersistenceError> {
+        let row = self.lookup_row(creator).await?;
+        let id = row.id;
+        self.decrypt_credentials(&row)
+            .map(|credentials| (id, credentials))
+    }
+
     /// Loads and authenticates one exact internal Creator row for worker composition.
     pub async fn load_by_id(
         &self,

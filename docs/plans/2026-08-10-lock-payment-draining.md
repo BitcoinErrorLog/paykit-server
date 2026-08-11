@@ -139,7 +139,18 @@ POST /payment-request-drain-lookups
 { "lock_resource": "..." }
 ```
 
-Returns aggregate factual status only. Exact field/status vocabulary is an implementation-contract gate. It must not include Bundle IDs, readers, request IDs, addresses, references, or raw errors.
+Both drain endpoints return `200` with the same closed aggregate body:
+
+```json
+{
+  "status": "active",
+  "accepted_count": 0,
+  "terminal_count": 0,
+  "cancellation_enqueued_count": 0
+}
+```
+
+`status` is exactly `active` or `completed`. The response contains no drain ID, replay flag, Bundle ID, reader, Payment Request ID, address, payment reference, or raw error. Exact replay returns the same aggregate body.
 
 ### Per-Bundle lifecycle/payment status
 
@@ -152,8 +163,8 @@ Return orthogonal fields rather than a combinatorial state enum:
 
 ```json
 {
-  "request_state": "<closed value>",
-  "payment_state": "<closed value>",
+  "request_state": "proposed",
+  "payment_state": "undetected",
   "invoice_created_at": "<RFC3339 UTC>",
   "payment_deadline": "<RFC3339 UTC>",
   "confirmations": 0,
@@ -173,6 +184,15 @@ The canonical persisted `request_state` is one of these exact closed snake-case 
 - `recovery_required`
 - `invalid_conflict`
 
+`payment_state` is exactly one of:
+
+- `undetected`
+- `detected`
+- `confirmed`
+- `expired`
+
+`expired` is returned when the invoice has a durable `payment_expired_at`; otherwise the persisted observation state maps one-to-one to `undetected`, `detected`, or `confirmed`. `confirmations` and `amount_matched` remain orthogonal factual fields.
+
 Drain classification uses the persisted state without inference from invoice delivery or Bitcoin observation:
 
 - `accepted` is accepted and blocking;
@@ -181,6 +201,13 @@ Drain classification uses the persisted state without inference from invoice del
 - `recovery_required`, `invalid_conflict`, `proof_submitted`, and `active_recurring` fail drain classification rather than being collapsed into another lifecycle.
 
 For the later HTTP slice, `recovery_required` maps to `503 unavailable`; `invalid_conflict`, `proof_submitted`, and `active_recurring` map to `409 conflict`. These mappings do not alter the canonical lifecycle persisted by this projection.
+
+The stable drain-classification error envelopes are:
+
+- `409 {"error":{"code":"conflict","message":"request conflicts with persisted payment state"}}`
+- `503 {"error":{"code":"unavailable","message":"payment request state is unavailable"}}`
+
+Absent drain lookups and absent per-Bundle statuses reuse `404 {"error":{"code":"not_found","message":"requested resource was not found"}}`.
 
 ### Operational drain cleanup
 
@@ -433,9 +460,7 @@ Cross-service acceptance must prove:
 
 Before code starts for the affected slice, patch this plan and the Locks sibling plan identically with:
 
-1. Exact `request_state` and `payment_state` values and HTTP mappings for recovery/conflict states.
-2. Exact aggregate drain response status/fields.
-3. Exact signed POST-body route for completed operational-drain cleanup.
+1. Exact signed POST-body route for completed operational-drain cleanup.
 
 
 ## Out of scope
