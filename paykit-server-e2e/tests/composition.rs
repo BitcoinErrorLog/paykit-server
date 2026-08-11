@@ -333,6 +333,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             creator: &creator_a,
             reader: &reader,
             bundle_binding: b"composition-bundle-a",
+            lock_resource_binding: b"composition-lock-a",
             payment_request_binding: b"composition-request-a",
             new_reader_payloads: &Payloads {
                 reader: reader.clone(),
@@ -350,6 +351,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             creator: &creator_b,
             reader: &reader,
             bundle_binding: b"composition-bundle-b",
+            lock_resource_binding: b"composition-lock-b",
             payment_request_binding: b"composition-request-b",
             new_reader_payloads: &Payloads {
                 reader: reader.clone(),
@@ -369,6 +371,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             creator: &creator_c,
             reader: &unreachable_reader,
             bundle_binding: b"composition-bundle-c",
+            lock_resource_binding: b"composition-lock-c",
             payment_request_binding: b"composition-request-c",
             new_reader_payloads: &Payloads {
                 reader: unreachable_reader.clone(),

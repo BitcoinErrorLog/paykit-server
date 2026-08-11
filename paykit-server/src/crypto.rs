@@ -172,6 +172,8 @@ pub enum EnvelopeType {
     BitcoinObservation,
     /// Versioned server-owned semantic inputs for an outbound SDK handoff.
     OutboxSemanticIntent,
+    /// Canonical addressed lock resource bound to one operational drain.
+    PaymentDrain,
 }
 
 impl EnvelopeType {
@@ -184,6 +186,7 @@ impl EnvelopeType {
             Self::InvoicePaymentRecord => b"invoice-payment-record",
             Self::BitcoinObservation => b"bitcoin-observation",
             Self::OutboxSemanticIntent => b"outbox-semantic-intent",
+            Self::PaymentDrain => b"payment-drain",
         }
     }
 }
@@ -262,6 +265,10 @@ impl EnvelopeContext {
             creator_lookup_hash,
             row_id,
         )
+    }
+    /// Creates the binding context for one operational payment drain.
+    pub fn payment_drain(creator_lookup_hash: LookupHash, row_id: Uuid) -> Self {
+        Self::new(EnvelopeType::PaymentDrain, creator_lookup_hash, row_id)
     }
 
     fn new(envelope_type: EnvelopeType, creator_lookup_hash: LookupHash, row_id: Uuid) -> Self {

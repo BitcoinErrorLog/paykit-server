@@ -382,6 +382,7 @@ impl CreateInvoiceService {
         let started = self.clock.now();
         let creator = request.lock_resource.creator().clone();
         let bundle_binding = request.bundle_id.to_string().into_bytes();
+        let lock_resource_binding = request.lock_resource.to_string().into_bytes();
         let payment_request_binding = request_binding(&request)?;
         let preflight_remaining = remaining(started, self.clock.now())?;
         match tokio::time::timeout(
@@ -470,6 +471,7 @@ impl CreateInvoiceService {
                 creator: &creator,
                 reader: &request.reader,
                 bundle_binding: &bundle_binding,
+                lock_resource_binding: &lock_resource_binding,
                 payment_request_binding: &payment_request_binding,
                 new_reader_payloads: &new_reader_payloads,
                 payment_request_intent,

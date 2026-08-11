@@ -18,6 +18,7 @@ pub enum OutboxRetryClass {
     LinkEstablishment,
     EndpointPublication,
     PaymentRequestProposal,
+    PaymentRequestCancellation,
     ReconciliationPending,
     Reconciliation,
 }
@@ -32,6 +33,7 @@ impl OutboxRetryClass {
             Self::LinkEstablishment => "link_establishment",
             Self::EndpointPublication => "endpoint_publication",
             Self::PaymentRequestProposal => "payment_request_proposal",
+            Self::PaymentRequestCancellation => "payment_request_cancellation",
             Self::ReconciliationPending => "reconciliation_pending",
             Self::Reconciliation => "reconciliation",
         }
@@ -49,6 +51,11 @@ pub enum HandoffResult {
         event_id: String,
         payment_request_id: String,
     },
+    PaymentRequestCancellation {
+        outbound_message_id: u64,
+        event_id: String,
+        payment_request_id: String,
+    },
 }
 
 impl std::fmt::Debug for HandoffResult {
@@ -59,6 +66,9 @@ impl std::fmt::Debug for HandoffResult {
             }
             Self::PaymentRequestProposal { .. } => {
                 formatter.write_str("HandoffResult::PaymentRequestProposal(<redacted>)")
+            }
+            Self::PaymentRequestCancellation { .. } => {
+                formatter.write_str("HandoffResult::PaymentRequestCancellation(<redacted>)")
             }
         }
     }
@@ -71,6 +81,10 @@ impl HandoffResult {
                 outbound_message_id,
             }
             | Self::PaymentRequestProposal {
+                outbound_message_id,
+                ..
+            }
+            | Self::PaymentRequestCancellation {
                 outbound_message_id,
                 ..
             } => *outbound_message_id,
@@ -292,6 +306,11 @@ impl OutboxStore {
                 event_id,
                 payment_request_id,
                 ..
+            }
+            | HandoffResult::PaymentRequestCancellation {
+                event_id,
+                payment_request_id,
+                ..
             } => (Some(event_id.as_str()), Some(payment_request_id.as_str())),
         };
         let changed = sqlx::query(
@@ -448,6 +467,7 @@ mod tests {
                 OutboxRetryClass::LinkEstablishment,
                 OutboxRetryClass::EndpointPublication,
                 OutboxRetryClass::PaymentRequestProposal,
+                OutboxRetryClass::PaymentRequestCancellation,
                 OutboxRetryClass::ReconciliationPending,
                 OutboxRetryClass::Reconciliation,
             ]
@@ -460,6 +480,7 @@ mod tests {
                 "link_establishment",
                 "endpoint_publication",
                 "payment_request_proposal",
+                "payment_request_cancellation",
                 "reconciliation_pending",
                 "reconciliation",
             ]

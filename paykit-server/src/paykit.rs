@@ -9,7 +9,7 @@ use std::{
 use async_trait::async_trait;
 use paykit_lib::{
     PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier, PaymentReference,
-    PaymentRequestTerms,
+    PaymentRequestId, PaymentRequestTerms,
 };
 use paykit_sdk::{
     LinkedPeerState, OutboundPrivateMessageStatus, PaykitSdk, PaykitSdkConfig, PaykitSdkError,
@@ -22,17 +22,21 @@ use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use crate::{
-    application::semantic_intent::{DeliveryIntentV1, PaymentTermsV1, ReceivingDetailV1},
+    application::{
+        payment_drain::{PaymentDrainError, PaymentDrainResult},
+        semantic_intent::{DeliveryIntentV1, PaymentTermsV1, ReceivingDetailV1},
+    },
     config::PaykitConfig,
     domain::{
-        locks::CreatorPubky,
+        locks::{CreatorPubky, PubkyLockResource},
         payment_request_lifecycle::{
             PaymentRequestLifecycleProjection,
             PaymentRequestLifecycleState as PersistedPaymentRequestLifecycleState,
         },
     },
     persistence::{
-        CreatorStore, PaymentRequestLifecycleStore, PersistenceError, PostgresStorageAdapter,
+        CreatorStore, PaymentDrainStore, PaymentRequestLifecycleStore, PersistenceError,
+        PostgresStorageAdapter,
     },
     workers::outbox::{
         Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffCause, handoff_steps,
@@ -137,6 +141,7 @@ type CreatorSdk =
 pub struct PaykitAdapter {
     sdk: CreatorSdk,
     storage: PostgresStorageAdapter,
+    creator: CreatorPubky,
     mutation_lock: Arc<TokioMutex<()>>,
 }
 
@@ -160,6 +165,7 @@ impl PaykitAdapter {
         sessions: CreatorSessionProvider,
         config: &PaykitConfig,
     ) -> Result<Self, PaykitSdkError> {
+        let creator = sessions.creator.clone();
         let sdk = PaykitSdk::new(
             storage.clone(),
             sessions,
@@ -170,6 +176,7 @@ impl PaykitAdapter {
             sdk,
             mutation_lock: creator_mutation_lock(storage.creator_id()),
             storage,
+            creator,
         })
     }
 
@@ -205,6 +212,46 @@ impl PaykitAdapter {
         })
         .await
     }
+
+    /// Reconciles the canonical SDK reducer and atomically snapshots one lock's
+    /// drain while holding the same Creator-local mutation lock used by receive.
+    pub async fn reconcile_and_create_payment_drain(
+        &self,
+        lifecycles: &PaymentRequestLifecycleStore,
+        drains: &PaymentDrainStore,
+        lock_resource: &PubkyLockResource,
+    ) -> Result<PaymentDrainResult, PaymentDrainError> {
+        if lock_resource.creator() != &self.creator {
+            return Err(PaymentDrainError::CreatorMismatch);
+        }
+        let _guard = self.mutation_lock.lock().await;
+        if let Some(replay) = drains
+            .exact_replay(lock_resource)
+            .await
+            .map_err(map_drain_persistence_error)?
+        {
+            return Ok(replay);
+        }
+        let records = self
+            .sdk
+            .payment_requests()
+            .await
+            .map_err(|_| PaymentDrainError::Unavailable)?;
+        for record in &records {
+            let projection = lifecycle_projection(record).map_err(|error| match error {
+                LifecycleSyncError::InvalidProjection => PaymentDrainError::Conflict,
+                _ => PaymentDrainError::Unavailable,
+            })?;
+            lifecycles
+                .apply(self.storage.creator_id(), &projection)
+                .await
+                .map_err(map_drain_persistence_error)?;
+        }
+        drains
+            .create(lock_resource)
+            .await
+            .map_err(map_drain_persistence_error)
+    }
 }
 
 async fn project_lifecycles_after_receive<F, Fut>(
@@ -227,6 +274,13 @@ where
 
 fn map_projection_persistence_error(_: PersistenceError) -> LifecycleSyncError {
     LifecycleSyncError::Persistence
+}
+
+fn map_drain_persistence_error(error: PersistenceError) -> PaymentDrainError {
+    match error {
+        PersistenceError::Conflict => PaymentDrainError::Conflict,
+        _ => PaymentDrainError::Unavailable,
+    }
 }
 
 fn lifecycle_projection(
@@ -450,6 +504,29 @@ impl Adapter for PaykitAdapter {
                 .proposal_outbound_message_id
                 .ok_or(HandoffError::Permanent)?,
             event_id: record.proposal_event_id.ok_or(HandoffError::Permanent)?,
+            payment_request_id: record.payment_request_id,
+        })
+    }
+
+    async fn cancel_payment_request(
+        &self,
+        reader: &str,
+        path: &str,
+        payment_request_id: &str,
+    ) -> Result<HandoffResult, HandoffError> {
+        let (reader, path) = parse_peer(reader, path)?;
+        let payment_request_id = PaymentRequestId::new(payment_request_id.to_owned())
+            .map_err(|_| HandoffError::Permanent)?;
+        let record = self
+            .sdk
+            .cancel_payment_request(reader, path, &payment_request_id, None)
+            .await
+            .map_err(classify)?;
+        Ok(HandoffResult::PaymentRequestCancellation {
+            outbound_message_id: record
+                .last_outbound_message_id
+                .ok_or(HandoffError::Permanent)?,
+            event_id: record.canceled_event_id.ok_or(HandoffError::Permanent)?,
             payment_request_id: record.payment_request_id,
         })
     }

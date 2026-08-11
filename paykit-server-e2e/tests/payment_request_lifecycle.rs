@@ -65,12 +65,13 @@ async fn attributable_invoice(
     sqlx::query(
         "INSERT INTO invoices (
              id, creator_id, reader_lookup_hash, bundle_lookup_hash,
-             payment_request_lookup_hash, invoice_envelope, payment_record_envelope,
+             lock_resource_lookup_hash, payment_request_lookup_hash,
+             invoice_envelope, payment_record_envelope,
              bitcoin_address_lookup_hash, derivation_index_lookup_hash,
              payment_status, confirmation_count, amount_matched,
              invoice_created_at, payment_deadline, payment_in_hours
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', 0, FALSE,
-                   $10, $11, 24)",
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                   'pending', 0, FALSE, $11, $12, 24)",
     )
     .bind(invoice_id)
     .bind(creator_id)
@@ -81,6 +82,7 @@ async fn attributable_invoice(
             .as_bytes()
             .as_slice(),
     )
+    .bind(hash("lock-resource"))
     .bind(hash("request"))
     .bind(b"encrypted-invoice".as_slice())
     .bind(b"encrypted-payment".as_slice())

@@ -1,20 +1,25 @@
-use std::{str::FromStr, sync::OnceLock, time::Duration};
+use std::{borrow::Cow, str::FromStr, sync::OnceLock, time::Duration};
 
 use paykit_server::persistence::{MIGRATION_ADVISORY_LOCK_KEY, run_migrations};
 use paykit_server_e2e::postgres::TestDatabase;
-use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
+use sqlx::{Connection, PgConnection, PgPool, Row, migrate::Migrator, postgres::PgConnectOptions};
 use uuid::Uuid;
 
-const REQUIRED_TABLES: [&str; 8] = [
+const REQUIRED_TABLES: [&str; 11] = [
     "deployment_metadata",
     "creators",
     "sdk_states",
     "reader_assignments",
     "invoices",
+    "lock_payment_generations",
     "outbox",
     "bitcoin_observations",
     "payment_request_lifecycles",
+    "payment_drains",
+    "payment_drain_items",
 ];
+
+static ALL_MIGRATIONS: Migrator = sqlx::migrate!("../paykit-server/migrations");
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
 /// migration tests deliberately use the production migration lock key, so
@@ -56,7 +61,17 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, vec![1, 2, 3, 4]);
+    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5]);
+
+    let lock_lookup_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'invoices'
+           AND column_name = 'lock_resource_lookup_hash'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(lock_lookup_nullable, "NO");
 
     let observation_lifecycle_columns: Vec<(String, String)> = sqlx::query_as(
         "SELECT column_name, is_nullable
@@ -536,15 +551,17 @@ async fn insert_invoice_result_with_reader(
     let derivation_index_hash = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO invoices \
-         (creator_id, reader_lookup_hash, bundle_lookup_hash, payment_request_lookup_hash, \
+         (creator_id, reader_lookup_hash, bundle_lookup_hash, lock_resource_lookup_hash,
+          payment_request_lookup_hash, \
           invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash,
           derivation_index_lookup_hash, payment_status, invoice_created_at,
           payment_deadline, payment_in_hours) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                  NOW(), NOW() + INTERVAL '1 hour', 1)",
     )
     .bind(creator_id)
     .bind(reader_hash)
+    .bind(bundle_hash)
     .bind(bundle_hash)
     .bind(request_hash)
     .bind(b"encrypted-invoice".as_slice())
@@ -616,4 +633,77 @@ async fn acquire_and_release_advisory_lock(connection: &mut PgConnection) {
     })
     .await
     .expect("cancelled migration left the advisory lock held");
+}
+
+#[tokio::test]
+async fn payment_drain_migration_rejects_unattributable_historical_invoices() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    let migrator = Migrator {
+        migrations: Cow::Owned(ALL_MIGRATIONS.iter().take(4).cloned().collect()),
+        ignore_missing: false,
+        locking: false,
+        no_tx: false,
+    };
+    migrator.run(pool).await.unwrap();
+
+    let creator_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO creators (creator_lookup_hash, credential_envelope)
+         VALUES ($1, $2) RETURNING id",
+    )
+    .bind(b"historical-creator".as_slice())
+    .bind(b"encrypted-creator".as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO invoices (
+             creator_id, reader_lookup_hash, bundle_lookup_hash,
+             payment_request_lookup_hash, invoice_envelope, payment_record_envelope,
+             bitcoin_address_lookup_hash, derivation_index_lookup_hash,
+             payment_status, invoice_created_at, payment_deadline, payment_in_hours
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                   'undetected', NOW(), NOW() + INTERVAL '1 hour', 1)",
+    )
+    .bind(creator_id)
+    .bind(b"historical-reader".as_slice())
+    .bind(b"historical-bundle".as_slice())
+    .bind(b"historical-request".as_slice())
+    .bind(b"encrypted-invoice".as_slice())
+    .bind(b"encrypted-payment".as_slice())
+    .bind(b"historical-address".as_slice())
+    .bind(b"historical-index".as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let error = run_migrations(pool)
+        .await
+        .expect_err("historical lock attribution must not be guessed");
+    assert!(
+        error
+            .to_string()
+            .contains("reset before applying payment drain persistence"),
+        "unexpected migration failure: {error}"
+    );
+    let applied_versions: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(applied_versions, vec![1, 2, 3, 4]);
+    let lock_column_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'invoices'
+               AND column_name = 'lock_resource_lookup_hash'
+         )",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(!lock_column_exists);
+
+    database.cleanup().await;
 }

@@ -8,7 +8,7 @@ use std::fmt;
 
 use paykit_lib::{
     PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier,
-    PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
+    PaymentEndpointPayload, PaymentReference, PaymentRequestId, PaymentRequestTerms,
     serialize_paykit_receiver_marker,
 };
 use serde::{Deserialize, Serialize};
@@ -34,6 +34,9 @@ pub enum DeliveryOperationV1 {
     },
     PaymentRequestProposal {
         terms: PaymentTermsV1,
+    },
+    PaymentRequestCancellation {
+        payment_request_id: String,
     },
 }
 
@@ -97,7 +100,10 @@ impl DeliveryIntentV1 {
                 terms.proposal_expires_at = Some(proposal_expires_at);
                 self.validate()
             }
-            DeliveryOperationV1::EndpointPublication { .. } => Err(DeliveryIntentError::Invalid),
+            DeliveryOperationV1::EndpointPublication { .. }
+            | DeliveryOperationV1::PaymentRequestCancellation { .. } => {
+                Err(DeliveryIntentError::Invalid)
+            }
         }
     }
 
@@ -174,6 +180,30 @@ impl DeliveryIntentV1 {
         Ok(intent)
     }
 
+    /// Derives a cancellation from the authenticated proposal peer/path context.
+    pub fn payment_request_cancellation(
+        proposal: &Self,
+        payment_request_id: String,
+    ) -> Result<Self, DeliveryIntentError> {
+        if !matches!(
+            proposal.operation,
+            DeliveryOperationV1::PaymentRequestProposal { .. }
+        ) || PaymentRequestId::new(payment_request_id.clone()).is_err()
+        {
+            return Err(DeliveryIntentError::Invalid);
+        }
+        let intent = Self {
+            version: 2,
+            reader_pubky: proposal.reader_pubky.clone(),
+            selected_reader_path: proposal.selected_reader_path.clone(),
+            marker_fingerprint: proposal.marker_fingerprint,
+            local_receiver_path: proposal.local_receiver_path.clone(),
+            operation: DeliveryOperationV1::PaymentRequestCancellation { payment_request_id },
+        };
+        intent.validate()?;
+        Ok(intent)
+    }
+
     pub fn version(&self) -> u8 {
         self.version
     }
@@ -231,6 +261,10 @@ impl DeliveryIntentV1 {
                     return Err(DeliveryIntentError::Invalid);
                 }
             }
+            DeliveryOperationV1::PaymentRequestCancellation { payment_request_id } => {
+                PaymentRequestId::new(payment_request_id.clone())
+                    .map_err(|_| DeliveryIntentError::Invalid)?;
+            }
         }
         Ok(())
     }
@@ -273,6 +307,7 @@ impl fmt::Debug for DeliveryOperationV1 {
         formatter.write_str(match self {
             Self::EndpointPublication { .. } => "EndpointPublication { .. }",
             Self::PaymentRequestProposal { .. } => "PaymentRequestProposal { .. }",
+            Self::PaymentRequestCancellation { .. } => "PaymentRequestCancellation { .. }",
         })
     }
 }

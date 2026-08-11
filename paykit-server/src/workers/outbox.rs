@@ -85,6 +85,12 @@ pub trait Adapter: Send + Sync {
         path: &str,
         terms: &crate::application::semantic_intent::PaymentTermsV1,
     ) -> Result<HandoffResult, HandoffError>;
+    async fn cancel_payment_request(
+        &self,
+        reader: &str,
+        path: &str,
+        payment_request_id: &str,
+    ) -> Result<HandoffResult, HandoffError>;
     async fn outbound_status(
         &self,
         outbound_message_id: u64,
@@ -142,6 +148,14 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
             .propose_payment_request(intent.reader_pubky(), selected_path.as_str(), terms)
             .await
             .map_err(|error| at_stage(error, RetryableHandoffStage::PaymentRequestProposal)),
+        DeliveryOperationV1::PaymentRequestCancellation { payment_request_id } => adapter
+            .cancel_payment_request(
+                intent.reader_pubky(),
+                selected_path.as_str(),
+                payment_request_id,
+            )
+            .await
+            .map_err(|error| at_stage(error, RetryableHandoffStage::PaymentRequestCancellation)),
     }
 }
 

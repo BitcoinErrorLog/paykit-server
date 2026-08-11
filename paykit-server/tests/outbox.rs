@@ -72,6 +72,19 @@ impl Adapter for FakeAdapter {
         })
     }
 
+    async fn cancel_payment_request(
+        &self,
+        _reader: &str,
+        _path: &str,
+        payment_request_id: &str,
+    ) -> Result<HandoffResult, HandoffError> {
+        Ok(HandoffResult::PaymentRequestCancellation {
+            outbound_message_id: 43,
+            event_id: "event-43".into(),
+            payment_request_id: payment_request_id.into(),
+        })
+    }
+
     async fn outbound_status(
         &self,
         _outbound_message_id: u64,
@@ -158,4 +171,30 @@ async fn retry_after_an_ambiguous_handoff_can_propose_twice() {
         ) if event_id == "event-42" && payment_request_id == "request-42" && second_event == event_id && second_request == payment_request_id
     ));
     assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 2);
+}
+
+#[tokio::test]
+async fn cancellation_intent_routes_the_exact_payment_request_id() {
+    let selected = marker("bitkit/wallet");
+    let adapter = FakeAdapter {
+        marker: selected.clone(),
+        link_error: None,
+        payment_request_calls: Mutex::new(0),
+    };
+    let payment_request_id = uuid::Uuid::new_v4().hyphenated().to_string();
+    let cancellation = DeliveryIntentV1::payment_request_cancellation(
+        &payment_intent(&selected),
+        payment_request_id.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        handoff(&adapter, &cancellation).await,
+        Ok(HandoffResult::PaymentRequestCancellation {
+            outbound_message_id: 43,
+            event_id: "event-43".into(),
+            payment_request_id,
+        })
+    );
+    assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 0);
 }

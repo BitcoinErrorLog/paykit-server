@@ -167,6 +167,7 @@ fn input<'a>(
         creator,
         reader,
         bundle_binding: bundle,
+        lock_resource_binding: b"test-lock-resource",
         payment_request_binding: request,
         new_reader_payloads: &TEST_PAYLOADS,
         payment_request_intent: payment_intent(),
@@ -354,6 +355,9 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
         }
         DeliveryOperationV1::EndpointPublication { .. } => {
             panic!("payment row had endpoint intent")
+        }
+        DeliveryOperationV1::PaymentRequestCancellation { .. } => {
+            panic!("payment proposal row had cancellation intent")
         }
     };
     let original_path = original_intent.selected_reader_path().unwrap();
@@ -736,6 +740,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             creator: &first_creator,
             reader: &reader,
             bundle_binding: b"creator-one-bundle",
+            lock_resource_binding: b"creator-one-lock-resource",
             payment_request_binding: b"creator-one-request",
             new_reader_payloads: &first_payloads,
             payment_request_intent: payment_intent(),
@@ -746,6 +751,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             creator: &second_creator,
             reader: &reader,
             bundle_binding: b"creator-two-bundle",
+            lock_resource_binding: b"creator-two-lock-resource",
             payment_request_binding: b"creator-two-request",
             new_reader_payloads: &second_payloads,
             payment_request_intent: payment_intent(),
@@ -830,6 +836,82 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
         DeliveryOperationV1::EndpointPublication { receiving_details }
             if receiving_details[0].payload == "creator-one-address-0"
     ));
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn active_lock_drain_allows_exact_invoice_replay_but_fences_new_bundles() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let first = store
+        .create_atomic(input(
+            &creator,
+            &reader,
+            b"drain-fence-existing-bundle",
+            b"drain-fence-existing-request",
+        ))
+        .await
+        .unwrap();
+
+    let (creator_id, lock_hash, generation): (uuid::Uuid, Vec<u8>, i64) = sqlx::query_as(
+        "SELECT creator_id, lock_resource_lookup_hash, lock_resource_generation
+         FROM invoices WHERE id = $1",
+    )
+    .bind(first.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let drain_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO payment_drains (
+             id, creator_id, lock_resource_lookup_hash, lock_resource_generation,
+             lock_resource_envelope, status, accepted_count, terminal_count,
+             cancellation_enqueued_count
+         ) VALUES ($1, $2, $3, $4, $5, 'active', 1, 0, 0)",
+    )
+    .bind(drain_id)
+    .bind(creator_id)
+    .bind(&lock_hash)
+    .bind(generation)
+    .bind(b"encrypted-lock-resource".as_slice())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE lock_payment_generations SET active_drain_id = $1
+         WHERE creator_id = $2 AND lock_resource_lookup_hash = $3",
+    )
+    .bind(drain_id)
+    .bind(creator_id)
+    .bind(&lock_hash)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let replay = store
+        .create_atomic(input(
+            &creator,
+            &reader,
+            b"drain-fence-existing-bundle",
+            b"drain-fence-existing-request",
+        ))
+        .await
+        .unwrap();
+    assert!(replay.replayed());
+    assert_eq!(replay.invoice_id(), first.invoice_id());
+
+    let blocked = store
+        .create_atomic(input(
+            &creator,
+            &reader,
+            b"drain-fence-new-bundle",
+            b"drain-fence-new-request",
+        ))
+        .await;
+    assert_eq!(blocked.unwrap_err(), PersistenceError::Conflict);
 
     database.cleanup().await;
 }

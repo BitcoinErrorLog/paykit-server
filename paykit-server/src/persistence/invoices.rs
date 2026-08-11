@@ -34,6 +34,8 @@ pub struct AtomicInvoiceInput<'a> {
     pub reader: &'a ReaderPubky,
     /// Creator-scoped idempotency key for the Locks bundle.
     pub bundle_binding: &'a [u8],
+    /// Canonical addressed lock resource used for lock-wide drain membership.
+    pub lock_resource_binding: &'a [u8],
     /// Exact payment-request binding for idempotent replay detection.
     pub payment_request_binding: &'a [u8],
     /// Derives the encrypted assignment and endpoint payloads only after this
@@ -851,6 +853,7 @@ impl InvoiceStore {
             .lookup_hash(input.creator.to_string().as_bytes());
         let reader_hash = self.crypto.lookup_hash(input.reader.to_string().as_bytes());
         let bundle_hash = self.crypto.lookup_hash(input.bundle_binding);
+        let lock_resource_hash = self.crypto.lookup_hash(input.lock_resource_binding);
         let payment_request_hash = self.crypto.lookup_hash(input.payment_request_binding);
 
         let payment_in_hours =
@@ -939,6 +942,35 @@ impl InvoiceStore {
                 payment_deadline: existing.payment_deadline,
                 replayed: true,
             });
+        }
+
+        sqlx::query(
+            "INSERT INTO lock_payment_generations
+                 (creator_id, lock_resource_lookup_hash)
+             VALUES ($1, $2)
+             ON CONFLICT (creator_id, lock_resource_lookup_hash) DO NOTHING",
+        )
+        .bind(creator.id)
+        .bind(lock_resource_hash.as_bytes().as_slice())
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let (lock_resource_generation, active_drain_id): (i64, Option<Uuid>) = sqlx::query_as(
+            "SELECT current_generation, active_drain_id
+                 FROM lock_payment_generations
+                 WHERE creator_id = $1 AND lock_resource_lookup_hash = $2
+                 FOR UPDATE",
+        )
+        .bind(creator.id)
+        .bind(lock_resource_hash.as_bytes().as_slice())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if lock_resource_generation < 0 {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        if active_drain_id.is_some() {
+            return Err(PersistenceError::Conflict);
         }
 
         validate_intent(&input.payment_request_intent, input.reader, false)?;
@@ -1050,13 +1082,15 @@ impl InvoiceStore {
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         sqlx::query(
             "INSERT INTO invoices \
-             (id, creator_id, reader_lookup_hash, bundle_lookup_hash, payment_request_lookup_hash, invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status, invoice_created_at, payment_deadline, payment_in_hours) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'undetected', $10, $11, $12)",
+             (id, creator_id, reader_lookup_hash, bundle_lookup_hash, lock_resource_lookup_hash, lock_resource_generation, payment_request_lookup_hash, invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status, invoice_created_at, payment_deadline, payment_in_hours) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'undetected', $12, $13, $14)",
         )
         .bind(invoice_id)
         .bind(creator.id)
         .bind(reader_hash.as_bytes().as_slice())
         .bind(bundle_hash.as_bytes().as_slice())
+        .bind(lock_resource_hash.as_bytes().as_slice())
+        .bind(lock_resource_generation)
         .bind(payment_request_hash.as_bytes().as_slice())
         .bind(invoice_envelope.as_bytes())
         .bind(payment_record_envelope.as_bytes())

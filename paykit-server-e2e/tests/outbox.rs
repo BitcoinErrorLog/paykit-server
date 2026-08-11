@@ -114,6 +114,15 @@ impl Adapter for ReconciliationAdapter {
         Err(HandoffError::Permanent)
     }
 
+    async fn cancel_payment_request(
+        &self,
+        _reader: &str,
+        _path: &str,
+        _payment_request_id: &str,
+    ) -> Result<HandoffResult, HandoffError> {
+        Err(HandoffError::Permanent)
+    }
+
     async fn outbound_status(
         &self,
         _outbound_message_id: u64,
@@ -203,6 +212,7 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             creator: &creator,
             reader: &reader,
             bundle_binding: b"outbox-bundle",
+            lock_resource_binding: b"outbox-lock",
             payment_request_binding: b"outbox-payment-request",
             new_reader_payloads: &payloads,
             payment_request_intent: common::payment_intent(&reader),
@@ -681,6 +691,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             creator: &creator,
             reader: &reader,
             bundle_binding: b"public-sdk-crash-window-bundle",
+            lock_resource_binding: b"public-sdk-crash-window-lock",
             payment_request_binding: b"public-sdk-crash-window-request",
             new_reader_payloads: &Payloads {
                 reader: reader.clone(),
@@ -723,6 +734,9 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             metadata: terms.metadata.clone(),
         },
         DeliveryOperationV1::EndpointPublication { .. } => panic!("claimed endpoint row"),
+        DeliveryOperationV1::PaymentRequestCancellation { .. } => {
+            panic!("claimed cancellation row")
+        }
     };
 
     let first = creator_sdk
@@ -766,7 +780,8 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             event_id,
             payment_request_id,
         } => (*outbound_message_id, event_id, payment_request_id),
-        HandoffResult::EndpointPublication { .. } => unreachable!(),
+        HandoffResult::EndpointPublication { .. }
+        | HandoffResult::PaymentRequestCancellation { .. } => unreachable!(),
     };
     let (second_outbound, second_event, second_request) = match &second_result {
         HandoffResult::PaymentRequestProposal {
@@ -774,7 +789,8 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             event_id,
             payment_request_id,
         } => (*outbound_message_id, event_id, payment_request_id),
-        HandoffResult::EndpointPublication { .. } => unreachable!(),
+        HandoffResult::EndpointPublication { .. }
+        | HandoffResult::PaymentRequestCancellation { .. } => unreachable!(),
     };
     assert_ne!(first_outbound, second_outbound);
     assert_ne!(first_event, second_event);
