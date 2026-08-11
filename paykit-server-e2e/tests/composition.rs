@@ -2,7 +2,8 @@ use std::{sync::Arc, time::Duration};
 
 use paykit_lib::{
     PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount,
-    PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
+    PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference, PaymentRequestId,
+    PaymentRequestTerms,
 };
 use paykit_sdk::{
     InMemoryStorage, LinkedPeerState, PaykitSdk, PaykitSdkConfig, PubkyLocalSecretKey,
@@ -305,8 +306,8 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
     .await;
     let creator_a_key = PubkyPublicKey::from_raw_or_app_key(creator_a.to_string()).unwrap();
     let creator_b_key = PubkyPublicKey::from_raw_or_app_key(creator_b.to_string()).unwrap();
-    link(&sdk_a, creator_a_key, &peer_sdk, peer_key.clone()).await;
-    link(&sdk_b, creator_b_key, &peer_sdk, peer_key).await;
+    link(&sdk_a, creator_a_key.clone(), &peer_sdk, peer_key.clone()).await;
+    link(&sdk_b, creator_b_key.clone(), &peer_sdk, peer_key.clone()).await;
 
     let sdk_states = SdkStateStore::new(database.pool(), crypto.clone());
     let before_a = sdk_states
@@ -406,7 +407,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
     let server = Server::build_with_pubky(
         config(database.database_url(), &electrum_endpoint),
         database.pool().clone(),
-        pubky,
+        pubky.clone(),
     )
     .await
     .unwrap();
@@ -451,6 +452,97 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
     assert!(after_a.next_outbound_private_message_id > before_a);
     assert!(after_b.next_outbound_private_message_id > before_b);
     assert_eq!(after_c.next_outbound_private_message_id, before_c);
+
+    let payment_a = invoice_a.payment_request_outbox_id();
+    let payment_b = invoice_b.payment_request_outbox_id();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let (request_a, request_b) = loop {
+        let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, status, sdk_payment_request_id
+             FROM outbox
+             WHERE id = ANY($1)",
+        )
+        .bind(vec![payment_a, payment_b])
+        .fetch_all(database.pool())
+        .await
+        .unwrap();
+        let delivered = |id| {
+            rows.iter()
+                .find(|row| row.0 == id && row.1 == "delivered")
+                .and_then(|row| row.2.clone())
+        };
+        if let (Some(a), Some(b)) = (delivered(payment_a), delivered(payment_b)) {
+            let states: Vec<(Uuid, String)> = sqlx::query_as(
+                "SELECT invoice_id, request_state
+                 FROM payment_request_lifecycles
+                 WHERE invoice_id = ANY($1)",
+            )
+            .bind(vec![invoice_a.invoice_id(), invoice_b.invoice_id()])
+            .fetch_all(database.pool())
+            .await
+            .unwrap();
+            if states.len() == 2 && states.iter().all(|state| state.1 == "proposed") {
+                break (a, b);
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "production workers did not deliver and project both Payment Requests"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_ne!(request_a, request_b);
+
+    let intake = peer_sdk
+        .receive_private_messages_from_linked_peers()
+        .await
+        .unwrap();
+    assert!(intake.iter().all(|report| report.error.is_none()));
+    let peer_records = peer_sdk.payment_requests().await.unwrap();
+    assert!(
+        peer_records
+            .iter()
+            .any(|record| record.payment_request_id == request_a)
+    );
+    assert!(
+        peer_records
+            .iter()
+            .any(|record| record.payment_request_id == request_b)
+    );
+    let request_a_id = PaymentRequestId::new(request_a).unwrap();
+    let creator_path = PaykitReceiverPath::new("paykit/server").unwrap();
+    peer_sdk
+        .accept_payment_request(creator_a_key.clone(), creator_path.clone(), &request_a_id)
+        .await
+        .unwrap();
+    let acceptance = peer_sdk
+        .process_outbound_private_messages(creator_a_key, creator_path)
+        .await
+        .unwrap();
+    assert_eq!(acceptance.sent.len(), 1);
+    assert!(acceptance.failed.is_empty());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let state: Option<String> = sqlx::query_scalar(
+            "SELECT request_state
+             FROM payment_request_lifecycles
+             WHERE invoice_id = $1",
+        )
+        .bind(invoice_a.invoice_id())
+        .fetch_optional(database.pool())
+        .await
+        .unwrap();
+        if state.as_deref() == Some("accepted") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "production receive/query/projection did not persist acceptance"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     let health = runtime.readiness().await;
     assert_eq!(health.status, ComponentState::Degraded);
@@ -459,5 +551,43 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
 
     server_task.abort();
     let _ = server_task.await;
+
+    sqlx::query("DELETE FROM payment_request_lifecycles WHERE invoice_id = $1")
+        .bind(invoice_a.invoice_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let restarted = Server::build_with_pubky(
+        config(database.database_url(), &electrum_endpoint),
+        database.pool().clone(),
+        pubky,
+    )
+    .await
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let restarted_task = tokio::spawn(restarted.run(listener));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let state: Option<String> = sqlx::query_scalar(
+            "SELECT request_state
+             FROM payment_request_lifecycles
+             WHERE invoice_id = $1",
+        )
+        .bind(invoice_a.invoice_id())
+        .fetch_optional(database.pool())
+        .await
+        .unwrap();
+        if state.as_deref() == Some("accepted") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "restart did not rebuild accepted lifecycle from canonical SDK state"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    restarted_task.abort();
+    let _ = restarted_task.await;
     database.cleanup().await;
 }

@@ -17,8 +17,8 @@ use crate::{
     http::{self, auth::SignedLocksAuth},
     paykit::{CreatorSessionProvider, PaykitAdapter},
     persistence::{
-        CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PersistenceError,
-        PostgresStorageAdapter, SdkStateStore,
+        CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PaymentRequestLifecycleStore,
+        PersistenceError, PostgresStorageAdapter, SdkStateStore,
     },
     real_setup::RealSetupCompleter,
     runtime::{PostgresDependency, Runtime, operational_router},
@@ -65,6 +65,7 @@ struct WorkerComponents {
     creators: CreatorStore,
     outbox: OutboxStore,
     invoices: InvoiceStore,
+    payment_request_lifecycles: PaymentRequestLifecycleStore,
     electrum: Arc<dyn ElectrumPort>,
     pubky: Pubky,
     paykit: PaykitConfig,
@@ -135,6 +136,7 @@ impl Server {
         let creators = CreatorStore::new(&pool, crypto.clone());
         let invoices = InvoiceStore::new(&pool, crypto.clone());
         let outbox = OutboxStore::new(&pool, crypto.clone());
+        let payment_request_lifecycles = PaymentRequestLifecycleStore::new(&pool, crypto.clone());
 
         let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone());
         let relay = Arc::new(PubkyCompanionRelay::new(pubky.client().clone()));
@@ -206,6 +208,7 @@ impl Server {
             creators,
             outbox,
             invoices,
+            payment_request_lifecycles,
             electrum,
             pubky,
             paykit: config.paykit.clone(),
@@ -526,9 +529,37 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
                 outbox_available = false;
             }
         }
+        delivery_available &= reconcile_payment_request_lifecycles(workers.clone()).await;
         runtime.set_paykit_reconciliation_available(delivery_available);
         runtime.set_outbox_reconciliation_available(outbox_available);
     }
+}
+
+async fn reconcile_payment_request_lifecycles(workers: Arc<WorkerComponents>) -> bool {
+    let creator_ids = match workers.payment_request_lifecycles.creator_ids().await {
+        Ok(creator_ids) => creator_ids,
+        Err(_) => return false,
+    };
+    let mut batch = JoinSet::new();
+    for creator_id in creator_ids {
+        let workers = workers.clone();
+        batch.spawn(async move {
+            let adapter = creator_adapter(&workers, creator_id)
+                .await
+                .map_err(|_| ())?;
+            adapter
+                .receive_and_project_payment_requests(&workers.payment_request_lifecycles)
+                .await
+                .map_err(|_| ())
+        });
+    }
+    let mut available = true;
+    while let Some(result) = batch.join_next().await {
+        if !matches!(result, Ok(Ok(()))) {
+            available = false;
+        }
+    }
+    available
 }
 
 async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
