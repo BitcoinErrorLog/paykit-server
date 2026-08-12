@@ -422,6 +422,8 @@ Keep `/transactions/status` factual and backward-compatible.
 
 ## Cross-repository implementation/review order
 
+Locks creator-visible graceful-deletion failure codes use the closed stable vocabulary `tombstone_missing`, `tombstone_replaced`, `retry_exhausted`, and `state_corrupt`. Paykit exposes none of these codes; this synchronized note fixes the cross-repository status contract without changing Paykit routes.
+
 1. Commit synchronized plan-only changes separately.
 2. Locks implements and reviews core `payment_in` schema.
 3. Paykit Server updates pinned Locks Core revision and implements Tasks 1–3.
