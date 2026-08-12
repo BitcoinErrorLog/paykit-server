@@ -8,7 +8,10 @@ use crate::{
             CreateInvoiceError, CreateInvoiceService, LockFetchError, LockFetcher, MarkerDiscovery,
             PaykitIntentBuilder, SessionValidationError, SessionValidator,
         },
-        payment_drain::{PaymentDrainError, PaymentDrainOperations, PaymentDrainSummary},
+        payment_drain::{
+            PaymentDrainCleanupToken, PaymentDrainError, PaymentDrainOperations,
+            PaymentDrainSummary,
+        },
         payment_request_status::PaymentRequestStatusOperations,
         payment_status::PaymentStatusService,
     },
@@ -376,7 +379,7 @@ impl PaymentDrainOperations for ProductionPaymentDrainOperations {
             .await
             .map_err(|_| PaymentDrainError::Unavailable)?
         {
-            return Ok(PaymentDrainSummary::from(replay));
+            return Ok(self.summary(replay));
         }
         let (creator_id, credentials) = self
             .creators
@@ -401,7 +404,7 @@ impl PaymentDrainOperations for ProductionPaymentDrainOperations {
         adapter
             .reconcile_and_create_payment_drain(&self.lifecycles, &self.drains, lock_resource)
             .await
-            .map(PaymentDrainSummary::from)
+            .map(|snapshot| self.summary(snapshot))
     }
 
     async fn lookup(
@@ -411,8 +414,32 @@ impl PaymentDrainOperations for ProductionPaymentDrainOperations {
         self.drains
             .exact_replay(lock_resource)
             .await
-            .map(|snapshot| snapshot.map(PaymentDrainSummary::from))
+            .map(|snapshot| snapshot.map(|snapshot| self.summary(snapshot)))
             .map_err(|_| PaymentDrainError::Unavailable)
+    }
+
+    async fn cleanup(
+        &self,
+        lock_resource: &PubkyLockResource,
+        cleanup_token: PaymentDrainCleanupToken,
+    ) -> Result<(), PaymentDrainError> {
+        self.drains
+            .cleanup_completed(lock_resource, cleanup_token.as_bytes())
+            .await
+            .map_err(|error| match error {
+                PersistenceError::Conflict => PaymentDrainError::Conflict,
+                _ => PaymentDrainError::Unavailable,
+            })
+    }
+}
+
+impl ProductionPaymentDrainOperations {
+    fn summary(&self, snapshot: crate::persistence::PaymentDrainSnapshot) -> PaymentDrainSummary {
+        let token = self.crypto.payment_drain_cleanup_token(snapshot.drain_id());
+        PaymentDrainSummary::from_snapshot(
+            snapshot,
+            PaymentDrainCleanupToken::from_bytes(*token.as_bytes()),
+        )
     }
 }
 

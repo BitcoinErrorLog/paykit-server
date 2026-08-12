@@ -246,7 +246,7 @@ retry_max = "2s"
 }
 
 #[tokio::test]
-async fn production_composition_registers_all_task_six_routes_as_signed() {
+async fn production_composition_registers_all_payment_drain_routes_as_signed() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -268,6 +268,7 @@ async fn production_composition_registers_all_task_six_routes_as_signed() {
     for path in [
         "/payment-request-drains",
         "/payment-request-drain-lookups",
+        "/payment-request-drain-cleanups",
         "/payment-requests/status",
     ] {
         let response = server
@@ -331,6 +332,33 @@ async fn production_composition_registers_all_task_six_routes_as_signed() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let cleanup_token = URL_SAFE_NO_PAD.encode([9; 32]);
+    let cleanup_body = format!(
+        r#"{{"cleanup_token":"{cleanup_token}","lock_resource":"pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"}}"#
+    )
+    .into_bytes();
+    let cleanup = server
+        .router()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/payment-request-drain-cleanups")
+                .header(
+                    "X-Paykit-Signature",
+                    URL_SAFE_NO_PAD.encode(signing_key.sign(&cleanup_body).to_bytes()),
+                )
+                .body(Body::from(cleanup_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cleanup.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        to_bytes(cleanup.into_body(), 16 * 1024).await.unwrap(),
+        br#"{"error":{"code":"conflict","message":"request conflicts with persisted payment state"}}"#
+            .as_slice()
+    );
 
     database.cleanup().await;
 }
@@ -435,6 +463,9 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
     let lock_resource_a = format!(
         "{creator_a}/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
     );
+    let lock_resource_b = format!(
+        "{creator_b}/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+    );
     let invoices = InvoiceStore::new(database.pool(), crypto.clone());
     let invoice_a = invoices
         .create_atomic(AtomicInvoiceInput {
@@ -459,7 +490,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             creator: &creator_b,
             reader: &reader,
             bundle_binding: b"composition-bundle-b",
-            lock_resource_binding: b"composition-lock-b",
+            lock_resource_binding: lock_resource_b.as_bytes(),
             payment_request_binding: b"composition-request-b",
             new_reader_payloads: &Payloads {
                 reader: reader.clone(),
@@ -675,10 +706,13 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
     let first = router.clone().oneshot(drain_request()).await.unwrap();
     assert_eq!(first.status(), StatusCode::OK);
     let first_body = to_bytes(first.into_body(), 16 * 1024).await.unwrap();
-    assert_eq!(
-        first_body.as_ref(),
-        br#"{"status":"active","accepted_count":1,"terminal_count":0,"cancellation_enqueued_count":0}"#
-    );
+    let first_json: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+    assert_eq!(first_json["status"], "active");
+    assert_eq!(first_json["accepted_count"], 1);
+    assert_eq!(first_json["terminal_count"], 0);
+    assert_eq!(first_json["cancellation_enqueued_count"], 0);
+    assert_eq!(first_json["cleanup_token"].as_str().unwrap().len(), 43);
+    assert_eq!(first_json.as_object().unwrap().len(), 5);
 
     let creator_id: Uuid = sqlx::query_scalar("SELECT creator_id FROM invoices WHERE id = $1")
         .bind(invoice_a.invoice_id())
@@ -725,6 +759,61 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
         .execute(database.pool())
         .await
         .unwrap();
+
+    let drain_b_body = format!(r#"{{"lock_resource":"{lock_resource_b}"}}"#).into_bytes();
+    let request_b = |path: &'static str, body: Vec<u8>| {
+        Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(
+                "X-Paykit-Signature",
+                URL_SAFE_NO_PAD.encode(signing_key.sign(&body).to_bytes()),
+            )
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let completed = router
+        .clone()
+        .oneshot(request_b("/payment-request-drains", drain_b_body.clone()))
+        .await
+        .unwrap();
+    assert_eq!(completed.status(), StatusCode::OK);
+    let completed_body = to_bytes(completed.into_body(), 16 * 1024).await.unwrap();
+    let completed_json: serde_json::Value = serde_json::from_slice(&completed_body).unwrap();
+    assert_eq!(completed_json["status"], "completed");
+    assert_eq!(completed_json["accepted_count"], 0);
+    assert_eq!(completed_json["terminal_count"], 0);
+    assert_eq!(completed_json["cancellation_enqueued_count"], 1);
+    let cleanup_token = completed_json["cleanup_token"].as_str().unwrap();
+    assert_eq!(cleanup_token.len(), 43);
+    assert_eq!(completed_json.as_object().unwrap().len(), 5);
+    let cleanup_body =
+        format!(r#"{{"cleanup_token":"{cleanup_token}","lock_resource":"{lock_resource_b}"}}"#)
+            .into_bytes();
+    for _ in 0..2 {
+        let cleanup = router
+            .clone()
+            .oneshot(request_b(
+                "/payment-request-drain-cleanups",
+                cleanup_body.clone(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cleanup.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(cleanup.into_body(), 16 * 1024).await.unwrap(),
+            br#"{"status":"removed"}"#.as_slice()
+        );
+    }
+    let absent = router
+        .clone()
+        .oneshot(request_b(
+            "/payment-request-drain-lookups",
+            drain_b_body.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(absent.status(), StatusCode::NOT_FOUND);
 
     tokio::time::sleep(Duration::from_millis(1_100)).await;
     let health = runtime.readiness().await;

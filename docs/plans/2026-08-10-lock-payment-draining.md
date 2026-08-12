@@ -211,7 +211,13 @@ Absent drain lookups and absent per-Bundle statuses reuse `404 {"error":{"code":
 
 ### Operational drain cleanup
 
-Add an idempotent signed POST-body operation that deletes only a completed operational drain after Locks external cleanup succeeds. Exact route/body is an implementation-contract gate. It must never delete invoices, Bitcoin observations, Payment Request events, or financial audit history.
+Drain creation and lookup responses include an opaque `cleanup_token`: the canonical unpadded base64url encoding of 32 server-keyed, domain-separated bytes bound to the immutable drain identity. The token is not an internal drain ID, is not reversible, is stable across restart/exact replay, and must never be logged. Add `POST /payment-request-drain-cleanups`, authenticated by the existing canonical Locks signature boundary. It accepts the exact query-free body:
+
+```json
+{"cleanup_token":"<43-character-unpadded-base64url>","lock_resource":"pubky<creator>/pub/locks.app/<lock_id>.json"}
+```
+
+On success it returns the exact closed response `200 {"status":"removed"}`. Cleanup is cycle-bound and idempotent: deleting the matching completed drain advances the publication generation once and durably retains the consumed token as the generation boundary's cleanup receipt; replay of that token while no newer drain exists returns the same response without advancing again. A token that cannot be verified against either the current drain or its retained cleanup receipt—including an arbitrary token for a never-known lock or a delayed old token after a newer drain exists—returns the existing coarse `409 conflict` envelope and cannot delete or advance the newer cycle. An active matching drain also returns `409 conflict`. Authenticated envelope mismatch, corrupt receipt/generation state, or unavailable persistence returns the existing coarse `503 unavailable` envelope. The operation rejects query strings, unknown body fields, padding, non-canonical base64url, and token lengths other than exactly 32 decoded bytes. It deletes only a completed operational drain after Locks external cleanup succeeds and must never delete invoices, Bitcoin observations, Payment Request events, cancellation intents, or financial audit history. No lock, Bundle, internal drain ID, invoice, reader, or Payment Request identifier appears in the response or error envelope.
 
 ## Persistence model
 
@@ -458,9 +464,7 @@ Cross-service acceptance must prove:
 
 ## Remaining implementation-contract gates
 
-Before code starts for the affected slice, patch this plan and the Locks sibling plan identically with:
-
-1. Exact signed POST-body route for completed operational-drain cleanup.
+None for Tasks 1–7.
 
 
 ## Out of scope

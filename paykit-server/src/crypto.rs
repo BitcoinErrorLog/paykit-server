@@ -138,6 +138,14 @@ impl Crypto {
         self.domain_separated_lookup_hash(b"paykit-server:bitcoin-outpoint:v1", outpoint)
     }
 
+    /// Produces an opaque capability bound to one immutable payment drain.
+    pub fn payment_drain_cleanup_token(&self, drain_id: uuid::Uuid) -> LookupHash {
+        self.domain_separated_lookup_hash(
+            b"paykit-server:payment-drain-cleanup:v1",
+            drain_id.as_bytes(),
+        )
+    }
+
     fn domain_separated_lookup_hash(&self, domain: &[u8], logical_bytes: &[u8]) -> LookupHash {
         let mut mac = match <Hmac<Sha256> as Mac>::new_from_slice(&*self.lookup_hmac_key) {
             Ok(mac) => mac,

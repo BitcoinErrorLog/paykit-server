@@ -61,7 +61,28 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5]);
+    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5, 6]);
+
+    let cleanup_receipt_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'lock_payment_generations'
+           AND column_name = 'last_cleanup_token'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(cleanup_receipt_nullable, "YES");
+    let cleanup_receipt_constraint: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pg_constraint
+             WHERE conrelid = 'lock_payment_generations'::regclass
+               AND conname = 'lock_payment_generations_cleanup_token_length'
+         )",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(cleanup_receipt_constraint);
 
     let lock_lookup_nullable: String = sqlx::query_scalar(
         "SELECT is_nullable FROM information_schema.columns

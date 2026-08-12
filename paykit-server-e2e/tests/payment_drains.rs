@@ -265,12 +265,14 @@ async fn drain_atomically_freezes_classification_and_cancellation_intent_for_exa
     assert_eq!(first.terminal_count(), 3);
     assert_eq!(first.cancellation_enqueued_count(), 1);
     assert!(!first.completed());
+    let first_token = crypto.payment_drain_cleanup_token(first.drain_id());
 
-    let active_delete = sqlx::query("DELETE FROM payment_drains WHERE id = $1")
-        .bind(first.drain_id())
-        .execute(database.pool())
-        .await;
-    assert!(active_delete.is_err());
+    assert_eq!(
+        store
+            .cleanup_completed(&lock_resource(), first_token.as_bytes())
+            .await,
+        Err(PersistenceError::Conflict)
+    );
     let retained_active_drain: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM payment_drains WHERE id = $1")
             .bind(first.drain_id())
@@ -429,6 +431,15 @@ async fn durable_cancellation_enqueue_is_sufficient_for_completion() {
         PaymentRequestLifecycleState::Rejected,
     )
     .await;
+    sqlx::query(
+        "UPDATE invoices
+         SET payment_status = 'detected', amount_matched = TRUE
+         WHERE id = $1",
+    )
+    .bind(historical_rejected)
+    .execute(database.pool())
+    .await
+    .unwrap();
 
     let store = PaymentDrainStore::new(database.pool(), crypto.clone());
     let drain = store.create(&lock_resource()).await.unwrap();
@@ -456,21 +467,30 @@ async fn durable_cancellation_enqueue_is_sufficient_for_completion() {
     assert!(replay_only.replayed());
     assert!(replay_only.completed());
     assert_eq!(replay_only.drain_id(), drain.drain_id());
+    let drain_token = crypto.payment_drain_cleanup_token(drain.drain_id());
 
-    sqlx::query("DELETE FROM payment_drains WHERE id = $1")
-        .bind(drain.drain_id())
-        .execute(database.pool())
+    store
+        .cleanup_completed(&lock_resource(), drain_token.as_bytes())
         .await
         .unwrap();
-    let remaining: (i64, i64) = sqlx::query_as(
+    let remaining: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
            (SELECT COUNT(*) FROM payment_drain_items),
-           (SELECT COUNT(*) FROM outbox)",
+           (SELECT COUNT(*) FROM outbox),
+           (SELECT COUNT(*) FROM invoices),
+           (SELECT COUNT(*) FROM payment_request_lifecycles)",
     )
     .fetch_one(database.pool())
     .await
     .unwrap();
-    assert_eq!(remaining, (0, 3));
+    assert_eq!(remaining, (0, 3, 2, 2));
+    let retained_observation: (String, bool) =
+        sqlx::query_as("SELECT payment_status, amount_matched FROM invoices WHERE id = $1")
+            .bind(historical_rejected)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(retained_observation, ("detected".into(), true));
 
     let boundary: (i64, Option<Uuid>) = sqlx::query_as(
         "SELECT current_generation, active_drain_id
@@ -480,6 +500,32 @@ async fn durable_cancellation_enqueue_is_sufficient_for_completion() {
     .await
     .unwrap();
     assert_eq!(boundary, (1, None));
+
+    store
+        .cleanup_completed(&lock_resource(), drain_token.as_bytes())
+        .await
+        .unwrap();
+    let idempotent_boundary: (i64, Option<Uuid>) = sqlx::query_as(
+        "SELECT current_generation, active_drain_id
+         FROM lock_payment_generations",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(idempotent_boundary, boundary);
+
+    sqlx::query(
+        "UPDATE payment_request_lifecycles
+         SET request_state = 'accepted', state_event_id = $1,
+             last_stream_item_id = last_stream_item_id + 1,
+             last_event_at = last_event_at + INTERVAL '1 second'
+         WHERE invoice_id = $2",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(historical_proposed)
+    .execute(database.pool())
+    .await
+    .unwrap();
 
     let (fresh_invoice, _) = insert_invoice(
         &database,
@@ -504,6 +550,84 @@ async fn durable_cancellation_enqueue_is_sufficient_for_completion() {
     assert_eq!(fresh_items, vec![fresh_invoice]);
     assert!(!fresh_items.contains(&historical_proposed));
     assert!(!fresh_items.contains(&historical_rejected));
+    let fresh_token = crypto.payment_drain_cleanup_token(fresh_drain.drain_id());
+
+    assert_eq!(
+        store
+            .cleanup_completed(&lock_resource(), drain_token.as_bytes())
+            .await,
+        Err(PersistenceError::Conflict)
+    );
+    let fresh_boundary: (i64, Option<Uuid>) =
+        sqlx::query_as("SELECT current_generation, active_drain_id FROM lock_payment_generations")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(fresh_boundary, (1, Some(fresh_drain.drain_id())));
+
+    let original_envelope: Vec<u8> =
+        sqlx::query_scalar("SELECT lock_resource_envelope FROM payment_drains WHERE id = $1")
+            .bind(fresh_drain.drain_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    let swapped_plaintext = format!("{}-authenticated-mismatch", lock_resource());
+    let swapped_envelope = crypto
+        .encrypt(
+            &EnvelopeContext::payment_drain(
+                crypto.lookup_hash(CREATOR.as_bytes()),
+                fresh_drain.drain_id(),
+            ),
+            swapped_plaintext.as_bytes(),
+        )
+        .unwrap();
+    sqlx::query("UPDATE payment_drains SET lock_resource_envelope = $1 WHERE id = $2")
+        .bind(swapped_envelope.as_bytes())
+        .bind(fresh_drain.drain_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .cleanup_completed(&lock_resource(), fresh_token.as_bytes())
+            .await,
+        Err(PersistenceError::CorruptOrMissing)
+    );
+    let after_mismatch: (i64, Option<Uuid>, i64) = sqlx::query_as(
+        "SELECT current_generation, active_drain_id,
+                (SELECT COUNT(*) FROM payment_drains WHERE id = $1)
+         FROM lock_payment_generations",
+    )
+    .bind(fresh_drain.drain_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(after_mismatch, (1, Some(fresh_drain.drain_id()), 1));
+    sqlx::query("UPDATE payment_drains SET lock_resource_envelope = $1 WHERE id = $2")
+        .bind(original_envelope)
+        .bind(fresh_drain.drain_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    sqlx::query("DELETE FROM lock_payment_generations WHERE creator_id = $1")
+        .bind(creator_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .cleanup_completed(&lock_resource(), fresh_token.as_bytes())
+            .await,
+        Err(PersistenceError::CorruptOrMissing)
+    );
+    let retained_corrupt_drain: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM payment_drains WHERE id = $1")
+            .bind(fresh_drain.drain_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(retained_corrupt_drain, 1);
 
     database.cleanup().await;
 }

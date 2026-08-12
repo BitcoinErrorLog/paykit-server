@@ -29,6 +29,20 @@ fn master_key() -> &'static [u8; 32] {
 }
 
 #[test]
+fn payment_drain_cleanup_tokens_are_stable_distinct_and_redacted() {
+    let crypto = Crypto::from_master_key(master_key()).expect("valid master key");
+    let drain = Uuid::new_v4();
+    let first = crypto.payment_drain_cleanup_token(drain);
+    let replay = crypto.payment_drain_cleanup_token(drain);
+    let another = crypto.payment_drain_cleanup_token(Uuid::new_v4());
+
+    assert_eq!(first, replay);
+    assert_ne!(first, another);
+    assert_ne!(first, crypto.lookup_hash(drain.as_bytes()));
+    assert_eq!(format!("{first:?}"), "LookupHash(<redacted>)");
+}
+
+#[test]
 fn creator_envelope_round_trips_with_the_persistent_binary_layout() {
     let crypto = Crypto::from_master_key(master_key()).expect("valid master key");
     let context = EnvelopeContext::creator_credentials(

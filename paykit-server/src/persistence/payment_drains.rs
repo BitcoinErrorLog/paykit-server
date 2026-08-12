@@ -155,6 +155,147 @@ impl PaymentDrainStore {
         snapshot(existing, true).map(Some)
     }
 
+    /// Idempotently removes a completed operational drain while retaining its
+    /// invoices, lifecycle projection, observations, and outbox history.
+    pub async fn cleanup_completed(
+        &self,
+        lock_resource: &PubkyLockResource,
+        cleanup_token: &[u8; 32],
+    ) -> Result<(), PersistenceError> {
+        let canonical_lock = lock_resource.to_string();
+        let creator_hash = self
+            .crypto
+            .lookup_hash(lock_resource.creator().to_string().as_bytes());
+        let lock_hash = self.crypto.lookup_hash(canonical_lock.as_bytes());
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+
+        let creator_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM creators WHERE creator_lookup_hash = $1 FOR UPDATE")
+                .bind(creator_hash.as_bytes().as_slice())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+        let Some(creator_id) = creator_id else {
+            return Err(PersistenceError::Conflict);
+        };
+
+        let generation: Option<(Option<Uuid>, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT active_drain_id, last_cleanup_token
+             FROM lock_payment_generations
+             WHERE creator_id = $1 AND lock_resource_lookup_hash = $2
+             FOR UPDATE",
+        )
+        .bind(creator_id)
+        .bind(lock_hash.as_bytes().as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some((active_drain_id, last_cleanup_token)) = generation else {
+            let orphaned: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1 FROM payment_drains
+                     WHERE creator_id = $1 AND lock_resource_lookup_hash = $2
+                     UNION ALL
+                     SELECT 1 FROM invoices
+                     WHERE creator_id = $1 AND lock_resource_lookup_hash = $2
+                 )",
+            )
+            .bind(creator_id)
+            .bind(lock_hash.as_bytes().as_slice())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            if orphaned {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+            return Err(PersistenceError::Conflict);
+        };
+        let Some(drain_id) = active_drain_id else {
+            let orphaned: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1 FROM payment_drains
+                     WHERE creator_id = $1 AND lock_resource_lookup_hash = $2
+                 )",
+            )
+            .bind(creator_id)
+            .bind(lock_hash.as_bytes().as_slice())
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            if orphaned {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+            let receipt = last_cleanup_token.ok_or(PersistenceError::CorruptOrMissing)?;
+            if receipt.as_slice() != cleanup_token {
+                return Err(PersistenceError::Conflict);
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(());
+        };
+
+        let drain: ExistingDrainRow = sqlx::query_as(
+            "SELECT id, lock_resource_envelope, accepted_count, terminal_count,
+                    cancellation_enqueued_count, status, created_at
+             FROM payment_drains
+             WHERE id = $1 AND creator_id = $2 AND lock_resource_lookup_hash = $3
+             FOR UPDATE",
+        )
+        .bind(drain_id)
+        .bind(creator_id)
+        .bind(lock_hash.as_bytes().as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?
+        .ok_or(PersistenceError::CorruptOrMissing)?;
+        let expected_token = self.crypto.payment_drain_cleanup_token(drain.id);
+        if expected_token.as_bytes() != cleanup_token {
+            return Err(PersistenceError::Conflict);
+        }
+        let plaintext = self
+            .crypto
+            .decrypt(
+                &EnvelopeContext::payment_drain(creator_hash, drain.id),
+                &EncryptedEnvelope::from_bytes(drain.lock_resource_envelope.clone()),
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        if plaintext != canonical_lock.as_bytes() {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        let drain_id = drain.id;
+        let validated = snapshot(drain, false)?;
+        if !validated.completed() {
+            return Err(PersistenceError::Conflict);
+        }
+
+        sqlx::query(
+            "UPDATE lock_payment_generations
+             SET last_cleanup_token = $1
+             WHERE creator_id = $2 AND lock_resource_lookup_hash = $3",
+        )
+        .bind(cleanup_token.as_slice())
+        .bind(creator_id)
+        .bind(lock_hash.as_bytes().as_slice())
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        sqlx::query("DELETE FROM payment_drains WHERE id = $1")
+            .bind(drain_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)
+    }
+
     /// Creates or exactly replays one immutable lock-wide lifecycle snapshot.
     pub async fn create(
         &self,
