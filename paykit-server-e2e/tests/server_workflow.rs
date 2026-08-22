@@ -8,43 +8,43 @@ use std::{
 
 use async_trait::async_trait;
 use axum::{
-    body::{to_bytes, Body},
+    body::{Body, to_bytes},
     http::{Method, Request, StatusCode},
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bitcoin::{
+    Network, OutPoint, Txid,
     bip32::{ChildNumber, Xpriv, Xpub},
     hashes::Hash,
     secp256k1::Secp256k1,
-    Network, OutPoint, Txid,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use locks_core::{
     ids::CreatorPubky as RawCreatorPubky,
     lock_policy::{
-        AccessPolicy, ContentLock, Criterion, LockLogic, LockServerConfig, VerifierType,
-        CONTENT_LOCK_VERSION,
+        AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, LockLogic, LockServerConfig,
+        VerifierType,
     },
 };
 use paykit_lib::{PaykitReceiverCapabilities, PaykitReceiverPath};
 use paykit_sdk::{
-    storage::StorageState, InMemoryStorage, LinkedPeerState, PaykitSdk, PaykitSdkConfig,
-    PubkyLocalSecretKey, PubkyPublicKey, PubkySessionBootstrap, ReceiverNoiseSecretKey,
+    InMemoryStorage, LinkedPeerState, PaykitSdk, PaykitSdkConfig, PubkyLocalSecretKey,
+    PubkyPublicKey, PubkySessionBootstrap, ReceiverNoiseSecretKey, storage::StorageState,
 };
 use paykit_server::{
+    Server,
     application::create_invoice::derive_bip84_p2wpkh_address,
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     bitcoin::{ObservationTarget, ObservedOutput},
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
-    domain::locks::{parse_bundle_id, parse_creator, parse_reader, CreatorPubky, ReaderPubky},
+    domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
     persistence::{CreatorCredentials, CreatorStore, PostgresStorageAdapter, SdkStateStore},
     startup::initialize_database,
     workers::observer::{ElectrumPort, ObserverError},
-    Server,
 };
 use paykit_server_e2e::postgres::TestDatabase;
-use pubky_testnet::{pubky::Keypair, EphemeralTestnet};
+use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
@@ -731,8 +731,8 @@ async fn assert_persisted_workflow_inputs(
             DeliveryOperationV1::EndpointPublication { receiving_details }
                 if receiving_details.len() == 1
                     && receiving_details[0].identifier == "btc-testnet-p2wpkh"
-                    && receiving_details[0].payload
-                        == serde_json::json!({ "value": fixture.address }).to_string()
+                    && serde_json::json!({ "value": fixture.address }).to_string()
+                        == receiving_details[0].payload
         ));
 
         let payment_plaintext = crypto
@@ -903,9 +903,11 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
             .await
             .unwrap();
     assert_eq!(queued_before.len(), 4);
-    assert!(queued_before
-        .iter()
-        .all(|(status, attempts)| status == "queued" && *attempts == 0));
+    assert!(
+        queued_before
+            .iter()
+            .all(|(status, attempts)| status == "queued" && *attempts == 0)
+    );
 
     first_runtime.begin_shutdown();
     let rejected = first_router
