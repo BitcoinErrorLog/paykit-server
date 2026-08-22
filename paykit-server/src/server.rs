@@ -185,7 +185,9 @@ impl Server {
             Arc::new(creators.clone()),
             config.deployment_invariants().bitcoin_network.clone(),
             Arc::new(invoices.clone()),
-            Arc::new(PaykitIntentBuilder),
+            Arc::new(PaykitIntentBuilder::for_network(
+                &config.deployment_invariants().bitcoin_network,
+            )),
         ));
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
         let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));

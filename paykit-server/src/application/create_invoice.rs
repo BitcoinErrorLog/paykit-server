@@ -8,9 +8,9 @@ use std::{
 
 use async_trait::async_trait;
 use bitcoin::{
-    Address, NetworkKind,
     bip32::{ChildNumber, Xpub},
     secp256k1::Secp256k1,
+    Address, NetworkKind,
 };
 use locks_core::{
     ids::CreatorPubky as RawCreatorPubky,
@@ -153,8 +153,32 @@ pub trait IntentBuilder: Send + Sync {
     ) -> Result<Vec<(PaymentEndpointIdentifier, PaymentEndpointPayload)>, CreateInvoiceError>;
 }
 
-#[derive(Default)]
-pub struct PaykitIntentBuilder;
+pub struct PaykitIntentBuilder {
+    onchain_endpoint_identifier: &'static str,
+}
+impl PaykitIntentBuilder {
+    /// Real wallets (Bitkit) reject payment endpoint identifiers whose network
+    /// component does not match their configured chain, so non-mainnet
+    /// deployments must not advertise `btc-bitcoin-p2wpkh`.
+    pub fn for_network(network: &crate::config::BitcoinNetwork) -> Self {
+        let onchain_endpoint_identifier = match network {
+            crate::config::BitcoinNetwork::Mainnet => "btc-bitcoin-p2wpkh",
+            crate::config::BitcoinNetwork::Testnet => "btc-testnet-p2wpkh",
+            crate::config::BitcoinNetwork::Signet => "btc-signet-p2wpkh",
+            crate::config::BitcoinNetwork::Regtest => "btc-regtest-p2wpkh",
+        };
+        Self {
+            onchain_endpoint_identifier,
+        }
+    }
+}
+impl Default for PaykitIntentBuilder {
+    fn default() -> Self {
+        Self {
+            onchain_endpoint_identifier: "btc-bitcoin-p2wpkh",
+        }
+    }
+}
 impl IntentBuilder for PaykitIntentBuilder {
     fn payment_request_terms(
         &self,
@@ -174,19 +198,22 @@ impl IntentBuilder for PaykitIntentBuilder {
         );
         metadata.insert("reader".into(), Value::String(request.reader.to_string()));
         Ok(PaymentRequestTerms {
+            // Paykit payment-requests spec: amount.asset is case-sensitive and
+            // SHOULD use the same lowercase asset string as the endpoint
+            // identifier asset segment; wallets (Bitkit) enforce "btc".
             amount: PaymentAmount::new(
                 format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000),
-                "BTC",
+                "btc",
             )
             .map_err(|_| CreateInvoiceError::InvalidRequest)?,
             payment_reference: PaymentReference::new(uuid::Uuid::new_v4().hyphenated().to_string())
                 .map_err(|_| CreateInvoiceError::InvalidRequest)?,
             proposal_expires_at: None,
             recurrence: None,
-            accepted_payment_endpoint_identifiers: vec![
-                PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh")
-                    .map_err(|_| CreateInvoiceError::InvalidRequest)?,
-            ],
+            accepted_payment_endpoint_identifiers: vec![PaymentEndpointIdentifier::new(
+                self.onchain_endpoint_identifier,
+            )
+            .map_err(|_| CreateInvoiceError::InvalidRequest)?],
             metadata,
         })
     }
@@ -198,9 +225,14 @@ impl IntentBuilder for PaykitIntentBuilder {
         if address.is_empty() {
             return Err(CreateInvoiceError::InvalidRequest);
         }
-        let identifier = PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh")
+        let identifier = PaymentEndpointIdentifier::new(self.onchain_endpoint_identifier)
             .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-        Ok(vec![(identifier, PaymentEndpointPayload::new(address))])
+        // Payment-endpoint-identifier spec section 7: the interoperable payload
+        // convention is a JSON object with the receiving handle under "value".
+        // Wallets (Bitkit) reject bare-string payloads; the demo reader masked
+        // this by accepting raw addresses.
+        let payload = serde_json::json!({ "value": address }).to_string();
+        Ok(vec![(identifier, PaymentEndpointPayload::new(payload))])
     }
 }
 

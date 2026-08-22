@@ -2,37 +2,37 @@ use std::{
     collections::{BTreeMap, VecDeque},
     str::FromStr,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use axum::{
-    Extension,
     body::Body,
     http::{Method, Request, StatusCode},
+    Extension,
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signer, SigningKey};
 use locks_core::{
     ids::CreatorPubky as RawCreatorPubky,
     lock_policy::{
-        AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, LockLogic, LockServerConfig,
-        VerifierType,
+        AccessPolicy, ContentLock, Criterion, LockLogic, LockServerConfig, VerifierType,
+        CONTENT_LOCK_VERSION,
     },
 };
 use paykit_server::{
     application::create_invoice::{
-        CreateInvoiceError, CreateInvoiceRequest, CreateInvoiceService, CreatorXpubProvider,
-        DeadlineClock, IntentBuilder, InvoicePersistence, LockFetchError, LockFetcher,
-        MarkerDiscovery, PaykitIntentBuilder, SessionValidationError, SessionValidator,
-        derive_bip84_p2wpkh_address,
+        derive_bip84_p2wpkh_address, CreateInvoiceError, CreateInvoiceRequest,
+        CreateInvoiceService, CreatorXpubProvider, DeadlineClock, IntentBuilder,
+        InvoicePersistence, LockFetchError, LockFetcher, MarkerDiscovery, PaykitIntentBuilder,
+        SessionValidationError, SessionValidator,
     },
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     config::{BitcoinNetwork, Config, ConfigEnvironment},
-    domain::locks::{CreatorPubky, parse_addressed_lock_resource, parse_bundle_id, parse_reader},
+    domain::locks::{parse_addressed_lock_resource, parse_bundle_id, parse_reader, CreatorPubky},
     http::{auth::SignedLocksAuth, invoices::invoices_router},
     persistence::{AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, PersistenceError},
 };
@@ -100,11 +100,11 @@ fn capable_marker() -> paykit_lib::PaykitReceiverMarker {
 #[test]
 fn library_payment_request_has_exact_terms_amount_and_metadata() {
     let request = request();
-    let terms = PaykitIntentBuilder
+    let terms = PaykitIntentBuilder::default()
         .payment_request_terms(&request, &valid_lock())
         .unwrap();
     assert_eq!(terms.amount.value, "0.00050000");
-    assert_eq!(terms.amount.asset, "BTC");
+    assert_eq!(terms.amount.asset, "btc");
     assert_eq!(terms.proposal_expires_at, None);
     assert_eq!(terms.recurrence, None);
     assert_eq!(
@@ -120,9 +120,9 @@ fn library_payment_request_has_exact_terms_amount_and_metadata() {
 #[test]
 fn private_payment_list_uses_derived_bech32_p2wpkh_address() {
     use bitcoin::{
-        Network,
         bip32::{ChildNumber, Xpriv, Xpub},
         secp256k1::Secp256k1,
+        Network,
     };
 
     let secp = Secp256k1::new();
@@ -140,11 +140,14 @@ fn private_payment_list_uses_derived_bech32_p2wpkh_address() {
     let xpub = Xpub::from_priv(&secp, &account).to_string();
     let address = derive_bip84_p2wpkh_address(&xpub, 0, &BitcoinNetwork::Mainnet, 0)
         .expect("valid account xpub derives an address");
-    let details = PaykitIntentBuilder
+    let details = PaykitIntentBuilder::default()
         .receiving_details(&address)
         .expect("canonical library types accept endpoint");
     assert_eq!(details[0].0.as_str(), "btc-bitcoin-p2wpkh");
-    assert_eq!(details[0].1.as_str(), address);
+    assert_eq!(
+        details[0].1.as_str(),
+        serde_json::json!({ "value": address }).to_string()
+    );
 }
 
 struct FakeStore {
@@ -244,9 +247,9 @@ struct FakeCredentials;
 
 fn account_xpub() -> String {
     use bitcoin::{
-        Network,
         bip32::{ChildNumber, Xpriv, Xpub},
         secp256k1::Secp256k1,
+        Network,
     };
     let secp = Secp256k1::new();
     let account = Xpriv::new_master(Network::Bitcoin, &[42; 32])
@@ -299,7 +302,7 @@ fn service(
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store,
-        Arc::new(PaykitIntentBuilder),
+        Arc::new(PaykitIntentBuilder::default()),
     )
 }
 
@@ -439,7 +442,7 @@ async fn fifteen_second_deadline_is_safe_and_does_not_commit() {
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store.clone(),
-        Arc::new(PaykitIntentBuilder),
+        Arc::new(PaykitIntentBuilder::default()),
         Arc::new(FixedClock::new([start, start + Duration::from_secs(15)])),
     );
 
@@ -477,7 +480,7 @@ async fn marker_discovery_cannot_start_after_the_whole_request_deadline() {
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store.clone(),
-        Arc::new(PaykitIntentBuilder),
+        Arc::new(PaykitIntentBuilder::default()),
         Arc::new(FixedClock::new([
             start,
             start,
@@ -521,7 +524,7 @@ async fn signed_router_maps_deadline_exhaustion_to_dependency_timeout() {
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store,
-        Arc::new(PaykitIntentBuilder),
+        Arc::new(PaykitIntentBuilder::default()),
         Arc::new(FixedClock::new([start, start + Duration::from_secs(15)])),
     );
     let router = invoices_router(Arc::new(service)).layer(Extension(signed_auth(&key)));
@@ -793,7 +796,7 @@ async fn new_invoice_discovers_marker_before_atomic_persistence_and_pins_it_in_b
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store.clone(),
-        Arc::new(PaykitIntentBuilder),
+        Arc::new(PaykitIntentBuilder::default()),
     );
 
     service.create(request()).await.unwrap();
@@ -860,14 +863,10 @@ fn delivery_intent_is_closed_and_contains_complete_sdk_inputs_not_final_wire_ids
             if receiving_details.len() == 1
     ));
     let serialized = postcard::to_allocvec(&intent).unwrap();
-    assert!(
-        !serialized
-            .windows(b"event_id".len())
-            .any(|window| window == b"event_id")
-    );
-    assert!(
-        !serialized
-            .windows(b"payment_request_id".len())
-            .any(|window| window == b"payment_request_id")
-    );
+    assert!(!serialized
+        .windows(b"event_id".len())
+        .any(|window| window == b"event_id"));
+    assert!(!serialized
+        .windows(b"payment_request_id".len())
+        .any(|window| window == b"payment_request_id"));
 }
