@@ -2,37 +2,37 @@ use std::{
     collections::{BTreeMap, VecDeque},
     str::FromStr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
 use axum::{
+    Extension,
     body::Body,
     http::{Method, Request, StatusCode},
-    Extension,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
 use locks_core::{
     ids::CreatorPubky as RawCreatorPubky,
     lock_policy::{
-        AccessPolicy, ContentLock, Criterion, LockLogic, LockServerConfig, VerifierType,
-        CONTENT_LOCK_VERSION,
+        AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, LockLogic, LockServerConfig,
+        VerifierType,
     },
 };
 use paykit_server::{
     application::create_invoice::{
-        derive_bip84_p2wpkh_address, CreateInvoiceError, CreateInvoiceRequest,
-        CreateInvoiceService, CreatorXpubProvider, DeadlineClock, IntentBuilder,
-        InvoicePersistence, LockFetchError, LockFetcher, MarkerDiscovery, PaykitIntentBuilder,
-        SessionValidationError, SessionValidator,
+        CreateInvoiceError, CreateInvoiceRequest, CreateInvoiceService, CreatorXpubProvider,
+        DeadlineClock, IntentBuilder, InvoicePersistence, LockFetchError, LockFetcher,
+        MarkerDiscovery, PaykitIntentBuilder, SessionValidationError, SessionValidator,
+        derive_bip84_p2wpkh_address,
     },
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     config::{BitcoinNetwork, Config, ConfigEnvironment},
-    domain::locks::{parse_addressed_lock_resource, parse_bundle_id, parse_reader, CreatorPubky},
+    domain::locks::{CreatorPubky, parse_addressed_lock_resource, parse_bundle_id, parse_reader},
     http::{auth::SignedLocksAuth, invoices::invoices_router},
     persistence::{AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, PersistenceError},
 };
@@ -120,9 +120,9 @@ fn library_payment_request_has_exact_terms_amount_and_metadata() {
 #[test]
 fn private_payment_list_uses_derived_bech32_p2wpkh_address() {
     use bitcoin::{
+        Network,
         bip32::{ChildNumber, Xpriv, Xpub},
         secp256k1::Secp256k1,
-        Network,
     };
 
     let secp = Secp256k1::new();
@@ -247,9 +247,9 @@ struct FakeCredentials;
 
 fn account_xpub() -> String {
     use bitcoin::{
+        Network,
         bip32::{ChildNumber, Xpriv, Xpub},
         secp256k1::Secp256k1,
-        Network,
     };
     let secp = Secp256k1::new();
     let account = Xpriv::new_master(Network::Bitcoin, &[42; 32])
@@ -863,10 +863,14 @@ fn delivery_intent_is_closed_and_contains_complete_sdk_inputs_not_final_wire_ids
             if receiving_details.len() == 1
     ));
     let serialized = postcard::to_allocvec(&intent).unwrap();
-    assert!(!serialized
-        .windows(b"event_id".len())
-        .any(|window| window == b"event_id"));
-    assert!(!serialized
-        .windows(b"payment_request_id".len())
-        .any(|window| window == b"payment_request_id"));
+    assert!(
+        !serialized
+            .windows(b"event_id".len())
+            .any(|window| window == b"event_id")
+    );
+    assert!(
+        !serialized
+            .windows(b"payment_request_id".len())
+            .any(|window| window == b"payment_request_id")
+    );
 }

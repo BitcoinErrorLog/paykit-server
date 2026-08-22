@@ -227,18 +227,29 @@ impl SetupCompleter for RealSetupCompleter {
     }
 }
 
-struct CreatorSetupCommit {
-    session: pubky::PubkySession,
-    public_storage_client: pubky::Pubky,
-    owner: paykit_lib::PublicKey,
-    creator: crate::domain::locks::CreatorPubky,
-    session_secret: String,
-    initial_noise_secret: ReceiverNoiseSecretKey,
-    creators: CreatorStore,
-    marker_publisher: Arc<dyn MarkerPublisher>,
-    bitcoin_network: BitcoinNetwork,
-    receiver_path: PaykitReceiverPath,
-    marker_capabilities: PaykitReceiverCapabilities,
+/// One authenticated watch-only account commit: xpub validation, marker
+/// publish/read-back, and encrypted credential persistence under the
+/// creator-scoped advisory lock. Shared by the Bitkit companion setup flow
+/// and the manual claim endpoint, which authenticate the creator through
+/// different channels but must persist the exact same account record.
+pub(crate) struct CreatorSetupCommit {
+    pub(crate) session: pubky::PubkySession,
+    pub(crate) public_storage_client: pubky::Pubky,
+    pub(crate) owner: paykit_lib::PublicKey,
+    pub(crate) creator: crate::domain::locks::CreatorPubky,
+    pub(crate) session_secret: String,
+    pub(crate) initial_noise_secret: ReceiverNoiseSecretKey,
+    pub(crate) creators: CreatorStore,
+    pub(crate) marker_publisher: Arc<dyn MarkerPublisher>,
+    pub(crate) bitcoin_network: BitcoinNetwork,
+    pub(crate) receiver_path: PaykitReceiverPath,
+    pub(crate) marker_capabilities: PaykitReceiverCapabilities,
+}
+
+impl CreatorSetupCommit {
+    pub(crate) fn marker_capabilities() -> PaykitReceiverCapabilities {
+        default_marker_capabilities()
+    }
 }
 
 #[async_trait]
@@ -295,7 +306,7 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                     .await
                     .map(|_| ()),
             };
-            if persistence.is_err() {
+            if let Err(error) = persistence {
                 // Publication and Postgres cannot share a transaction. This
                 // creator-scoped lock covers load, publication, persistence,
                 // and compensation, so a failed first creator cannot remove a
@@ -307,7 +318,12 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                         .remove(&self.session, &self.receiver_path)
                         .await;
                 }
-                return Err(ClaimError::InvalidEnvelope);
+                return Err(match error {
+                    crate::persistence::PersistenceError::ReauthenticationMismatch => {
+                        ClaimError::AccountMismatch
+                    }
+                    _ => ClaimError::InvalidEnvelope,
+                });
             }
             Ok(())
         }

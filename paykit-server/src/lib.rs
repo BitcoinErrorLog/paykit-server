@@ -12,6 +12,8 @@ pub mod crypto;
 /// Side-effect-free protocol and business value objects.
 pub mod domain;
 pub mod http;
+/// Manual watch-only account claims authenticated by capability-scoped AuthTokens.
+pub mod manual_claim;
 /// Identifier-free operational metrics.
 pub mod metrics;
 /// Concrete per-Creator public Paykit SDK adapter.

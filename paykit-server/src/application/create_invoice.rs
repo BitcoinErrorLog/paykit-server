@@ -8,9 +8,9 @@ use std::{
 
 use async_trait::async_trait;
 use bitcoin::{
+    Address, NetworkKind,
     bip32::{ChildNumber, Xpub},
     secp256k1::Secp256k1,
-    Address, NetworkKind,
 };
 use locks_core::{
     ids::CreatorPubky as RawCreatorPubky,
@@ -171,6 +171,13 @@ impl PaykitIntentBuilder {
             onchain_endpoint_identifier,
         }
     }
+
+    /// The network-correct on-chain payment endpoint identifier this builder
+    /// advertises. Shared with the marketplace payment-request service so
+    /// lock-free requests carry the same identifier wallets accept.
+    pub fn onchain_endpoint_identifier(&self) -> &'static str {
+        self.onchain_endpoint_identifier
+    }
 }
 impl Default for PaykitIntentBuilder {
     fn default() -> Self {
@@ -210,10 +217,10 @@ impl IntentBuilder for PaykitIntentBuilder {
                 .map_err(|_| CreateInvoiceError::InvalidRequest)?,
             proposal_expires_at: None,
             recurrence: None,
-            accepted_payment_endpoint_identifiers: vec![PaymentEndpointIdentifier::new(
-                self.onchain_endpoint_identifier,
-            )
-            .map_err(|_| CreateInvoiceError::InvalidRequest)?],
+            accepted_payment_endpoint_identifiers: vec![
+                PaymentEndpointIdentifier::new(self.onchain_endpoint_identifier)
+                    .map_err(|_| CreateInvoiceError::InvalidRequest)?,
+            ],
             metadata,
         })
     }
@@ -272,14 +279,14 @@ pub fn derive_bip84_p2wpkh_address(
     Ok(Address::p2wpkh(&derived.to_pub(), network).to_string())
 }
 
-struct DerivedNewReaderPayloads {
-    intents: Arc<dyn IntentBuilder>,
-    xpub: String,
-    account_index: u32,
-    network: crate::config::BitcoinNetwork,
-    reader: String,
-    marker: PaykitReceiverMarker,
-    local_receiver_path: PaykitReceiverPath,
+pub(crate) struct DerivedNewReaderPayloads {
+    pub(crate) intents: Arc<dyn IntentBuilder>,
+    pub(crate) xpub: String,
+    pub(crate) account_index: u32,
+    pub(crate) network: crate::config::BitcoinNetwork,
+    pub(crate) reader: String,
+    pub(crate) marker: PaykitReceiverMarker,
+    pub(crate) local_receiver_path: PaykitReceiverPath,
 }
 impl NewReaderPayloadFactory for DerivedNewReaderPayloads {
     fn for_child_index(&self, child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
@@ -514,7 +521,7 @@ impl CreateInvoiceService {
 fn request_binding(request: &CreateInvoiceRequest) -> Result<Vec<u8>, CreateInvoiceError> {
     serde_json_canonicalizer::to_vec(&serde_json::json!({"bundle_id":request.bundle_id.to_string(),"lock_resource":request.lock_resource.to_string(),"reader":request.reader.to_string()})).map_err(|_| CreateInvoiceError::InvalidRequest)
 }
-fn remaining(start: Instant, now: Instant) -> Result<Duration, CreateInvoiceError> {
+pub(crate) fn remaining(start: Instant, now: Instant) -> Result<Duration, CreateInvoiceError> {
     let remaining = REQUEST_DEADLINE
         .checked_sub(now.saturating_duration_since(start))
         .ok_or(CreateInvoiceError::DeadlineExceeded)?;
@@ -523,7 +530,7 @@ fn remaining(start: Instant, now: Instant) -> Result<Duration, CreateInvoiceErro
     }
     Ok(remaining)
 }
-fn map_store(error: PersistenceError) -> CreateInvoiceError {
+pub(crate) fn map_store(error: PersistenceError) -> CreateInvoiceError {
     match error {
         PersistenceError::Conflict => CreateInvoiceError::Conflict,
         PersistenceError::Unavailable => CreateInvoiceError::Unavailable,

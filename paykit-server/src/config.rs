@@ -13,6 +13,11 @@ use url::Url;
 pub struct Config {
     pub http: HttpConfig,
     pub locks: LocksConfig,
+    /// Optional marketplace transaction-service trust anchor. When present,
+    /// requests signed by this key are accepted on the signed business routes
+    /// (payment requests and status lookups) exactly like Lock Server
+    /// signatures.
+    pub marketplace: Option<MarketplaceConfig>,
     pub setup: SetupConfig,
     pub paykit: PaykitConfig,
     pub electrum: ElectrumConfig,
@@ -57,17 +62,32 @@ impl Config {
 
         validate_url("electrum.endpoint", &raw.electrum.endpoint)?;
         let allowed_origins = validate_allowed_origins(raw.setup.allowed_origins)?;
+        let marketplace = raw
+            .marketplace
+            .map(|marketplace| {
+                TrustedLocksPublicKey::parse(marketplace.trusted_public_key)
+                    .map_err(|_| ConfigError::InvalidTrustedMarketplacePublicKey)
+                    .map(|trusted_public_key| MarketplaceConfig { trusted_public_key })
+            })
+            .transpose()?;
+        let auth_relay = match raw.paykit.auth_relay {
+            Some(value) => validate_url("paykit.auth_relay", &value)?,
+            None => Url::parse(pubky::DEFAULT_HTTP_RELAY_INBOX)
+                .expect("default HTTP relay inbox URL parses"),
+        };
 
         let config = Self {
             http: HttpConfig {
                 listen_addr: raw.http.listen_addr,
             },
             locks: LocksConfig { trusted_public_key },
+            marketplace,
             setup: SetupConfig { allowed_origins },
             paykit: PaykitConfig {
                 receiver_path: receiver_path.clone(),
                 receiver_path_priority,
                 network: PaykitNetwork::parse(&raw.paykit.network)?,
+                auth_relay,
             },
             electrum: ElectrumConfig {
                 endpoint: raw.electrum.endpoint,
@@ -149,6 +169,10 @@ impl Config {
             (
                 "rate_limits.max_completion_polls",
                 self.rate_limits.max_completion_polls,
+            ),
+            (
+                "rate_limits.claims_per_minute",
+                self.rate_limits.claims_per_minute,
             ),
         ] {
             if value == 0 {
@@ -296,6 +320,11 @@ pub struct LocksConfig {
 }
 
 #[derive(Debug)]
+pub struct MarketplaceConfig {
+    pub trusted_public_key: TrustedLocksPublicKey,
+}
+
+#[derive(Debug)]
 pub struct SetupConfig {
     pub allowed_origins: Vec<String>,
 }
@@ -306,6 +335,10 @@ pub struct PaykitConfig {
     /// Ordered first-segment preference for discovered reader receiver paths.
     pub receiver_path_priority: Vec<ReceiverPathPriority>,
     pub network: PaykitNetwork,
+    /// HTTP relay inbox base used both by the SDK auth flows and by the
+    /// manual claim loopback that exchanges a caller-supplied AuthToken for
+    /// a homeserver session.
+    pub auth_relay: Url,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -376,6 +409,9 @@ pub struct RateLimitsConfig {
     pub max_pending_setup_flows: u64,
     pub max_completion_polls_per_flow: u64,
     pub max_completion_polls: u64,
+    /// Process-wide manual claim budget: each claim performs a relay
+    /// round-trip and a homeserver session exchange.
+    pub claims_per_minute: u64,
 }
 
 #[derive(Debug)]
@@ -420,6 +456,8 @@ pub enum ConfigError {
     InvalidMasterKey,
     #[error("locks.trusted_public_key must be a canonical pubky-prefixed public key")]
     InvalidTrustedLocksPublicKey,
+    #[error("marketplace.trusted_public_key must be a canonical pubky-prefixed public key")]
+    InvalidTrustedMarketplacePublicKey,
     #[error("bitcoin.network must be mainnet, testnet, signet, or regtest")]
     InvalidNetwork,
     #[error("{0} must be a valid absolute URL")]
@@ -497,6 +535,8 @@ fn validate_allowed_origins(values: Vec<String>) -> Result<Vec<String>, ConfigEr
 struct RawConfig {
     http: RawHttpConfig,
     locks: RawLocksConfig,
+    #[serde(default)]
+    marketplace: Option<RawMarketplaceConfig>,
     setup: RawSetupConfig,
     paykit: RawPaykitConfig,
     bitcoin: RawBitcoinConfig,
@@ -524,6 +564,12 @@ struct RawLocksConfig {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawMarketplaceConfig {
+    trusted_public_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawSetupConfig {
     allowed_origins: Vec<String>,
 }
@@ -535,6 +581,8 @@ struct RawPaykitConfig {
     #[serde(default = "default_receiver_path_priority")]
     receiver_path_priority: Vec<String>,
     network: String,
+    #[serde(default)]
+    auth_relay: Option<String>,
 }
 
 fn default_receiver_path_priority() -> Vec<String> {
@@ -612,6 +660,8 @@ struct RawRateLimitsConfig {
     max_completion_polls_per_flow: u64,
     #[serde(default = "default_max_completion_polls")]
     max_completion_polls: u64,
+    #[serde(default = "default_claims_per_minute")]
+    claims_per_minute: u64,
 }
 
 #[derive(Deserialize)]
@@ -640,6 +690,7 @@ impl Default for RawRateLimitsConfig {
             max_pending_setup_flows: default_max_pending_setup_flows(),
             max_completion_polls_per_flow: default_max_completion_polls_per_flow(),
             max_completion_polls: default_max_completion_polls(),
+            claims_per_minute: default_claims_per_minute(),
         }
     }
 }
@@ -683,6 +734,7 @@ impl From<RawRateLimitsConfig> for RateLimitsConfig {
             max_pending_setup_flows: value.max_pending_setup_flows,
             max_completion_polls_per_flow: value.max_completion_polls_per_flow,
             max_completion_polls: value.max_completion_polls,
+            claims_per_minute: value.claims_per_minute,
         }
     }
 }
@@ -734,6 +786,9 @@ const fn default_max_completion_polls_per_flow() -> u64 {
 }
 const fn default_max_completion_polls() -> u64 {
     200
+}
+const fn default_claims_per_minute() -> u64 {
+    30
 }
 const fn default_shutdown_drain_timeout() -> Duration {
     Duration::from_secs(30)

@@ -44,7 +44,10 @@ impl Clock for SystemClock {
 }
 
 pub struct SignedLocksAuth {
-    trusted_key: VerifyingKey,
+    /// Every key allowed to sign business requests: the Lock Server's key,
+    /// plus the marketplace transaction service's key when configured. A
+    /// request is authentic when any trusted key verifies its signature.
+    trusted_keys: Vec<VerifyingKey>,
     request_body_bytes: usize,
     limiter: Mutex<TokenBucket>,
     clock: Arc<dyn Clock>,
@@ -55,7 +58,7 @@ impl fmt::Debug for SignedLocksAuth {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SignedLocksAuth")
-            .field("trusted_key", &"<redacted>")
+            .field("trusted_keys", &"<redacted>")
             .field("request_body_bytes", &self.request_body_bytes)
             .finish_non_exhaustive()
     }
@@ -85,8 +88,12 @@ impl SignedLocksAuth {
         observer: Arc<dyn AuthProcessingObserver>,
     ) -> Self {
         let now = clock.now();
+        let mut trusted_keys = vec![config.locks.trusted_public_key.verifying_key()];
+        if let Some(marketplace) = &config.marketplace {
+            trusted_keys.push(marketplace.trusted_public_key.verifying_key());
+        }
         Self {
-            trusted_key: config.locks.trusted_public_key.verifying_key(),
+            trusted_keys,
             request_body_bytes: usize::try_from(config.limits.request_body_bytes)
                 .expect("validated request body limit fits usize"),
             limiter: Mutex::new(TokenBucket::new(
@@ -178,7 +185,7 @@ where
             return Err(ApiError::PayloadTooLarge);
         }
         auth.observer.signature_verification_started();
-        verify_signature(&auth.trusted_key, &parts.headers, &raw_body)?;
+        verify_signature(&auth.trusted_keys, &parts.headers, &raw_body)?;
 
         let value: serde_json::Value =
             serde_json::from_slice(&raw_body).map_err(|_| ApiError::InvalidRequest)?;
@@ -205,7 +212,7 @@ where
 }
 
 fn verify_signature(
-    trusted_key: &VerifyingKey,
+    trusted_keys: &[VerifyingKey],
     headers: &axum::http::HeaderMap,
     raw_body: &[u8],
 ) -> Result<(), ApiError> {
@@ -227,9 +234,12 @@ fn verify_signature(
     if URL_SAFE_NO_PAD.encode(signature) != encoded {
         return Err(ApiError::InvalidSignature);
     }
-    trusted_key
-        .verify(raw_body, &Signature::from_bytes(&signature))
-        .map_err(|_| ApiError::InvalidSignature)
+    let signature = Signature::from_bytes(&signature);
+    trusted_keys
+        .iter()
+        .any(|key| key.verify(raw_body, &signature).is_ok())
+        .then_some(())
+        .ok_or(ApiError::InvalidSignature)
 }
 
 #[cfg(test)]

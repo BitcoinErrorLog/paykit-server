@@ -8,13 +8,15 @@ use crate::{
             CreateInvoiceError, CreateInvoiceService, LockFetchError, LockFetcher, MarkerDiscovery,
             PaykitIntentBuilder, SessionValidationError, SessionValidator,
         },
+        create_payment_request::MarketplacePaymentRequestService,
         payment_status::PaymentStatusService,
     },
     bitkit_setup::BitkitAuthStarter,
     config::{Config, OutboxConfig, PaykitConfig, PaykitNetwork},
     crypto::Crypto,
     domain::locks::{CreatorPubky, PubkyLockResource, ReaderPubky},
-    http::{self, auth::SignedLocksAuth},
+    http::{self, accounts::AccountsState, auth::SignedLocksAuth},
+    manual_claim::{ManualClaimService, RelayLoopbackSessionMinter},
     paykit::{CreatorSessionProvider, PaykitAdapter},
     persistence::{
         CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PersistenceError,
@@ -190,12 +192,50 @@ impl Server {
             )),
         ));
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
-        let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
-        let business_routes = http::setup::setup_router(setup).merge(
-            http::invoices::invoices_router(invoice_service)
-                .merge(http::status::status_router(status_service))
-                .layer(Extension(signed_auth)),
+        let payment_request_service = Arc::new(MarketplacePaymentRequestService::new(
+            Arc::new(CreatorSessionValidator {
+                creators: creators.clone(),
+                pubky: pubky.clone(),
+            }),
+            Arc::new(PubkyMarkerDiscovery {
+                storage: pubky.public_storage(),
+            }),
+            config.paykit.receiver_path_priority.clone(),
+            config.paykit.receiver_path.clone(),
+            Arc::new(creators.clone()),
+            config.deployment_invariants().bitcoin_network.clone(),
+            Arc::new(invoices.clone()),
+            Arc::new(PaykitIntentBuilder::for_network(
+                &config.deployment_invariants().bitcoin_network,
+            )),
+        ));
+        let manual_claims = Arc::new(ManualClaimService::new(
+            pubky.clone(),
+            Arc::new(RelayLoopbackSessionMinter::new(
+                pubky.clone(),
+                config.paykit.auth_relay.clone(),
+            )),
+            creators.clone(),
+            Arc::new(crate::real_setup::DirectMarkerPublisher),
+            config.deployment_invariants().bitcoin_network.clone(),
+            config.paykit.receiver_path.clone(),
+        ));
+        let accounts_state = AccountsState::new(
+            manual_claims,
+            config.rate_limits.claims_per_minute,
+            config.setup.allowed_origins.clone(),
         );
+        let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
+        let business_routes = http::setup::setup_router(setup)
+            .merge(http::accounts::accounts_router(accounts_state))
+            .merge(
+                http::invoices::invoices_router(invoice_service)
+                    .merge(http::status::status_router(status_service))
+                    .merge(http::payment_requests::payment_requests_router(
+                        payment_request_service,
+                    ))
+                    .layer(Extension(signed_auth)),
+            );
 
         let runtime = Arc::new(Runtime::new(
             Arc::new(PostgresDependency::new(pool.clone())),

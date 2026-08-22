@@ -66,6 +66,12 @@ pub enum ClaimError {
     InvalidEnvelope,
     #[error("companion authentication failed")]
     AuthenticationFailed,
+    /// A re-claim presented a different account xpub or index than the one
+    /// already persisted for this creator. The stored watch-only account is
+    /// immutable (existing invoices watch addresses derived from it), so the
+    /// claim is refused instead of replaced.
+    #[error("claimed account does not match the persisted account")]
+    AccountMismatch,
 }
 
 pub fn required_capabilities(receiver_path: &PaykitReceiverPath) -> String {

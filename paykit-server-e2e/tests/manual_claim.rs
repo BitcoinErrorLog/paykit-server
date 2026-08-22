@@ -1,0 +1,228 @@
+//! End-to-end manual watch-only claims against a real ephemeral Pubky
+//! testnet: DHT, homeserver, and HTTP relay. The claim exchanges a genuine
+//! capability-scoped AuthToken for a homeserver session through the relay
+//! loopback, publishes the receiver marker, and persists encrypted creator
+//! credentials — the exact production path with no substituted transports.
+
+use std::{str::FromStr, sync::Arc};
+
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use bitcoin::{
+    Network,
+    bip32::{ChildNumber, Xpriv, Xpub},
+    secp256k1::Secp256k1,
+};
+use paykit_lib::PaykitReceiverPath;
+use paykit_sdk::{PaykitSdkConfig, PubkyPublicKey};
+use paykit_server::{
+    application::create_invoice::derive_bip84_p2wpkh_address,
+    config::BitcoinNetwork,
+    crypto::Crypto,
+    domain::locks::parse_creator,
+    manual_claim::{
+        ManualClaimError, ManualClaimRequest, ManualClaimService, RelayLoopbackSessionMinter,
+    },
+    persistence::{CreatorStore, run_migrations},
+    real_setup::DirectMarkerPublisher,
+};
+use paykit_server_e2e::postgres::TestDatabase;
+use pubky_testnet::{
+    EphemeralTestnet,
+    pubky::{AuthToken, Capabilities, Keypair},
+};
+
+static PUBKY_TESTNET_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn account_xpub(seed: u8, account_index: u32) -> String {
+    let secp = Secp256k1::new();
+    let account = Xpriv::new_master(Network::Testnet, &[seed; 32])
+        .unwrap()
+        .derive_priv(
+            &secp,
+            &[
+                ChildNumber::from_hardened_idx(84).unwrap(),
+                ChildNumber::from_hardened_idx(1).unwrap(),
+                ChildNumber::from_hardened_idx(account_index).unwrap(),
+            ],
+        )
+        .unwrap();
+    Xpub::from_priv(&secp, &account).to_string()
+}
+
+async fn build_pubky_testnet() -> EphemeralTestnet {
+    let postgres = std::env::var("TEST_DATABASE_URL").unwrap();
+    let postgres = pubky_testnet::pubky_homeserver::ConnectionString::new(&postgres).unwrap();
+    EphemeralTestnet::builder()
+        .postgres(postgres)
+        .with_http_relay()
+        .build()
+        .await
+        .unwrap()
+}
+
+fn claim_token(keypair: &Keypair, capabilities: &str) -> String {
+    let capabilities = Capabilities::try_from(capabilities).unwrap();
+    URL_SAFE_NO_PAD.encode(AuthToken::sign(keypair, capabilities).serialize())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_claim_persists_account_publishes_marker_and_refuses_replacement() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let relay_inbox = testnet.http_relay().local_url().join("inbox").unwrap();
+
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(database.pool(), crypto);
+    let receiver_path = PaykitReceiverPath::new("paykit/server").unwrap();
+    let required_capabilities =
+        PaykitSdkConfig::new(receiver_path.clone()).required_session_capabilities();
+    let service = ManualClaimService::new(
+        pubky.clone(),
+        Arc::new(RelayLoopbackSessionMinter::new(pubky.clone(), relay_inbox)),
+        creators.clone(),
+        Arc::new(DirectMarkerPublisher),
+        BitcoinNetwork::Testnet,
+        receiver_path.clone(),
+    );
+    assert_eq!(service.required_capabilities(), required_capabilities);
+
+    // The seller identity exists on the homeserver; only the keypair signer
+    // (Pubky Ring / Bitkit) ever holds its secret.
+    let keypair = Keypair::random();
+    let homeserver = testnet.homeserver_app().public_key();
+    pubky
+        .signer(keypair.clone())
+        .signup(&homeserver, None)
+        .await
+        .unwrap();
+    let creator = parse_creator(&format!("pubky{}", keypair.public_key().z32())).unwrap();
+    assert!(!service.account_exists(&creator).await.unwrap());
+
+    let xpub = account_xpub(51, 0);
+    let outcome = service
+        .claim(ManualClaimRequest {
+            auth_token: claim_token(&keypair, &required_capabilities),
+            account_xpub: xpub.clone(),
+            account_index: 0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome.creator, creator.to_string());
+    assert_eq!(outcome.account_index, 0);
+
+    // The persisted record is the exact watch-only account: fresh invoice
+    // addresses derive from the claimed xpub.
+    let credentials = creators.load(&creator).await.unwrap();
+    assert_eq!(credentials.xpub(), xpub);
+    assert_eq!(credentials.account_index(), 0);
+    let first_session_secret = credentials.session_secret().to_owned();
+    assert_eq!(
+        derive_bip84_p2wpkh_address(credentials.xpub(), 0, &BitcoinNetwork::Testnet, 0).unwrap(),
+        derive_bip84_p2wpkh_address(&xpub, 0, &BitcoinNetwork::Testnet, 0).unwrap()
+    );
+
+    // The receiver marker was published to the creator's homeserver and is
+    // publicly readable, exactly like a companion-flow setup.
+    let owner = PubkyPublicKey::from_public_key(&keypair.public_key())
+        .to_public_key()
+        .unwrap();
+    let marker =
+        paykit_lib::get_paykit_receiver_marker(&pubky.public_storage(), &owner, &receiver_path)
+            .await
+            .unwrap()
+            .expect("receiver marker is published");
+    assert!(marker.capabilities.private_payments);
+    assert!(marker.capabilities.payment_requests);
+    assert!(!marker.capabilities.receipts);
+
+    assert!(service.account_exists(&creator).await.unwrap());
+
+    // Re-claiming the same account refreshes the session (a wallet re-setup)
+    // while the immutable account identity is untouched.
+    let outcome = service
+        .claim(ManualClaimRequest {
+            auth_token: claim_token(&keypair, &required_capabilities),
+            account_xpub: xpub.clone(),
+            account_index: 0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome.creator, creator.to_string());
+    let refreshed = creators.load(&creator).await.unwrap();
+    assert_eq!(refreshed.xpub(), xpub);
+    assert_ne!(
+        refreshed.session_secret(),
+        first_session_secret,
+        "a re-claim replaces the session secret"
+    );
+
+    // A different xpub (or index) is refused, matching the companion flow's
+    // reauthentication semantics: existing invoices watch addresses derived
+    // from the persisted account.
+    assert_eq!(
+        service
+            .claim(ManualClaimRequest {
+                auth_token: claim_token(&keypair, &required_capabilities),
+                account_xpub: account_xpub(52, 0),
+                account_index: 0,
+            })
+            .await,
+        Err(ManualClaimError::AccountMismatch)
+    );
+    assert_eq!(
+        service
+            .claim(ManualClaimRequest {
+                auth_token: claim_token(&keypair, &required_capabilities),
+                account_xpub: account_xpub(51, 1),
+                account_index: 1,
+            })
+            .await,
+        Err(ManualClaimError::AccountMismatch)
+    );
+
+    // Root-capability tokens are refused outright: the server must never
+    // hold a broader session than the receiver paths require.
+    let root = Capabilities::try_from("/:rw").unwrap();
+    assert_eq!(
+        service
+            .claim(ManualClaimRequest {
+                auth_token: URL_SAFE_NO_PAD.encode(AuthToken::sign(&keypair, root).serialize()),
+                account_xpub: xpub.clone(),
+                account_index: 0,
+            })
+            .await,
+        Err(ManualClaimError::InvalidCapabilities)
+    );
+
+    // An identity that never signed up on any homeserver cannot mint a
+    // session, so its claim fails without touching persistence.
+    let stranger = Keypair::random();
+    let result = service
+        .claim(ManualClaimRequest {
+            auth_token: claim_token(&stranger, &required_capabilities),
+            account_xpub: account_xpub(53, 0),
+            account_index: 0,
+        })
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(ManualClaimError::InvalidToken | ManualClaimError::SessionUnavailable)
+        ),
+        "unexpected claim result: {result:?}"
+    );
+    let stranger_creator = parse_creator(&format!("pubky{}", stranger.public_key().z32())).unwrap();
+    assert!(!service.account_exists(&stranger_creator).await.unwrap());
+
+    let xpub_str = xpub;
+    drop(service);
+    // Sanity: the derived first receive address matches BIP84 for the seed.
+    let expected = derive_bip84_p2wpkh_address(&xpub_str, 0, &BitcoinNetwork::Testnet, 0).unwrap();
+    assert!(expected.starts_with("tb1"));
+    assert_eq!(Xpub::from_str(&xpub_str).unwrap().depth, 3);
+
+    database.cleanup().await;
+}
