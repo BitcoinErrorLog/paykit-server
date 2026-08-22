@@ -731,8 +731,9 @@ async fn assert_persisted_workflow_inputs(
             DeliveryOperationV1::EndpointPublication { receiving_details }
                 if receiving_details.len() == 1
                     && receiving_details[0].identifier == "btc-testnet-p2wpkh"
-                    && serde_json::json!({ "value": fixture.address }).to_string()
-                        == receiving_details[0].payload
+                    && serde_json::from_str::<serde_json::Value>(&receiving_details[0].payload)
+                        .ok()
+                        == Some(serde_json::json!({ "value": fixture.address }))
         ));
 
         let payment_plaintext = crypto
