@@ -1,5 +1,29 @@
 # Paykit Server
 
+## This fork: Pubky Marketplace project
+
+This is `BitcoinErrorLog/paykit-server` (branch `marketplace-rails`), a fork
+of the official [`pubky/paykit-server`](https://github.com/pubky/paykit-server)
+used by the Pubky Marketplace's deployed payment rails
+(`BitcoinErrorLog/pubky-payment-rails`). No upstream PRs are filed while the
+protocol shape settles.
+
+**Added over upstream:**
+
+- **Signed marketplace payment requests**: a payment-request route
+  authenticated exactly like `/invoices` (canonical JSON body, single
+  `x-paykit-signature` header), whose expected signer is the marketplace
+  transaction service — configured via the optional `marketplace`
+  trust-anchor config (`marketplace.trusted_public_key`). This is how the
+  service requests receiver-side invoices for physical-bitcoin orders
+  without ever holding wallet material.
+- **Manual watch-only claims**: a companion-claim path used by the composed
+  test environment and the live Bitkit wallet-leg proof.
+
+**Fixes:** endpoint identifiers and JSON payloads are advertised
+network-correct (and the e2e workflow/reader-demo assertions validate
+spec-correct payloads as JSON values rather than strings).
+
 A PostgreSQL-backed, receiver-side Paykit prototype for Locks invoice workflows. It derives and observes a direct invoice-specific Bitcoin address. It does not use payer identity, payer inbox messages, or payment-proof messages to attribute payment.
 
 This repository is pre-production. Persisted-data compatibility, stable releases, and production deployment support are not yet provided.
