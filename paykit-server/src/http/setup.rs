@@ -67,8 +67,16 @@ fn iframe_response(flow: StartedFlow) -> Response<Body> {
     let state = json_for_script(&flow.state);
     let origin = json_for_script(&flow.origin);
     let authorization_url = html_for_text(&flow.authorization_url);
+    let bitkit_action = bitkit_setup_url(&flow.authorization_url)
+        .map(|url| {
+            format!(
+                "<p><a href=\"{}\">Open in Bitkit</a></p>",
+                html_for_text(&url)
+            )
+        })
+        .unwrap_or_default();
     let shell = format!(
-        "<!doctype html><meta charset=\"utf-8\"><main><p>Paykit auth URL:</p><code>{authorization_url}</code><p>Generate the regtest BIP84 account tpub:</p><code>npm --prefix examples/js-sdk run generate-paykit-account-tpub</code><p>Then authenticate and paste the auth URL, tpub, and account index:</p><code>docker compose exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator</code></main><script>\nconst flowId={flow_id};const state={state};const targetOrigin={origin};\nconst retryable=new Set([408,425,429,502,503,504]);let delay=500;\nasync function poll(){{try{{const response=await fetch('/setup/'+flowId+'/complete',{{method:'POST'}});if(response.status===200){{window.parent.postMessage({{type:'paykit-setup-callback',state}},targetOrigin);return;}}if(!retryable.has(response.status)){{window.parent.postMessage({{type:'paykit-setup-callback',state,error:'setup-failed'}},targetOrigin);return;}}}}catch(_error){{}}setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script>"
+        "<!doctype html><meta charset=\"utf-8\"><main><p>Paykit auth URL:</p><code>{authorization_url}</code>{bitkit_action}<p>Generate the regtest BIP84 account tpub:</p><code>npm --prefix examples/js-sdk run generate-paykit-account-tpub</code><p>Then authenticate and paste the auth URL, tpub, and account index:</p><code>docker compose exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator</code></main><script>\nconst flowId={flow_id};const state={state};const targetOrigin={origin};\nconst retryable=new Set([408,425,429,502,503,504]);let delay=500;\nasync function poll(){{try{{const response=await fetch('/setup/'+flowId+'/complete',{{method:'POST'}});if(response.status===200){{window.parent.postMessage({{type:'paykit-setup-callback',state}},targetOrigin);return;}}if(!retryable.has(response.status)){{window.parent.postMessage({{type:'paykit-setup-callback',state,error:'setup-failed'}},targetOrigin);return;}}}}catch(_error){{}}setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script>"
     );
     let mut response = Response::new(Body::from(shell));
     *response.status_mut() = StatusCode::OK;
@@ -82,6 +90,28 @@ fn iframe_response(flow: StartedFlow) -> Response<Body> {
             .expect("validated origin is a header value"),
     );
     response
+}
+
+fn bitkit_setup_url(authorization_url: &str) -> Option<String> {
+    let url = url::Url::parse(authorization_url).ok()?;
+    if url.scheme() != "pubkyauth"
+        || url.host_str() != Some("signin")
+        || !url.path().is_empty()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+    {
+        return None;
+    }
+    url.query().filter(|query| !query.is_empty())?;
+    let query_and_fragment = authorization_url.strip_prefix("pubkyauth://signin?")?;
+    let query = query_and_fragment
+        .split_once('#')
+        .map_or(query_and_fragment, |(query, _)| query);
+    if query.is_empty() || query.starts_with('?') {
+        return None;
+    }
+    Some(format!("bitkit://pubky-auth/setup?{query}"))
 }
 
 fn html_for_text(value: &str) -> String {
@@ -158,4 +188,59 @@ fn safe_response_with_retry(
         .headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from_static(retry_after));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bitkit_setup_url;
+
+    #[test]
+    fn bitkit_setup_url_preserves_the_original_encoded_query() {
+        let authorization_url = "pubkyauth://signin?caps=a%2Fb&relay=https%3A%2F%2Fx&secret=s&x-bitkit-claim=watch-only-account-v1&label=<approve>";
+
+        assert_eq!(
+            bitkit_setup_url(authorization_url).as_deref(),
+            Some(
+                "bitkit://pubky-auth/setup?caps=a%2Fb&relay=https%3A%2F%2Fx&secret=s&x-bitkit-claim=watch-only-account-v1&label=<approve>"
+            )
+        );
+    }
+
+    #[test]
+    fn bitkit_setup_url_preserves_duplicate_keys_and_omits_the_fragment() {
+        let authorization_url = "pubkyauth://signin?caps=first&caps=second&secret=s#ignored";
+        let target = bitkit_setup_url(authorization_url).expect("valid Bitkit setup target");
+
+        assert_eq!(
+            target,
+            "bitkit://pubky-auth/setup?caps=first&caps=second&secret=s"
+        );
+        assert_eq!(target.matches('?').count(), 1);
+    }
+
+    #[test]
+    fn bitkit_setup_url_requires_a_signin_query() {
+        for authorization_url in [
+            "pubkyauth://signin",
+            "pubkyauth://signin?",
+            "pubkyauth://signin??secret=s",
+            "pubkyauth://signin#ignored?secret=s",
+            "pubkyauth://other?secret=s",
+            "pubkyauth://signin/other?secret=s",
+            "pubkyauth://@signin?secret=s",
+            "pubkyauth://:@signin?secret=s",
+            "pubkyauth://user@signin?secret=s",
+            "pubkyauth://user:password@signin?secret=s",
+            "pubkyauth://signin:?secret=s",
+            "pubkyauth://signin:123?secret=s",
+            "https://signin?secret=s",
+            "not a URL",
+        ] {
+            assert_eq!(
+                bitkit_setup_url(authorization_url),
+                None,
+                "unexpected Bitkit target for {authorization_url:?}"
+            );
+        }
+    }
 }

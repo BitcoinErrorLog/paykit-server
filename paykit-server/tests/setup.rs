@@ -1033,7 +1033,11 @@ async fn setup_iframe_displays_escaped_auth_url_and_approved_cli_command() {
         .split_once("<script>")
         .expect("setup shell contains polling script");
     assert!(instructions.contains("pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;"));
+    assert!(instructions.contains(
+        "href=\"bitkit://pubky-auth/setup?secret=mock&amp;label=&lt;approve&gt;\">Open in Bitkit</a>"
+    ));
     assert!(!script.contains("pubkyauth://signin?secret=mock"));
+    assert!(!script.contains("bitkit://pubky-auth/setup"));
     assert!(instructions.contains(
         "docker compose exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator"
     ));

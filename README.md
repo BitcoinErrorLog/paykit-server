@@ -72,7 +72,15 @@ Invoice/status signatures use the configured trusted Locks Ed25519 key. Setup us
 
 ### Setup iframe
 
-`GET /setup` renders the Paykit auth URL and this local approval command instead of automatically navigating the iframe:
+`GET /setup` renders the raw Paykit `pubkyauth` URL for QR, clipboard, and Pubky Ring use. When that URL is a `pubkyauth://signin` request with a non-empty query, the page also renders an **Open in Bitkit** action using:
+
+```text
+bitkit://pubky-auth/setup?<original pubkyauth query>
+```
+
+The wrapper preserves the original encoded query byte-for-byte, including parameter order and duplicates. It adds exactly one `?`, omits any source fragment, and is not rendered for a missing or invalid query. The raw `pubkyauth` URL remains unchanged.
+
+The page also shows this local approval command instead of automatically navigating the iframe:
 
 ```bash
 docker compose exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator
