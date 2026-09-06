@@ -335,6 +335,14 @@ impl MarketplaceConfig {
             .into_iter()
             .map(TrustedMarketplaceKey::parse)
             .collect::<Result<Vec<_>, _>>()?;
+        let mut seen_key_ids = std::collections::HashSet::new();
+        for key in &trusted_keys {
+            if !seen_key_ids.insert(key.key_id().to_owned()) {
+                return Err(ConfigError::DuplicateTrustedMarketplacePublicKey(
+                    key.key_id().to_owned(),
+                ));
+            }
+        }
         Ok(Self { trusted_keys })
     }
 }
@@ -522,6 +530,8 @@ pub enum ConfigError {
     ConflictingTrustedMarketplacePublicKeys,
     #[error("marketplace.trusted_public_keys must contain at least one key")]
     EmptyTrustedMarketplacePublicKeys,
+    #[error("marketplace.trusted_public_keys must not contain duplicates (key_id {0})")]
+    DuplicateTrustedMarketplacePublicKey(String),
     #[error("bitcoin.network must be mainnet, testnet, signet, or regtest")]
     InvalidNetwork,
     #[error("{0} must be a valid absolute URL")]

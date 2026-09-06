@@ -488,6 +488,28 @@ fn marketplace_config_trusted_public_key_accepts_prefixed_and_rejects_bare_forms
 }
 
 #[test]
+fn marketplace_trusted_public_keys_rejects_duplicates() {
+    let section = format!("trusted_public_keys = [\"{KEY}\", \"{KEY}\"]");
+    let error =
+        Config::from_toml_and_environment(&marketplace_toml(&section), environment()).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("must not contain duplicates"), "{message}");
+    // The error names the duplicate's log-safe key_id, never key material.
+    let key_id = {
+        let config = Config::from_toml_and_environment(
+            &marketplace_toml(&format!("trusted_public_key = \"{KEY}\"")),
+            environment(),
+        )
+        .expect("single-key form");
+        config.marketplace.expect("marketplace config").trusted_keys[0]
+            .key_id()
+            .to_owned()
+    };
+    assert!(message.contains(&key_id), "{message}");
+    assert!(!message.contains(KEY), "{message}");
+}
+
+#[test]
 fn marketplace_single_and_list_forms_are_mutually_exclusive() {
     let section = format!("trusted_public_key = \"{KEY}\"\ntrusted_public_keys = [\"{KEY}\"]");
     let error =
