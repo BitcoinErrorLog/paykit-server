@@ -440,6 +440,54 @@ fn marketplace_malformed_list_fails_fast_at_startup() {
 }
 
 #[test]
+fn marketplace_config_trusted_public_key_accepts_prefixed_and_rejects_bare_forms() {
+    // Synthetic throwaway key derived from a clearly-fake fixed seed ([4; 32]);
+    // no real seed or production key material is used anywhere here.
+    let synthetic = second_pubky_key();
+    assert!(synthetic.starts_with("pubky"));
+    assert_eq!(synthetic.len(), 57, "pubky-prefixed form must be 57 chars");
+    let bare = &synthetic["pubky".len()..];
+    assert_eq!(bare.len(), 52, "bare z-base-32 form must be 52 chars");
+    assert!(
+        bare.chars()
+            .all(|ch| "ybndrfg8ejkmcpqxot1uwisza345h769".contains(ch)),
+        "bare form must stay inside the z-base-32 alphabet"
+    );
+
+    // (a) pubky-prefixed 57-char key parses in both single and list forms.
+    let prefixed_single = Config::from_toml_and_environment(
+        &marketplace_toml(&format!("trusted_public_key = \"{synthetic}\"")),
+        environment(),
+    );
+    assert!(
+        prefixed_single.is_ok(),
+        "prefixed single form should parse: {:?}",
+        prefixed_single.err()
+    );
+    let prefixed_list = Config::from_toml_and_environment(
+        &marketplace_toml(&format!(
+            "trusted_public_keys = [\"{synthetic}\", \"{KEY}\"]"
+        )),
+        environment(),
+    );
+    assert!(
+        prefixed_list.is_ok(),
+        "prefixed list form should parse: {:?}",
+        prefixed_list.err()
+    );
+
+    // (b) bare 52-char z-base-32 key (no `pubky` prefix) does not parse.
+    for section in [
+        format!("trusted_public_key = \"{bare}\""),
+        format!("trusted_public_keys = [\"{bare}\"]"),
+        format!("trusted_public_keys = [\"{KEY}\", \"{bare}\"]"),
+    ] {
+        let result = Config::from_toml_and_environment(&marketplace_toml(&section), environment());
+        assert!(result.is_err(), "bare form should be rejected: {section}");
+    }
+}
+
+#[test]
 fn marketplace_single_and_list_forms_are_mutually_exclusive() {
     let section = format!("trusted_public_key = \"{KEY}\"\ntrusted_public_keys = [\"{KEY}\"]");
     let error =
