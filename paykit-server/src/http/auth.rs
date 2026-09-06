@@ -43,11 +43,18 @@ impl Clock for SystemClock {
     }
 }
 
+/// One trusted request-signing key with its secret-free log identifier.
+struct TrustedSigner {
+    key_id: String,
+    verifying_key: VerifyingKey,
+}
+
 pub struct SignedLocksAuth {
     /// Every key allowed to sign business requests: the Lock Server's key,
-    /// plus the marketplace transaction service's key when configured. A
-    /// request is authentic when any trusted key verifies its signature.
-    trusted_keys: Vec<VerifyingKey>,
+    /// plus each of the marketplace transaction services' keys when
+    /// configured. A request is authentic when any trusted key verifies its
+    /// signature.
+    trusted_keys: Vec<TrustedSigner>,
     request_body_bytes: usize,
     limiter: Mutex<TokenBucket>,
     clock: Arc<dyn Clock>,
@@ -88,9 +95,15 @@ impl SignedLocksAuth {
         observer: Arc<dyn AuthProcessingObserver>,
     ) -> Self {
         let now = clock.now();
-        let mut trusted_keys = vec![config.locks.trusted_public_key.verifying_key()];
+        let mut trusted_keys = vec![TrustedSigner {
+            key_id: "locks".to_owned(),
+            verifying_key: config.locks.trusted_public_key.verifying_key(),
+        }];
         if let Some(marketplace) = &config.marketplace {
-            trusted_keys.push(marketplace.trusted_public_key.verifying_key());
+            trusted_keys.extend(marketplace.trusted_keys.iter().map(|key| TrustedSigner {
+                key_id: format!("marketplace:{}", key.key_id()),
+                verifying_key: key.verifying_key(),
+            }));
         }
         Self {
             trusted_keys,
@@ -212,7 +225,7 @@ where
 }
 
 fn verify_signature(
-    trusted_keys: &[VerifyingKey],
+    trusted_keys: &[TrustedSigner],
     headers: &axum::http::HeaderMap,
     raw_body: &[u8],
 ) -> Result<(), ApiError> {
@@ -235,11 +248,22 @@ fn verify_signature(
         return Err(ApiError::InvalidSignature);
     }
     let signature = Signature::from_bytes(&signature);
-    trusted_keys
-        .iter()
-        .any(|key| key.verify(raw_body, &signature).is_ok())
-        .then_some(())
-        .ok_or(ApiError::InvalidSignature)
+    // Every trusted key is always checked, so the work performed does not
+    // depend on which (if any) key matches; the unknown-key rejection path is
+    // identical to a known-key miss.
+    let mut verified_key_id = None;
+    for signer in trusted_keys {
+        if signer.verifying_key.verify(raw_body, &signature).is_ok() {
+            verified_key_id = Some(signer.key_id.as_str());
+        }
+    }
+    match verified_key_id {
+        Some(key_id) => {
+            tracing::debug!(key_id, "signed request verified against trusted key");
+            Ok(())
+        }
+        None => Err(ApiError::InvalidSignature),
+    }
 }
 
 #[cfg(test)]

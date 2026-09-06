@@ -13,10 +13,10 @@ use url::Url;
 pub struct Config {
     pub http: HttpConfig,
     pub locks: LocksConfig,
-    /// Optional marketplace transaction-service trust anchor. When present,
-    /// requests signed by this key are accepted on the signed business routes
-    /// (payment requests and status lookups) exactly like Lock Server
-    /// signatures.
+    /// Optional marketplace transaction-service trust anchors. When present,
+    /// requests signed by any of these keys are accepted on the signed
+    /// business routes (payment requests and status lookups) exactly like
+    /// Lock Server signatures.
     pub marketplace: Option<MarketplaceConfig>,
     pub setup: SetupConfig,
     pub paykit: PaykitConfig,
@@ -62,14 +62,7 @@ impl Config {
 
         validate_url("electrum.endpoint", &raw.electrum.endpoint)?;
         let allowed_origins = validate_allowed_origins(raw.setup.allowed_origins)?;
-        let marketplace = raw
-            .marketplace
-            .map(|marketplace| {
-                TrustedLocksPublicKey::parse(marketplace.trusted_public_key)
-                    .map_err(|_| ConfigError::InvalidTrustedMarketplacePublicKey)
-                    .map(|trusted_public_key| MarketplaceConfig { trusted_public_key })
-            })
-            .transpose()?;
+        let marketplace = raw.marketplace.map(MarketplaceConfig::parse).transpose()?;
         let auth_relay = match raw.paykit.auth_relay {
             Some(value) => validate_url("paykit.auth_relay", &value)?,
             None => Url::parse(pubky::DEFAULT_HTTP_RELAY_INBOX)
@@ -319,9 +312,74 @@ pub struct LocksConfig {
     pub trusted_public_key: TrustedLocksPublicKey,
 }
 
+/// Trusted marketplace request-signing keys. Every configured key is trusted
+/// equally; a request is authentic when any one of them verifies.
 #[derive(Debug)]
 pub struct MarketplaceConfig {
-    pub trusted_public_key: TrustedLocksPublicKey,
+    pub trusted_keys: Vec<TrustedMarketplaceKey>,
+}
+
+impl MarketplaceConfig {
+    fn parse(raw: RawMarketplaceConfig) -> Result<Self, ConfigError> {
+        if raw.trusted_public_key.is_some() && !raw.trusted_public_keys.is_empty() {
+            return Err(ConfigError::ConflictingTrustedMarketplacePublicKeys);
+        }
+        let values = match raw.trusted_public_key {
+            Some(single) => vec![single],
+            None => raw.trusted_public_keys,
+        };
+        if values.is_empty() {
+            return Err(ConfigError::EmptyTrustedMarketplacePublicKeys);
+        }
+        let trusted_keys = values
+            .into_iter()
+            .map(TrustedMarketplaceKey::parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { trusted_keys })
+    }
+}
+
+/// One trusted marketplace signing key. `key_id` is a short fingerprint
+/// prefix safe to log; the key material itself is never rendered.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TrustedMarketplaceKey {
+    public_key: TrustedLocksPublicKey,
+    key_id: String,
+}
+
+impl TrustedMarketplaceKey {
+    fn parse(value: String) -> Result<Self, ConfigError> {
+        let public_key = TrustedLocksPublicKey::parse(value)
+            .map_err(|_| ConfigError::InvalidTrustedMarketplacePublicKey)?;
+        let key_id = public_key
+            .fingerprint()
+            .as_bytes()
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Ok(Self { public_key, key_id })
+    }
+
+    /// Stable, secret-free identifier (truncated SHA-256 fingerprint) used in
+    /// verification logs.
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub(crate) fn verifying_key(&self) -> VerifyingKey {
+        self.public_key.verifying_key()
+    }
+}
+
+impl fmt::Debug for TrustedMarketplaceKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TrustedMarketplaceKey")
+            .field("key_id", &self.key_id)
+            .field("public_key", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -456,8 +514,14 @@ pub enum ConfigError {
     InvalidMasterKey,
     #[error("locks.trusted_public_key must be a canonical pubky-prefixed public key")]
     InvalidTrustedLocksPublicKey,
-    #[error("marketplace.trusted_public_key must be a canonical pubky-prefixed public key")]
+    #[error("marketplace trusted public keys must be canonical pubky-prefixed public keys")]
     InvalidTrustedMarketplacePublicKey,
+    #[error(
+        "marketplace.trusted_public_key and marketplace.trusted_public_keys are mutually exclusive"
+    )]
+    ConflictingTrustedMarketplacePublicKeys,
+    #[error("marketplace.trusted_public_keys must contain at least one key")]
+    EmptyTrustedMarketplacePublicKeys,
     #[error("bitcoin.network must be mainnet, testnet, signet, or regtest")]
     InvalidNetwork,
     #[error("{0} must be a valid absolute URL")]
@@ -565,7 +629,10 @@ struct RawLocksConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawMarketplaceConfig {
-    trusted_public_key: String,
+    #[serde(default)]
+    trusted_public_key: Option<String>,
+    #[serde(default)]
+    trusted_public_keys: Vec<String>,
 }
 
 #[derive(Deserialize)]

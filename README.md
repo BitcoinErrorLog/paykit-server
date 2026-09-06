@@ -14,7 +14,12 @@ protocol shape settles.
   authenticated exactly like `/invoices` (canonical JSON body, single
   `x-paykit-signature` header), whose expected signer is the marketplace
   transaction service — configured via the optional `marketplace`
-  trust-anchor config (`marketplace.trusted_public_key`). This is how the
+  trust-anchor config. One signer uses `marketplace.trusted_public_key`;
+  several marketplace-service instances (for example production and staging,
+  each signing with its own key) use the list form
+  `marketplace.trusted_public_keys = ["pubky...", "pubky..."]`. A request is
+  accepted when any trusted key verifies; the verified key's id (a truncated
+  SHA-256 fingerprint, never key material) is logged. This is how the
   service requests receiver-side invoices for physical-bitcoin orders
   without ever holding wallet material.
 - **Manual watch-only claims**: a companion-claim path used by the composed

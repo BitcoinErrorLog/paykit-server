@@ -425,17 +425,40 @@ async fn a_reader_without_a_capable_marker_is_unavailable() {
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
 }
 
+fn encode(key: &SigningKey) -> String {
+    pubky::PublicKey::from(
+        pubky::pkarr::PublicKey::try_from(key.verifying_key().as_bytes()).unwrap(),
+    )
+    .to_string()
+}
+
 fn auth_config(locks_key: &SigningKey, marketplace_key: Option<&SigningKey>) -> Config {
-    let encode = |key: &SigningKey| {
-        pubky::PublicKey::from(
-            pubky::pkarr::PublicKey::try_from(key.verifying_key().as_bytes()).unwrap(),
-        )
-        .to_string()
-    };
-    let locks_key = encode(locks_key);
     let marketplace_section = marketplace_key
         .map(|key| format!("[marketplace]\ntrusted_public_key = \"{}\"\n", encode(key)))
         .unwrap_or_default();
+    auth_config_with_marketplace_section(locks_key, &marketplace_section)
+}
+
+fn auth_config_with_marketplace_list(
+    locks_key: &SigningKey,
+    marketplace_keys: &[&SigningKey],
+) -> Config {
+    let keys = marketplace_keys
+        .iter()
+        .map(|key| format!("\"{}\"", encode(key)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    auth_config_with_marketplace_section(
+        locks_key,
+        &format!("[marketplace]\ntrusted_public_keys = [{keys}]\n"),
+    )
+}
+
+fn auth_config_with_marketplace_section(
+    locks_key: &SigningKey,
+    marketplace_section: &str,
+) -> Config {
+    let locks_key = encode(locks_key);
     Config::from_toml_and_environment(
         &format!(
             r#"
@@ -525,6 +548,38 @@ async fn signed_route_accepts_locks_and_marketplace_keys_and_refuses_others() {
         router.clone().oneshot(unsigned).await.unwrap().status(),
         StatusCode::UNAUTHORIZED
     );
+}
+
+#[tokio::test]
+async fn marketplace_key_list_accepts_every_listed_key_and_refuses_others() {
+    let locks_key = SigningKey::from_bytes(&[3; 32]);
+    let staging_key = SigningKey::from_bytes(&[4; 32]);
+    let production_key = SigningKey::from_bytes(&[6; 32]);
+    let stranger_key = SigningKey::from_bytes(&[5; 32]);
+    let config = auth_config_with_marketplace_list(&locks_key, &[&staging_key, &production_key]);
+    let auth = Arc::new(SignedLocksAuth::from_config(&config));
+    let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    let router = payment_requests_router(Arc::new(service(
+        ok_session(),
+        store.clone(),
+        BitcoinNetwork::Mainnet,
+    )))
+    .layer(Extension(auth));
+
+    // The second listed key verifies exactly like the first.
+    for (key, expected) in [
+        (&staging_key, StatusCode::NO_CONTENT),
+        (&production_key, StatusCode::NO_CONTENT),
+        (&locks_key, StatusCode::NO_CONTENT),
+        (&stranger_key, StatusCode::UNAUTHORIZED),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(signed_request(key, canonical_body()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
 }
 
 #[tokio::test]

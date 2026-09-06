@@ -380,3 +380,69 @@ fn rejects_outbox_batch_size_above_the_supported_integer_range() {
     );
     assert!(Config::from_toml_and_environment(&oversized, environment()).is_err());
 }
+
+fn marketplace_toml(section: &str) -> String {
+    format!("{}\n[marketplace]\n{section}\n", valid_toml())
+}
+
+#[test]
+fn marketplace_single_key_form_still_parses_with_a_loggable_key_id() {
+    let config = Config::from_toml_and_environment(
+        &marketplace_toml(&format!("trusted_public_key = \"{KEY}\"")),
+        environment(),
+    )
+    .expect("single-key marketplace form");
+
+    let marketplace = config.marketplace.expect("marketplace config");
+    assert_eq!(marketplace.trusted_keys.len(), 1);
+    assert_eq!(marketplace.trusted_keys[0].key_id().len(), 16);
+}
+
+fn second_pubky_key() -> String {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+    pubky::PublicKey::from(
+        pubky::pkarr::PublicKey::try_from(signing_key.verifying_key().as_bytes()).unwrap(),
+    )
+    .to_string()
+}
+
+#[test]
+fn marketplace_list_form_parses_multiple_trusted_keys() {
+    let second_key = second_pubky_key();
+    let config = Config::from_toml_and_environment(
+        &marketplace_toml(&format!(
+            "trusted_public_keys = [\"{KEY}\", \"{second_key}\"]"
+        )),
+        environment(),
+    )
+    .expect("list marketplace form");
+
+    let marketplace = config.marketplace.expect("marketplace config");
+    assert_eq!(marketplace.trusted_keys.len(), 2);
+    assert_ne!(
+        marketplace.trusted_keys[0].key_id(),
+        marketplace.trusted_keys[1].key_id()
+    );
+}
+
+#[test]
+fn marketplace_malformed_list_fails_fast_at_startup() {
+    for section in [
+        "trusted_public_keys = [\"not-a-key\"]",
+        "trusted_public_keys = []",
+        "trusted_public_keys = [\"pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo\", \"not-a-key\"]",
+        "trusted_public_key = \"not-a-key\"",
+        "",
+    ] {
+        let result = Config::from_toml_and_environment(&marketplace_toml(section), environment());
+        assert!(result.is_err(), "{section} should be rejected");
+    }
+}
+
+#[test]
+fn marketplace_single_and_list_forms_are_mutually_exclusive() {
+    let section = format!("trusted_public_key = \"{KEY}\"\ntrusted_public_keys = [\"{KEY}\"]");
+    let error =
+        Config::from_toml_and_environment(&marketplace_toml(&section), environment()).unwrap_err();
+    assert!(error.to_string().contains("mutually exclusive"), "{error}");
+}

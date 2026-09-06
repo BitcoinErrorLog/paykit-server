@@ -10,6 +10,17 @@ listen_addr = "127.0.0.1:8080"
 # Use the exact Pubky rendered by Locks as credentials.lock_server_public_key.
 # trusted_public_key = "pubky<pubky-key>"
 
+# Optional marketplace transaction-service trust anchors. Requests signed by
+# any listed key are accepted on the signed business routes exactly like Lock
+# Server signatures. Use the single-key form for one marketplace signer, or
+# the list form when several marketplace-service instances (for example
+# production and staging) each sign with their own key. The two forms are
+# mutually exclusive; a malformed or empty list fails startup.
+# [marketplace]
+# trusted_public_key = "pubky<pubky-key>"
+# or:
+# trusted_public_keys = ["pubky<production-key>", "pubky<staging-key>"]
+
 [setup]
 # Configure exact HTTP(S) origins, or use ["*"] alone to accept any valid
 # HTTP(S) parent. Even with "*", CSP and postMessage use the caller's concrete origin.
