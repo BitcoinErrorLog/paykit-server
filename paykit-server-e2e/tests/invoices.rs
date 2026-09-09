@@ -473,6 +473,121 @@ async fn concurrent_exact_invoice_allocation_serializes_to_one_durable_result() 
 }
 
 #[tokio::test]
+async fn failed_baseline_burns_index_and_never_reissues_it() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let burned = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"burned-bundle",
+            b"burned-request",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(burned.reader_child_index(), 0);
+    store
+        .fail_creation_baseline(burned.invoice_id())
+        .await
+        .unwrap();
+
+    let next = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"after-burn-bundle",
+            b"after-burn-request",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next.reader_child_index(), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        2
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn failed_snapshot_voids_without_delivery_or_target_membership() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let created = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"failed-snapshot-bundle",
+            b"failed-snapshot-request",
+        ))
+        .await
+        .unwrap();
+    store
+        .fail_creation_baseline(created.invoice_id())
+        .await
+        .unwrap();
+
+    let state: String = sqlx::query_scalar("SELECT baseline_state FROM invoices WHERE id = $1")
+        .bind(created.invoice_id())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(state, "void_baseline_failed");
+    let statuses: Vec<String> =
+        sqlx::query_scalar("SELECT status FROM outbox WHERE invoice_id = $1 ORDER BY id")
+            .bind(created.invoice_id())
+            .fetch_all(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(statuses, vec!["prepared", "prepared"]);
+    assert!(store.observation_plan().await.unwrap().is_empty());
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn concurrent_first_binds_derive_distinct_indices_under_unique_constraint() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let other_store = store.clone();
+    let creator = creator();
+    let reader = reader();
+
+    let (first, second) = tokio::join!(
+        store.create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"first-bind-a",
+            b"first-request-a",
+        )),
+        other_store.create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"first-bind-b",
+            b"first-request-b",
+        ))
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_ne!(first.reader_child_index(), second.reader_child_index());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT derivation_index_lookup_hash) FROM invoices"
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        2
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn atomic_store_rejects_wrong_intent_role_and_reader_before_any_insert() {
     static BAD_PAYLOADS: PaymentAsEndpointPayloads = PaymentAsEndpointPayloads;
     let database = TestDatabase::create().await;
