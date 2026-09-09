@@ -70,6 +70,21 @@ pub trait ChainHistoryPort: Send + Sync {
     ) -> Result<Vec<bool>, ClaimScanError>;
 }
 
+/// The claim scan's result: the derivation cursor the account must start at,
+/// plus whether ANY history was seen at all. `saw_history` is the §B.8.6
+/// corroborating fact a `bitkit_watch_only_v1` claim is checked against — a
+/// freshly reserved Shop account is empty, and any history at all means this
+/// is not one (downgrade `account_has_history`); it is reported explicitly
+/// rather than inferred from `start_index != 0`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClaimScan {
+    /// The child index the account's derivation cursor must start at: 0 for
+    /// an unused account, `last_used_index + 1 + 20` otherwise.
+    pub start_index: u32,
+    /// Whether the scan found history on any derived address.
+    pub saw_history: bool,
+}
+
 /// Scans the claimed BIP84 account's external chain and returns the child
 /// index the account's derivation cursor must start at. Only counts and
 /// window indices are logged — never the xpub, addresses, or scripthashes.
@@ -78,7 +93,7 @@ pub async fn scan_claim_start_index(
     canonical_xpub: &str,
     account_index: u32,
     network: &BitcoinNetwork,
-) -> Result<u32, ClaimScanError> {
+) -> Result<ClaimScan, ClaimScanError> {
     let mut last_used: Option<u32> = None;
     for window in 0..CLAIM_SCAN_MAX_WINDOWS {
         let first = window * CLAIM_SCAN_WINDOW;
@@ -120,7 +135,10 @@ pub async fn scan_claim_start_index(
                 start_index = start,
                 "claim history scan complete"
             );
-            return Ok(start);
+            return Ok(ClaimScan {
+                start_index: start,
+                saw_history: last_used.is_some(),
+            });
         }
     }
     tracing::warn!(

@@ -37,8 +37,7 @@ use paykit_sdk::PaykitSdkConfig;
 use paykit_server::{
     application::create_invoice::derive_bip84_p2wpkh_address,
     chain_history::{
-        CLAIM_SCAN_MAX_WINDOWS, CLAIM_SCAN_WINDOW, ChainHistoryPort, ClaimScanError,
-        scan_claim_start_index,
+        CLAIM_SCAN_WINDOW, ChainHistoryPort, ClaimScan, ClaimScanError, scan_claim_start_index,
     },
     config::{BitcoinNetwork, StackRole},
     crypto::Crypto,
@@ -82,7 +81,7 @@ fn derived_script(xpub: &str, child_index: u32) -> ScriptBuf {
         .script_pubkey()
 }
 
-async fn scan(server: &HistoryServer, xpub: &str) -> Result<u32, ClaimScanError> {
+async fn scan(server: &HistoryServer, xpub: &str) -> Result<ClaimScan, ClaimScanError> {
     let adapter = ElectrumAdapter::connect(
         server.endpoint(),
         BitcoinNetwork::Regtest,
@@ -101,9 +100,10 @@ async fn manual_claim_scan_of_an_unused_account_starts_at_zero_with_one_batched_
     let xpub = regtest_account_tpub();
     let server = HistoryServer::start(vec![]).await;
 
-    let start = scan(&server, &xpub).await.unwrap();
+    let scan = scan(&server, &xpub).await.unwrap();
 
-    assert_eq!(start, 0, "an unused account keeps start index 0");
+    assert_eq!(scan.start_index, 0, "an unused account keeps start index 0");
+    assert!(!scan.saw_history, "an unused account saw no history");
     // ONE batched window = exactly 20 scripthash queries, and nothing else:
     // presence-only means no transaction fanout, ever.
     server.assert_rpc_counts(CLAIM_SCAN_WINDOW as usize, 0, 0);
@@ -114,9 +114,14 @@ async fn manual_claim_scan_with_usage_at_index_three_starts_at_twenty_four_after
     let xpub = regtest_account_tpub();
     let server = HistoryServer::start(vec![derived_script(&xpub, 3)]).await;
 
-    let start = scan(&server, &xpub).await.unwrap();
+    let scan = scan(&server, &xpub).await.unwrap();
 
-    assert_eq!(start, 3 + 1 + 20, "start is last_used_index + 1 + 20");
+    assert_eq!(
+        scan.start_index,
+        3 + 1 + 20,
+        "start is last_used_index + 1 + 20"
+    );
+    assert!(scan.saw_history, "usage at index 3 is history");
     // Window 0 (usage at 3) + window 1 (empty) = two batched requests.
     server.assert_rpc_counts(2 * CLAIM_SCAN_WINDOW as usize, 0, 0);
 }
@@ -131,9 +136,14 @@ async fn manual_claim_scan_with_usage_at_index_twenty_five_starts_at_forty_six_a
     let used: Vec<ScriptBuf> = (0..=25).map(|index| derived_script(&xpub, index)).collect();
     let server = HistoryServer::start(used).await;
 
-    let start = scan(&server, &xpub).await.unwrap();
+    let scan = scan(&server, &xpub).await.unwrap();
 
-    assert_eq!(start, 25 + 1 + 20, "start is last_used_index + 1 + 20");
+    assert_eq!(
+        scan.start_index,
+        25 + 1 + 20,
+        "start is last_used_index + 1 + 20"
+    );
+    assert!(scan.saw_history);
     // Windows 0 (empty), 1 (usage at 25), 2 (empty) = three batched requests.
     server.assert_rpc_counts(3 * CLAIM_SCAN_WINDOW as usize, 0, 0);
 }
@@ -207,10 +217,11 @@ async fn manual_claim_scan_treats_an_over_cap_history_window_as_used() {
     // only advances the start index; nothing is derived onto the
     // deep-history address.
     assert_eq!(
-        start,
+        start.start_index,
         19 + 1 + 20,
         "over-cap window treated as used: start is the window's last index + 1 + 20"
     );
+    assert!(start.saw_history, "an over-cap window is history");
     // Literal request-log evidence: exactly two batched windows (40
     // get_history queries), no unspent, no transaction fetches.
     server.assert_rpc_counts(40, 0, 0);
@@ -716,8 +727,20 @@ async fn manual_claim_scan_refuses_scans_beyond_the_concurrency_bound_without_an
     // one never made an Electrum call, so the log ends at exactly two
     // batched windows (2 x 20).
     server.open_gate();
-    assert_eq!(scan_a.await.unwrap(), Ok(0));
-    assert_eq!(scan_b.await.unwrap(), Ok(0));
+    assert_eq!(
+        scan_a.await.unwrap(),
+        Ok(ClaimScan {
+            start_index: 0,
+            saw_history: false,
+        })
+    );
+    assert_eq!(
+        scan_b.await.unwrap(),
+        Ok(ClaimScan {
+            start_index: 0,
+            saw_history: false,
+        })
+    );
     assert_eq!(
         server.rpc_count("blockchain.scripthash.get_history"),
         40,
@@ -815,7 +838,14 @@ async fn timed_out_scan_holds_its_permit_until_the_orphaned_read_returns() {
         }
     };
 
-    assert_eq!(start, Ok(0), "the freed slot admits the next claim");
+    assert_eq!(
+        start,
+        Ok(ClaimScan {
+            start_index: 0,
+            saw_history: false,
+        }),
+        "the freed slot admits the next claim"
+    );
 }
 
 // ---------------------------------------------------------------------------

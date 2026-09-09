@@ -165,6 +165,7 @@ async fn startup_authenticates_two_independent_creators_before_returning_ready_d
             &credentials_for(creator(), SESSION, XPUB, 7, [9; 32]),
             &first_state,
             &key_tail(1),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -173,6 +174,7 @@ async fn startup_authenticates_two_independent_creators_before_returning_ready_d
             &credentials_for(other_creator(), "other-session", "other-xpub", 19, [8; 32]),
             &second_state,
             &key_tail(2),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -204,6 +206,7 @@ async fn exact_creator_id_lookup_is_isolated_and_never_falls_back() {
             &credentials_for(creator(), SESSION, XPUB, 7, [9; 32]),
             &StorageState::default(),
             &key_tail(3),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -212,6 +215,7 @@ async fn exact_creator_id_lookup_is_isolated_and_never_falls_back() {
             &credentials_for(other_creator(), OTHER_SESSION, OTHER_XPUB, 19, [8; 32]),
             &StorageState::default(),
             &key_tail(4),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -243,6 +247,7 @@ async fn startup_rejects_a_correctly_shaped_wrong_master_key_without_exposing_st
             &credentials(SESSION, XPUB, 7, [9; 32]),
             &StorageState::default(),
             &key_tail(5),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -263,6 +268,7 @@ async fn startup_rejects_corrupt_encrypted_payment_records_before_readiness() {
             &credentials(SESSION, XPUB, 7, [9; 32]),
             &StorageState::default(),
             &key_tail(6),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -309,6 +315,7 @@ async fn startup_rejects_one_corrupt_creator_or_sdk_state_before_returning_ready
                 &credentials(SESSION, XPUB, 7, [9; 32]),
                 &StorageState::default(),
                 &key_tail(7),
+                &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
             )
             .await
             .unwrap();
@@ -317,6 +324,7 @@ async fn startup_rejects_one_corrupt_creator_or_sdk_state_before_returning_ready
                 &credentials_for(other_creator(), "other-session", "other-xpub", 19, [8; 32]),
                 &StorageState::default(),
                 &key_tail(8),
+                &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
             )
             .await
             .unwrap();
@@ -353,6 +361,7 @@ async fn startup_rejects_creator_envelopes_swapped_between_rows() {
             &credentials(SESSION, XPUB, 7, [9; 32]),
             &StorageState::default(),
             &key_tail(9),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -361,6 +370,7 @@ async fn startup_rejects_creator_envelopes_swapped_between_rows() {
             &credentials_for(other_creator(), "other-session", "other-xpub", 19, [8; 32]),
             &StorageState::default(),
             &key_tail(10),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -471,6 +481,7 @@ async fn setup_and_sdk_mutation_for_one_creator_leave_all_other_creator_state_un
             &credentials_for(creator(), SESSION, XPUB, 7, [9; 32]),
             &first_state,
             &key_tail(11),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -479,6 +490,7 @@ async fn setup_and_sdk_mutation_for_one_creator_leave_all_other_creator_state_un
             &credentials_for(other_creator(), OTHER_SESSION, OTHER_XPUB, 19, [8; 32]),
             &second_state,
             &key_tail(12),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -497,6 +509,7 @@ async fn setup_and_sdk_mutation_for_one_creator_leave_all_other_creator_state_un
         .reauthenticate(
             &credentials_for(creator(), "first-new-session", XPUB, 7, [4; 32]),
             &key_tail(1),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -595,6 +608,7 @@ async fn creator_and_sdk_state_round_trip_only_through_ciphertext() {
             &credentials(SESSION, XPUB, 7, [9; 32]),
             &initial,
             &key_tail(1),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -646,6 +660,7 @@ async fn creator_create_rolls_back_when_initial_sdk_state_insert_fails() {
                 &credentials(SESSION, XPUB, 7, [9; 32]),
                 &StorageState::default(),
                 &key_tail(13),
+                &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
             )
             .await
             .is_err()
@@ -669,6 +684,7 @@ async fn boot_scan_rejects_corrupt_creator_sdk_and_missing_state_without_histori
             &credentials(SESSION, XPUB, 7, [9; 32]),
             &StorageState::default(),
             &key_tail(14),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -700,6 +716,7 @@ async fn boot_scan_rejects_corrupt_sdk_state_and_missing_sdk_state() {
             &credentials(SESSION, XPUB, 7, [9; 32]),
             &StorageState::default(),
             &key_tail(15),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -728,13 +745,18 @@ async fn reauthentication_preserves_noise_index_and_assignments_and_rejects_acco
             &credentials(SESSION, XPUB, 7, [9; 32]),
             &StorageState::default(),
             &key_tail(16),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
     sqlx::query("INSERT INTO reader_assignments (creator_id, reader_lookup_hash, bundle_lookup_hash, assignment_envelope) VALUES ($1, $2, $3, $4)")
         .bind(persisted.id()).bind(b"reader".as_slice()).bind(b"bundle".as_slice()).bind(b"assignment".as_slice()).execute(database.pool()).await.unwrap();
     creators
-        .reauthenticate(&credentials("new-session", XPUB, 7, [4; 32]), &key_tail(1))
+        .reauthenticate(
+            &credentials("new-session", XPUB, 7, [4; 32]),
+            &key_tail(1),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+        )
         .await
         .unwrap();
     let restored = creators.load(&creator()).await.unwrap();
@@ -750,13 +772,21 @@ async fn reauthentication_preserves_noise_index_and_assignments_and_rejects_acco
     );
     assert!(
         creators
-            .reauthenticate(&credentials("bad", "other-xpub", 7, [9; 32]), &key_tail(1))
+            .reauthenticate(
+            &credentials("bad", "other-xpub", 7, [9; 32]),
+            &key_tail(1),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+        )
             .await
             .is_err()
     );
     assert!(
         creators
-            .reauthenticate(&credentials("bad", XPUB, 8, [9; 32]), &key_tail(1))
+            .reauthenticate(
+            &credentials("bad", XPUB, 8, [9; 32]),
+            &key_tail(1),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+        )
             .await
             .is_err()
     );
@@ -776,6 +806,7 @@ async fn concurrent_sdk_updates_serialize_and_retain_both_mutations() {
             &credentials(SESSION, XPUB, 7, [9; 32]),
             &StorageState::default(),
             &key_tail(17),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();

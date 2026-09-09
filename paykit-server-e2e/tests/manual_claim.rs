@@ -166,6 +166,8 @@ async fn manual_claim_persists_account_publishes_marker_and_refuses_replacement(
             auth_token: claim_token(&keypair, &required_capabilities),
             account_xpub: xpub.clone(),
             account_index: 0,
+            claim_channel: None,
+            allocation_mode: None,
         })
         .await
         .unwrap();
@@ -225,6 +227,8 @@ async fn manual_claim_persists_account_publishes_marker_and_refuses_replacement(
             auth_token: claim_token(&keypair, &required_capabilities),
             account_xpub: xpub.clone(),
             account_index: 0,
+            claim_channel: None,
+            allocation_mode: None,
         })
         .await
         .unwrap();
@@ -246,6 +250,8 @@ async fn manual_claim_persists_account_publishes_marker_and_refuses_replacement(
                 auth_token: claim_token(&keypair, &required_capabilities),
                 account_xpub: account_xpub(52, 0),
                 account_index: 0,
+            claim_channel: None,
+            allocation_mode: None,
             })
             .await,
         Err(ManualClaimError::AccountMismatch)
@@ -256,6 +262,8 @@ async fn manual_claim_persists_account_publishes_marker_and_refuses_replacement(
                 auth_token: claim_token(&keypair, &required_capabilities),
                 account_xpub: account_xpub(51, 1),
                 account_index: 1,
+            claim_channel: None,
+            allocation_mode: None,
             })
             .await,
         Err(ManualClaimError::AccountMismatch)
@@ -270,6 +278,8 @@ async fn manual_claim_persists_account_publishes_marker_and_refuses_replacement(
                 auth_token: URL_SAFE_NO_PAD.encode(AuthToken::sign(&keypair, root).serialize()),
                 account_xpub: xpub.clone(),
                 account_index: 0,
+            claim_channel: None,
+            allocation_mode: None,
             })
             .await,
         Err(ManualClaimError::InvalidCapabilities)
@@ -283,6 +293,8 @@ async fn manual_claim_persists_account_publishes_marker_and_refuses_replacement(
             auth_token: claim_token(&stranger, &required_capabilities),
             account_xpub: account_xpub(53, 0),
             account_index: 0,
+            claim_channel: None,
+            allocation_mode: None,
         })
         .await;
     assert!(
@@ -363,6 +375,8 @@ async fn manual_claim_persists_the_scanned_start_index_and_refuses_unscanned_cla
             auth_token: claim_token(&keypair, &required_capabilities),
             account_xpub: xpub.clone(),
             account_index: 0,
+            claim_channel: None,
+            allocation_mode: None,
         })
         .await
         .unwrap();
@@ -384,6 +398,8 @@ async fn manual_claim_persists_the_scanned_start_index_and_refuses_unscanned_cla
             auth_token: claim_token(&keypair, &required_capabilities),
             account_xpub: xpub.clone(),
             account_index: 0,
+            claim_channel: None,
+            allocation_mode: None,
         })
         .await
         .unwrap();
@@ -425,6 +441,8 @@ async fn manual_claim_persists_the_scanned_start_index_and_refuses_unscanned_cla
                 auth_token: claim_token(&stranger, &required_capabilities),
                 account_xpub: account_xpub(62, 0),
                 account_index: 0,
+            claim_channel: None,
+            allocation_mode: None,
             })
             .await,
         Err(ManualClaimError::ClaimScanUnavailable)

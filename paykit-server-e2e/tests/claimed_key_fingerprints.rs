@@ -56,6 +56,7 @@ async fn the_binding_is_written_with_the_claim_and_never_expires() {
             &credentials(creator_a(), "a-session"),
             &StorageState::default(),
             &tail,
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -82,7 +83,11 @@ async fn the_binding_is_written_with_the_claim_and_never_expires() {
 
     // A re-claim (reauthentication) by the same seller is unaffected.
     creators
-        .reauthenticate(&credentials(creator_a(), "a-new-session"), &tail)
+        .reauthenticate(
+            &credentials(creator_a(), "a-new-session"),
+            &tail,
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+        )
         .await
         .unwrap();
 
@@ -104,6 +109,7 @@ async fn the_binding_is_written_with_the_claim_and_never_expires() {
                 &credentials(creator_b(), "b-session"),
                 &StorageState::default(),
                 &tail,
+                &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
             )
             .await,
         Err(PersistenceError::KeyClaimedByOtherSeller)
@@ -134,8 +140,9 @@ async fn concurrent_first_claims_of_one_tail_have_exactly_one_winner() {
     let a_credentials = credentials(creator_a(), "a-session");
     let b_credentials = credentials(creator_b(), "b-session");
     let state = StorageState::default();
-    let a = creators.create(&a_credentials, &state, &tail);
-    let b = creators.create(&b_credentials, &state, &tail);
+    let allocation = paykit_server::allocation::ClaimAllocation::shared_manual_default();
+    let a = creators.create(&a_credentials, &state, &tail, &allocation);
+    let b = creators.create(&b_credentials, &state, &tail, &allocation);
     let (a, b) = tokio::join!(a, b);
     let outcomes = [a, b];
     let winners = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
