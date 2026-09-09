@@ -117,18 +117,105 @@ async fn electrum_readiness_requires_a_fresh_chain_tip_unless_the_check_is_skipp
     runtime.set_electrum_available(true);
     runtime.set_paykit_delivery_available(true);
     runtime.set_outbox_available(true);
-    // A tip from 2020 is far older than the default four-hour maximum.
+    // A tip from 2020 is far older than the default four-hour maximum: the
+    // endpoint's chain view cannot be trusted, so readiness fails closed.
     runtime.record_electrum_probe(ElectrumProbe::success(1, 1_600_000_000));
     let report = runtime.readiness().await;
     assert!(!report.electrum_probe.available);
-    assert_eq!(report.electrum, ComponentState::Degraded);
+    assert_eq!(report.electrum, ComponentState::NotReady);
 
-    // Regtest deployments skip the tip-age check: blocks are mined on
+    // Regtest deployments skip the tip checks: blocks are mined on
     // demand, so an arbitrarily old tip says nothing about endpoint health.
     runtime.set_electrum_max_tip_age(None);
     let report = runtime.readiness().await;
     assert!(report.electrum_probe.available);
     assert_eq!(report.electrum, ComponentState::Ready);
+}
+
+#[tokio::test]
+async fn a_stale_tip_fails_readiness_closed_with_http_503() {
+    let runtime = runtime(true, 1);
+    runtime.set_electrum_available(true);
+    runtime.record_electrum_probe(ElectrumProbe::success(800_000, 1_600_000_000));
+    runtime.set_paykit_delivery_available(true);
+    runtime.set_outbox_available(true);
+    let app = operational_router(Router::new(), runtime);
+
+    let ready = app
+        .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(ready.into_body(), 1024).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["status"], "not_ready");
+    assert_eq!(parsed["electrum"]["state"], "not_ready");
+    assert_eq!(parsed["electrum"]["available"], false);
+}
+
+#[tokio::test]
+async fn a_tip_height_regression_fails_readiness_closed_until_the_tip_recovers() {
+    let runtime = runtime(true, 1);
+    runtime.set_electrum_available(true);
+    runtime.set_paykit_delivery_available(true);
+    runtime.set_outbox_available(true);
+    runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
+    assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
+
+    // A lower tip than any earlier probe is a peer-attested impossibility.
+    runtime.record_electrum_probe(ElectrumProbe::success(799_999, fresh_tip_time()));
+    let report = runtime.readiness().await;
+    assert!(!report.electrum_probe.available);
+    assert_eq!(report.electrum, ComponentState::NotReady);
+    assert_eq!(report.status, ComponentState::NotReady);
+
+    // The regression stays visible while the tip remains below the
+    // previously observed maximum.
+    runtime.record_electrum_probe(ElectrumProbe::success(799_999, fresh_tip_time()));
+    assert_eq!(runtime.readiness().await.electrum, ComponentState::NotReady);
+    runtime.record_electrum_probe(ElectrumProbe::success(800_001, fresh_tip_time()));
+    assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
+}
+
+#[tokio::test]
+async fn a_stalled_tip_height_fails_readiness_closed() {
+    let runtime = runtime(true, 1);
+    runtime.set_electrum_available(true);
+    runtime.set_paykit_delivery_available(true);
+    runtime.set_outbox_available(true);
+    runtime.set_electrum_max_tip_age(Some(Duration::from_millis(1_100)));
+    runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
+    assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
+
+    // No new block within the accepted tip-age window: the chain view is
+    // not advancing, so the endpoint cannot be trusted.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
+    let report = runtime.readiness().await;
+    assert!(!report.electrum_probe.available);
+    assert_eq!(report.electrum, ComponentState::NotReady);
+
+    // The next advance restores readiness.
+    runtime.record_electrum_probe(ElectrumProbe::success(800_001, fresh_tip_time()));
+    assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
+}
+
+#[tokio::test]
+async fn a_far_future_tip_time_is_degraded_without_failing_closed() {
+    let runtime = runtime(true, 1);
+    runtime.set_electrum_available(true);
+    runtime.set_paykit_delivery_available(true);
+    runtime.set_outbox_available(true);
+    // Three hours ahead exceeds Bitcoin's MAX_FUTURE_BLOCK_TIME: the
+    // peer's clock cannot be trusted, a 200-degraded condition.
+    runtime.record_electrum_probe(ElectrumProbe::success(
+        800_000,
+        fresh_tip_time() + 3 * 60 * 60,
+    ));
+    let report = runtime.readiness().await;
+    assert!(!report.electrum_probe.available);
+    assert_eq!(report.electrum, ComponentState::Degraded);
+    assert_eq!(report.status, ComponentState::Degraded);
 }
 
 #[tokio::test]

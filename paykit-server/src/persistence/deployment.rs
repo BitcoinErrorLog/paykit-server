@@ -27,6 +27,33 @@ impl DeploymentStore {
         &self,
         invariants: &DeploymentInvariants,
     ) -> Result<(), PersistenceError> {
+        self.initialize_inner(invariants, None).await
+    }
+
+    /// Test hook: like [`Self::initialize`], but signals once the deployment
+    /// row lock is held and waits for `release` before attempting role
+    /// adoption, so a concurrent adopter can be proven blocked on the row
+    /// lock. Only compiled under the `test-utils` feature.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub async fn initialize_holding_lock_for_test(
+        &self,
+        invariants: &DeploymentInvariants,
+        lock_held: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), PersistenceError> {
+        self.initialize_inner(invariants, Some((lock_held, release)))
+            .await
+    }
+
+    async fn initialize_inner(
+        &self,
+        invariants: &DeploymentInvariants,
+        #[cfg_attr(not(feature = "test-utils"), allow(unused_variables))] barrier: Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    ) -> Result<(), PersistenceError> {
         let mut transaction = self
             .pool
             .begin()
@@ -55,6 +82,14 @@ impl DeploymentStore {
         .fetch_one(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+
+        #[cfg(feature = "test-utils")]
+        if let Some((lock_held, release)) = barrier {
+            // Reached only through the test hook: the row lock is now held,
+            // so prove it and wait for the test to release the barrier.
+            let _ = lock_held.send(());
+            let _ = release.await;
+        }
 
         if existing.bitcoin_network != invariants.bitcoin_network.as_str()
             || existing.receiver_path != invariants.receiver_path.as_str()

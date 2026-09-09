@@ -531,10 +531,15 @@ pub struct ElectrumConfig {
     /// metrics) and excluded from the bypass on later ticks, so one
     /// unbounded-history address cannot monopolise the endpoint.
     pub max_target_requests: u32,
-    /// Maximum accepted chain-tip age for readiness: a probed tip older than
-    /// this marks Electrum unavailable on /health/ready. Skipped on regtest,
-    /// whose tips are mined on demand and can be arbitrarily old without
-    /// indicating endpoint trouble.
+    /// Maximum accepted chain-tip age for readiness. On networks with a
+    /// live block cadence, /health/ready answers 503 (not_ready) when the
+    /// probed tip is older than this, when the tip height regresses, or
+    /// when the tip height stops advancing within this window — the
+    /// endpoint's chain view cannot be trusted, so a load balancer or
+    /// pager must see the failure. Only a probe older than the freshness
+    /// window (or a tip time over two hours in the future) stays at HTTP
+    /// 200 degraded. Skipped on regtest, whose tips are mined on demand and
+    /// can be arbitrarily old without indicating endpoint trouble.
     pub max_tip_age: Duration,
 }
 

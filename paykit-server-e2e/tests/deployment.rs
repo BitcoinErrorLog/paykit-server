@@ -1,5 +1,8 @@
+use std::time::Duration;
+
 use paykit_server::{
     config::{Config, ConfigEnvironment},
+    persistence::{DeploymentStore, PersistenceError},
     startup::{StartupError, initialize_database},
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -144,25 +147,72 @@ async fn concurrent_first_boots_on_an_unset_role_adopt_exactly_once() {
     .await
     .unwrap();
 
-    // Two first boots race to adopt the NULL row with different roles:
-    // exactly one adopts, the other observes the adopted role and refuses.
-    let proof_config = config(database.database_url(), "testnet", "proof");
-    let production_config = config(database.database_url(), "testnet", "production");
-    let proof = initialize_database(&proof_config);
-    let production = initialize_database(&production_config);
-    let (proof, production) = tokio::join!(proof, production);
-    assert!(
-        matches!(
-            (&proof, &production),
-            (Ok(_), Err(StartupError::Deployment)) | (Err(StartupError::Deployment), Ok(_))
-        ),
-        "exactly one concurrent first boot must adopt the role"
+    // Two first boots race to adopt the NULL row with different roles. The
+    // winner holds the deployment row lock through the test hook while the
+    // loser attempts adoption: the loser must block on the row lock until
+    // the winner commits, then observe the adopted role and refuse.
+    let proof_invariants = config(database.database_url(), "testnet", "proof")
+        .deployment_invariants()
+        .clone();
+    let production_invariants = config(database.database_url(), "testnet", "production")
+        .deployment_invariants()
+        .clone();
+    let (lock_held, held) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let winner_store = DeploymentStore::new(database.pool());
+    let winner = tokio::spawn(async move {
+        winner_store
+            .initialize_holding_lock_for_test(&proof_invariants, lock_held, released)
+            .await
+    });
+    held.await.expect("the winner signals its held row lock");
+
+    let loser_store = DeploymentStore::new(database.pool());
+    let mut loser =
+        tokio::spawn(async move { loser_store.initialize(&production_invariants).await });
+
+    // The loser must reach the row lock and stay blocked on it: it cannot
+    // complete while the winner holds FOR UPDATE.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let lock_waits: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity \
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+            if lock_waits > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the losing adopter must block on the deployment row lock");
+    tokio::select! {
+        result = &mut loser => {
+            panic!("loser completed while the winner held the deployment row lock: {result:?}")
+        }
+        _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+    }
+
+    release.send(()).expect("release the winner's lock barrier");
+    winner
+        .await
+        .expect("winner task joins")
+        .expect("the winner adopts the role");
+    assert_eq!(
+        loser.await.expect("loser task joins"),
+        Err(PersistenceError::DeploymentMismatch),
+        "the loser must observe the winner's committed role and refuse"
     );
     let adopted: String =
         sqlx::query_scalar("SELECT stack_role FROM deployment_metadata WHERE id = 1")
             .fetch_one(database.pool())
             .await
             .unwrap();
+    assert_eq!(adopted, "proof", "exactly one concurrent boot adopts");
 
     // Two boots that agree with the adopted role both succeed.
     let first_config = config(database.database_url(), "testnet", &adopted);

@@ -77,6 +77,37 @@ impl Drop for AdmissionGuard {
     }
 }
 
+const DEFAULT_ELECTRUM_PROBE_FRESHNESS: Duration = Duration::from_secs(20);
+const DEFAULT_ELECTRUM_MAX_TIP_AGE: Duration = Duration::from_secs(4 * 60 * 60);
+/// A tip timestamp further than this in the future is invalid under
+/// Bitcoin's own MAX_FUTURE_BLOCK_TIME rule: the peer's clock cannot be
+/// trusted, so the tip proves nothing about endpoint freshness.
+const MAX_FUTURE_TIP_TIME: Duration = Duration::from_secs(2 * 60 * 60);
+
+/// Cross-probe chain-tip progress: the highest tip height any successful
+/// probe has returned, and when the height last advanced. A peer-attested
+/// tip is only trustworthy when the height never regresses and keeps
+/// advancing within the accepted tip-age window.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TipProgress {
+    max_tip_height: Option<u32>,
+    last_tip_advance_at: Option<Instant>,
+}
+
+/// Readiness verdict for the most recent Electrum probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProbeVerdict {
+    Available,
+    /// 200-degraded: the probe itself is older than the freshness window,
+    /// the endpoint's genesis did not match, or the tip time is more than
+    /// two hours in the future.
+    Degraded,
+    /// 503 not-ready: the tip is stale, the tip height regressed, or the
+    /// tip height stopped advancing — the endpoint's chain view cannot be
+    /// trusted, so a load balancer or pager must see the failure.
+    NotReady,
+}
+
 /// One recorded Electrum tip probe. A probe that reached the endpoint but
 /// proved the wrong chain records `genesis_ok: false` with no tip facts.
 #[derive(Clone, Copy, Debug)]
@@ -112,29 +143,74 @@ impl ElectrumProbe {
         }
     }
 
-    fn is_available(&self, freshness: Duration, max_tip_age: Option<Duration>) -> bool {
-        if !self.genesis_ok || self.probed_at.elapsed() > freshness {
-            return false;
+    /// Folds this probe into the cross-probe tip progress: a new highest
+    /// height restarts the advance clock; equal or lower heights leave it
+    /// untouched so a regression stays visible to later verdicts.
+    fn advance(self, progress: &mut TipProgress) {
+        if !self.genesis_ok {
+            return;
         }
-        match (max_tip_age, self.tip_time_unix) {
-            (Some(max_tip_age), Some(tip_time_unix)) => {
-                unix_now().saturating_sub(u64::from(tip_time_unix)) <= max_tip_age.as_secs()
-            }
-            _ => true,
+        if let Some(height) = self.tip_height
+            && progress.max_tip_height.is_none_or(|max| height > max)
+        {
+            progress.max_tip_height = Some(height);
+            progress.last_tip_advance_at = Some(Instant::now());
         }
     }
 
-    /// Secret-free probe report for the health surface. `max_tip_age` bounds
-    /// the accepted chain-tip age; `None` skips the tip-age check (regtest
-    /// deployments, whose tips are arbitrarily old by design).
-    pub fn report(
+    fn verdict(
         &self,
+        progress: &TipProgress,
+        freshness: Duration,
+        max_tip_age: Option<Duration>,
+    ) -> ProbeVerdict {
+        if !self.genesis_ok || self.probed_at.elapsed() > freshness {
+            return ProbeVerdict::Degraded;
+        }
+        let now = unix_now();
+        if self
+            .tip_time_unix
+            .is_some_and(|tip| u64::from(tip) > now.saturating_add(MAX_FUTURE_TIP_TIME.as_secs()))
+        {
+            return ProbeVerdict::Degraded;
+        }
+        // The height and age checks apply together and are skipped together
+        // where the tip-age check is skipped (regtest, whose tips are mined
+        // on demand). The peer-attested tip is otherwise trusted only when
+        // it is fresh, non-decreasing, and still advancing.
+        if let Some(max_tip_age) = max_tip_age {
+            if let (Some(height), Some(max_height)) = (self.tip_height, progress.max_tip_height)
+                && height < max_height
+            {
+                return ProbeVerdict::NotReady;
+            }
+            if let Some(last_advance_at) = progress.last_tip_advance_at
+                && last_advance_at.elapsed() > max_tip_age
+            {
+                return ProbeVerdict::NotReady;
+            }
+            if let Some(tip_time_unix) = self.tip_time_unix
+                && now.saturating_sub(u64::from(tip_time_unix)) > max_tip_age.as_secs()
+            {
+                return ProbeVerdict::NotReady;
+            }
+        }
+        ProbeVerdict::Available
+    }
+
+    /// Secret-free probe report for the health surface, evaluated against
+    /// the cross-probe tip progress. `max_tip_age` bounds the accepted
+    /// chain-tip age; `None` skips the tip-age and tip-height checks
+    /// (regtest deployments, whose tips are arbitrarily old by design).
+    fn report(
+        &self,
+        progress: &TipProgress,
         freshness: Duration,
         max_tip_age: Option<Duration>,
     ) -> ElectrumProbeReport {
         let now = unix_now();
         ElectrumProbeReport {
-            available: self.is_available(freshness, max_tip_age),
+            available: self.verdict(progress, freshness, max_tip_age) == ProbeVerdict::Available,
             tip_height: self.tip_height,
             tip_age_secs: self
                 .tip_time_unix
@@ -174,9 +250,6 @@ fn unix_now() -> u64 {
         .unwrap_or_default()
 }
 
-const DEFAULT_ELECTRUM_PROBE_FRESHNESS: Duration = Duration::from_secs(20);
-const DEFAULT_ELECTRUM_MAX_TIP_AGE: Duration = Duration::from_secs(4 * 60 * 60);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Readiness {
     pub status: ComponentState,
@@ -211,6 +284,14 @@ impl DependencyCheck for PostgresDependency {
     }
 }
 
+/// The most recent Electrum probe together with the cross-probe tip
+/// progress it fed.
+#[derive(Default)]
+struct ElectrumProbeState {
+    probe: Option<ElectrumProbe>,
+    progress: TipProgress,
+}
+
 /// Shared, injectable lifecycle state. Worker adapters report availability here;
 /// they never publish endpoint, identity, or provider-error data.
 pub struct Runtime {
@@ -223,7 +304,7 @@ pub struct Runtime {
     electrum: AtomicU8,
     electrum_overrun_targets: AtomicU64,
     bitcoin_creation_enabled: AtomicBool,
-    electrum_probe: Mutex<Option<ElectrumProbe>>,
+    electrum_probe: Mutex<ElectrumProbeState>,
     electrum_probe_freshness: Mutex<Duration>,
     electrum_max_tip_age: Mutex<Option<Duration>>,
     paykit_enqueue: AtomicU8,
@@ -251,7 +332,7 @@ impl Runtime {
             electrum: AtomicU8::new(NOT_READY),
             electrum_overrun_targets: AtomicU64::new(0),
             bitcoin_creation_enabled: AtomicBool::new(true),
-            electrum_probe: Mutex::new(None),
+            electrum_probe: Mutex::new(ElectrumProbeState::default()),
             electrum_probe_freshness: Mutex::new(DEFAULT_ELECTRUM_PROBE_FRESHNESS),
             electrum_max_tip_age: Mutex::new(Some(DEFAULT_ELECTRUM_MAX_TIP_AGE)),
             paykit_enqueue: AtomicU8::new(NOT_READY),
@@ -288,14 +369,17 @@ impl Runtime {
         self.bitcoin_creation_enabled
             .store(enabled, Ordering::Release);
     }
-    /// Records the most recent Electrum tip probe result.
+    /// Records the most recent Electrum tip probe result, folding its tip
+    /// height into the cross-probe progress used by readiness.
     pub fn record_electrum_probe(&self, probe: ElectrumProbe) {
         // A poisoned lock must not take down the readiness path: the
         // critical section holds no user code, so the inner value is sound.
-        *self
+        let mut state = self
             .electrum_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(probe);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        probe.advance(&mut state.progress);
+        state.probe = Some(probe);
     }
     /// Sets the observer poll interval; a probe older than three intervals
     /// (covering ±20% jitter plus tick duration) is stale and Electrum is
@@ -315,7 +399,7 @@ impl Runtime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = max_tip_age;
     }
-    fn electrum_probe_report(&self) -> ElectrumProbeReport {
+    fn electrum_probe_evaluation(&self) -> (ElectrumProbeReport, ProbeVerdict) {
         let freshness = *self
             .electrum_probe_freshness
             .lock()
@@ -324,11 +408,21 @@ impl Runtime {
             .electrum_max_tip_age
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.electrum_probe
+        let state = self
+            .electrum_probe
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .map(|probe| probe.report(freshness, max_tip_age))
-            .unwrap_or_else(ElectrumProbeReport::never_probed)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match &state.probe {
+            Some(probe) => {
+                let verdict = probe.verdict(&state.progress, freshness, max_tip_age);
+                (
+                    probe.report(&state.progress, freshness, max_tip_age),
+                    verdict,
+                )
+            }
+            // Never probed: a freshness-window failure, reported degraded.
+            None => (ElectrumProbeReport::never_probed(), ProbeVerdict::Degraded),
+        }
     }
     pub fn set_paykit_delivery_available(&self, available: bool) {
         self.set_paykit_enqueue_available(available);
@@ -381,10 +475,17 @@ impl Runtime {
         } else {
             ComponentState::Ready
         };
-        let electrum_probe = self.electrum_probe_report();
-        let electrum = match ComponentState::from_atomic(self.electrum.load(Ordering::Acquire)) {
-            ComponentState::NotReady => ComponentState::NotReady,
-            ComponentState::Ready if electrum_probe.available => ComponentState::Ready,
+        let (electrum_probe, probe_verdict) = self.electrum_probe_evaluation();
+        let electrum = match (
+            ComponentState::from_atomic(self.electrum.load(Ordering::Acquire)),
+            probe_verdict,
+        ) {
+            (ComponentState::NotReady, _) => ComponentState::NotReady,
+            // A stale, regressed, or stalled chain tip means the endpoint's
+            // chain view cannot be trusted: fail readiness closed (503) so a
+            // load balancer or pager sees it.
+            (_, ProbeVerdict::NotReady) => ComponentState::NotReady,
+            (ComponentState::Ready, ProbeVerdict::Available) => ComponentState::Ready,
             _ => ComponentState::Degraded,
         };
         let paykit_delivery = ComponentState::combine(
