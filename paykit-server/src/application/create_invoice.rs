@@ -33,6 +33,7 @@ use crate::{
         AtomicInvoiceInput, AtomicInvoiceResult, CreatorStore, InvoicePreflight, InvoiceStore,
         NewReaderPayloadFactory, NewReaderPayloads, PersistenceError,
     },
+    workers::observer::{CreationSnapshot, ElectrumPort},
 };
 
 const REQUEST_DEADLINE: Duration = Duration::from_secs(15);
@@ -114,6 +115,19 @@ pub trait InvoicePersistence: Send + Sync {
         &self,
         input: AtomicInvoiceInput<'_>,
     ) -> Result<AtomicInvoiceResult, PersistenceError>;
+    async fn complete_creation_baseline(
+        &self,
+        _invoice_id: uuid::Uuid,
+        _snapshot: &CreationSnapshot,
+    ) -> Result<(), PersistenceError> {
+        Ok(())
+    }
+    async fn fail_creation_baseline(
+        &self,
+        _invoice_id: uuid::Uuid,
+    ) -> Result<(), PersistenceError> {
+        Ok(())
+    }
 }
 #[async_trait]
 impl InvoicePersistence for InvoiceStore {
@@ -138,7 +152,24 @@ impl InvoicePersistence for InvoiceStore {
         &self,
         input: AtomicInvoiceInput<'_>,
     ) -> Result<AtomicInvoiceResult, PersistenceError> {
-        InvoiceStore::create_atomic(self, input).await
+        InvoiceStore::create_awaiting_baseline(self, input).await
+    }
+    async fn complete_creation_baseline(
+        &self,
+        invoice_id: uuid::Uuid,
+        snapshot: &CreationSnapshot,
+    ) -> Result<(), PersistenceError> {
+        InvoiceStore::complete_creation_baseline(
+            self,
+            invoice_id,
+            snapshot.tip_height,
+            &snapshot.baseline_outputs,
+            &snapshot.unconfirmed_inputs,
+        )
+        .await
+    }
+    async fn fail_creation_baseline(&self, invoice_id: uuid::Uuid) -> Result<(), PersistenceError> {
+        InvoiceStore::fail_creation_baseline(self, invoice_id).await
     }
 }
 
@@ -334,6 +365,9 @@ pub struct CreateInvoiceService {
     bitcoin_network: crate::config::BitcoinNetwork,
     bitcoin_creation_enabled: bool,
     store: Arc<dyn InvoicePersistence>,
+    electrum: Arc<dyn ElectrumPort>,
+    max_creation_history_entries: usize,
+    max_transaction_bytes: usize,
     intents: Arc<dyn IntentBuilder>,
     clock: Arc<dyn DeadlineClock>,
 }
@@ -349,6 +383,9 @@ impl CreateInvoiceService {
         bitcoin_network: crate::config::BitcoinNetwork,
         bitcoin_creation_enabled: bool,
         store: Arc<dyn InvoicePersistence>,
+        electrum: Arc<dyn ElectrumPort>,
+        max_creation_history_entries: usize,
+        max_transaction_bytes: usize,
         intents: Arc<dyn IntentBuilder>,
     ) -> Self {
         Self::with_clock(
@@ -361,6 +398,9 @@ impl CreateInvoiceService {
             bitcoin_network,
             bitcoin_creation_enabled,
             store,
+            electrum,
+            max_creation_history_entries,
+            max_transaction_bytes,
             intents,
             Arc::new(SystemDeadlineClock),
         )
@@ -377,6 +417,9 @@ impl CreateInvoiceService {
         bitcoin_network: crate::config::BitcoinNetwork,
         bitcoin_creation_enabled: bool,
         store: Arc<dyn InvoicePersistence>,
+        electrum: Arc<dyn ElectrumPort>,
+        max_creation_history_entries: usize,
+        max_transaction_bytes: usize,
         intents: Arc<dyn IntentBuilder>,
         clock: Arc<dyn DeadlineClock>,
     ) -> Self {
@@ -390,6 +433,9 @@ impl CreateInvoiceService {
             bitcoin_network,
             bitcoin_creation_enabled,
             store,
+            electrum,
+            max_creation_history_entries,
+            max_transaction_bytes,
             intents,
             clock,
         }
@@ -406,6 +452,9 @@ impl CreateInvoiceService {
         bitcoin_network: crate::config::BitcoinNetwork,
         bitcoin_creation_enabled: bool,
         store: Arc<dyn InvoicePersistence>,
+        electrum: Arc<dyn ElectrumPort>,
+        max_creation_history_entries: usize,
+        max_transaction_bytes: usize,
         intents: Arc<dyn IntentBuilder>,
     ) -> Self {
         Self::new(
@@ -418,6 +467,9 @@ impl CreateInvoiceService {
             bitcoin_network,
             bitcoin_creation_enabled,
             store,
+            electrum,
+            max_creation_history_entries,
+            max_transaction_bytes,
             intents,
         )
     }
@@ -517,7 +569,8 @@ impl CreateInvoiceService {
         // Once PostgreSQL mutation starts it must be awaited to a factual
         // commit/rollback result. Canceling this future at the HTTP deadline
         // could otherwise return failure while COMMIT succeeds concurrently.
-        self.store
+        let created = self
+            .store
             .create_atomic(AtomicInvoiceInput {
                 creator: &creator,
                 reader: &request.reader,
@@ -528,7 +581,42 @@ impl CreateInvoiceService {
                 required_sats: extract_terms(&lock)?.as_sats(),
             })
             .await
-            .map_err(map_store)
+            .map_err(map_store)?;
+        let address = new_reader_payloads
+            .for_child_index(created.reader_child_index())
+            .map_err(map_store)?
+            .bitcoin_address;
+        let snapshot = self
+            .electrum
+            .creation_snapshot(
+                &address,
+                self.max_creation_history_entries,
+                self.max_transaction_bytes,
+            )
+            .await;
+        let snapshot = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                self.store
+                    .fail_creation_baseline(created.invoice_id())
+                    .await
+                    .map_err(map_store)?;
+                return Err(CreateInvoiceError::Unavailable);
+            }
+        };
+        let probe = self.electrum.probe().await;
+        if !matches!(probe, Ok(probe) if probe.height.abs_diff(snapshot.tip_height) <= 3) {
+            self.store
+                .fail_creation_baseline(created.invoice_id())
+                .await
+                .map_err(map_store)?;
+            return Err(CreateInvoiceError::Unavailable);
+        }
+        self.store
+            .complete_creation_baseline(created.invoice_id(), &snapshot)
+            .await
+            .map_err(map_store)?;
+        Ok(created)
     }
 }
 

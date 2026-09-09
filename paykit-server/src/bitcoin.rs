@@ -80,6 +80,7 @@ pub struct ObservedOutput {
     pub outpoint: OutPoint,
     pub sats: u64,
     pub confirmations: u32,
+    pub confirmed_height: Option<u32>,
     /// False models an output removed by a replacement or reorganization.
     pub present: bool,
 }
@@ -93,6 +94,7 @@ impl fmt::Debug for ObservedOutput {
             .field("outpoint", &"<redacted>")
             .field("sats", &"<redacted>")
             .field("confirmations", &self.confirmations)
+            .field("confirmed_height", &self.confirmed_height)
             .field("present", &self.present)
             .finish()
     }

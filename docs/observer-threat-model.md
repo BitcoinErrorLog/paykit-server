@@ -61,6 +61,12 @@ failed targets keep their staleness and lead the next tick's plan, so every
 target is observed within a bounded number of ticks and only successfully
 observed targets are stamped/rotated.
 
+## Bounded transaction fetches
+
+The r5 rule forbids HISTORY-DRIVEN FAN-OUT in the observation tick (never `get_history` and never a `transaction.get` per history entry). It does NOT forbid two bounded, one-shot, per-invoice fetches, each charged to the same token bucket and each with a hard response-byte cap (new config `electrum.max_transaction_bytes`, default 400_000, deny_unknown_fields; over-cap = fetch failure, handled as below):
+(1) CREATION-TIME (§B.4.1/§B.4.3): after the bounded history snapshot (cap `electrum.max_creation_history_entries`, default 50; over-cap = void_baseline_failed), fetch `transaction.get` for each UNCONFIRMED baseline transaction only (confirmed ones contribute no inputs, §B.4.3) to record its input outpoints. Bounded by the history cap. Any fetch failure = void_baseline_failed (acceptance 5) — never a partial baseline. For a fresh xpub-derived address the snapshot is normally EMPTY, so this path costs 0 fetches in the honest case.
+(2) FIRST-BIND TIME (§B.4.2/§B.4.3): when the observer tick sees an exact-amount UTXO on a tracked address that is not in the baseline outpoint set and is above the floor, it does NOT bind immediately; it records a `candidate` and a separate bounded step fetches that ONE transaction to obtain its inputs, evaluates the replaced-input rule, then binds or marks the outpoint permanently ineligible. At most one candidate fetch per tick per invoice (oldest by height first), and once an invoice is bound no further fetches ever occur for it. Charged to the bucket like any other request. Fetch failure = candidate stays a candidate (retry next tick, isolated, never degrades global availability).
+
 ## Acceptable degradation
 
 **Per-address only.** A failed (oversized, timed-out, or errored) lookup

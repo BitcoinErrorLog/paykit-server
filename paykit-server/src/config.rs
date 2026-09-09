@@ -95,6 +95,8 @@ impl Config {
                 max_requests_per_tick: raw.electrum.max_requests_per_tick,
                 max_requests_per_second: raw.electrum.max_requests_per_second,
                 max_tip_age: raw.electrum.max_tip_age,
+                max_creation_history_entries: raw.electrum.max_creation_history_entries,
+                max_transaction_bytes: raw.electrum.max_transaction_bytes,
             },
             outbox: OutboxConfig::from(raw.outbox),
             limits: LimitsConfig::from(raw.limits),
@@ -154,6 +156,14 @@ impl Config {
             (
                 "electrum.max_requests_per_second",
                 u64::from(self.electrum.max_requests_per_second),
+            ),
+            (
+                "electrum.max_creation_history_entries",
+                u64::from(self.electrum.max_creation_history_entries),
+            ),
+            (
+                "electrum.max_transaction_bytes",
+                u64::from(self.electrum.max_transaction_bytes),
             ),
             ("limits.request_body_bytes", self.limits.request_body_bytes),
             (
@@ -531,6 +541,10 @@ pub struct ElectrumConfig {
     /// regtest, whose tips are mined on demand and can be arbitrarily old
     /// without indicating endpoint trouble.
     pub max_tip_age: Duration,
+    /// Maximum complete history entries accepted by one creation snapshot.
+    pub max_creation_history_entries: u32,
+    /// Maximum raw transaction response accepted by bounded transaction fetches.
+    pub max_transaction_bytes: u32,
 }
 
 #[derive(Debug)]
@@ -789,6 +803,10 @@ struct RawElectrumConfig {
     max_requests_per_second: u32,
     #[serde(default = "default_electrum_max_tip_age", with = "humantime_serde")]
     max_tip_age: Duration,
+    #[serde(default = "default_electrum_max_creation_history_entries")]
+    max_creation_history_entries: u32,
+    #[serde(default = "default_electrum_max_transaction_bytes")]
+    max_transaction_bytes: u32,
 }
 
 const fn default_electrum_max_requests_per_tick() -> u32 {
@@ -797,6 +815,14 @@ const fn default_electrum_max_requests_per_tick() -> u32 {
 
 const fn default_electrum_max_requests_per_second() -> u32 {
     5
+}
+
+const fn default_electrum_max_creation_history_entries() -> u32 {
+    50
+}
+
+const fn default_electrum_max_transaction_bytes() -> u32 {
+    400_000
 }
 
 const fn default_electrum_max_tip_age() -> Duration {

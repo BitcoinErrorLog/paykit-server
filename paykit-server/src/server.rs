@@ -191,6 +191,11 @@ impl Server {
             config.deployment_invariants().bitcoin_network.clone(),
             config.bitcoin.creation_enabled,
             Arc::new(invoices.clone()),
+            electrum.clone(),
+            usize::try_from(config.electrum.max_creation_history_entries)
+                .expect("validated history cap fits usize"),
+            usize::try_from(config.electrum.max_transaction_bytes)
+                .expect("validated transaction cap fits usize"),
             Arc::new(PaykitIntentBuilder::for_network(
                 &config.deployment_invariants().bitcoin_network,
             )),
@@ -210,6 +215,11 @@ impl Server {
             config.deployment_invariants().bitcoin_network.clone(),
             config.bitcoin.creation_enabled,
             Arc::new(invoices.clone()),
+            electrum.clone(),
+            usize::try_from(config.electrum.max_creation_history_entries)
+                .expect("validated history cap fits usize"),
+            usize::try_from(config.electrum.max_transaction_bytes)
+                .expect("validated transaction cap fits usize"),
             Arc::new(PaykitIntentBuilder::for_network(
                 &config.deployment_invariants().bitcoin_network,
             )),
@@ -275,6 +285,8 @@ impl Server {
                 poll_interval: config.electrum.poll_interval,
                 max_requests_per_tick: config.electrum.max_requests_per_tick,
                 max_requests_per_second: config.electrum.max_requests_per_second,
+                max_transaction_bytes: usize::try_from(config.electrum.max_transaction_bytes)
+                    .expect("validated transaction cap fits usize"),
             },
         };
 

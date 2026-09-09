@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 use zeroize::Zeroizing;
@@ -54,11 +55,13 @@ pub struct NewReaderPayloads {
 }
 
 #[derive(Serialize, Deserialize)]
-struct InvoicePaymentRecordV1 {
+struct InvoicePaymentRecordV2 {
     version: u8,
     derivation_index: i64,
     bitcoin_address: String,
     required_sats: u64,
+    creation_chain_height: u32,
+    baseline_set_hash: [u8; 32],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -73,7 +76,14 @@ pub(crate) struct BitcoinObservationInput {
     pub outpoint: BitcoinOutpoint,
     pub observed_sats: u64,
     pub confirmations: u32,
+    pub confirmed_height: Option<u32>,
     pub present: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingCandidate {
+    pub invoice_id: Uuid,
+    pub outpoint: bitcoin::OutPoint,
 }
 
 /// Produces payloads after the creator-row lock determines the child index.
@@ -262,9 +272,9 @@ impl InvoiceStore {
                     &EncryptedEnvelope::from_bytes(envelope),
                 )
                 .map_err(|_| PersistenceError::CorruptOrMissing)?;
-            let record: InvoicePaymentRecordV1 =
+            let record: InvoicePaymentRecordV2 =
                 postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
-            if record.version != 1
+            if record.version != 2
                 || address_hash
                     != self
                         .crypto
@@ -329,7 +339,7 @@ impl InvoiceStore {
              FROM invoices JOIN creators ON creators.id = invoices.creator_id \
              LEFT JOIN bitcoin_observations AS observations \
                ON observations.invoice_id = invoices.id AND observations.active \
-             WHERE NOT (invoices.payment_status = 'confirmed' \
+             WHERE invoices.baseline_state = 'observing' AND NOT (invoices.payment_status = 'confirmed' \
                         AND invoices.confirmation_count = 6 AND invoices.amount_matched) \
              ORDER BY COALESCE(invoices.last_observed_at, invoices.created_at), invoices.id",
         )
@@ -377,7 +387,7 @@ impl InvoiceStore {
             let address_lookup_hash = self.crypto.bitcoin_address_lookup_hash(address.as_bytes());
             let stamped = sqlx::query(
                 "UPDATE invoices SET last_observed_at = NOW(), updated_at = NOW() \
-                 WHERE bitcoin_address_lookup_hash = $1",
+                 WHERE bitcoin_address_lookup_hash = $1 AND baseline_state = 'observing'",
             )
             .bind(address_lookup_hash.as_bytes().as_slice())
             .execute(&mut *tx)
@@ -413,9 +423,9 @@ impl InvoiceStore {
                 &EncryptedEnvelope::from_bytes(row.payment_record_envelope),
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let payment: InvoicePaymentRecordV1 =
+        let payment: InvoicePaymentRecordV2 =
             postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
-        if payment.version != 1
+        if payment.version != 2
             || row.bitcoin_address_lookup_hash
                 != self
                     .crypto
@@ -596,6 +606,285 @@ impl InvoiceStore {
         row.map(PersistedPaymentStatus::try_from).transpose()
     }
 
+    pub async fn complete_creation_baseline(
+        &self,
+        invoice_id: Uuid,
+        creation_chain_height: u32,
+        baseline_outputs: &[bitcoin::OutPoint],
+        unconfirmed_inputs: &[bitcoin::OutPoint],
+    ) -> Result<(), PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let row = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, String)>(
+            "SELECT creators.creator_lookup_hash, invoices.payment_record_envelope,
+                    invoices.baseline_state
+             FROM invoices JOIN creators ON creators.id = invoices.creator_id
+             WHERE invoices.id = $1 FOR UPDATE OF invoices",
+        )
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?
+        .ok_or(PersistenceError::CorruptOrMissing)?;
+        if row.2 != "awaiting_baseline" {
+            return Err(PersistenceError::Conflict);
+        }
+        let creator_hash = lookup_hash_from_storage(&row.0)?;
+        let plaintext = self
+            .crypto
+            .decrypt(
+                &EnvelopeContext::invoice_payment_record(creator_hash, invoice_id),
+                &EncryptedEnvelope::from_bytes(row.1),
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let mut record: InvoicePaymentRecordV2 =
+            postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        if record.version != 2 {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        let mut entries = baseline_outputs
+            .iter()
+            .map(|outpoint| {
+                Ok((
+                    "output",
+                    outpoint.txid.to_string(),
+                    i32::try_from(outpoint.vout).map_err(|_| PersistenceError::CorruptOrMissing)?,
+                ))
+            })
+            .chain(unconfirmed_inputs.iter().map(|outpoint| {
+                Ok((
+                    "replaced_input",
+                    outpoint.txid.to_string(),
+                    i32::try_from(outpoint.vout).map_err(|_| PersistenceError::CorruptOrMissing)?,
+                ))
+            }))
+            .collect::<Result<Vec<_>, PersistenceError>>()?;
+        entries.sort_unstable_by(|left, right| {
+            left.0
+                .cmp(right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        entries.dedup();
+        let mut hasher = Sha256::new();
+        for (kind, txid, vout) in &entries {
+            hasher.update(kind.as_bytes());
+            hasher.update(b":");
+            hasher.update(format!("{txid}:{vout}").as_bytes());
+            hasher.update(b"\n");
+            sqlx::query(
+                "INSERT INTO invoice_baseline_outpoints (invoice_id, txid, vout, kind)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(invoice_id)
+            .bind(txid)
+            .bind(vout)
+            .bind(kind)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Conflict)?;
+        }
+        record.creation_chain_height = creation_chain_height;
+        record.baseline_set_hash = hasher.finalize().into();
+        let record_plaintext =
+            postcard::to_allocvec(&record).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let envelope = self
+            .crypto
+            .encrypt(
+                &EnvelopeContext::invoice_payment_record(creator_hash, invoice_id),
+                &record_plaintext,
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        sqlx::query(
+            "UPDATE invoices SET payment_record_envelope = $1,
+                    creation_chain_height = $2, baseline_state = 'observing', updated_at = NOW()
+             WHERE id = $3",
+        )
+        .bind(envelope.as_bytes())
+        .bind(i32::try_from(creation_chain_height).map_err(|_| PersistenceError::CorruptOrMissing)?)
+        .bind(invoice_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        sqlx::query(
+            "UPDATE outbox SET status = 'queued', updated_at = NOW()
+             WHERE invoice_id = $1 AND status = 'prepared'",
+        )
+        .bind(invoice_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit().await.map_err(|_| PersistenceError::Unavailable)
+    }
+
+    pub async fn fail_creation_baseline(&self, invoice_id: Uuid) -> Result<(), PersistenceError> {
+        sqlx::query(
+            "UPDATE invoices SET baseline_state = 'void_baseline_failed', updated_at = NOW()
+             WHERE id = $1 AND baseline_state = 'awaiting_baseline'",
+        )
+        .bind(invoice_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(())
+    }
+
+    pub async fn pending_candidates(&self) -> Result<Vec<PendingCandidate>, PersistenceError> {
+        let rows = sqlx::query_as::<_, (Uuid, String, i32)>(
+            "SELECT candidates.invoice_id, candidates.txid, candidates.vout
+             FROM bitcoin_observation_candidates AS candidates
+             JOIN invoices ON invoices.id = candidates.invoice_id
+             WHERE NOT candidates.approved
+               AND invoices.baseline_state = 'observing'
+               AND NOT (invoices.payment_status = 'confirmed'
+                        AND invoices.confirmation_count = 6 AND invoices.amount_matched)
+             ORDER BY candidates.confirmed_height, candidates.created_at",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        rows.into_iter()
+            .map(|(invoice_id, txid, vout)| {
+                let outpoint = format!("{txid}:{vout}")
+                    .parse()
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                Ok(PendingCandidate {
+                    invoice_id,
+                    outpoint,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn resolve_candidate(
+        &self,
+        candidate: &PendingCandidate,
+        inputs: &[bitcoin::OutPoint],
+    ) -> Result<(), PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let replaces_baseline: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM invoice_baseline_outpoints
+                WHERE invoice_id = $1 AND kind = 'replaced_input'
+                  AND (txid, vout) IN (
+                    SELECT * FROM UNNEST($2::TEXT[], $3::INTEGER[])
+                  )
+             )",
+        )
+        .bind(candidate.invoice_id)
+        .bind(
+            inputs
+                .iter()
+                .map(|input| input.txid.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .bind(
+            inputs
+                .iter()
+                .map(|input| i32::try_from(input.vout).unwrap_or(i32::MAX))
+                .collect::<Vec<_>>(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let mut approved_binding = None;
+        if replaces_baseline {
+            sqlx::query(
+                "INSERT INTO invoice_baseline_outpoints (invoice_id, txid, vout, kind)
+                 VALUES ($1, $2, $3, 'ineligible')
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(candidate.invoice_id)
+            .bind(candidate.outpoint.txid.to_string())
+            .bind(
+                i32::try_from(candidate.outpoint.vout)
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            sqlx::query("DELETE FROM bitcoin_observation_candidates WHERE invoice_id = $1")
+                .bind(candidate.invoice_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+        } else {
+            let row = sqlx::query_as::<_, (i32, i32, Vec<u8>, Vec<u8>)>(
+                "SELECT candidates.confirmations, candidates.confirmed_height,
+                        creators.creator_lookup_hash, invoices.payment_record_envelope
+                 FROM bitcoin_observation_candidates AS candidates
+                 JOIN invoices ON invoices.id = candidates.invoice_id
+                 JOIN creators ON creators.id = invoices.creator_id
+                 WHERE candidates.invoice_id = $1 AND candidates.txid = $2
+                   AND candidates.vout = $3 FOR UPDATE OF candidates, invoices",
+            )
+            .bind(candidate.invoice_id)
+            .bind(candidate.outpoint.txid.to_string())
+            .bind(
+                i32::try_from(candidate.outpoint.vout)
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?,
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?
+            .ok_or(PersistenceError::CorruptOrMissing)?;
+            let creator_hash = lookup_hash_from_storage(&row.2)?;
+            let plaintext = self
+                .crypto
+                .decrypt(
+                    &EnvelopeContext::invoice_payment_record(creator_hash, candidate.invoice_id),
+                    &EncryptedEnvelope::from_bytes(row.3),
+                )
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            let record: InvoicePaymentRecordV2 =
+                postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
+            if record.version != 2 {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+            sqlx::query(
+                "UPDATE bitcoin_observation_candidates SET approved = TRUE, updated_at = NOW()
+                 WHERE invoice_id = $1 AND txid = $2 AND vout = $3",
+            )
+            .bind(candidate.invoice_id)
+            .bind(candidate.outpoint.txid.to_string())
+            .bind(
+                i32::try_from(candidate.outpoint.vout)
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            approved_binding = Some((
+                record.bitcoin_address,
+                record.required_sats,
+                u32::try_from(row.0).map_err(|_| PersistenceError::CorruptOrMissing)?,
+                u32::try_from(row.1).map_err(|_| PersistenceError::CorruptOrMissing)?,
+            ));
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        if let Some((address, sats, confirmations, height)) = approved_binding {
+            self.apply_bitcoin_observation_at_height(
+                &address,
+                &BitcoinOutpoint::from_bitcoin(candidate.outpoint),
+                sats,
+                confirmations,
+                Some(height),
+                true,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Records one direct, invoice-address-specific output observation. The
     /// database resolves the address; callers cannot nominate an invoice.
     pub async fn apply_bitcoin_observation(
@@ -605,6 +894,50 @@ impl InvoiceStore {
         observed_sats: u64,
         confirmations: u32,
         present: bool,
+    ) -> Result<bool, PersistenceError> {
+        self.apply_bitcoin_observation_with_gate(
+            address,
+            outpoint,
+            observed_sats,
+            confirmations,
+            (confirmations > 0).then_some(confirmations),
+            present,
+            false,
+        )
+        .await
+    }
+
+    pub async fn apply_bitcoin_observation_at_height(
+        &self,
+        address: &str,
+        outpoint: &BitcoinOutpoint,
+        observed_sats: u64,
+        confirmations: u32,
+        confirmed_height: Option<u32>,
+        present: bool,
+    ) -> Result<bool, PersistenceError> {
+        self.apply_bitcoin_observation_with_gate(
+            address,
+            outpoint,
+            observed_sats,
+            confirmations,
+            confirmed_height,
+            present,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn apply_bitcoin_observation_with_gate(
+        &self,
+        address: &str,
+        outpoint: &BitcoinOutpoint,
+        observed_sats: u64,
+        confirmations: u32,
+        confirmed_height: Option<u32>,
+        present: bool,
+        require_candidate: bool,
     ) -> Result<bool, PersistenceError> {
         let mut tx = self
             .pool
@@ -618,7 +951,9 @@ impl InvoiceStore {
                 outpoint,
                 observed_sats,
                 confirmations,
+                confirmed_height,
                 present,
+                require_candidate,
             )
             .await?;
         tx.commit()
@@ -648,7 +983,9 @@ impl InvoiceStore {
                     &observation.outpoint,
                     observation.observed_sats,
                     observation.confirmations,
+                    observation.confirmed_height,
                     observation.present,
+                    true,
                 )
                 .await?
             {
@@ -661,6 +998,7 @@ impl InvoiceStore {
         Ok(applied)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_bitcoin_observation_in_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -668,17 +1006,23 @@ impl InvoiceStore {
         outpoint: &BitcoinOutpoint,
         observed_sats: u64,
         confirmations: u32,
+        confirmed_height: Option<u32>,
         present: bool,
+        require_candidate: bool,
     ) -> Result<bool, PersistenceError> {
         let incoming_confirmations = confirmations;
         let confirmations = i32::try_from(incoming_confirmations)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let txid = outpoint.txid().to_owned();
+        let vout =
+            i32::try_from(outpoint.vout()).map_err(|_| PersistenceError::CorruptOrMissing)?;
         let outpoint = outpoint.canonical_text();
         let address_lookup_hash = self.crypto.bitcoin_address_lookup_hash(address.as_bytes());
         let invoice = sqlx::query_as::<_, BitcoinInvoiceRow>(
             "SELECT invoices.id, invoices.payment_record_envelope,
                     invoices.bitcoin_address_lookup_hash, invoices.payment_status,
                     invoices.confirmation_count, invoices.amount_matched,
+                    invoices.baseline_state, invoices.creation_chain_height,
                     creators.creator_lookup_hash
              FROM invoices JOIN creators ON creators.id = invoices.creator_id
              WHERE invoices.bitcoin_address_lookup_hash = $1 FOR UPDATE OF invoices",
@@ -690,6 +1034,9 @@ impl InvoiceStore {
         let Some(invoice) = invoice else {
             return Ok(false);
         };
+        if invoice.baseline_state != "observing" {
+            return Ok(true);
+        }
         let creator_hash = lookup_hash_from_storage(&invoice.creator_lookup_hash)?;
         let payment_record_plaintext = self
             .crypto
@@ -698,11 +1045,14 @@ impl InvoiceStore {
                 &EncryptedEnvelope::from_bytes(invoice.payment_record_envelope),
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let payment_record: InvoicePaymentRecordV1 =
+        let payment_record: InvoicePaymentRecordV2 =
             postcard::from_bytes(&payment_record_plaintext)
                 .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        if payment_record.version != 1
+        if payment_record.version != 2
             || payment_record.bitcoin_address != address
+            || payment_record.creation_chain_height
+                != u32::try_from(invoice.creation_chain_height)
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?
             || invoice.bitcoin_address_lookup_hash != address_lookup_hash.as_bytes()
         {
             return Err(PersistenceError::CorruptOrMissing);
@@ -714,6 +1064,89 @@ impl InvoiceStore {
             && invoice.confirmation_count == 6
             && invoice.amount_matched
         {
+            return Ok(true);
+        }
+
+        let approved_candidate: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM bitcoin_observation_candidates
+                WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND approved
+             )",
+        )
+        .bind(invoice.id)
+        .bind(&txid)
+        .bind(vout)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let baseline_entries = sqlx::query_as::<_, (String, String, i32)>(
+            "SELECT kind, txid, vout FROM invoice_baseline_outpoints
+             WHERE invoice_id = $1 AND kind IN ('output', 'replaced_input')
+             ORDER BY kind, txid, vout",
+        )
+        .bind(invoice.id)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let mut hasher = Sha256::new();
+        for (kind, entry_txid, entry_vout) in &baseline_entries {
+            hasher.update(kind.as_bytes());
+            hasher.update(b":");
+            hasher.update(format!("{entry_txid}:{entry_vout}").as_bytes());
+            hasher.update(b"\n");
+        }
+        if payment_record.baseline_set_hash != <[u8; 32]>::from(hasher.finalize()) {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        let baseline_member: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                SELECT 1 FROM invoice_baseline_outpoints
+                WHERE invoice_id = $1 AND txid = $2 AND vout = $3
+             )",
+        )
+        .bind(invoice.id)
+        .bind(&txid)
+        .bind(vout)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if baseline_member {
+            return Ok(true);
+        }
+        if let Some(height) = confirmed_height
+            && height
+                <= u32::try_from(invoice.creation_chain_height)
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?
+        {
+            return Ok(true);
+        }
+        if present
+            && observed_sats == required
+            && confirmations > 0
+            && !approved_candidate
+            && require_candidate
+        {
+            let height = confirmed_height.ok_or(PersistenceError::CorruptOrMissing)?;
+            sqlx::query(
+                "INSERT INTO bitcoin_observation_candidates
+                    (invoice_id, txid, vout, confirmations, confirmed_height)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (invoice_id) DO UPDATE SET
+                    txid = EXCLUDED.txid, vout = EXCLUDED.vout,
+                    confirmations = EXCLUDED.confirmations,
+                    confirmed_height = EXCLUDED.confirmed_height,
+                    approved = FALSE, updated_at = NOW()
+                 WHERE EXCLUDED.confirmed_height
+                    < bitcoin_observation_candidates.confirmed_height",
+            )
+            .bind(invoice.id)
+            .bind(&txid)
+            .bind(vout)
+            .bind(confirmations)
+            .bind(i32::try_from(height).map_err(|_| PersistenceError::CorruptOrMissing)?)
+            .execute(&mut **tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
             return Ok(true);
         }
 
@@ -862,6 +1295,24 @@ impl InvoiceStore {
         &self,
         input: AtomicInvoiceInput<'_>,
     ) -> Result<AtomicInvoiceResult, PersistenceError> {
+        self.create_atomic_with_state(input, "observing", "queued")
+            .await
+    }
+
+    pub async fn create_awaiting_baseline(
+        &self,
+        input: AtomicInvoiceInput<'_>,
+    ) -> Result<AtomicInvoiceResult, PersistenceError> {
+        self.create_atomic_with_state(input, "awaiting_baseline", "prepared")
+            .await
+    }
+
+    async fn create_atomic_with_state(
+        &self,
+        input: AtomicInvoiceInput<'_>,
+        baseline_state: &'static str,
+        outbox_status: &'static str,
+    ) -> Result<AtomicInvoiceResult, PersistenceError> {
         let creator_hash = self
             .crypto
             .lookup_hash(input.creator.to_string().as_bytes());
@@ -990,6 +1441,7 @@ impl InvoiceStore {
                         intent_envelope: endpoint_envelope.as_bytes(),
                         depends_on_id: None,
                         reader_assignment_id: Some(assignment_id),
+                        status: outbox_status,
                     },
                 )
                 .await?;
@@ -1007,11 +1459,13 @@ impl InvoiceStore {
         let payment_request_plaintext = postcard::to_allocvec(&input.payment_request_intent)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         let invoice_id = Uuid::new_v4();
-        let payment_record_plaintext = postcard::to_allocvec(&InvoicePaymentRecordV1 {
-            version: 1,
+        let payment_record_plaintext = postcard::to_allocvec(&InvoicePaymentRecordV2 {
+            version: 2,
             derivation_index: assignment.child_index,
             bitcoin_address: bitcoin_address.clone(),
             required_sats: input.required_sats,
+            creation_chain_height: 0,
+            baseline_set_hash: Sha256::digest([]).into(),
         })
         .map_err(|_| PersistenceError::CorruptOrMissing)?;
         let payment_record_envelope = self
@@ -1036,8 +1490,8 @@ impl InvoiceStore {
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         sqlx::query(
             "INSERT INTO invoices \
-             (id, creator_id, reader_lookup_hash, bundle_lookup_hash, payment_request_lookup_hash, invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'undetected')",
+             (id, creator_id, reader_lookup_hash, bundle_lookup_hash, payment_request_lookup_hash, invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status, baseline_state) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'undetected', $10)",
         )
         .bind(invoice_id)
         .bind(creator.id)
@@ -1048,6 +1502,7 @@ impl InvoiceStore {
         .bind(payment_record_envelope.as_bytes())
         .bind(bitcoin_address_lookup_hash.as_bytes().as_slice())
         .bind(derivation_index_lookup_hash.as_bytes().as_slice())
+        .bind(baseline_state)
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Conflict)?;
@@ -1077,6 +1532,7 @@ impl InvoiceStore {
                 intent_envelope: payment_request_envelope.as_bytes(),
                 depends_on_id: endpoint_publication_outbox_id,
                 reader_assignment_id: None,
+                status: outbox_status,
             },
         )
         .await?;
@@ -1162,6 +1618,7 @@ struct OutboxInsert<'a> {
     intent_envelope: &'a [u8],
     depends_on_id: Option<Uuid>,
     reader_assignment_id: Option<Uuid>,
+    status: &'static str,
 }
 
 async fn insert_outbox(
@@ -1171,12 +1628,13 @@ async fn insert_outbox(
     sqlx::query(
         "INSERT INTO outbox \
          (id, creator_id, invoice_id, intent_envelope, status, depends_on_id, reader_assignment_id) \
-         VALUES ($1, $2, $3, $4, 'queued', $5, $6)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
     .bind(row.id)
     .bind(row.creator_id)
     .bind(row.invoice_id)
     .bind(row.intent_envelope)
+    .bind(row.status)
     .bind(row.depends_on_id)
     .bind(row.reader_assignment_id)
     .execute(&mut **tx)
@@ -1240,6 +1698,8 @@ struct BitcoinInvoiceRow {
     payment_status: String,
     confirmation_count: i32,
     amount_matched: bool,
+    baseline_state: String,
+    creation_chain_height: i32,
     creator_lookup_hash: Vec<u8>,
 }
 
