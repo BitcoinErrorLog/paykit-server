@@ -84,6 +84,10 @@ pub struct ManualClaimOutcome {
     /// (design §B.5/§B.6): the child index the next invoice address derives
     /// from.
     pub next_child_index: i64,
+    /// The claim-time child index (W1.13 r3), persisted on the creator row
+    /// and stable forever: `first_derived_address` derives at this index,
+    /// and the seller status surface reports the same value.
+    pub first_child_index: i64,
     /// Hex of the first 8 bytes of SHA-256 over the canonical 78-byte key
     /// serialization; the client recomputes it locally and refuses to enable
     /// Bitcoin on mismatch (design §B.6).
@@ -123,9 +127,21 @@ pub struct SellerAllocationStatus {
     /// Hex of the first 8 bytes of SHA-256 over the canonical 78-byte key
     /// serialization — the same value the claim response emits.
     pub key_fingerprint: String,
-    /// The account's derived address at the persisted derivation cursor, on
-    /// this stack's network — the same value the claim response emits.
+    /// The account's derived address at the persisted CLAIM-TIME child index
+    /// (`first_child_index`, W1.13 r3), on this stack's network — the same
+    /// value the claim response emitted, forever. It never derives at the
+    /// mutable cursor: invoice allocation advances `next_child_index`, and a
+    /// status derived there would drift away from the claim response.
     pub first_derived_address: String,
+    /// The persisted BIP84 account index; with the seller's own xpub it
+    /// re-derives `first_derived_address` at `first_child_index`.
+    pub account_index: u32,
+    /// The immutable claim-time child index the claim response's
+    /// `first_derived_address` was derived at.
+    pub first_child_index: u32,
+    /// The mutable derivation cursor the next invoice address derives from.
+    /// Informational: it moves as invoices are allocated.
+    pub next_child_index: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -323,27 +339,11 @@ impl ManualClaimService {
         &self,
         request: ManualClaimRequest,
     ) -> Result<ManualClaimOutcome, ManualClaimError> {
-        // `pasted_auto` is refused unconditionally (design §B.8.6 r6, Sol
-        // P1): no configuration flag, operator toggle or per-seller override
-        // exists anywhere, so this check reads nothing and is the FIRST
-        // thing the claim path does — before token verification, before any
-        // gate, on every code path and under every configuration.
-        if request.allocation_mode.as_deref() == Some(REQUESTED_MODE_PASTED_AUTO) {
-            return Err(ManualClaimError::AllocationModeNotEnabled);
-        }
-        // An unknown `claim_channel` is refused (fail closed, design §B.8.6:
-        // the field is one of `manual` | `bitkit_watch_only_v1`) — never
-        // canonicalized silently, never persisted verbatim. Like the
-        // `pasted_auto` refusal this is request-shape validation, so it
-        // precedes token verification and touches nothing.
-        if let Some(channel) = request.claim_channel.as_deref()
-            && !matches!(
-                channel,
-                CLAIM_CHANNEL_MANUAL | CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1
-            )
-        {
-            return Err(ManualClaimError::UnknownClaimChannel);
-        }
+        // Pure request-shape validation is the FIRST thing the claim path
+        // does — before token verification, before any gate, on every code
+        // path and under every configuration. The HTTP layer runs the same
+        // check before its rate-limit charge (W1.13 r3 P2).
+        validate_request_shape(&request)?;
         let token = self.verify_claim_token(&request.auth_token)?;
         // A missing channel is treated — and recorded — as `manual`
         // (design §B.8.6: a paste is "a bare key and nothing else").
@@ -477,19 +477,28 @@ impl ManualClaimService {
         let next_child_index = report
             .next_child_index
             .unwrap_or(i64::from(scan.start_index));
-        // The address at the returned cursor: derived with the same function
-        // invoice addresses use, on this stack's network (design §B.6).
+        // The claim-time child index (W1.13 r3), persisted on the creator
+        // row at creation and read back in the commit's critical section.
+        // The claim response's address derives at THIS index — identical to
+        // `next_child_index` on a first claim, and stable across re-claims
+        // and invoice allocation, so the claim response and the seller
+        // status surface always agree.
+        let first_child_index = report.first_child_index.unwrap_or(next_child_index);
+        // The address at the claim-time index: derived with the same
+        // function invoice addresses use, on this stack's network (design
+        // §B.6).
         let first_derived_address = derive_bip84_p2wpkh_address(
             &canonical_xpub,
             claim.account_index,
             &self.bitcoin_network,
-            next_child_index,
+            first_child_index,
         )
         .map_err(|_| ManualClaimError::Unavailable)?;
         Ok(ManualClaimOutcome {
             creator: creator.to_string(),
             account_index: claim.account_index,
             next_child_index,
+            first_child_index,
             key_fingerprint,
             first_derived_address,
             stack_id: self.stack_id.clone(),
@@ -544,30 +553,19 @@ impl ManualClaimService {
         else {
             return Ok(None);
         };
-        let CreatorStatusRecord {
-            allocation,
-            xpub,
-            account_index,
-            next_child_index,
-        } = record;
-        // The same canonical-78-byte fingerprint and cursor-address
-        // derivations the claim response emits (design §B.6).
-        let serialized_xpub = Xpub::from_str(&xpub)
-            .map_err(|_| ManualClaimError::Unavailable)?
-            .encode();
-        let first_derived_address = derive_bip84_p2wpkh_address(
-            &xpub,
-            account_index,
-            &self.bitcoin_network,
-            next_child_index,
-        )
-        .map_err(|_| ManualClaimError::Unavailable)?;
+        let (key_fingerprint, first_derived_address) =
+            status_evidence(&record, &self.bitcoin_network)?;
         Ok(Some(SellerAllocationStatus {
-            allocation_mode: allocation.allocation_mode,
-            claim_channel: allocation.claim_channel,
-            downgrade_reason: allocation.downgrade_reason,
-            key_fingerprint: key_fingerprint(&serialized_xpub),
+            allocation_mode: record.allocation.allocation_mode,
+            claim_channel: record.allocation.claim_channel,
+            downgrade_reason: record.allocation.downgrade_reason,
+            key_fingerprint,
             first_derived_address,
+            account_index: record.account_index,
+            first_child_index: u32::try_from(record.first_child_index)
+                .map_err(|_| ManualClaimError::Unavailable)?,
+            next_child_index: u32::try_from(record.next_child_index)
+                .map_err(|_| ManualClaimError::Unavailable)?,
         }))
     }
 
@@ -587,6 +585,58 @@ impl ManualClaimService {
         }
         Ok(token)
     }
+}
+
+/// Pure request-shape validation needing no I/O (W1.13 r3 P2). The HTTP
+/// claim handler runs this BEFORE its rate-limit charge so unauthenticated
+/// garbage requests never consume claim capacity; `claim` re-runs it as the
+/// first gate, so every code path refuses identically. Everything after it
+/// — token verification, the claim scan, persistence — is I/O-bearing and
+/// stays behind the rate limit.
+///
+/// Two refusals, in this order:
+/// - `allocation_mode = 'pasted_auto'` is refused unconditionally (design
+///   §B.8.6 r6, Sol P1): no configuration flag, operator toggle or
+///   per-seller override exists anywhere.
+/// - An unknown `claim_channel` is refused (fail closed, design §B.8.6: the
+///   field is one of `manual` | `bitkit_watch_only_v1`) — never
+///   canonicalized silently, never persisted verbatim.
+pub fn validate_request_shape(request: &ManualClaimRequest) -> Result<(), ManualClaimError> {
+    if request.allocation_mode.as_deref() == Some(REQUESTED_MODE_PASTED_AUTO) {
+        return Err(ManualClaimError::AllocationModeNotEnabled);
+    }
+    if let Some(channel) = request.claim_channel.as_deref()
+        && !matches!(
+            channel,
+            CLAIM_CHANNEL_MANUAL | CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1
+        )
+    {
+        return Err(ManualClaimError::UnknownClaimChannel);
+    }
+    Ok(())
+}
+
+/// The status surface's two evidence fields, derived from the persisted
+/// account record by the exact functions the claim response uses (design
+/// §B.6). The address derives at the record's immutable CLAIM-TIME index
+/// `first_child_index` (W1.13 r3) — never at the mutable `next_child_index`
+/// cursor, which invoice allocation advances — so the status emits the
+/// claim response's address forever.
+fn status_evidence(
+    record: &CreatorStatusRecord,
+    network: &BitcoinNetwork,
+) -> Result<(String, String), ManualClaimError> {
+    let serialized_xpub = Xpub::from_str(&record.xpub)
+        .map_err(|_| ManualClaimError::Unavailable)?
+        .encode();
+    let first_derived_address = derive_bip84_p2wpkh_address(
+        &record.xpub,
+        record.account_index,
+        network,
+        record.first_child_index,
+    )
+    .map_err(|_| ManualClaimError::Unavailable)?;
+    Ok((key_fingerprint(&serialized_xpub), first_derived_address))
 }
 
 /// The validated claim plus the §B.8.6 index-agreement fact: whether the
@@ -756,5 +806,76 @@ mod tests {
         .unwrap();
         assert!(validated.index_mismatch);
         assert_eq!(validated.claim.account_index, 2);
+    }
+
+    fn status_record(
+        xpub: String,
+        first_child_index: i64,
+        next_child_index: i64,
+    ) -> CreatorStatusRecord {
+        CreatorStatusRecord {
+            allocation: crate::persistence::CreatorAllocationStatus {
+                allocation_mode: "shared_manual".to_owned(),
+                claim_channel: Some("manual".to_owned()),
+                downgrade_reason: None,
+            },
+            xpub,
+            account_index: 3,
+            first_child_index,
+            next_child_index,
+        }
+    }
+
+    #[test]
+    fn status_evidence_derives_at_first_child_index_not_the_moved_cursor() {
+        // W1.13 r3 P1: invoice allocation has advanced the cursor from the
+        // claim-time index 24 to 31. The status address must still be the
+        // claim response's address — derived at `first_child_index`.
+        let xpub = regtest_account_tpub(3);
+        let record = status_record(xpub.clone(), 24, 31);
+        let (fingerprint, address) = status_evidence(&record, &BitcoinNetwork::Regtest).unwrap();
+        assert_eq!(
+            address,
+            derive_bip84_p2wpkh_address(&xpub, 3, &BitcoinNetwork::Regtest, 24).unwrap(),
+            "the status address derives at the immutable claim-time index"
+        );
+        assert_ne!(
+            address,
+            derive_bip84_p2wpkh_address(&xpub, 3, &BitcoinNetwork::Regtest, 31).unwrap(),
+            "...and never at the mutable derivation cursor"
+        );
+        assert_eq!(
+            fingerprint,
+            key_fingerprint(&Xpub::from_str(&xpub).unwrap().encode())
+        );
+    }
+
+    #[test]
+    fn request_shape_validation_refuses_the_reserved_mode_then_unknown_channels() {
+        let request = |channel: Option<&str>, mode: Option<&str>| ManualClaimRequest {
+            auth_token: String::new(),
+            account_xpub: String::new(),
+            account_index: 0,
+            claim_channel: channel.map(str::to_owned),
+            allocation_mode: mode.map(str::to_owned),
+        };
+        assert_eq!(
+            validate_request_shape(&request(Some("manual"), Some(REQUESTED_MODE_PASTED_AUTO))),
+            Err(ManualClaimError::AllocationModeNotEnabled),
+            "the reserved-mode refusal precedes the channel check"
+        );
+        assert_eq!(
+            validate_request_shape(&request(Some("carrier_pigeon"), None)),
+            Err(ManualClaimError::UnknownClaimChannel)
+        );
+        assert_eq!(
+            validate_request_shape(&request(Some("manual"), None)),
+            Ok(())
+        );
+        assert_eq!(
+            validate_request_shape(&request(Some("bitkit_watch_only_v1"), None)),
+            Ok(())
+        );
+        assert_eq!(validate_request_shape(&request(None, None)), Ok(()));
     }
 }
