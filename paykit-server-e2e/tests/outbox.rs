@@ -18,13 +18,16 @@ use paykit_server::{
     application::semantic_intent::DeliveryOperationV1,
     crypto::Crypto,
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    metrics::Metrics,
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
         NewReaderPayloadFactory, NewReaderPayloads, OutboxStore, PersistenceError,
-        PostgresStorageAdapter, SdkStateStore, run_migrations,
+        PostgresStorageAdapter, RETRY_BUDGET_EXHAUSTED_ERROR_CLASS, RetryBudget, SdkStateStore,
+        run_migrations,
     },
     workers::outbox::{
-        Adapter, HandoffError, HandoffResult, process_claim, process_reconciliation,
+        Adapter, HandoffError, HandoffResult, ProcessingHealth, process_claim,
+        process_claim_with_health, process_reconciliation, process_reconciliation_with_health,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -38,6 +41,10 @@ mod sdk_fixtures;
 use sdk_fixtures::{TestPaymentAdapter, TestSessionProvider};
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+fn test_budget() -> RetryBudget {
+    RetryBudget::new(50, Duration::from_secs(7 * 24 * 60 * 60))
+}
 
 async fn build_pubky_testnet() -> EphemeralTestnet {
     let postgres = std::env::var("TEST_DATABASE_URL").unwrap();
@@ -152,9 +159,16 @@ async fn assert_reconciliation_status(
         statuses: Mutex::new(VecDeque::from([sdk_status])),
     };
     assert!(
-        process_reconciliation(outbox, &adapter, claim, Duration::from_secs(5))
-            .await
-            .unwrap()
+        process_reconciliation(
+            outbox,
+            &adapter,
+            claim,
+            Duration::from_secs(5),
+            &test_budget(),
+            &Metrics::new(),
+        )
+        .await
+        .unwrap()
     );
     let actual: (String, bool, Option<String>) = sqlx::query_as(
         "SELECT status, next_attempt_at > NOW(), error_class FROM outbox WHERE id = $1",
@@ -211,6 +225,7 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
         .await
         .unwrap();
     let outbox = OutboxStore::new(database.pool(), crypto);
+    let metrics = Metrics::new();
 
     let endpoint_claims = outbox
         .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
@@ -235,6 +250,8 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             &retry_adapter,
             &endpoint_claims[0],
             Duration::from_secs(5),
+            &test_budget(),
+            &metrics,
         )
         .await
         .unwrap()
@@ -319,6 +336,8 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             &reconciliation_adapter,
             &reconciliation[0],
             Duration::ZERO,
+            &test_budget(),
+            &metrics,
         )
         .await
         .unwrap()
@@ -342,6 +361,8 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             &reconciliation_adapter,
             &reconciliation[0],
             Duration::ZERO,
+            &test_budget(),
+            &metrics,
         )
         .await
         .unwrap()
@@ -403,6 +424,8 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             &failed_adapter,
             &failed_reconciliation[0],
             Duration::from_secs(5),
+            &test_budget(),
+            &metrics,
         )
         .await
         .unwrap()
@@ -433,6 +456,8 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             &sent_adapter,
             &sent_reconciliation[0],
             Duration::from_secs(5),
+            &test_budget(),
+            &metrics,
         )
         .await
         .unwrap()
@@ -499,6 +524,8 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             &retry_adapter,
             &corrupt_claim[0],
             Duration::from_secs(5),
+            &test_budget(),
+            &metrics,
         )
         .await
         .unwrap()
@@ -967,6 +994,312 @@ async fn postgres_sdk_transactions_are_durable_and_creator_isolated() {
         2,
         "callback error committed mutated SDK state"
     );
+
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_budget_exhaustion_is_terminal_exactly_once_and_scoped_out_of_health() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[13; 32]).unwrap());
+    let creator = creator();
+    let reader = reader();
+    CreatorStore::new(database.pool(), crypto.clone())
+        .create(
+            &CreatorCredentials::new(
+                creator.clone(),
+                "session-secret".into(),
+                ReceiverNoiseSecretKey::new([10; 32]),
+                "xpub-secret".into(),
+                0,
+            ),
+            &StorageState::default(),
+        )
+        .await
+        .unwrap();
+    let invoice = InvoiceStore::new(database.pool(), crypto.clone())
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"budget-bundle",
+            payment_request_binding: b"budget-payment-request",
+            new_reader_payloads: &Payloads {
+                reader: reader.clone(),
+            },
+            payment_request_intent: common::payment_intent(&reader),
+            required_sats: 100,
+        })
+        .await
+        .unwrap();
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    let metrics = Metrics::new();
+    let budget = test_budget();
+    let row_id = invoice.endpoint_publication_outbox_id().unwrap();
+    let retry_adapter = ReconciliationAdapter {
+        statuses: Mutex::new(VecDeque::new()),
+    };
+    let delivery_count = |encoded: &str| {
+        format!("paykit_outbox_permanent_failures_total{{kind=\"delivery\"}} {encoded}")
+    };
+
+    // (1) Exhaustion by attempts: the claim reaching max_attempts is failed
+    // terminally at its next retry scheduling, not rescheduled.
+    sqlx::query("UPDATE outbox SET attempt_count = 49 WHERE id = $1")
+        .bind(row_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let claims = outbox
+        .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].attempt_count(), 50);
+    let outcome = process_claim_with_health(
+        &outbox,
+        &retry_adapter,
+        &claims[0],
+        Duration::from_secs(5),
+        &budget,
+        &metrics,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, (true, ProcessingHealth::PermanentFailure));
+    let state: (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_class FROM outbox WHERE id = $1")
+            .bind(row_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        state,
+        (
+            "permanently_failed".into(),
+            Some(RETRY_BUDGET_EXHAUSTED_ERROR_CLASS.into())
+        )
+    );
+    let encoded = metrics.encode().unwrap();
+    assert!(
+        encoded.contains(&delivery_count("1")),
+        "attempt exhaustion must count once: {encoded}"
+    );
+
+    // (2) A permanently_failed row never degrades delivery health.
+    assert!(
+        outbox.delivery_available(&budget).await.unwrap(),
+        "a terminal row must not degrade delivery availability"
+    );
+
+    // (3) Exhaustion by age: an in-attempt-budget row older than max_age is
+    // failed terminally at its next retry scheduling.
+    sqlx::query(
+        "UPDATE outbox SET status = 'queued', attempt_count = 1, error_class = NULL, \
+         created_at = NOW() - INTERVAL '8 days', next_attempt_at = NOW() - INTERVAL '1 second' \
+         WHERE id = $1",
+    )
+    .bind(row_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let claims = outbox
+        .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    assert_eq!(claims[0].attempt_count(), 2);
+    let outcome = process_claim_with_health(
+        &outbox,
+        &retry_adapter,
+        &claims[0],
+        Duration::from_secs(5),
+        &budget,
+        &metrics,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, (true, ProcessingHealth::PermanentFailure));
+    let state: (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_class FROM outbox WHERE id = $1")
+            .bind(row_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        state,
+        (
+            "permanently_failed".into(),
+            Some(RETRY_BUDGET_EXHAUSTED_ERROR_CLASS.into())
+        )
+    );
+    let encoded = metrics.encode().unwrap();
+    assert!(
+        encoded.contains(&delivery_count("2")),
+        "age exhaustion must count once more: {encoded}"
+    );
+
+    // (4) A live in-budget retryable row still degrades delivery health; a
+    // row beyond the budget does not pin the rail degraded while it converges
+    // on its terminal transition.
+    sqlx::query(
+        "UPDATE outbox SET status = 'retryable', attempt_count = 1, error_class = 'marker_missing', \
+         created_at = NOW(), next_attempt_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind(row_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        !outbox.delivery_available(&budget).await.unwrap(),
+        "a live in-budget retryable row must degrade delivery availability"
+    );
+    sqlx::query("UPDATE outbox SET attempt_count = 6000 WHERE id = $1")
+        .bind(row_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(
+        outbox.delivery_available(&budget).await.unwrap(),
+        "an over-budget row must not keep the rail degraded"
+    );
+
+    // (5) Concurrent double-claim of an exhausted row transitions exactly
+    // once, counts once, and cannot be re-opened by the fenced-out worker.
+    sqlx::query(
+        "UPDATE outbox SET status = 'retryable', attempt_count = 49, \
+         created_at = NOW(), next_attempt_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind(row_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let stale_claim = outbox
+        .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(row_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let live_claim = outbox
+        .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(stale_claim.id(), live_claim.id());
+    assert_ne!(stale_claim.claim_token(), live_claim.claim_token());
+    let (stale_outcome, live_outcome) = tokio::join!(
+        process_claim_with_health(
+            &outbox,
+            &retry_adapter,
+            &stale_claim,
+            Duration::from_secs(5),
+            &budget,
+            &metrics,
+        ),
+        process_claim_with_health(
+            &outbox,
+            &retry_adapter,
+            &live_claim,
+            Duration::from_secs(5),
+            &budget,
+            &metrics,
+        ),
+    );
+    assert_eq!(stale_outcome.unwrap(), (false, ProcessingHealth::Retryable));
+    assert_eq!(
+        live_outcome.unwrap(),
+        (true, ProcessingHealth::PermanentFailure)
+    );
+    let encoded = metrics.encode().unwrap();
+    assert!(
+        encoded.contains(&delivery_count("3")),
+        "concurrent double-claim must count exactly once: {encoded}"
+    );
+    // A late retry by the fenced-out worker neither re-opens nor double-counts.
+    let late_outcome = process_claim_with_health(
+        &outbox,
+        &retry_adapter,
+        &stale_claim,
+        Duration::from_secs(5),
+        &budget,
+        &metrics,
+    )
+    .await
+    .unwrap();
+    assert_eq!(late_outcome, (false, ProcessingHealth::Retryable));
+    let status: String = sqlx::query_scalar("SELECT status FROM outbox WHERE id = $1")
+        .bind(row_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(status, "permanently_failed");
+    let encoded = metrics.encode().unwrap();
+    assert!(
+        encoded.contains(&delivery_count("3")),
+        "fenced-out retry must not double-count: {encoded}"
+    );
+
+    // (6) The reconciliation lane enforces the same budget.
+    let reconciliation_row: Uuid = sqlx::query_scalar(
+        "INSERT INTO outbox \
+         (creator_id, intent_envelope, status, sdk_outbound_message_id, attempt_count) \
+         SELECT id, decode('00', 'hex'), 'handed_off', '77', 49 FROM creators LIMIT 1 \
+         RETURNING id",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let reconciliation = outbox
+        .claim_reconciliation(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let claim = reconciliation
+        .iter()
+        .find(|claim| claim.id() == reconciliation_row)
+        .expect("inserted reconciliation row was claimable");
+    assert_eq!(claim.attempt_count(), 50);
+    let pending_adapter = ReconciliationAdapter {
+        statuses: Mutex::new(VecDeque::from([OutboundPrivateMessageStatus::Pending])),
+    };
+    let outcome = process_reconciliation_with_health(
+        &outbox,
+        &pending_adapter,
+        claim,
+        Duration::from_secs(5),
+        &budget,
+        &metrics,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, (true, ProcessingHealth::PermanentFailure));
+    let state: (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_class FROM outbox WHERE id = $1")
+            .bind(reconciliation_row)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        state,
+        (
+            "permanently_failed".into(),
+            Some(RETRY_BUDGET_EXHAUSTED_ERROR_CLASS.into())
+        )
+    );
+    let encoded = metrics.encode().unwrap();
+    assert!(
+        encoded.contains("paykit_outbox_permanent_failures_total{kind=\"reconciliation\"} 1"),
+        "reconciliation exhaustion must count once: {encoded}"
+    );
+
+    // (7) The retained terminal rows are counted for the informational
+    // health surface.
+    assert_eq!(outbox.permanently_failed_count().await.unwrap(), 2);
 
     database.cleanup().await;
 }
