@@ -25,6 +25,18 @@ async fn main() -> anyhow::Result<()> {
         },
     )?;
     let pool = initialize_database(&config).await?;
+    let electrum_host = url::Url::parse(&config.electrum.endpoint)
+        .ok()
+        .and_then(|endpoint| endpoint.host_str().map(str::to_owned))
+        .unwrap_or_else(|| "<unparseable>".to_owned());
+    tracing::info!(
+        bitcoin_network = config.deployment_invariants().bitcoin_network.as_str(),
+        stack_role = config.deployment_invariants().stack_role.as_str(),
+        electrum_host = electrum_host,
+        version = env!("CARGO_PKG_VERSION"),
+        "deployment invariants verified; the stack role is adopted once on \
+         first boot and every later boot refuses a mismatch"
+    );
     let listen_addr = config.http.listen_addr.clone();
     let server = Server::build(config, pool).await?;
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;

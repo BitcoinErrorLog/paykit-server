@@ -59,6 +59,7 @@ impl Config {
             return Err(ConfigError::DuplicateReceiverPathPriority);
         }
         let bitcoin_network = BitcoinNetwork::parse(&raw.bitcoin.network)?;
+        let stack_role = StackRole::parse(raw.deployment)?;
 
         validate_url("electrum.endpoint", &raw.electrum.endpoint)?;
         let allowed_origins = validate_allowed_origins(raw.setup.allowed_origins)?;
@@ -96,6 +97,7 @@ impl Config {
             master_key,
             deployment_invariants: DeploymentInvariants {
                 bitcoin_network,
+                stack_role,
                 receiver_path,
                 trusted_locks_key_fingerprint,
             },
@@ -197,8 +199,40 @@ pub struct ConfigEnvironment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeploymentInvariants {
     pub bitcoin_network: BitcoinNetwork,
+    /// Deployment role distinguishing real-money production stacks from
+    /// proof-of-concept stacks. Persisted adopt-once: a database that has
+    /// never recorded a role adopts the configured one on first boot, and
+    /// every later boot refuses to start on a mismatch.
+    pub stack_role: StackRole,
     pub receiver_path: PaykitReceiverPath,
     pub trusted_locks_key_fingerprint: TrustedLocksKeyFingerprint,
+}
+
+/// Whether this stack serves production traffic or proof-of-concept testing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StackRole {
+    Production,
+    Proof,
+}
+
+impl StackRole {
+    fn parse(raw: Option<RawDeploymentConfig>) -> Result<Self, ConfigError> {
+        let value = raw
+            .and_then(|deployment| deployment.stack_role)
+            .ok_or(ConfigError::MissingStackRole)?;
+        match value.as_str() {
+            "production" => Ok(Self::Production),
+            "proof" => Ok(Self::Proof),
+            _ => Err(ConfigError::InvalidStackRole),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::Proof => "proof",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -534,6 +568,10 @@ pub enum ConfigError {
     DuplicateTrustedMarketplacePublicKey(String),
     #[error("bitcoin.network must be mainnet, testnet, signet, or regtest")]
     InvalidNetwork,
+    #[error("[deployment] stack_role is required and must be production or proof")]
+    MissingStackRole,
+    #[error("[deployment] stack_role must be production or proof")]
+    InvalidStackRole,
     #[error("{0} must be a valid absolute URL")]
     InvalidUrl(&'static str),
     #[error(
@@ -614,6 +652,8 @@ struct RawConfig {
     setup: RawSetupConfig,
     paykit: RawPaykitConfig,
     bitcoin: RawBitcoinConfig,
+    #[serde(default)]
+    deployment: Option<RawDeploymentConfig>,
     electrum: RawElectrumConfig,
     outbox: RawOutboxConfig,
     #[serde(default)]
@@ -670,6 +710,13 @@ fn default_receiver_path_priority() -> Vec<String> {
 #[serde(deny_unknown_fields)]
 struct RawBitcoinConfig {
     network: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDeploymentConfig {
+    #[serde(default)]
+    stack_role: Option<String>,
 }
 
 #[derive(Deserialize)]

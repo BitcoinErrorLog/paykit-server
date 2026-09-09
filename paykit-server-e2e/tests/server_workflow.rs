@@ -359,6 +359,8 @@ receiver_path = "paykit/server"
 network = "testnet"
 [bitcoin]
 network = "testnet"
+[deployment]
+stack_role = "proof"
 [electrum]
 endpoint = "tcp://127.0.0.1:1"
 poll_interval = "{poll_interval}"

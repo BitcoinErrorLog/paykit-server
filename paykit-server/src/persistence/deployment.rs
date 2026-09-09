@@ -18,6 +18,11 @@ impl DeploymentStore {
     }
 
     /// Persists the first deployment configuration, or validates it on restart.
+    ///
+    /// The stack role follows an adopt-once rule: a stored NULL means the role
+    /// is unset (a database created before roles existed), so the configured
+    /// role is written exactly once; from then on every boot compares the
+    /// stored role with the configured one and refuses to start on mismatch.
     pub async fn initialize(
         &self,
         invariants: &DeploymentInvariants,
@@ -44,23 +49,41 @@ impl DeploymentStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         let existing = sqlx::query_as::<_, DeploymentMetadataRow>(
-            "SELECT bitcoin_network, receiver_path, locks_key_fingerprint \
+            "SELECT bitcoin_network, receiver_path, locks_key_fingerprint, stack_role \
              FROM deployment_metadata WHERE id = 1 FOR UPDATE",
         )
         .fetch_one(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
 
-        if existing.bitcoin_network == invariants.bitcoin_network.as_str()
-            && existing.receiver_path == invariants.receiver_path.as_str()
-            && existing.locks_key_fingerprint == invariants.trusted_locks_key_fingerprint.as_bytes()
+        if existing.bitcoin_network != invariants.bitcoin_network.as_str()
+            || existing.receiver_path != invariants.receiver_path.as_str()
+            || existing.locks_key_fingerprint != invariants.trusted_locks_key_fingerprint.as_bytes()
         {
-            transaction
+            return Err(PersistenceError::DeploymentMismatch);
+        }
+        match existing.stack_role.as_deref() {
+            Some(role) if role != invariants.stack_role.as_str() => {
+                Err(PersistenceError::DeploymentMismatch)
+            }
+            Some(_) => transaction
                 .commit()
                 .await
-                .map_err(|_| PersistenceError::Unavailable)
-        } else {
-            Err(PersistenceError::DeploymentMismatch)
+                .map_err(|_| PersistenceError::Unavailable),
+            None => {
+                sqlx::query(
+                    "UPDATE deployment_metadata SET stack_role = $1, updated_at = NOW() \
+                     WHERE id = 1 AND stack_role IS NULL",
+                )
+                .bind(invariants.stack_role.as_str())
+                .execute(&mut *transaction)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)
+            }
         }
     }
 }
@@ -70,6 +93,7 @@ struct DeploymentMetadataRow {
     bitcoin_network: String,
     receiver_path: String,
     locks_key_fingerprint: Vec<u8>,
+    stack_role: Option<String>,
 }
 
 /// Secret-free persistence failures suitable for startup and API boundaries.

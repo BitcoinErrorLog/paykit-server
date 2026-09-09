@@ -37,6 +37,13 @@ network = "testnet"
 # Must match the supplied Creator xpubs, derived addresses, and Electrum chain.
 network = "testnet"
 
+[deployment]
+# Required, no default. "production" serves real-money traffic; "proof" marks
+# proof-of-concept stacks. The role is persisted adopt-once: a database that
+# has never recorded a role adopts the configured one on first boot, and every
+# later boot refuses to start when the configured role differs.
+stack_role = "proof"
+
 [electrum]
 # Use one CA-valid ssl:// endpoint in production. tcp:// is accepted but has no
 # server authentication or transport confidentiality. No failover pool exists.

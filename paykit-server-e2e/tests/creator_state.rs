@@ -46,6 +46,8 @@ receiver_path = "paykit/server"
 network = "testnet"
 [bitcoin]
 network = "{network}"
+[deployment]
+stack_role = "proof"
 [electrum]
 endpoint = "ssl://electrum.example:50002"
 [outbox]

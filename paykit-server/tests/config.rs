@@ -30,6 +30,8 @@ network = "testnet"
 
 [bitcoin]
 network = "testnet"
+[deployment]
+stack_role = "proof"
 
 [electrum]
 endpoint = "ssl://electrum.example:50002"
@@ -59,6 +61,8 @@ network = "testnet"
 
 [bitcoin]
 network = "regtest"
+[deployment]
+stack_role = "proof"
 
 [electrum]
 endpoint = "tcp://fulcrum:50001"
@@ -515,4 +519,37 @@ fn marketplace_single_and_list_forms_are_mutually_exclusive() {
     let error =
         Config::from_toml_and_environment(&marketplace_toml(&section), environment()).unwrap_err();
     assert!(error.to_string().contains("mutually exclusive"), "{error}");
+}
+
+#[test]
+fn deployment_stack_role_is_required_and_named_when_missing_or_unrecognised() {
+    let missing_section = valid_toml().replace("[deployment]\nstack_role = \"proof\"\n", "");
+    let error = Config::from_toml_and_environment(&missing_section, environment()).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "[deployment] stack_role is required and must be production or proof"
+    );
+
+    let missing_value = valid_toml().replace("stack_role = \"proof\"\n", "");
+    let error = Config::from_toml_and_environment(&missing_value, environment()).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "[deployment] stack_role is required and must be production or proof"
+    );
+
+    let unrecognised = valid_toml().replace("stack_role = \"proof\"", "stack_role = \"staging\"");
+    let error = Config::from_toml_and_environment(&unrecognised, environment()).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "[deployment] stack_role must be production or proof"
+    );
+
+    let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
+    assert_eq!(config.deployment_invariants().stack_role.as_str(), "proof");
+    let production = valid_toml().replace("stack_role = \"proof\"", "stack_role = \"production\"");
+    let config = Config::from_toml_and_environment(&production, environment()).unwrap();
+    assert_eq!(
+        config.deployment_invariants().stack_role.as_str(),
+        "production"
+    );
 }

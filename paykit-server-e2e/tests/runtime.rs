@@ -41,6 +41,8 @@ network = "testnet"
 
 [bitcoin]
 network = "testnet"
+[deployment]
+stack_role = "proof"
 
 [electrum]
 endpoint = "{electrum_endpoint}"
