@@ -25,7 +25,9 @@ use serde_json::json;
 use crate::{
     domain::locks::parse_creator,
     http::error::ApiError,
-    manual_claim::{ManualClaimError, ManualClaimRequest, ManualClaimService},
+    manual_claim::{
+        ManualClaimError, ManualClaimRequest, ManualClaimService, validate_request_shape,
+    },
 };
 
 /// Rolling one-minute claim budget. Each claim performs a relay round-trip
@@ -162,6 +164,22 @@ struct ClaimBody {
 }
 
 async fn claim(State(state): State<AccountsState>, body: Json<ClaimBody>) -> Response {
+    let request = ManualClaimRequest {
+        auth_token: body.0.auth_token,
+        account_xpub: body.0.account_xpub,
+        account_index: body.0.account_index,
+        claim_channel: body.0.claim_channel,
+        allocation_mode: body.0.allocation_mode,
+    };
+    // Gate order (W1.13 r3 P2): pure request-shape validation runs BEFORE
+    // the rate-limit charge, so unauthenticated garbage (an unknown
+    // `claim_channel`, a `pasted_auto` request) never consumes claim
+    // capacity. Every I/O-bearing check — token verification, the
+    // claim-time scan, persistence — stays behind the limit inside
+    // `service.claim`, which re-runs the shape check as its first gate.
+    if let Err(error) = validate_request_shape(&request) {
+        return claim_error(error);
+    }
     let permitted = state
         .claim_limiter
         .lock()
@@ -170,13 +188,6 @@ async fn claim(State(state): State<AccountsState>, body: Json<ClaimBody>) -> Res
     if !permitted {
         return ApiError::RateLimited.into_response();
     }
-    let request = ManualClaimRequest {
-        auth_token: body.0.auth_token,
-        account_xpub: body.0.account_xpub,
-        account_index: body.0.account_index,
-        claim_channel: body.0.claim_channel,
-        allocation_mode: body.0.allocation_mode,
-    };
     match state.service.claim(request).await {
         Ok(outcome) => (
             StatusCode::OK,
