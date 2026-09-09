@@ -85,6 +85,13 @@ const OFFER_AVAILABILITY_HYSTERESIS: u8 = 3;
 /// Bitcoin's own MAX_FUTURE_BLOCK_TIME rule: the peer's clock cannot be
 /// trusted, so the tip proves nothing about endpoint freshness.
 const MAX_FUTURE_TIP_TIME: Duration = Duration::from_secs(2 * 60 * 60);
+/// Tip-height regression tolerated before readiness fails closed. A
+/// depth-1 reorg returns an equal height, but reconnecting to a
+/// pool-balanced Electrum endpoint whose backend trails by a block or two
+/// is routine: a regression within this window is degraded (HTTP 200, the
+/// Bitcoin offer folds out via the component gate), and only a regression
+/// beyond it is not_ready (HTTP 503).
+const REORG_TOLERANCE_BLOCKS: u32 = 6;
 
 /// Cross-probe chain-tip progress: the highest tip height any successful
 /// probe has returned, and when the height last advanced. A peer-attested
@@ -101,12 +108,15 @@ pub(crate) struct TipProgress {
 pub(crate) enum ProbeVerdict {
     Available,
     /// 200-degraded: the probe itself is older than the freshness window,
-    /// the endpoint's genesis did not match, or the tip time is more than
-    /// two hours in the future.
+    /// the endpoint's genesis did not match, the tip time is more than
+    /// two hours in the future, or the tip height regressed by at most
+    /// [`REORG_TOLERANCE_BLOCKS`] (a trailing backend of a pool-balanced
+    /// endpoint, which recovers on its own).
     Degraded,
-    /// 503 not-ready: the tip is stale, the tip height regressed, or the
-    /// tip height stopped advancing — the endpoint's chain view cannot be
-    /// trusted, so a load balancer or pager must see the failure.
+    /// 503 not-ready: the tip is stale, the tip height regressed by more
+    /// than [`REORG_TOLERANCE_BLOCKS`], or the tip height stopped
+    /// advancing — the endpoint's chain view cannot be trusted, so a load
+    /// balancer or pager must see the failure.
     NotReady,
 }
 
@@ -179,12 +189,21 @@ impl ElectrumProbe {
         // The height and age checks apply together and are skipped together
         // where the tip-age check is skipped (regtest, whose tips are mined
         // on demand). The peer-attested tip is otherwise trusted only when
-        // it is fresh, non-decreasing, and still advancing.
+        // it is fresh, non-decreasing beyond the reorg tolerance, and still
+        // advancing.
         if let Some(max_tip_age) = max_tip_age {
             if let (Some(height), Some(max_height)) = (self.tip_height, progress.max_tip_height)
                 && height < max_height
             {
-                return ProbeVerdict::NotReady;
+                // A small regression is a trailing backend behind a
+                // pool-balanced endpoint, not a lying peer: degrade instead
+                // of failing the whole fleet closed. Beyond the tolerance
+                // the chain view cannot be trusted.
+                return if max_height - height <= REORG_TOLERANCE_BLOCKS {
+                    ProbeVerdict::Degraded
+                } else {
+                    ProbeVerdict::NotReady
+                };
             }
             if let Some(last_advance_at) = progress.last_tip_advance_at
                 && last_advance_at.elapsed() > max_tip_age

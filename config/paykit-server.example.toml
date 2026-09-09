@@ -79,12 +79,15 @@ max_requests_per_second = 5
 # docs/observation-overrun-recovery.md for the manual clear path.
 # overrun_lane_interval_ticks = 10
 # Readiness also requires a trustworthy chain tip: a probed tip older than
-# max_tip_age, a tip-height regression, or a tip height that stops
-# advancing within this window marks Electrum not_ready on /health/ready
-# (HTTP 503), so a load balancer or pager sees the failure. Only a probe
-# older than the freshness window (or a tip time over two hours in the
-# future) stays at HTTP 200 degraded. Ignored on regtest, whose tips are
-# mined on demand and can be arbitrarily old without indicating endpoint
+# max_tip_age, a tip-height regression beyond the six-block reorg
+# tolerance, or a tip height that stops advancing within this window marks
+# Electrum not_ready on /health/ready (HTTP 503), so a load balancer or
+# pager sees the failure. A probe older than the freshness window, a tip
+# time over two hours in the future, or a regression within the tolerance
+# (a trailing backend of a pool-balanced endpoint) stays at HTTP 200
+# degraded. A regression beyond the tolerance is 503 until the chain
+# exceeds the previous maximum. Ignored on regtest, whose tips are mined
+# on demand and can be arbitrarily old without indicating endpoint
 # trouble.
 # max_tip_age = "4h"
 

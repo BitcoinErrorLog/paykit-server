@@ -199,27 +199,78 @@ async fn a_stale_tip_fails_readiness_closed_with_http_503() {
 }
 
 #[tokio::test]
-async fn a_tip_height_regression_fails_readiness_closed_until_the_tip_recovers() {
+async fn a_tip_height_regression_within_the_reorg_tolerance_is_degraded_not_503() {
     let runtime = runtime(true, 1);
     runtime.set_electrum_available(true);
     runtime.set_paykit_delivery_available(true);
     runtime.set_outbox_available(true);
-    runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
+    for _ in 0..3 {
+        runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
+    }
+    let report = runtime.readiness().await;
+    assert_eq!(report.status, ComponentState::Ready);
+    assert!(report.bitcoin_offer_available);
+
+    // A one-block-lagging backend of a pool-balanced endpoint is a
+    // degraded (HTTP 200) condition, not a fleet-wide 503.
+    for lagging_height in [799_999, 799_994] {
+        runtime.record_electrum_probe(ElectrumProbe::success(lagging_height, fresh_tip_time()));
+        let report = runtime.readiness().await;
+        assert!(!report.electrum_probe.available);
+        assert_eq!(report.electrum, ComponentState::Degraded);
+        assert_eq!(report.status, ComponentState::Degraded);
+        assert!(!report.bitcoin_offer_available);
+    }
+    let app = operational_router(Router::new(), runtime.clone());
+    let ready = app
+        .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+
+    // The tip catches back up to the previous maximum: readiness recovers.
+    for _ in 0..3 {
+        runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
+    }
+    let report = runtime.readiness().await;
+    assert_eq!(report.status, ComponentState::Ready);
+    assert!(report.bitcoin_offer_available);
+}
+
+#[tokio::test]
+async fn a_tip_height_regression_beyond_the_reorg_tolerance_fails_closed_until_recovery() {
+    let runtime = runtime(true, 1);
+    runtime.set_electrum_available(true);
+    runtime.set_paykit_delivery_available(true);
+    runtime.set_outbox_available(true);
+    for _ in 0..3 {
+        runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
+    }
     assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
 
-    // A lower tip than any earlier probe is a peer-attested impossibility.
-    runtime.record_electrum_probe(ElectrumProbe::success(799_999, fresh_tip_time()));
+    // Seven blocks below the observed maximum exceeds the reorg tolerance:
+    // the endpoint's chain view cannot be trusted, so readiness fails
+    // closed (503) until the chain exceeds the previous maximum.
+    runtime.record_electrum_probe(ElectrumProbe::success(799_993, fresh_tip_time()));
     let report = runtime.readiness().await;
     assert!(!report.electrum_probe.available);
     assert_eq!(report.electrum, ComponentState::NotReady);
     assert_eq!(report.status, ComponentState::NotReady);
     assert!(!report.bitcoin_offer_available);
+    let app = operational_router(Router::new(), runtime.clone());
+    let ready = app
+        .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-    // The regression stays visible while the tip remains below the
-    // previously observed maximum.
-    runtime.record_electrum_probe(ElectrumProbe::success(799_999, fresh_tip_time()));
+    // The regression stays visible while the tip remains beyond the
+    // tolerance below the previously observed maximum.
+    runtime.record_electrum_probe(ElectrumProbe::success(799_993, fresh_tip_time()));
     assert_eq!(runtime.readiness().await.electrum, ComponentState::NotReady);
-    runtime.record_electrum_probe(ElectrumProbe::success(800_001, fresh_tip_time()));
+    for _ in 0..3 {
+        runtime.record_electrum_probe(ElectrumProbe::success(800_001, fresh_tip_time()));
+    }
     assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
 }
 
