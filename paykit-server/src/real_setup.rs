@@ -17,8 +17,9 @@ use crate::{
     application::create_invoice::derive_bip84_p2wpkh_address,
     bitkit_claim::{ClaimError, WatchOnlyAccountClaim},
     bitkit_setup::{BitkitAuthStarter, StartedBitkitAuth},
-    config::BitcoinNetwork,
+    config::{BitcoinNetwork, StackRole},
     domain::locks::parse_creator,
+    key_identity::{MAX_CLAIMABLE_ACCOUNT_INDEX, canonical_key_tail, is_deny_listed},
     persistence::{CreatorCredentials, CreatorStore},
     setup::{Completion, SetupAttempt, SetupCompleter, StartedSetup},
     setup_orchestration::{CompanionRelay, receive_verify_commit},
@@ -100,6 +101,7 @@ pub struct RealSetupCompleter {
     marker_publisher: Arc<dyn MarkerPublisher>,
     creators: CreatorStore,
     bitcoin_network: BitcoinNetwork,
+    stack_role: StackRole,
     receiver_path: PaykitReceiverPath,
     marker_capabilities: PaykitReceiverCapabilities,
     relay_deadline: Duration,
@@ -111,6 +113,7 @@ impl RealSetupCompleter {
         relay: Arc<dyn CompanionRelay>,
         creators: CreatorStore,
         bitcoin_network: BitcoinNetwork,
+        stack_role: StackRole,
         receiver_path: PaykitReceiverPath,
     ) -> Self {
         Self::with_marker_publisher(
@@ -119,6 +122,7 @@ impl RealSetupCompleter {
             Arc::new(DirectMarkerPublisher),
             creators,
             bitcoin_network,
+            stack_role,
             receiver_path,
         )
     }
@@ -129,6 +133,7 @@ impl RealSetupCompleter {
         marker_publisher: Arc<dyn MarkerPublisher>,
         creators: CreatorStore,
         bitcoin_network: BitcoinNetwork,
+        stack_role: StackRole,
         receiver_path: PaykitReceiverPath,
     ) -> Self {
         Self {
@@ -137,6 +142,7 @@ impl RealSetupCompleter {
             marker_publisher,
             creators,
             bitcoin_network,
+            stack_role,
             receiver_path,
             marker_capabilities: default_marker_capabilities(),
             relay_deadline: Duration::from_secs(30),
@@ -207,6 +213,7 @@ impl SetupCompleter for RealSetupCompleter {
             creators: self.creators.clone(),
             marker_publisher: self.marker_publisher.clone(),
             bitcoin_network: self.bitcoin_network.clone(),
+            stack_role: self.stack_role,
             receiver_path: self.receiver_path.clone(),
             marker_capabilities: self.marker_capabilities,
             // The companion flow performs no claim-time history scan (§B.5
@@ -245,6 +252,7 @@ pub(crate) struct CreatorSetupCommit {
     pub(crate) creators: CreatorStore,
     pub(crate) marker_publisher: Arc<dyn MarkerPublisher>,
     pub(crate) bitcoin_network: BitcoinNetwork,
+    pub(crate) stack_role: StackRole,
     pub(crate) receiver_path: PaykitReceiverPath,
     pub(crate) marker_capabilities: PaykitReceiverCapabilities,
     /// Claim-scan start index (design §B.5) applied to the creator's
@@ -271,7 +279,16 @@ impl CreatorSetupCommit {
             &claim.serialized_xpub,
             claim.account_index,
             &self.bitcoin_network,
+            self.stack_role,
         )?;
+        // The canonical 65-byte tail (chain code + public key, version-byte
+        // independent) the fingerprint-to-seller binding keys on; it is
+        // written in the same transaction as the claim commit below.
+        let key_tail = canonical_key_tail(
+            &Xpub::decode(&claim.serialized_xpub)
+                .map_err(|_| ClaimError::InvalidPayload)?
+                .encode(),
+        );
         let setup_lock = self
             .creators
             .acquire_setup_lock(&self.creator)
@@ -308,10 +325,10 @@ impl CreatorSetupCommit {
                 claim.account_index,
             );
             let persistence = match existing {
-                Some(_) => self.creators.reauthenticate(&credentials).await,
+                Some(_) => self.creators.reauthenticate(&credentials, &key_tail).await,
                 None => self
                     .creators
-                    .create(&credentials, &StorageState::default())
+                    .create(&credentials, &StorageState::default(), &key_tail)
                     .await
                     .map(|_| ()),
             };
@@ -330,6 +347,9 @@ impl CreatorSetupCommit {
                 return Err(match error {
                     crate::persistence::PersistenceError::ReauthenticationMismatch => {
                         ClaimError::AccountMismatch
+                    }
+                    crate::persistence::PersistenceError::KeyClaimedByOtherSeller => {
+                        ClaimError::KeyClaimedByOtherSeller
                     }
                     _ => ClaimError::InvalidEnvelope,
                 });
@@ -373,15 +393,35 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
 /// Validates the exact 78-byte BIP32 account xpub bytes and returns bitcoin's
 /// canonical Base58 rendering. Mainnet uses xpub version bytes; testnet,
 /// signet, and regtest use tpub version bytes.
+///
+/// Gate order (design B.6, claim-path ordering): parse the 78 bytes, then the
+/// depth-3/hardened-child-number cross-check (inside the first-address
+/// derivation), then the bounded account range `0..=99` (both roles — r4
+/// reversed r3's refusal of account 0), then the deny-list on canonical key
+/// data, which every stack whose role is not `proof` enforces.
 pub fn validate_xpub(
     serialized_xpub: &[u8; 78],
     account_index: u32,
     configured_network: &BitcoinNetwork,
+    stack_role: StackRole,
 ) -> Result<String, ClaimError> {
     let xpub = Xpub::decode(serialized_xpub).map_err(|_| ClaimError::InvalidPayload)?;
     let canonical = xpub.to_string();
-    derive_bip84_p2wpkh_address(&canonical, account_index, configured_network, 0)
-        .map_err(|_| ClaimError::InvalidPayload)?;
+    let first_address =
+        derive_bip84_p2wpkh_address(&canonical, account_index, configured_network, 0)
+            .map_err(|_| ClaimError::InvalidPayload)?;
+    if account_index > MAX_CLAIMABLE_ACCOUNT_INDEX {
+        return Err(ClaimError::AccountIndexOutOfRange);
+    }
+    // Deny on the canonical 65-byte tail (chain code + public key), never on
+    // the submitted string: the xpub and zpub encodings of one key normalize
+    // to identical bytes, so one entry catches both. The derived first
+    // address is checked as belt-and-braces.
+    if stack_role != StackRole::Proof
+        && is_deny_listed(&canonical_key_tail(&xpub.encode()), &first_address)
+    {
+        return Err(ClaimError::KeyDenyListed);
+    }
     Ok(canonical)
 }
 

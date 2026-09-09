@@ -72,6 +72,18 @@ pub enum ClaimError {
     /// claim is refused instead of replaced.
     #[error("claimed account does not match the persisted account")]
     AccountMismatch,
+    /// The account index is outside the bounded claimable range 0..=99
+    /// (design B.6 r4: the bound is what keeps the deny-list enumerable).
+    #[error("account index is outside the claimable range 0..=99")]
+    AccountIndexOutOfRange,
+    /// The canonical key material is a known-public test-vector key. Refused
+    /// on every stack whose role is not `proof` (design B.6).
+    #[error("account key material is deny-listed")]
+    KeyDenyListed,
+    /// The canonical key tail was already claimed by a different creator on
+    /// this stack, whether or not that claim is still active (design B.8.5).
+    #[error("account key material is claimed by a different creator")]
+    KeyClaimedByOtherSeller,
 }
 
 pub fn required_capabilities(receiver_path: &PaykitReceiverPath) -> String {

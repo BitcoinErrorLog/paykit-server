@@ -171,6 +171,9 @@ async fn claim(State(state): State<AccountsState>, body: Json<ClaimBody>) -> Res
                 "creator": outcome.creator,
                 "account_index": outcome.account_index,
                 "next_child_index": outcome.next_child_index,
+                "key_fingerprint": outcome.key_fingerprint,
+                "first_derived_address": outcome.first_derived_address,
+                "stack_id": outcome.stack_id,
             })),
         )
             .into_response(),
@@ -194,6 +197,21 @@ fn claim_error(error: ManualClaimError) -> Response {
             StatusCode::BAD_REQUEST,
             "invalid_xpub",
             "account xpub is not a valid BIP84 account key for this network and index",
+        ),
+        ManualClaimError::AccountIndexOutOfRange => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "account_index_out_of_range",
+            "account index is outside the claimable range 0..=99",
+        ),
+        ManualClaimError::KeyDenyListed => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "key_deny_listed",
+            "account key material is a known-public test-vector key and cannot be claimed",
+        ),
+        ManualClaimError::KeyClaimedByOtherSeller => (
+            StatusCode::CONFLICT,
+            "key_claimed_by_other_seller",
+            "this watch-only key material is claimed by a different seller on this stack",
         ),
         ManualClaimError::AccountMismatch => (
             StatusCode::CONFLICT,

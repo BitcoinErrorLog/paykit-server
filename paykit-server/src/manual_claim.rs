@@ -30,10 +30,12 @@ use rand::{TryRngCore, rngs::OsRng};
 use url::Url;
 
 use crate::{
+    application::create_invoice::derive_bip84_p2wpkh_address,
     bitkit_claim::{ClaimError, WatchOnlyAccountClaim, required_capabilities},
     chain_history::{ChainHistoryPort, ClaimScanError, scan_claim_start_index},
-    config::BitcoinNetwork,
+    config::{BitcoinNetwork, StackRole},
     domain::locks::{CreatorPubky, parse_creator},
+    key_identity::{canonical_key_tail, key_fingerprint},
     persistence::CreatorStore,
     real_setup::{CreatorSetupCommit, MarkerPublisher, validate_xpub},
 };
@@ -68,6 +70,16 @@ pub struct ManualClaimOutcome {
     /// (design §B.5/§B.6): the child index the next invoice address derives
     /// from.
     pub next_child_index: i64,
+    /// Hex of the first 8 bytes of SHA-256 over the canonical 78-byte key
+    /// serialization; the client recomputes it locally and refuses to enable
+    /// Bitcoin on mismatch (design §B.6).
+    pub key_fingerprint: String,
+    /// The account's derived address at the returned `next_child_index`, on
+    /// this stack's network (design §B.6).
+    pub first_derived_address: String,
+    /// This stack's identity, `{stack_role}:{instance_uuid}` (the
+    /// `stack_id` contract).
+    pub stack_id: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +93,15 @@ pub enum ManualClaimError {
     /// The xpub is not a valid BIP84 account key for the configured network
     /// and account index.
     InvalidXpub,
+    /// The account index is outside the bounded claimable range 0..=99
+    /// (design §B.6 r4).
+    AccountIndexOutOfRange,
+    /// The canonical key material is a known-public test-vector key; refused
+    /// on every stack whose role is not `proof` (design §B.6).
+    KeyDenyListed,
+    /// The canonical key tail was ever claimed by a different creator on
+    /// this stack, whether or not that claim is still active (design §B.8.5).
+    KeyClaimedByOtherSeller,
     /// A different account is already persisted for this creator.
     AccountMismatch,
     /// The claim-time history scan could not reach Electrum (connect,
@@ -167,26 +188,60 @@ impl SessionMinter for RelayLoopbackSessionMinter {
     }
 }
 
+/// Read-only fingerprint↔seller pre-check seam (design §B.8.5). The
+/// authoritative check is the binding write inside the claim-commit
+/// transaction; this lookup runs before the chain scan so a refused claim
+/// never reaches Electrum. Production uses the real [`CreatorStore`]; unit
+/// tests script it.
+#[async_trait::async_trait]
+pub trait ClaimedKeyLookup: Send + Sync {
+    async fn key_tail_claimed_by_other(
+        &self,
+        key_tail: &[u8; 65],
+        creator: &CreatorPubky,
+    ) -> Result<bool, ManualClaimError>;
+}
+
+#[async_trait::async_trait]
+impl ClaimedKeyLookup for CreatorStore {
+    async fn key_tail_claimed_by_other(
+        &self,
+        key_tail: &[u8; 65],
+        creator: &CreatorPubky,
+    ) -> Result<bool, ManualClaimError> {
+        CreatorStore::key_tail_claimed_by_other(self, key_tail, creator)
+            .await
+            .map_err(|_| ManualClaimError::Unavailable)
+    }
+}
+
 /// Application service behind `POST /v0/accounts/claim`.
 pub struct ManualClaimService {
     pubky: Pubky,
     minter: Arc<dyn SessionMinter>,
     creators: CreatorStore,
+    claimed_keys: Arc<dyn ClaimedKeyLookup>,
     marker_publisher: Arc<dyn MarkerPublisher>,
     history: Arc<dyn ChainHistoryPort>,
     bitcoin_network: BitcoinNetwork,
+    stack_role: StackRole,
+    stack_id: String,
     receiver_path: PaykitReceiverPath,
     required_capabilities: String,
 }
 
 impl ManualClaimService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pubky: Pubky,
         minter: Arc<dyn SessionMinter>,
         creators: CreatorStore,
+        claimed_keys: Arc<dyn ClaimedKeyLookup>,
         marker_publisher: Arc<dyn MarkerPublisher>,
         history: Arc<dyn ChainHistoryPort>,
         bitcoin_network: BitcoinNetwork,
+        stack_role: StackRole,
+        stack_id: String,
         receiver_path: PaykitReceiverPath,
     ) -> Self {
         let required_capabilities = required_capabilities(&receiver_path);
@@ -194,9 +249,12 @@ impl ManualClaimService {
             pubky,
             minter,
             creators,
+            claimed_keys,
             marker_publisher,
             history,
             bitcoin_network,
+            stack_role,
+            stack_id,
             receiver_path,
             required_capabilities,
         }
@@ -221,11 +279,33 @@ impl ManualClaimService {
         if token.capabilities().to_string() != self.required_capabilities {
             return Err(ManualClaimError::InvalidCapabilities);
         }
+        // Claim gate order (design §B.6): xpub parse → depth/child-number
+        // cross-check → bounded account range → deny-list (role-gated) →
+        // fingerprint↔seller check → chain scan → session mint/persist.
+        // Every gate before the scan refuses without touching Electrum.
         let claim = validate_claimed_account(
             &request.account_xpub,
             request.account_index,
             &self.bitcoin_network,
+            self.stack_role,
         )?;
+
+        // Fingerprint↔seller pre-check (design §B.8.5). The claiming creator
+        // is the verified token's signer — the session minted below is
+        // required to match it — so a refused claim never reaches Electrum.
+        // The authoritative check is the binding write inside the
+        // claim-commit transaction, which the primary key serializes.
+        let key_tail = canonical_key_tail(&claim.serialized_xpub);
+        let token_creator: CreatorPubky =
+            parse_creator(&PubkyPublicKey::from_public_key(token.public_key()).to_app_key())
+                .map_err(|_| ManualClaimError::InvalidToken)?;
+        if self
+            .claimed_keys
+            .key_tail_claimed_by_other(&key_tail, &token_creator)
+            .await?
+        {
+            return Err(ManualClaimError::KeyClaimedByOtherSeller);
+        }
 
         // Claim-time address-index scan (design §B.5): derive the account's
         // external chain in windows of 20 until a fully empty window, bounded
@@ -284,22 +364,37 @@ impl ManualClaimService {
             creators: self.creators.clone(),
             marker_publisher: self.marker_publisher.clone(),
             bitcoin_network: self.bitcoin_network.clone(),
+            stack_role: self.stack_role,
             receiver_path: self.receiver_path.clone(),
             marker_capabilities: CreatorSetupCommit::marker_capabilities(),
             next_child_index_floor: Some(i64::from(start_index)),
         };
+        let key_fingerprint = key_fingerprint(&claim.serialized_xpub);
         let next_child_index = commit
             .publish_readback_and_commit_reporting(claim)
             .await
             .map_err(|error| match error {
                 ClaimError::AccountMismatch => ManualClaimError::AccountMismatch,
+                ClaimError::KeyClaimedByOtherSeller => ManualClaimError::KeyClaimedByOtherSeller,
                 _ => ManualClaimError::Unavailable,
             })?
             .unwrap_or(i64::from(start_index));
+        // The address at the returned cursor: derived with the same function
+        // invoice addresses use, on this stack's network (design §B.6).
+        let first_derived_address = derive_bip84_p2wpkh_address(
+            &canonical_xpub,
+            request.account_index,
+            &self.bitcoin_network,
+            next_child_index,
+        )
+        .map_err(|_| ManualClaimError::Unavailable)?;
         Ok(ManualClaimOutcome {
             creator: creator.to_string(),
             account_index: request.account_index,
             next_child_index,
+            key_fingerprint,
+            first_derived_address,
+            stack_id: self.stack_id.clone(),
         })
     }
 
@@ -316,16 +411,25 @@ impl ManualClaimService {
 
 /// Parses the base58 account xpub, then reuses the companion flow's exact
 /// validation (network kind, depth 3, hardened child number equal to the
-/// account index, derivable external chain).
+/// account index, bounded account range, role-gated deny-list, derivable
+/// external chain). The named range and deny-list refusals pass through; a
+/// client presenting zpub form is rejected here — zpub→xpub normalization is
+/// the client's job (SLIP-132 version-byte rewrite before POST, design §B.6).
 fn validate_claimed_account(
     account_xpub: &str,
     account_index: u32,
     network: &BitcoinNetwork,
+    stack_role: StackRole,
 ) -> Result<WatchOnlyAccountClaim, ManualClaimError> {
     let xpub = Xpub::from_str(account_xpub).map_err(|_| ManualClaimError::InvalidXpub)?;
     let serialized_xpub = xpub.encode();
-    validate_xpub(&serialized_xpub, account_index, network)
-        .map_err(|_| ManualClaimError::InvalidXpub)?;
+    validate_xpub(&serialized_xpub, account_index, network, stack_role).map_err(
+        |error| match error {
+            ClaimError::AccountIndexOutOfRange => ManualClaimError::AccountIndexOutOfRange,
+            ClaimError::KeyDenyListed => ManualClaimError::KeyDenyListed,
+            _ => ManualClaimError::InvalidXpub,
+        },
+    )?;
     Ok(WatchOnlyAccountClaim {
         account_index,
         serialized_xpub,
@@ -359,8 +463,13 @@ mod tests {
 
     #[test]
     fn accepts_a_network_correct_account_xpub_at_its_hardened_index() {
-        let claim = validate_claimed_account(&regtest_account_tpub(3), 3, &BitcoinNetwork::Regtest)
-            .unwrap();
+        let claim = validate_claimed_account(
+            &regtest_account_tpub(3),
+            3,
+            &BitcoinNetwork::Regtest,
+            StackRole::Proof,
+        )
+        .unwrap();
         assert_eq!(claim.account_index, 3);
         assert_eq!(
             Xpub::decode(&claim.serialized_xpub).unwrap().to_string(),
@@ -371,15 +480,25 @@ mod tests {
     #[test]
     fn rejects_wrong_network_wrong_index_and_garbage() {
         assert_eq!(
-            validate_claimed_account(&regtest_account_tpub(0), 0, &BitcoinNetwork::Mainnet),
+            validate_claimed_account(
+                &regtest_account_tpub(0),
+                0,
+                &BitcoinNetwork::Mainnet,
+                StackRole::Proof
+            ),
             Err(ManualClaimError::InvalidXpub)
         );
         assert_eq!(
-            validate_claimed_account(&regtest_account_tpub(0), 1, &BitcoinNetwork::Regtest),
+            validate_claimed_account(
+                &regtest_account_tpub(0),
+                1,
+                &BitcoinNetwork::Regtest,
+                StackRole::Proof
+            ),
             Err(ManualClaimError::InvalidXpub)
         );
         assert_eq!(
-            validate_claimed_account("not-an-xpub", 0, &BitcoinNetwork::Regtest),
+            validate_claimed_account("not-an-xpub", 0, &BitcoinNetwork::Regtest, StackRole::Proof),
             Err(ManualClaimError::InvalidXpub)
         );
     }
