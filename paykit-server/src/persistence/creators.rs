@@ -218,11 +218,14 @@ impl CreatorStore {
         Ok(CreatorSetupLock { connection, key })
     }
 
-    /// Inserts a creator and its initial full SDK state atomically.
+    /// Inserts a creator and its initial full SDK state atomically, binding
+    /// the claim's canonical key tail to this creator in the same
+    /// transaction (design B.8.5).
     pub async fn create(
         &self,
         credentials: &CreatorCredentials,
         state: &StorageState,
+        key_tail: &[u8; 65],
     ) -> Result<PersistedCreator, PersistenceError> {
         let lookup_hash = self
             .crypto
@@ -243,6 +246,7 @@ impl CreatorStore {
             .begin()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
+        self.bind_key_tail(&mut tx, key_tail, &lookup_hash).await?;
         sqlx::query("INSERT INTO creators (id, creator_lookup_hash, credential_envelope) VALUES ($1, $2, $3)")
             .bind(id).bind(lookup_hash.as_bytes().as_slice()).bind(credential_envelope.as_bytes()).execute(&mut *tx).await.map_err(|_| PersistenceError::Unavailable)?;
         sqlx::query("INSERT INTO sdk_states (creator_id, state_envelope) VALUES ($1, $2)")
@@ -255,6 +259,62 @@ impl CreatorStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         Ok(PersistedCreator { id, lookup_hash })
+    }
+
+    /// Whether the canonical key tail was ever claimed by a creator other
+    /// than `creator` on this stack. This is the claim handler's read-only
+    /// pre-check so a refused claim never reaches Electrum; the authoritative
+    /// check is the binding write inside the claim-commit transaction, which
+    /// the primary key serializes under concurrency.
+    pub async fn key_tail_claimed_by_other(
+        &self,
+        key_tail: &[u8; 65],
+        creator: &CreatorPubky,
+    ) -> Result<bool, PersistenceError> {
+        let hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        let claimed_by: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT creator_lookup_hash FROM claimed_key_fingerprints WHERE key_tail = $1",
+        )
+        .bind(key_tail.as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(claimed_by.is_some_and(|claimed| claimed != hash.as_bytes()))
+    }
+
+    /// Writes the never-expiring fingerprint-to-seller binding inside the
+    /// caller's claim-commit transaction. `ON CONFLICT DO NOTHING` blocks on
+    /// a concurrent uncommitted claim of the same tail until it commits, so
+    /// exactly one of two racing first claims wins; the loser (and any later
+    /// claim by a different creator, active or not) is refused with
+    /// [`PersistenceError::KeyClaimedByOtherSeller`], rolling the whole claim
+    /// commit back. A re-claim by the same creator is unaffected.
+    async fn bind_key_tail(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        key_tail: &[u8; 65],
+        lookup_hash: &LookupHash,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query(
+            "INSERT INTO claimed_key_fingerprints (key_tail, creator_lookup_hash) \
+             VALUES ($1, $2) ON CONFLICT (key_tail) DO NOTHING",
+        )
+        .bind(key_tail.as_slice())
+        .bind(lookup_hash.as_bytes().as_slice())
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let claimed_by: Vec<u8> = sqlx::query_scalar(
+            "SELECT creator_lookup_hash FROM claimed_key_fingerprints WHERE key_tail = $1",
+        )
+        .bind(key_tail.as_slice())
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if claimed_by != lookup_hash.as_bytes() {
+            return Err(PersistenceError::KeyClaimedByOtherSeller);
+        }
+        Ok(())
     }
 
     /// Loads and authenticates a creator credential envelope by canonical creator identity.
@@ -300,9 +360,13 @@ impl CreatorStore {
     }
 
     /// Replaces only the Pubky session secret after proving immutable account identity matches.
+    /// The claim's canonical key tail is bound to this creator in the same
+    /// transaction: a re-claim by the same creator is unaffected, and a tail
+    /// ever claimed by a different creator is refused (design B.8.5).
     pub async fn reauthenticate(
         &self,
         replacement: &CreatorCredentials,
+        key_tail: &[u8; 65],
     ) -> Result<(), PersistenceError> {
         let hash = self
             .crypto
@@ -319,6 +383,7 @@ impl CreatorStore {
         {
             return Err(PersistenceError::ReauthenticationMismatch);
         }
+        self.bind_key_tail(&mut tx, key_tail, &hash).await?;
         let updated = CreatorCredentials::from_secret_parts(
             existing.creator,
             replacement.session_secret.clone(),

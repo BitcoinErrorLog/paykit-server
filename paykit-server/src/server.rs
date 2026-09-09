@@ -944,7 +944,8 @@ poll_interval = "1s"
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://127.0.0.1:1/paykit")
             .unwrap();
-        let server = Server::build(config, pool).await.unwrap();
+        let stack_identity = StackIdentity::new(crate::config::StackRole::Proof, Uuid::new_v4());
+        let server = Server::build(config, pool, stack_identity).await.unwrap();
         let installed = server.runtime.electrum_request_limiter();
         assert_eq!(
             installed.available(),
