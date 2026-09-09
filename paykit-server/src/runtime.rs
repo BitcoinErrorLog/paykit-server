@@ -96,7 +96,9 @@ const REORG_TOLERANCE_BLOCKS: u32 = 6;
 /// Cross-probe chain-tip progress: the highest tip height any successful
 /// probe has returned, and when the height last advanced. A peer-attested
 /// tip is only trustworthy when the height never regresses and keeps
-/// advancing within the accepted tip-age window.
+/// advancing within the accepted tip-age window. The progress is
+/// per-process: a regression that straddles a restart is undetectable,
+/// because the previous maximum is lost with the process.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TipProgress {
     max_tip_height: Option<u32>,

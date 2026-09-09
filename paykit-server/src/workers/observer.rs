@@ -350,11 +350,14 @@ pub fn select_within_budget(
 /// target absorbs its own cost instead of smearing it across the batch.
 ///
 /// Each share is `max(1, ceil(total × est_i / Σ est_j))`; the remainder
-/// after summing the shares (negative when the ceiling overshoots) is
-/// assigned to the largest-estimate target, so the shares sum to `total`
-/// exactly whenever `total` is at least the target count. That always
-/// holds for a real Electrum sync, which costs at least one history
-/// request per script.
+/// after summing the shares is assigned to the largest-estimate target.
+/// The guaranteed properties are: every share is at least 1, and the
+/// shares sum to at least `total`. The sum equals `total` exactly when
+/// every proportional share is at least 1 before clamping; otherwise the
+/// `.max(1)` floor re-inflates the sum after a negative remainder (for
+/// example `attribute_request_count(4, &[1, 2, 3, 4])` yields
+/// `[1, 1, 2, 1]`, summing to 5), so the total can be over-attributed by
+/// at most the target count.
 pub fn attribute_request_count(total: u64, estimates: &[u64]) -> Vec<u64> {
     if estimates.is_empty() {
         return Vec::new();
@@ -427,6 +430,27 @@ impl ObserverBackoff {
         BACKOFF_INITIAL
             .saturating_mul(1_u32 << shift)
             .min(BACKOFF_MAX)
+    }
+
+    /// Folds one observer tick outcome into the backoff schedule: an
+    /// `Unavailable` probe or fetch records a failure; a successful tick
+    /// resets the schedule. A stamp miss also resets it: the tick reached
+    /// Electrum and committed the other records, so a persistent miss must
+    /// not hold the observer at the backoff cap after an outage recovered.
+    pub fn record_outcome(&mut self, outcome: &ObserverTickOutcome) {
+        match outcome {
+            ObserverTickOutcome::ProbeFailed(ObserverError::Unavailable)
+            | ObserverTickOutcome::ObservationFailed(ObserverError::Unavailable) => {
+                self.record_failure();
+            }
+            ObserverTickOutcome::Observed { .. }
+            | ObserverTickOutcome::ObservationFailed(ObserverError::ObservationStampMiss) => {
+                self.reset();
+            }
+            ObserverTickOutcome::ProbeFailed(_)
+            | ObserverTickOutcome::ObservationFailed(_)
+            | ObserverTickOutcome::PlanUnavailable => {}
+        }
     }
 }
 
@@ -661,7 +685,12 @@ pub async fn observe_tick(
         // left silent, the head would never rotate and the bypass would
         // re-sync the same target every tick with unbounded cost. The other
         // records were stamped; surface the miss as a named tick failure.
+        // The tick itself reached Electrum and committed the other records,
+        // so availability recovers and the loop's backoff resets: a
+        // persistent miss must not hold the observer at the backoff cap
+        // after an outage has already recovered.
         runtime.metrics().electrum_observation_stamp_misses(misses);
+        runtime.set_electrum_available(true);
         return ObserverTickOutcome::ObservationFailed(ObserverError::ObservationStampMiss);
     }
     runtime.set_electrum_available(true);
@@ -699,7 +728,7 @@ pub async fn observation_loop(
         if !runtime.may_start_worker_claim() {
             break;
         }
-        match observe_tick(
+        let outcome = observe_tick(
             port.as_ref(),
             backend.as_ref(),
             &network,
@@ -707,17 +736,8 @@ pub async fn observation_loop(
             &runtime,
             &mut overrun_lane,
         )
-        .await
-        {
-            ObserverTickOutcome::ProbeFailed(ObserverError::Unavailable)
-            | ObserverTickOutcome::ObservationFailed(ObserverError::Unavailable) => {
-                backoff.record_failure();
-            }
-            ObserverTickOutcome::Observed { .. } => backoff.reset(),
-            ObserverTickOutcome::ProbeFailed(_)
-            | ObserverTickOutcome::ObservationFailed(_)
-            | ObserverTickOutcome::PlanUnavailable => {}
-        }
+        .await;
+        backoff.record_outcome(&outcome);
     }
 }
 
@@ -1303,6 +1323,11 @@ mod tests {
         assert!(shares.iter().all(|share| *share >= 1));
         let shares = attribute_request_count(5, &[2, 1]);
         assert_eq!(shares, vec![3, 2]);
+        // The clamp floor re-inflates after a negative remainder: the sum
+        // exceeds the total while every share stays at least one.
+        let shares = attribute_request_count(4, &[1, 2, 3, 4]);
+        assert_eq!(shares, vec![1, 1, 2, 1]);
+        assert!(shares.iter().sum::<u64>() >= 4);
     }
 
     #[test]
@@ -1311,6 +1336,7 @@ mod tests {
         let shares = attribute_request_count(0, &[5, 1]);
         assert_eq!(shares.len(), 2);
         assert!(shares.iter().all(|share| *share >= 1));
+        assert_eq!(shares.iter().sum::<u64>(), 2);
     }
 
     #[test]

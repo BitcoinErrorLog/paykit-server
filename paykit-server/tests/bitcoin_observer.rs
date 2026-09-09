@@ -800,6 +800,47 @@ mod tick {
     }
 
     #[tokio::test]
+    async fn a_stamp_miss_recovers_availability_and_resets_the_backoff() {
+        // Backoff accumulated from an outage must not persist through a
+        // stamp miss: the tick reached Electrum and committed the other
+        // records, so availability recovers and the backoff resets.
+        let port = FakeElectrum::healthy().with_ghost_history("ghost");
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![FakeEntry::new("known", Some(0), 300)]),
+            applied: Mutex::new(Vec::new()),
+            marked_overrun: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+        let mut backoff = ObserverBackoff::new();
+        backoff.record_failure();
+        backoff.record_failure();
+        assert_eq!(backoff.delay(), Duration::from_secs(60));
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(100),
+            &runtime,
+            &mut closed_lane(),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::ObservationFailed(ObserverError::ObservationStampMiss)
+        );
+        backoff.record_outcome(&outcome);
+        assert!(!backoff.is_backing_off());
+        assert_eq!(backoff.delay(), Duration::ZERO);
+        let report = runtime.readiness().await;
+        assert_eq!(
+            report.electrum,
+            paykit_server::runtime::ComponentState::Ready,
+            "a stamp miss must not leave Electrum degraded after recovery"
+        );
+    }
+
+    #[tokio::test]
     async fn a_flagged_head_does_not_block_the_next_over_budget_target() {
         // Tick 1 flags the over-bound head. On tick 2 the bypass passes over
         // the flagged head and admits the second over-budget target instead
