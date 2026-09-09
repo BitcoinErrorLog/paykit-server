@@ -463,6 +463,23 @@ fn rejects_subsecond_persistence_lease_and_retry_durations() {
 }
 
 #[test]
+fn rejects_subsecond_max_age() {
+    let input = valid_toml().replace(
+        "poll_interval = \"5s\"",
+        "poll_interval = \"5s\"\nmax_age = \"999ms\"",
+    );
+    let error = Config::from_toml_and_environment(&input, environment()).unwrap_err();
+    assert!(matches!(
+        &error,
+        ConfigError::SubsecondPersistenceDuration("outbox.max_age")
+    ));
+    assert_eq!(
+        error.to_string(),
+        "outbox.max_age must be at least one second"
+    );
+}
+
+#[test]
 fn accepts_one_second_persistence_lease_and_retry_durations() {
     let input = valid_toml().replace(
         "poll_interval = \"5s\"",

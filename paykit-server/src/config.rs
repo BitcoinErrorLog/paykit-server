@@ -207,6 +207,7 @@ impl Config {
             ("outbox.lease_duration", self.outbox.lease_duration),
             ("outbox.retry_initial", self.outbox.retry_initial),
             ("outbox.retry_max", self.outbox.retry_max),
+            ("outbox.max_age", self.outbox.max_age),
         ] {
             if value < Duration::from_secs(1) {
                 return Err(ConfigError::SubsecondPersistenceDuration(name));

@@ -18,15 +18,15 @@ No part of this design claims exactly-once remote delivery.
 
 Retries are bounded two ways (`[outbox]` config, with floors `max_attempts >= 3` and `max_age >= max(1h, 3 * retry_max)`): `max_attempts` (default 50) caps claim attempts per row, and `max_age` (default 7d) caps row age from `created_at`; there is no emergency override, so operators clear rows through the existing requeue/ops path. When a claimed row reaches either ceiling, the same fenced statement that releases the lease transitions the row to `permanently_failed` with error class `retry_budget_exhausted` — atomically, so concurrent workers transition it exactly once. Each exhaustion raises one ERROR log naming the row id, the lane kind (`delivery` or `reconciliation`), and the attempt count (never payload contents), and increments `paykit_outbox_permanent_failures{kind}` exactly once.
 
-Health semantics: `permanently_failed` rows are terminal and never degrade `/health/ready`; `retryable` and `handed_off` rows degrade `paykit_delivery` only while still inside the budget (attempts below `max_attempts` and age below `max_age`), since an over-budget row is already converging on `permanently_failed` at its next fenced scheduling and must not pin the rail degraded. The count of retained `permanently_failed` rows is exposed as the informational `outbox_permanently_failed` field on `/health/ready` (and the `paykit_outbox_permanently_failed_rows` gauge); it never changes readiness status.
+Health semantics: `permanently_failed` rows are terminal and never degrade `/health/ready`; `retryable` and `handed_off` rows degrade `paykit_delivery` only while still inside the budget (attempts below `max_attempts` and age below `max_age`), since an over-budget row is already converging on `permanently_failed` at its next fenced scheduling and must not pin the rail degraded. The count of retained `permanently_failed` rows is exposed as the informational `outbox_permanently_failed` field on `/health/ready` (and the `paykit_outbox_permanently_failed_rows` gauge); it never changes readiness status, refreshes only on the enqueue tick, can lag reconciliation-only terminalisations until the next tick, and is 0 before the first tick.
 
 Operator requeue of a terminal row, when the underlying cause is fixed:
 
 ```sql
 UPDATE outbox
 SET status = 'queued', attempt_count = 0, error_class = NULL,
-    next_attempt_at = NOW(), updated_at = NOW()
+    next_attempt_at = NOW(), created_at = NOW(), updated_at = NOW()
 WHERE id = '<row-id>' AND status = 'permanently_failed';
 ```
 
-Requeuing resets the attempt counter so the row gets a fresh budget; without the reset it would be failed again at the next scheduling.
+Requeuing resets the attempt counter and creation time so the row gets a fresh attempt and age budget; without both resets it would be failed again at the next scheduling.

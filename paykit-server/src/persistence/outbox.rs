@@ -429,17 +429,16 @@ impl OutboxStore {
         let final_status = sqlx::query_scalar::<_, Option<String>>(
             "UPDATE outbox \
              SET status = CASE \
-                     WHEN attempt_count >= $4 OR created_at < NOW() - ($5 * INTERVAL '1 second') \
+                     WHEN attempt_count >= $3 OR created_at < NOW() - ($4 * INTERVAL '1 second') \
                      THEN 'permanently_failed' ELSE 'retryable' END, \
                  error_class = CASE \
-                     WHEN attempt_count >= $4 OR created_at < NOW() - ($5 * INTERVAL '1 second') \
-                     THEN 'retry_budget_exhausted' ELSE $2 END, \
-                 next_attempt_at = NOW() + ($3 * INTERVAL '1 second'), \
+                     WHEN attempt_count >= $3 OR created_at < NOW() - ($4 * INTERVAL '1 second') \
+                     THEN 'retry_budget_exhausted' ELSE $1 END, \
+                 next_attempt_at = NOW() + ($2 * INTERVAL '1 second'), \
                  lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = NOW() \
-             WHERE id = $6 AND status = 'leased' AND claim_token = $7 AND lease_expires_at > NOW() \
+             WHERE id = $5 AND status = 'leased' AND claim_token = $6 AND lease_expires_at > NOW() \
              RETURNING status",
         )
-        .bind("retryable")
         .bind(error_class.as_str())
         .bind(lease_seconds(delay)?)
         .bind(budget.max_attempts_i64())
