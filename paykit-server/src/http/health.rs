@@ -18,6 +18,7 @@ struct LiveResponse {
 #[derive(Serialize)]
 struct ReadyResponse {
     status: &'static str,
+    stack_id: String,
     postgres: &'static str,
     electrum: ElectrumResponse,
     bitcoin_creation_enabled: bool,
@@ -58,6 +59,7 @@ async fn ready(State(runtime): State<Arc<Runtime>>) -> impl IntoResponse {
     };
     let body = Json(ReadyResponse {
         status,
+        stack_id: report.stack_id,
         postgres: report.postgres.as_str(),
         electrum: ElectrumResponse {
             state: report.electrum.as_str(),

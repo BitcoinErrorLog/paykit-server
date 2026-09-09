@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use paykit_server::{
-    config::{Config, ConfigEnvironment},
+    config::{Config, ConfigEnvironment, StackRole},
     persistence::{DeploymentStore, PersistenceError},
     startup::{StartupError, initialize_database},
 };
@@ -224,4 +224,80 @@ async fn concurrent_first_boots_on_an_unset_role_adopt_exactly_once() {
     second.unwrap();
 
     database.cleanup().await;
+}
+
+#[tokio::test]
+async fn stack_identity_is_minted_once_and_byte_identical_across_reboots() {
+    let database = TestDatabase::create().await;
+    let configured = config(database.database_url(), "testnet", "proof");
+
+    // The first boot mints the single-row identity inside the
+    // deployment-adoption transaction.
+    let first = initialize_database(&configured).await.unwrap();
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stack_identity")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "exactly one identity row exists after first boot");
+    let stored: uuid::Uuid =
+        sqlx::query_scalar("SELECT instance_uuid FROM stack_identity WHERE singleton = TRUE")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored, first.stack_identity.instance_uuid());
+
+    // A second boot against the same database reads the same row back: the
+    // stack_id is byte-identical across restarts and never rewritten.
+    let second = initialize_database(&configured).await.unwrap();
+    assert_eq!(first.stack_identity, second.stack_identity);
+    assert_eq!(
+        first.stack_identity.stack_id(),
+        second.stack_identity.stack_id()
+    );
+    let rows_after_reboot: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stack_identity")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_after_reboot, 1,
+        "the identity row was never rewritten or duplicated"
+    );
+
+    // The role component equals the configured stack_role.
+    assert_eq!(first.stack_identity.role(), StackRole::Proof);
+    assert!(
+        first.stack_identity.stack_id().starts_with("proof:"),
+        "stack_id is {{stack_role}}:{{instance_uuid}}: {}",
+        first.stack_identity.stack_id()
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn two_databases_migrated_from_the_same_binary_get_different_stack_ids() {
+    let first_database = TestDatabase::create().await;
+    let second_database = TestDatabase::create().await;
+
+    let first = initialize_database(&config(first_database.database_url(), "testnet", "proof"))
+        .await
+        .unwrap();
+    let second = initialize_database(&config(second_database.database_url(), "testnet", "proof"))
+        .await
+        .unwrap();
+
+    // The same-role/wrong-instance case: two proof stacks share a role but
+    // never a stack_id, because each database mints its own instance UUID.
+    assert_eq!(first.stack_identity.role(), second.stack_identity.role());
+    assert_ne!(
+        first.stack_identity.instance_uuid(),
+        second.stack_identity.instance_uuid()
+    );
+    assert_ne!(
+        first.stack_identity.stack_id(),
+        second.stack_identity.stack_id()
+    );
+
+    first_database.cleanup().await;
+    second_database.cleanup().await;
 }

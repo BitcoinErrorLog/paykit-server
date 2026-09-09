@@ -20,7 +20,7 @@ use crate::{
     paykit::{CreatorSessionProvider, PaykitAdapter},
     persistence::{
         CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PersistenceError,
-        PostgresStorageAdapter, SdkStateStore,
+        PostgresStorageAdapter, SdkStateStore, StackIdentity,
     },
     real_setup::RealSetupCompleter,
     runtime::{PostgresDependency, Runtime, operational_router},
@@ -84,9 +84,13 @@ struct WorkerComponents {
 
 impl Server {
     /// Builds every required production adapter and all public routes.
-    pub async fn build(config: Config, pool: PgPool) -> Result<Self, ServerBuildError> {
+    pub async fn build(
+        config: Config,
+        pool: PgPool,
+        stack_identity: StackIdentity,
+    ) -> Result<Self, ServerBuildError> {
         let pubky = configured_pubky(config.paykit.network)?;
-        Self::build_with_client(config, pool, pubky).await
+        Self::build_with_client(config, pool, stack_identity, pubky).await
     }
 
     /// Builds the production composition with a controlled Pubky client for E2E tests.
@@ -95,9 +99,10 @@ impl Server {
     pub async fn build_with_pubky(
         config: Config,
         pool: PgPool,
+        stack_identity: StackIdentity,
         pubky: Pubky,
     ) -> Result<Self, ServerBuildError> {
-        Self::build_with_client(config, pool, pubky).await
+        Self::build_with_client(config, pool, stack_identity, pubky).await
     }
 
     /// Builds the production composition with controlled transport ports for E2E tests.
@@ -106,15 +111,17 @@ impl Server {
     pub async fn build_with_transports(
         config: Config,
         pool: PgPool,
+        stack_identity: StackIdentity,
         pubky: Pubky,
         electrum: Arc<dyn ElectrumPort>,
     ) -> Result<Self, ServerBuildError> {
-        Self::build_with_clients(config, pool, pubky, electrum).await
+        Self::build_with_clients(config, pool, stack_identity, pubky, electrum).await
     }
 
     async fn build_with_client(
         config: Config,
         pool: PgPool,
+        stack_identity: StackIdentity,
         pubky: Pubky,
     ) -> Result<Self, ServerBuildError> {
         let electrum = ElectrumAdapter::configured(
@@ -124,12 +131,13 @@ impl Server {
             config.electrum.connect_retries,
         )
         .map_err(map_electrum_error)?;
-        Self::build_with_clients(config, pool, pubky, Arc::new(electrum)).await
+        Self::build_with_clients(config, pool, stack_identity, pubky, Arc::new(electrum)).await
     }
 
     async fn build_with_clients(
         config: Config,
         pool: PgPool,
+        stack_identity: StackIdentity,
         pubky: Pubky,
         electrum: Arc<dyn ElectrumPort>,
     ) -> Result<Self, ServerBuildError> {
@@ -148,6 +156,7 @@ impl Server {
             relay,
             creators.clone(),
             config.deployment_invariants().bitcoin_network.clone(),
+            config.deployment_invariants().stack_role,
             config.paykit.receiver_path.clone(),
         ));
         let setup = SetupService::new(
@@ -244,9 +253,12 @@ impl Server {
                 config.paykit.auth_relay.clone(),
             )),
             creators.clone(),
+            Arc::new(creators.clone()),
             Arc::new(crate::real_setup::DirectMarkerPublisher),
             claim_history,
             config.deployment_invariants().bitcoin_network.clone(),
+            config.deployment_invariants().stack_role,
+            stack_identity.stack_id(),
             config.paykit.receiver_path.clone(),
         ));
         let accounts_state = AccountsState::new(
@@ -270,6 +282,7 @@ impl Server {
             Arc::new(PostgresDependency::new(pool.clone())),
             64,
         ));
+        runtime.set_stack_id(stack_identity.stack_id());
         runtime.set_electrum_probe_interval(config.electrum.poll_interval);
         // Regtest tips are mined on demand and can be arbitrarily old
         // without indicating endpoint trouble, so the tip-age check only
@@ -826,7 +839,8 @@ poll_interval = "1s"
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://127.0.0.1:1/paykit")
             .unwrap();
-        let server = Server::build(config, pool).await.unwrap();
+        let stack_identity = StackIdentity::new(crate::config::StackRole::Proof, Uuid::new_v4());
+        let server = Server::build(config, pool, stack_identity).await.unwrap();
         let mut tasks = spawn_owned_workers(server.workers, server.runtime);
         assert_eq!(tasks.len(), 3);
         tasks.abort_all();

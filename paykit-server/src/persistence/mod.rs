@@ -8,7 +8,7 @@ mod outbox;
 pub(crate) mod sdk_state;
 
 pub use creators::{CreatorCredentials, CreatorSetupLock, CreatorStore, PersistedCreator};
-pub use deployment::{DeploymentStore, PersistenceError};
+pub use deployment::{DeploymentStore, PersistenceError, StackIdentity};
 pub(crate) use invoices::BitcoinObservationInput;
 pub use invoices::{
     AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, InvoiceStore,

@@ -3,7 +3,7 @@ use std::{env, fs};
 use paykit_server::{
     Server,
     config::{Config, ConfigEnvironment},
-    startup::initialize_database,
+    startup::{InitializedDatabase, initialize_database},
 };
 
 #[tokio::main]
@@ -24,7 +24,10 @@ async fn main() -> anyhow::Result<()> {
             master_key: env::var("PAYKIT_MASTER_KEY").ok(),
         },
     )?;
-    let pool = initialize_database(&config).await?;
+    let InitializedDatabase {
+        pool,
+        stack_identity,
+    } = initialize_database(&config).await?;
     let electrum_host = url::Url::parse(&config.electrum.endpoint)
         .ok()
         .and_then(|endpoint| endpoint.host_str().map(str::to_owned))
@@ -32,13 +35,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         bitcoin_network = config.deployment_invariants().bitcoin_network.as_str(),
         stack_role = config.deployment_invariants().stack_role.as_str(),
+        stack_id = stack_identity.stack_id(),
         electrum_host = electrum_host,
         version = env!("CARGO_PKG_VERSION"),
         "deployment invariants verified; the stack role is adopted once on \
          first boot and every later boot refuses a mismatch"
     );
     let listen_addr = config.http.listen_addr.clone();
-    let server = Server::build(config, pool).await?;
+    let server = Server::build(config, pool, stack_identity).await?;
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     server.run(listener).await?;
     Ok(())
