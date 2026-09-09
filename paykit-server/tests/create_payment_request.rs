@@ -1,34 +1,129 @@
 use std::sync::{
-    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
 };
 
 use async_trait::async_trait;
 use axum::{
-    Extension,
     body::Body,
     http::{Method, Request, StatusCode},
+    Extension,
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signer, SigningKey};
 use paykit_server::{
     application::create_invoice::{
-        CreateInvoiceError, CreatorXpubProvider, InvoicePersistence, MarkerDiscovery,
-        PaykitIntentBuilder, SessionValidationError, SessionValidator, derive_bip84_p2wpkh_address,
+        derive_bip84_p2wpkh_address, CreateInvoiceError, CreatorXpubProvider, InvoicePersistence,
+        MarkerDiscovery, PaykitIntentBuilder, SessionValidationError, SessionValidator,
     },
     application::create_payment_request::{
         MarketplacePaymentRequest, MarketplacePaymentRequestService,
     },
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     config::{BitcoinNetwork, Config, ConfigEnvironment},
-    domain::locks::{CreatorPubky, parse_bundle_id, parse_creator, parse_reader},
+    domain::locks::{parse_bundle_id, parse_creator, parse_reader, CreatorPubky},
     http::{auth::SignedLocksAuth, payment_requests::payment_requests_router},
     persistence::{AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, PersistenceError},
+    workers::observer::{
+        CreationSnapshot, ElectrumPort, ObservationReport, ObserverError, TipProbe,
+    },
 };
 use tower::ServiceExt;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 const REFERENCE: &str = "000G40R40M30E209185GR38E1W";
+
+struct EmptyBaselineElectrum;
+
+#[async_trait]
+impl ElectrumPort for EmptyBaselineElectrum {
+    async fn creation_snapshot(
+        &self,
+        _address: &str,
+        _max_history_entries: usize,
+        _max_transaction_bytes: usize,
+    ) -> Result<CreationSnapshot, ObserverError> {
+        Ok(CreationSnapshot {
+            tip_height: 100,
+            baseline_outputs: Vec::new(),
+            unconfirmed_inputs: Vec::new(),
+        })
+    }
+
+    async fn observations(
+        &self,
+        _tip_height: u32,
+        _targets: &[paykit_server::bitcoin::ObservationTarget],
+    ) -> Result<ObservationReport, ObserverError> {
+        unreachable!()
+    }
+
+    async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        Ok(TipProbe {
+            height: 100,
+            time_unix: 0,
+        })
+    }
+}
+
+struct FailingBaselineElectrum;
+
+#[async_trait]
+impl ElectrumPort for FailingBaselineElectrum {
+    async fn creation_snapshot(
+        &self,
+        _address: &str,
+        _max_history_entries: usize,
+        _max_transaction_bytes: usize,
+    ) -> Result<CreationSnapshot, ObserverError> {
+        Err(ObserverError::Unavailable)
+    }
+
+    async fn observations(
+        &self,
+        _tip_height: u32,
+        _targets: &[paykit_server::bitcoin::ObservationTarget],
+    ) -> Result<ObservationReport, ObserverError> {
+        unreachable!()
+    }
+
+    async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        unreachable!()
+    }
+}
+
+struct StaleBaselineElectrum;
+
+#[async_trait]
+impl ElectrumPort for StaleBaselineElectrum {
+    async fn creation_snapshot(
+        &self,
+        _address: &str,
+        _max_history_entries: usize,
+        _max_transaction_bytes: usize,
+    ) -> Result<CreationSnapshot, ObserverError> {
+        Ok(CreationSnapshot {
+            tip_height: 96,
+            baseline_outputs: Vec::new(),
+            unconfirmed_inputs: Vec::new(),
+        })
+    }
+
+    async fn observations(
+        &self,
+        _tip_height: u32,
+        _targets: &[paykit_server::bitcoin::ObservationTarget],
+    ) -> Result<ObservationReport, ObserverError> {
+        unreachable!()
+    }
+
+    async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        Ok(TipProbe {
+            height: 100,
+            time_unix: 0,
+        })
+    }
+}
 
 fn reader() -> String {
     for replacement in "ybndrfg8ejkmcpqxot1uwisza345h769".chars() {
@@ -97,9 +192,9 @@ struct FakeCredentials;
 
 fn account_xpub() -> String {
     use bitcoin::{
-        Network,
         bip32::{ChildNumber, Xpriv, Xpub},
         secp256k1::Secp256k1,
+        Network,
     };
     let secp = Secp256k1::new();
     let account = Xpriv::new_master(Network::Bitcoin, &[42; 32])
@@ -219,6 +314,22 @@ fn service_with_creation(
     network: BitcoinNetwork,
     bitcoin_creation_enabled: bool,
 ) -> MarketplacePaymentRequestService {
+    service_with_port(
+        session,
+        store,
+        network,
+        bitcoin_creation_enabled,
+        Arc::new(EmptyBaselineElectrum),
+    )
+}
+
+fn service_with_port(
+    session: Arc<FakeSession>,
+    store: Arc<CapturingStore>,
+    network: BitcoinNetwork,
+    bitcoin_creation_enabled: bool,
+    electrum: Arc<dyn ElectrumPort>,
+) -> MarketplacePaymentRequestService {
     MarketplacePaymentRequestService::new(
         session,
         Arc::new(FakeMarkers {
@@ -231,6 +342,9 @@ fn service_with_creation(
         network.clone(),
         bitcoin_creation_enabled,
         store,
+        electrum,
+        50,
+        400_000,
         Arc::new(PaykitIntentBuilder::for_network(&network)),
     )
 }
@@ -291,9 +405,9 @@ async fn persists_exact_terms_bindings_and_derived_address_without_a_lock() {
 #[tokio::test]
 async fn regtest_deployments_advertise_the_regtest_endpoint_identifier() {
     use bitcoin::{
-        Network,
         bip32::{ChildNumber, Xpriv, Xpub},
         secp256k1::Secp256k1,
+        Network,
     };
     struct RegtestCredentials;
     #[async_trait]
@@ -328,6 +442,9 @@ async fn regtest_deployments_advertise_the_regtest_endpoint_identifier() {
         BitcoinNetwork::Regtest,
         true,
         store.clone(),
+        Arc::new(EmptyBaselineElectrum),
+        50,
+        400_000,
         Arc::new(PaykitIntentBuilder::for_network(&BitcoinNetwork::Regtest)),
     );
     service.create(request(21_000)).await.unwrap();
@@ -356,6 +473,38 @@ async fn zero_amount_is_rejected_before_any_dependency_access() {
     assert_eq!(session.calls.load(Ordering::SeqCst), 0);
     assert_eq!(store.preflight_calls.load(Ordering::SeqCst), 0);
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn failed_creation_snapshot_returns_unavailable() {
+    let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    let service = service_with_port(
+        ok_session(),
+        store,
+        BitcoinNetwork::Mainnet,
+        true,
+        Arc::new(FailingBaselineElectrum),
+    );
+    assert_eq!(
+        service.create(request(50_000)).await,
+        Err(CreateInvoiceError::Unavailable)
+    );
+}
+
+#[tokio::test]
+async fn snapshot_tip_more_than_three_blocks_stale_refuses_creation() {
+    let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    let service = service_with_port(
+        ok_session(),
+        store,
+        BitcoinNetwork::Mainnet,
+        true,
+        Arc::new(StaleBaselineElectrum),
+    );
+    assert_eq!(
+        service.create(request(50_000)).await,
+        Err(CreateInvoiceError::Unavailable)
+    );
 }
 
 #[tokio::test]
@@ -428,6 +577,9 @@ async fn a_reader_without_a_capable_marker_is_unavailable() {
         BitcoinNetwork::Mainnet,
         true,
         store.clone(),
+        Arc::new(EmptyBaselineElectrum),
+        50,
+        400_000,
         Arc::new(PaykitIntentBuilder::default()),
     );
     assert_eq!(
@@ -709,8 +861,8 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
         bitcoin::{ObservationTarget, PlannedObservation},
         runtime::{DependencyCheck, Runtime},
         workers::observer::{
-            ElectrumPort, ObservationBackend, ObservationReport, ObserverError, ObserverPolicy,
-            ObserverTickOutcome, ObserverTickState, TipProbe, observe_tick,
+            observe_tick, ElectrumPort, ObservationBackend, ObservationReport, ObserverError,
+            ObserverPolicy, ObserverTickOutcome, ObserverTickState, TipProbe,
         },
     };
 
@@ -795,6 +947,7 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
             poll_interval: std::time::Duration::from_secs(10),
             max_requests_per_tick: 100,
             max_requests_per_second: 5,
+            max_transaction_bytes: 400_000,
         }),
     )
     .await;

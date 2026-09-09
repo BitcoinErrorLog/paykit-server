@@ -41,7 +41,10 @@ use paykit_server::{
     domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
     persistence::{CreatorCredentials, CreatorStore, PostgresStorageAdapter, SdkStateStore},
     startup::initialize_database,
-    workers::observer::{ElectrumPort, ObservationReport, ObserverError, TipProbe},
+    workers::observer::{
+        CandidateTransaction, CreationSnapshot, ElectrumPort, ObservationReport, ObserverError,
+        TipProbe,
+    },
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
@@ -108,6 +111,30 @@ impl DeterministicElectrum {
 
 #[async_trait]
 impl ElectrumPort for DeterministicElectrum {
+    async fn creation_snapshot(
+        &self,
+        _address: &str,
+        _max_history_entries: usize,
+        _max_transaction_bytes: usize,
+    ) -> Result<CreationSnapshot, ObserverError> {
+        Ok(CreationSnapshot {
+            tip_height: 300,
+            baseline_outputs: Vec::new(),
+            unconfirmed_inputs: Vec::new(),
+        })
+    }
+
+    async fn candidate_transaction(
+        &self,
+        txid: Txid,
+        _max_transaction_bytes: usize,
+    ) -> Result<CandidateTransaction, ObserverError> {
+        Ok(CandidateTransaction {
+            txid,
+            inputs: Vec::new(),
+        })
+    }
+
     async fn observations(
         &self,
         _tip_height: u32,
@@ -125,6 +152,7 @@ impl ElectrumPort for DeterministicElectrum {
                             outpoint: *outpoint,
                             sats: *sats,
                             confirmations: 6,
+                            confirmed_height: Some(301),
                             present: true,
                         })
                 })
@@ -139,7 +167,7 @@ impl ElectrumPort for DeterministicElectrum {
 
     async fn probe(&self) -> Result<TipProbe, ObserverError> {
         Ok(TipProbe {
-            height: 100,
+            height: 300,
             time_unix: fresh_tip_time(),
         })
     }

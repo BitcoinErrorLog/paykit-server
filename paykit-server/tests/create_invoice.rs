@@ -35,12 +35,46 @@ use paykit_server::{
     domain::locks::{CreatorPubky, parse_addressed_lock_resource, parse_bundle_id, parse_reader},
     http::{auth::SignedLocksAuth, invoices::invoices_router},
     persistence::{AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, PersistenceError},
+    workers::observer::{CreationSnapshot, ElectrumPort, ObserverError, TipProbe},
 };
 use tower::ServiceExt;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
 const BUNDLE: &str = "000G40R40M30E209185GR38E1W";
+
+struct EmptyBaselineElectrum;
+
+#[async_trait]
+impl ElectrumPort for EmptyBaselineElectrum {
+    async fn creation_snapshot(
+        &self,
+        _address: &str,
+        _max_history_entries: usize,
+        _max_transaction_bytes: usize,
+    ) -> Result<CreationSnapshot, ObserverError> {
+        Ok(CreationSnapshot {
+            tip_height: 100,
+            baseline_outputs: Vec::new(),
+            unconfirmed_inputs: Vec::new(),
+        })
+    }
+
+    async fn observations(
+        &self,
+        _tip_height: u32,
+        _targets: &[paykit_server::bitcoin::ObservationTarget],
+    ) -> Result<paykit_server::workers::observer::ObservationReport, ObserverError> {
+        unreachable!()
+    }
+
+    async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        Ok(TipProbe {
+            height: 100,
+            time_unix: 0,
+        })
+    }
+}
 
 fn reader() -> String {
     for replacement in "ybndrfg8ejkmcpqxot1uwisza345h769".chars() {
@@ -312,6 +346,9 @@ fn service_with_creation(
         BitcoinNetwork::Mainnet,
         bitcoin_creation_enabled,
         store,
+        Arc::new(EmptyBaselineElectrum),
+        50,
+        400_000,
         Arc::new(PaykitIntentBuilder::default()),
     )
 }
@@ -523,6 +560,9 @@ async fn fifteen_second_deadline_is_safe_and_does_not_commit() {
         BitcoinNetwork::Mainnet,
         true,
         store.clone(),
+        Arc::new(EmptyBaselineElectrum),
+        50,
+        400_000,
         Arc::new(PaykitIntentBuilder::default()),
         Arc::new(FixedClock::new([start, start + Duration::from_secs(15)])),
     );
@@ -562,6 +602,9 @@ async fn marker_discovery_cannot_start_after_the_whole_request_deadline() {
         BitcoinNetwork::Mainnet,
         true,
         store.clone(),
+        Arc::new(EmptyBaselineElectrum),
+        50,
+        400_000,
         Arc::new(PaykitIntentBuilder::default()),
         Arc::new(FixedClock::new([
             start,
@@ -607,6 +650,9 @@ async fn signed_router_maps_deadline_exhaustion_to_dependency_timeout() {
         BitcoinNetwork::Mainnet,
         true,
         store,
+        Arc::new(EmptyBaselineElectrum),
+        50,
+        400_000,
         Arc::new(PaykitIntentBuilder::default()),
         Arc::new(FixedClock::new([start, start + Duration::from_secs(15)])),
     );
@@ -882,6 +928,9 @@ async fn new_invoice_discovers_marker_before_atomic_persistence_and_pins_it_in_b
         BitcoinNetwork::Mainnet,
         true,
         store.clone(),
+        Arc::new(EmptyBaselineElectrum),
+        50,
+        400_000,
         Arc::new(PaykitIntentBuilder::default()),
     );
 

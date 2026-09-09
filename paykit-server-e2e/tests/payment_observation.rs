@@ -6,7 +6,7 @@ use paykit_sdk::{ReceiverNoiseSecretKey, storage::StorageState};
 use paykit_server::{
     bitcoin::{ObservationTarget, ObservedOutput, TrackedOutput},
     config::BitcoinNetwork,
-    crypto::Crypto,
+    crypto::{Crypto, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
     domain::payment::BitcoinOutpoint,
     persistence::{
@@ -18,6 +18,7 @@ use paykit_server::{
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
+use serde::Serialize;
 use sqlx::Row;
 
 mod common;
@@ -185,6 +186,209 @@ fn outpoint_text(outpoint: &BitcoinOutpoint) -> String {
     format!("{}:{}", outpoint.txid(), outpoint.vout())
 }
 
+async fn awaiting_invoice(
+    store: &InvoiceStore,
+    bundle: &'static [u8],
+    request: &'static [u8],
+    address: &'static str,
+) -> uuid::Uuid {
+    store
+        .create_awaiting_baseline(AtomicInvoiceInput {
+            creator: &creator(),
+            reader: &reader(),
+            bundle_binding: bundle,
+            payment_request_binding: request,
+            new_reader_payloads: &FixedPayloads(address),
+            payment_request_intent: common::payment_intent(&reader()),
+            required_sats: 100,
+        })
+        .await
+        .unwrap()
+        .invoice_id()
+}
+
+#[tokio::test]
+async fn new_1_baseline_unconfirmed_later_confirmed_above_floor_never_binds() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let invoice_id =
+        awaiting_invoice(&store, b"new-1-bundle", b"new-1-request", REGTEST_ADDRESS).await;
+    let baseline = provider_outpoint(201);
+    store
+        .complete_creation_baseline(invoice_id, 100, &[baseline], &[])
+        .await
+        .unwrap();
+
+    store
+        .apply_bitcoin_observation_at_height(
+            REGTEST_ADDRESS,
+            &BitcoinOutpoint::from_bitcoin(baseline),
+            100,
+            1,
+            Some(101),
+            true,
+        )
+        .await
+        .unwrap();
+
+    assert_invoice_has_no_observation_writes(&database, invoice_id).await;
+    assert!(store.pending_candidates().await.unwrap().is_empty());
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn baseline_input_replacement_never_binds_but_unrelated_input_does() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let baseline_input = provider_outpoint(202);
+    let blocked_id = awaiting_invoice(
+        &store,
+        b"rbf-blocked-bundle",
+        b"rbf-blocked-request",
+        REGTEST_ADDRESS,
+    )
+    .await;
+    store
+        .complete_creation_baseline(blocked_id, 100, &[], &[baseline_input])
+        .await
+        .unwrap();
+    let blocked = provider_outpoint(203);
+    store
+        .apply_bitcoin_observation_at_height(
+            REGTEST_ADDRESS,
+            &BitcoinOutpoint::from_bitcoin(blocked),
+            100,
+            1,
+            Some(101),
+            true,
+        )
+        .await
+        .unwrap();
+    let candidate = store.pending_candidates().await.unwrap().remove(0);
+    store
+        .resolve_candidate(&candidate, &[baseline_input])
+        .await
+        .unwrap();
+    store
+        .apply_bitcoin_observation_at_height(
+            REGTEST_ADDRESS,
+            &BitcoinOutpoint::from_bitcoin(blocked),
+            100,
+            1,
+            Some(101),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_invoice_has_no_observation_writes(&database, blocked_id).await;
+
+    let allowed_address = "bcrt1q6rz28mcfaxtmdy5rme7l2ae6f4h0d2sgzvv5u0";
+    let allowed_id = awaiting_invoice(
+        &store,
+        b"rbf-allowed-bundle",
+        b"rbf-allowed-request",
+        allowed_address,
+    )
+    .await;
+    store
+        .complete_creation_baseline(allowed_id, 100, &[], &[baseline_input])
+        .await
+        .unwrap();
+    let allowed = provider_outpoint(204);
+    store
+        .apply_bitcoin_observation_at_height(
+            allowed_address,
+            &BitcoinOutpoint::from_bitcoin(allowed),
+            100,
+            1,
+            Some(101),
+            true,
+        )
+        .await
+        .unwrap();
+    let candidate = store.pending_candidates().await.unwrap().remove(0);
+    store
+        .resolve_candidate(&candidate, &[provider_outpoint(205)])
+        .await
+        .unwrap();
+    store
+        .apply_bitcoin_observation_at_height(
+            allowed_address,
+            &BitcoinOutpoint::from_bitcoin(allowed),
+            100,
+            1,
+            Some(101),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        facts(&database, allowed_id).await,
+        ("confirmed".into(), 1, true)
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn post_baseline_output_binds_after_one_candidate_fetch_decision() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let invoice_id =
+        awaiting_invoice(&store, b"post-bundle", b"post-request", REGTEST_ADDRESS).await;
+    store
+        .complete_creation_baseline(invoice_id, 100, &[], &[])
+        .await
+        .unwrap();
+    let output = provider_outpoint(206);
+    for _ in 0..2 {
+        store
+            .apply_bitcoin_observation_at_height(
+                REGTEST_ADDRESS,
+                &BitcoinOutpoint::from_bitcoin(output),
+                100,
+                1,
+                Some(101),
+                true,
+            )
+            .await
+            .unwrap();
+        if let Some(candidate) = store.pending_candidates().await.unwrap().first() {
+            store.resolve_candidate(candidate, &[]).await.unwrap();
+        }
+    }
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 1, true)
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn output_at_or_below_creation_floor_writes_no_observation() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let invoice_id =
+        awaiting_invoice(&store, b"floor-bundle", b"floor-request", REGTEST_ADDRESS).await;
+    store
+        .complete_creation_baseline(invoice_id, 100, &[], &[])
+        .await
+        .unwrap();
+    store
+        .apply_bitcoin_observation_at_height(
+            REGTEST_ADDRESS,
+            &BitcoinOutpoint::from_bitcoin(provider_outpoint(207)),
+            100,
+            2,
+            Some(100),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_invoice_has_no_observation_writes(&database, invoice_id).await;
+    assert!(store.pending_candidates().await.unwrap().is_empty());
+    database.cleanup().await;
+}
+
 struct FixedBatch(Vec<ObservedOutput>);
 
 #[async_trait]
@@ -316,6 +520,7 @@ async fn provider_output_for_an_unrequested_address_causes_no_database_write() {
         outpoint: provider_outpoint(9),
         sats: 100,
         confirmations: 0,
+        confirmed_height: None,
         present: true,
     }]);
 
@@ -342,6 +547,7 @@ async fn invalid_output_late_in_provider_batch_causes_no_database_write() {
             outpoint: provider_outpoint(1),
             sats: 100,
             confirmations: 0,
+            confirmed_height: None,
             present: true,
         },
         ObservedOutput {
@@ -350,6 +556,7 @@ async fn invalid_output_late_in_provider_batch_causes_no_database_write() {
             outpoint: provider_outpoint(2),
             sats: 100,
             confirmations: 0,
+            confirmed_height: None,
             present: true,
         },
     ]);
@@ -390,6 +597,7 @@ async fn malformed_output_late_in_provider_batch_causes_no_database_write() {
             outpoint: provider_outpoint(3),
             sats: 100,
             confirmations: 0,
+            confirmed_height: None,
             present: true,
         },
         ObservedOutput {
@@ -398,6 +606,7 @@ async fn malformed_output_late_in_provider_batch_causes_no_database_write() {
             outpoint: provider_outpoint(4),
             sats: 100,
             confirmations: 0,
+            confirmed_height: None,
             present: true,
         },
     ]);
@@ -438,6 +647,7 @@ async fn noncanonical_address_late_in_provider_batch_causes_no_database_write() 
             outpoint: provider_outpoint(31),
             sats: 100,
             confirmations: 0,
+            confirmed_height: None,
             present: true,
         },
         ObservedOutput {
@@ -446,6 +656,7 @@ async fn noncanonical_address_late_in_provider_batch_causes_no_database_write() 
             outpoint: provider_outpoint(32),
             sats: 100,
             confirmations: 0,
+            confirmed_height: None,
             present: true,
         },
     ]);
@@ -477,6 +688,7 @@ async fn inconsistent_absence_late_in_provider_batch_causes_no_database_write() 
             outpoint: provider_outpoint(34),
             sats: 100,
             confirmations: 0,
+            confirmed_height: None,
             present: true,
         },
         ObservedOutput {
@@ -485,6 +697,7 @@ async fn inconsistent_absence_late_in_provider_batch_causes_no_database_write() 
             outpoint: tracked_outpoint,
             sats: 100,
             confirmations: 1,
+            confirmed_height: Some(1),
             present: false,
         },
     ]);
@@ -516,6 +729,7 @@ async fn duplicate_outpoint_late_in_provider_batch_causes_no_database_write() {
             outpoint: duplicate,
             sats: 50,
             confirmations: 0,
+            confirmed_height: None,
             present: true,
         },
         ObservedOutput {
@@ -524,6 +738,7 @@ async fn duplicate_outpoint_late_in_provider_batch_causes_no_database_write() {
             outpoint: duplicate,
             sats: 100,
             confirmations: 0,
+            confirmed_height: None,
             present: true,
         },
     ]);
@@ -554,6 +769,7 @@ async fn unrepresentable_confirmation_late_in_batch_causes_no_database_write() {
             outpoint: provider_outpoint(7),
             sats: 100,
             confirmations: 0,
+            confirmed_height: None,
             present: true,
         },
         ObservedOutput {
@@ -562,6 +778,7 @@ async fn unrepresentable_confirmation_late_in_batch_causes_no_database_write() {
             outpoint: provider_outpoint(8),
             sats: 100,
             confirmations: u32::MAX,
+            confirmed_height: Some(u32::MAX),
             present: true,
         },
     ]);
@@ -624,6 +841,7 @@ async fn persistence_conflict_late_in_batch_rolls_back_earlier_observations() {
             outpoint: provider_outpoint(10),
             sats: 100,
             confirmations: 0,
+            confirmed_height: None,
             present: true,
         },
         ObservedOutput {
@@ -632,6 +850,7 @@ async fn persistence_conflict_late_in_batch_rolls_back_earlier_observations() {
             outpoint: conflicting_provider_outpoint,
             sats: 100,
             confirmations: 0,
+            confirmed_height: None,
             present: true,
         },
     ]);
@@ -685,6 +904,7 @@ async fn multiple_underpaying_outputs_remain_separate_and_are_not_accumulated() 
             outpoint: provider_outpoint(5),
             sats: 50,
             confirmations: 1,
+            confirmed_height: Some(1),
             present: true,
         },
         ObservedOutput {
@@ -693,6 +913,7 @@ async fn multiple_underpaying_outputs_remain_separate_and_are_not_accumulated() 
             outpoint: provider_outpoint(6),
             sats: 50,
             confirmations: 1,
+            confirmed_height: Some(1),
             present: true,
         },
     ]);
@@ -1218,6 +1439,48 @@ async fn payment_record_integrity_rejects_row_and_type_envelope_swaps() {
         Err(PersistenceError::CorruptOrMissing)
     );
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn v1_payment_record_is_a_hard_integrity_error() {
+    #[derive(Serialize)]
+    struct InvoicePaymentRecordV1<'a> {
+        version: u8,
+        derivation_index: i64,
+        bitcoin_address: &'a str,
+        required_sats: u64,
+    }
+
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let (invoice_id, address) = invoice(&store).await;
+    let plaintext = postcard::to_allocvec(&InvoicePaymentRecordV1 {
+        version: 1,
+        derivation_index: 0,
+        bitcoin_address: &address,
+        required_sats: 100,
+    })
+    .unwrap();
+    let crypto = crypto();
+    let creator_hash = crypto.lookup_hash(creator().to_string().as_bytes());
+    let envelope = crypto
+        .encrypt(
+            &EnvelopeContext::invoice_payment_record(creator_hash, invoice_id),
+            &plaintext,
+        )
+        .unwrap();
+    sqlx::query("UPDATE invoices SET payment_record_envelope = $1 WHERE id = $2")
+        .bind(envelope.as_bytes())
+        .bind(invoice_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store.scan_payment_record_integrity().await,
+        Err(PersistenceError::CorruptOrMissing)
+    );
     database.cleanup().await;
 }
 

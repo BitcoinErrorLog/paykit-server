@@ -1,4 +1,4 @@
-use bitcoin::{OutPoint, Txid, hashes::Hash};
+use bitcoin::{hashes::Hash, OutPoint, Txid};
 use paykit_server::{
     bitcoin::{DirectBinding, ObservationAction, ObservationTarget, ObservedOutput, TrackedOutput},
     config::BitcoinNetwork,
@@ -19,6 +19,7 @@ fn output(label: u8, sats: u64, confirmations: u32, present: bool) -> ObservedOu
         outpoint: outpoint(label),
         sats,
         confirmations,
+        confirmed_height: (confirmations > 0).then_some(confirmations),
         present,
     }
 }
@@ -87,6 +88,7 @@ fn bitcoin_observation_debug_redacts_addresses_and_outpoints() {
         outpoint,
         sats: 100,
         confirmations: 0,
+        confirmed_height: None,
         present: true,
     };
     let binding = DirectBinding::new(outpoint.to_string(), 100, 0, true);
@@ -110,14 +112,17 @@ mod tick {
     };
 
     use async_trait::async_trait;
+    use bitcoin::{hashes::Hash, OutPoint, Txid};
     use paykit_server::{
         bitcoin::{ObservationTarget, PlannedObservation},
         config::BitcoinNetwork,
+        persistence::PendingCandidate,
         runtime::{DependencyCheck, Runtime},
         workers::observer::{
-            AddressFailureReason, ElectrumPort, FailedObservation, ObservationBackend,
-            ObservationReport, ObserverBackoff, ObserverError, ObserverPolicy, ObserverTickOutcome,
-            ObserverTickState, RequestLimiter, TipProbe, observe_tick,
+            observe_tick, AddressFailureReason, CandidateTransaction, ElectrumPort,
+            FailedObservation, ObservationBackend, ObservationReport, ObserverBackoff,
+            ObserverError, ObserverPolicy, ObserverTickOutcome, ObserverTickState, RequestLimiter,
+            TipProbe,
         },
     };
 
@@ -149,6 +154,7 @@ mod tick {
             poll_interval: Duration::from_secs(10),
             max_requests_per_tick: budget,
             max_requests_per_second: 100,
+            max_transaction_bytes: 400_000,
         }
     }
 
@@ -173,6 +179,7 @@ mod tick {
         /// matches no invoice row.
         ghost_observed: Vec<String>,
         calls: Mutex<Vec<Vec<String>>>,
+        candidate_calls: Mutex<Vec<Txid>>,
     }
 
     impl FakeElectrum {
@@ -185,6 +192,7 @@ mod tick {
                 failing_addresses: HashSet::new(),
                 ghost_observed: Vec::new(),
                 calls: Mutex::new(Vec::new()),
+                candidate_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -206,12 +214,25 @@ mod tick {
                 failing_addresses: HashSet::new(),
                 ghost_observed: Vec::new(),
                 calls: Mutex::new(Vec::new()),
+                candidate_calls: Mutex::new(Vec::new()),
             }
         }
     }
 
     #[async_trait]
     impl ElectrumPort for FakeElectrum {
+        async fn candidate_transaction(
+            &self,
+            txid: Txid,
+            _max_transaction_bytes: usize,
+        ) -> Result<CandidateTransaction, ObserverError> {
+            self.candidate_calls.lock().unwrap().push(txid);
+            Ok(CandidateTransaction {
+                txid,
+                inputs: Vec::new(),
+            })
+        }
+
         async fn observations(
             &self,
             _tip_height: u32,
@@ -262,6 +283,7 @@ mod tick {
         entries: Mutex<Vec<FakeEntry>>,
         applied: Mutex<Vec<Vec<String>>>,
         stamped: Mutex<Vec<Vec<String>>>,
+        candidates: Mutex<Vec<PendingCandidate>>,
     }
 
     #[async_trait]
@@ -314,6 +336,87 @@ mod tick {
             }
             Ok(misses)
         }
+
+        async fn pending_candidates(&self) -> Result<Vec<PendingCandidate>, ObserverError> {
+            Ok(self.candidates.lock().unwrap().clone())
+        }
+
+        async fn resolve_candidate(
+            &self,
+            candidate: &PendingCandidate,
+            _inputs: &[OutPoint],
+        ) -> Result<(), ObserverError> {
+            self.candidates
+                .lock()
+                .unwrap()
+                .retain(|entry| entry != candidate);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_fetch_runs_once_then_zero_for_bound_and_no_candidate_ticks() {
+        let port = FakeElectrum::healthy();
+        let txid = Txid::from_byte_array([42; 32]);
+        let backend = FakeBackend::default();
+        backend
+            .entries
+            .lock()
+            .unwrap()
+            .push(FakeEntry::new("candidate-address", 30));
+        backend.candidates.lock().unwrap().push(PendingCandidate {
+            invoice_id: uuid::Uuid::new_v4(),
+            outpoint: OutPoint::new(txid, 0),
+        });
+        let runtime = runtime();
+
+        let _ = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(4),
+            &runtime,
+            &mut failure_gate(),
+        )
+        .await;
+        let first_bind_requests = port.candidate_calls.lock().unwrap().len();
+        let _ = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(4),
+            &runtime,
+            &mut failure_gate(),
+        )
+        .await;
+        let already_bound_requests =
+            port.candidate_calls.lock().unwrap().len() - first_bind_requests;
+        let no_candidate_backend = FakeBackend::default();
+        no_candidate_backend
+            .entries
+            .lock()
+            .unwrap()
+            .push(FakeEntry::new("no-candidate-address", 30));
+        let _ = observe_tick(
+            &port,
+            &no_candidate_backend,
+            &BitcoinNetwork::Regtest,
+            &policy(4),
+            &runtime,
+            &mut failure_gate(),
+        )
+        .await;
+
+        let calls = port.candidate_calls.lock().unwrap().clone();
+        let no_candidate_requests = calls.len() - first_bind_requests - already_bound_requests;
+        eprintln!(
+            "candidate RPC log: first_bind=[blockchain.transaction.get]; \
+             already_bound=[]; no_candidate=[]; txids={calls:?}"
+        );
+        assert_eq!(calls, vec![txid]);
+        assert_eq!(first_bind_requests, 1);
+        assert_eq!(already_bound_requests, 0);
+        assert_eq!(no_candidate_requests, 0);
     }
 
     #[tokio::test]
@@ -407,6 +510,7 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            candidates: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut state = state(&policy(4));
@@ -499,6 +603,7 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            candidates: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         // Budget 3 minus the two reserved probe requests admits one lookup.
@@ -547,6 +652,7 @@ mod tick {
             ),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            candidates: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut state = state(&policy(3));
@@ -595,6 +701,7 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            candidates: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut state = state(&policy(100));
@@ -673,6 +780,7 @@ mod tick {
             entries: Mutex::new(vec![FakeEntry::new("dusted", 600)]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            candidates: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut state = state(&policy(100));
@@ -720,6 +828,7 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            candidates: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut state = state(&policy(100));
@@ -820,6 +929,7 @@ mod tick {
             entries: Mutex::new(vec![FakeEntry::new("known", 300)]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            candidates: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
 
@@ -853,6 +963,7 @@ mod tick {
             entries: Mutex::new(vec![FakeEntry::new("known", 300)]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            candidates: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut backoff = ObserverBackoff::new();
@@ -893,6 +1004,7 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            candidates: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
 
@@ -922,6 +1034,7 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            candidates: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
 

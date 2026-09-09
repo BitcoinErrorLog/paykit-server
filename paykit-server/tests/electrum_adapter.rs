@@ -17,7 +17,8 @@ use std::{
 };
 
 use bitcoin::{
-    Address, CompressedPublicKey, Network, OutPoint, ScriptBuf, Txid, consensus::encode,
+    Address, CompressedPublicKey, Network, OutPoint, ScriptBuf, Transaction, Txid,
+    absolute::LockTime, consensus::encode, transaction::Version,
 };
 use electrum_client::{ScriptHash, ToElectrumScriptHash};
 use paykit_server::{
@@ -219,6 +220,29 @@ async fn a_many_history_address_causes_no_transaction_fetch_fanout() {
     assert_eq!(report.observed, vec![address.to_string()]);
     // RPC-count evidence: one lookup, no history call, no fanout.
     server.assert_rpc_counts(1, 0, 0);
+}
+
+#[tokio::test]
+async fn candidate_fetch_uses_exactly_one_distinct_transaction_request() {
+    let transaction = Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: Vec::new(),
+        output: Vec::new(),
+    };
+    let txid = transaction.compute_txid();
+    let server = ProtocolServer::start_with_transaction(
+        Network::Regtest,
+        encode::serialize_hex(&transaction),
+    )
+    .await;
+    let adapter = connect(&server).await;
+
+    let fetched = adapter.candidate_transaction(txid, 400_000).await.unwrap();
+
+    assert_eq!(fetched.txid, txid);
+    assert!(fetched.inputs.is_empty());
+    server.assert_rpc_counts(0, 0, 1);
 }
 
 #[tokio::test]
@@ -592,6 +616,7 @@ struct ProtocolFixture {
     stall: Option<(ScriptBuf, Duration)>,
     /// Close each connection after its first list_unspent response.
     disconnect_after_unspent: bool,
+    transaction_raw: Option<String>,
     request_log: Mutex<Vec<String>>,
 }
 
@@ -608,7 +633,7 @@ impl ProtocolServer {
     }
 
     async fn start_multi(network: Network, unspent: Vec<(ScriptBuf, serde_json::Value)>) -> Self {
-        Self::start_with_fixture(network, unspent, 0, None, false).await
+        Self::start_with_fixture(network, unspent, 0, None, false, None).await
     }
 
     /// Starts a server that would answer get_history with `history_len`
@@ -616,7 +641,15 @@ impl ProtocolServer {
     /// list_unspent fixture is one current UTXO.
     async fn start_with_history(network: Network, script: ScriptBuf, history_len: usize) -> Self {
         let unspent = serde_json::json!([unspent_entry(9, 125_000, TIP_HEIGHT)]);
-        Self::start_with_fixture(network, vec![(script, unspent)], history_len, None, false).await
+        Self::start_with_fixture(
+            network,
+            vec![(script, unspent)],
+            history_len,
+            None,
+            false,
+            None,
+        )
+        .await
     }
 
     async fn start_multi_with_stall(
@@ -625,12 +658,24 @@ impl ProtocolServer {
         stall: Duration,
         healthy: Vec<(ScriptBuf, serde_json::Value)>,
     ) -> Self {
-        Self::start_with_fixture(network, healthy, 0, Some((stalled_script, stall)), false).await
+        Self::start_with_fixture(
+            network,
+            healthy,
+            0,
+            Some((stalled_script, stall)),
+            false,
+            None,
+        )
+        .await
     }
 
     async fn start_disconnecting(network: Network, script: ScriptBuf) -> Self {
         let unspent = serde_json::json!([unspent_entry(11, 125_000, TIP_HEIGHT)]);
-        Self::start_with_fixture(network, vec![(script, unspent)], 0, None, true).await
+        Self::start_with_fixture(network, vec![(script, unspent)], 0, None, true, None).await
+    }
+
+    async fn start_with_transaction(network: Network, transaction_raw: String) -> Self {
+        Self::start_with_fixture(network, Vec::new(), 0, None, false, Some(transaction_raw)).await
     }
 
     async fn start_with_fixture(
@@ -639,6 +684,7 @@ impl ProtocolServer {
         history_len: usize,
         stall: Option<(ScriptBuf, Duration)>,
         disconnect_after_unspent: bool,
+        transaction_raw: Option<String>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let wake_address = listener.local_addr().unwrap();
@@ -652,6 +698,7 @@ impl ProtocolServer {
             history_len,
             stall,
             disconnect_after_unspent,
+            transaction_raw,
             request_log: Mutex::new(Vec::new()),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -752,9 +799,12 @@ fn serve_connection(mut stream: TcpStream, fixture: Arc<ProtocolFixture>) {
                 let _ = fixture.history_len;
                 panic!("adapter called blockchain.scripthash.get_history");
             }
-            "blockchain.transaction.get" => {
-                panic!("adapter called blockchain.transaction.get");
-            }
+            "blockchain.transaction.get" => serde_json::Value::String(
+                fixture
+                    .transaction_raw
+                    .clone()
+                    .unwrap_or_else(|| panic!("adapter called blockchain.transaction.get")),
+            ),
             method => panic!("unexpected Electrum method: {method}"),
         };
         let response = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
