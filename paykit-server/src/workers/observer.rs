@@ -15,16 +15,16 @@
 use std::{
     collections::{HashMap, HashSet},
     str::FromStr,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
-use bdk_electrum::electrum_client::{
+use bitcoin::{Address, Network, hex::DisplayHex};
+use electrum_client::{
     Client, ConfigBuilder, ElectrumApi, Error as ElectrumError, ListUnspentRes, Param,
     ToElectrumScriptHash,
 };
-use bitcoin::{Address, Network, hex::DisplayHex};
 use rand::Rng;
 
 use crate::{
@@ -341,6 +341,188 @@ impl RequestBudget {
     }
 }
 
+/// The shared bucket holds fewer tokens than the caller asked to reserve;
+/// nothing was charged. `available` is the post-refill balance the caller
+/// was shown, so it can back off by `(requested - available) / refill
+/// rate` seconds instead of retrying immediately.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BudgetExhausted {
+    pub requested: u64,
+    pub available: u64,
+}
+
+impl std::fmt::Display for BudgetExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "electrum request budget exhausted: requested {}, available {}",
+            self.requested, self.available
+        )
+    }
+}
+
+impl std::error::Error for BudgetExhausted {}
+
+/// Proof that `granted` Electrum requests were charged against the shared
+/// bucket at reservation time. This is a rate limiter, not a concurrency
+/// limiter: dropping a permit neither refunds nor charges again — the
+/// tokens stay spent and refill only from elapsed wall time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Permit {
+    granted: u64,
+}
+
+impl Permit {
+    /// Requests this permit charged at reservation.
+    pub fn granted(&self) -> u64 {
+        self.granted
+    }
+}
+
+impl Drop for Permit {
+    /// Explicitly a no-op: the tokens were charged at reservation, so
+    /// dropping the permit neither refunds them nor charges again.
+    fn drop(&mut self) {}
+}
+
+/// App-owned, process-wide Electrum request limiter: one token bucket
+/// behind an `Arc`-shared mutex, cheap to clone into any task. Every
+/// Electrum caller charges this single bucket before dispatch, so the
+/// configured sustained rate bounds all callers jointly — there are no
+/// per-caller pools.
+///
+/// Expected callers:
+///
+/// - **The observer tick** ([`observe_tick`]): it must compute its
+///   admission (probe reservation + lookup budget) from one consistent
+///   balance, so it reads [`Self::available`] and then charges the probe
+///   and the admitted lookups through [`Self::spend`] rather than
+///   round-tripping through permits.
+/// - **Invoice-creation snapshot fetches, the first-bind candidate fetch,
+///   and the claim-time history scan** (sibling slices): charge
+///   [`Self::try_reserve`] before dispatch, or [`Self::reserve_or_wait`]
+///   when they may wait briefly for refill.
+///
+/// The mutex is held only for synchronous refill/spend arithmetic — never
+/// across an `.await` — so clones are tokio-friendly.
+#[derive(Clone, Debug)]
+pub struct RequestLimiter {
+    inner: Arc<Mutex<RequestBudget>>,
+}
+
+impl RequestLimiter {
+    /// Starts with a full bucket: the first callers may burst up to
+    /// capacity; sustained admission is then bounded by the refill rate.
+    pub fn new(capacity: u64, refill_per_second: u64) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RequestBudget::new(
+                capacity,
+                refill_per_second,
+                Instant::now(),
+            ))),
+        }
+    }
+
+    /// Builds the limiter from the observer policy's budget config
+    /// (`electrum.max_requests_per_tick` capacity,
+    /// `electrum.max_requests_per_second` refill).
+    pub fn from_policy(policy: &ObserverPolicy) -> Self {
+        Self::new(
+            u64::from(policy.max_requests_per_tick),
+            u64::from(policy.max_requests_per_second),
+        )
+    }
+
+    fn lock(&self) -> MutexGuard<'_, RequestBudget> {
+        // The critical section holds no user code, so a poisoned lock still
+        // holds a sound bucket; refusing to panic keeps the readiness path
+        // alive, matching the metrics registry's policy.
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Tokens available right now, after refilling from elapsed wall time.
+    pub fn available(&self) -> u64 {
+        self.lock().available(Instant::now())
+    }
+
+    /// Charges `requests` against the bucket and returns the permit to
+    /// dispatch them, or fails without charging when the bucket holds
+    /// fewer. Callers must reserve before dispatching.
+    pub fn try_reserve(&self, requests: u64) -> Result<Permit, BudgetExhausted> {
+        let mut budget = self.lock();
+        let available = budget.available(Instant::now());
+        if available < requests {
+            return Err(BudgetExhausted {
+                requested: requests,
+                available,
+            });
+        }
+        budget.spend(requests);
+        Ok(Permit { granted: requests })
+    }
+
+    /// `try_reserve` for non-tick callers that may wait briefly: waits for
+    /// wall-clock refill, giving up at `deadline`. Fails without charging
+    /// when the reservation cannot be satisfied by then (including
+    /// requests above capacity, which can never be satisfied). The bucket
+    /// lock is never held across a sleep, and each retry re-reads the
+    /// balance because another caller may have taken the refilled tokens.
+    pub async fn reserve_or_wait(
+        &self,
+        requests: u64,
+        deadline: Instant,
+    ) -> Result<Permit, BudgetExhausted> {
+        loop {
+            let wait = {
+                let mut budget = self.lock();
+                let now = Instant::now();
+                let available = budget.available(now);
+                if available >= requests {
+                    budget.spend(requests);
+                    return Ok(Permit { granted: requests });
+                }
+                if now >= deadline || requests > budget.capacity || budget.refill_per_second == 0 {
+                    return Err(BudgetExhausted {
+                        requested: requests,
+                        available,
+                    });
+                }
+                // Earliest wait that guarantees the deficit has refilled:
+                // the bucket's sub-token remainder keeps accruing, so
+                // ceil(deficit x 1000 / rate) milliseconds always grant the
+                // missing whole tokens.
+                let deficit = requests - available;
+                let millis =
+                    (u128::from(deficit) * 1000).div_ceil(u128::from(budget.refill_per_second));
+                let wake = now + Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX));
+                wake.min(deadline).saturating_duration_since(now)
+            };
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    /// Spends up to `requests` tokens without a permit (saturating at what
+    /// is available). Reserved for the observer tick's admission
+    /// accounting, which derives its lookup budget from one
+    /// [`Self::available`] read before charging; every other caller must
+    /// use [`Self::try_reserve`] or [`Self::reserve_or_wait`].
+    pub fn spend(&self, requests: u64) {
+        self.lock().spend(requests);
+    }
+
+    /// Rewinds the refill clock by `elapsed`, so deterministic tests can
+    /// simulate wall time passing exactly as the production loop's real
+    /// sleep between ticks would. Not for production callers.
+    pub fn rewind_refill_clock(&self, elapsed: Duration) {
+        let mut budget = self.lock();
+        if let Some(rewound) = budget.last_refill.checked_sub(elapsed) {
+            budget.last_refill = rewound;
+        }
+    }
+}
+
 /// Per-address WARN-log rate limiter: one failing address logs at most once
 /// per [`ADDRESS_FAILURE_LOG_INTERVAL`] no matter how many ticks it fails,
 /// so a permanently dusted address cannot flood the log.
@@ -367,24 +549,47 @@ impl AddressFailureLog {
     }
 }
 
-/// Cross-tick observer state owned by the loop: the sustained request
-/// budget and the per-address failure-log rate limiter.
+/// Cross-tick observer state owned by the loop: the shared sustained
+/// request limiter, the per-address failure-log rate limiter, and the
+/// zero-success-tick log streak.
 #[derive(Clone, Debug)]
 pub struct ObserverTickState {
-    budget: RequestBudget,
+    budget: RequestLimiter,
     failure_log: AddressFailureLog,
+    /// Whether the current zero-success streak has already emitted its one
+    /// ERROR log; reset by any tick with at least one successful lookup, so
+    /// the next zero-success streak logs again.
+    zero_success_logged: bool,
 }
 
 impl ObserverTickState {
+    /// Tick state over a private limiter built from the policy's budget —
+    /// for tests that drive ticks in isolation. Production uses
+    /// [`Self::with_limiter`] with the app-owned shared limiter.
     pub fn new(policy: &ObserverPolicy) -> Self {
+        Self::with_limiter(RequestLimiter::from_policy(policy))
+    }
+
+    /// Tick state over the app-owned shared limiter: the tick and every
+    /// other Electrum caller draw from one bucket, so a busy non-tick
+    /// caller shrinks the next tick's admission and vice versa.
+    pub fn with_limiter(limiter: RequestLimiter) -> Self {
         Self {
-            budget: RequestBudget::new(
-                u64::from(policy.max_requests_per_tick),
-                u64::from(policy.max_requests_per_second),
-                Instant::now(),
-            ),
+            budget: limiter,
             failure_log: AddressFailureLog::new(),
+            zero_success_logged: false,
         }
+    }
+
+    /// The shared limiter this tick charges, for other callers to clone.
+    pub fn limiter(&self) -> RequestLimiter {
+        self.budget.clone()
+    }
+
+    /// Whether the current zero-success streak has already emitted its one
+    /// ERROR log (the log gate; exposed for tests and diagnostics).
+    pub fn zero_success_logged(&self) -> bool {
+        self.zero_success_logged
     }
 
     /// Rewinds the budget's refill clock by `elapsed`, so the next tick
@@ -392,9 +597,7 @@ impl ObserverTickState {
     /// tick. The production loop gets the same refill from its real sleep
     /// between ticks; deterministic tests use this to space ticks.
     pub fn rewind_budget_clock(&mut self, elapsed: Duration) {
-        if let Some(rewound) = self.budget.last_refill.checked_sub(elapsed) {
-            self.budget.last_refill = rewound;
-        }
+        self.budget.rewind_refill_clock(elapsed);
     }
 }
 
@@ -539,10 +742,11 @@ pub async fn observe_tick(
     }
 
     // The active probe already issued its requests; charge them against
-    // the sustained token bucket so the configured rate bounds the probe
-    // and the observation batch together. The bucket refills from elapsed
-    // wall time, so the jittered loop cannot sustain a higher rate.
-    let available = state.budget.available(Instant::now());
+    // the shared sustained token bucket so the configured rate bounds the
+    // probe, the observation batch, and every non-tick caller jointly. The
+    // bucket refills from elapsed wall time, so the jittered loop cannot
+    // sustain a higher rate.
+    let available = state.budget.available();
     state.budget.spend(PROBE_REQUESTS_PER_TICK);
     let lookup_budget = available.saturating_sub(PROBE_REQUESTS_PER_TICK);
     let selection = select_within_budget(plan, lookup_budget);
@@ -666,7 +870,11 @@ pub async fn observation_loop(
     runtime: Arc<Runtime>,
 ) {
     let mut backoff = ObserverBackoff::new();
-    let mut state = ObserverTickState::new(&policy);
+    // The tick charges the app-owned shared limiter installed on the
+    // runtime at startup, so non-tick Electrum callers (creation snapshot
+    // fetches, first-bind candidate fetch, claim-time history scan) draw
+    // from the same bucket the tick does.
+    let mut state = ObserverTickState::with_limiter(runtime.electrum_request_limiter());
     let mut first_tick = true;
     let mut was_leader = true;
     loop {
@@ -790,7 +998,7 @@ impl ElectrumAdapter {
     /// electrum-client call retries stay at zero: each admitted target is
     /// exactly one request, charged once against the sustained budget, and
     /// the observer's own next tick is the retry.
-    fn client_config(&self) -> bdk_electrum::electrum_client::Config {
+    fn client_config(&self) -> electrum_client::Config {
         ConfigBuilder::new()
             .timeout(Some(self.timeout))
             .retry(0)
@@ -1230,6 +1438,88 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn concurrent_callers_cannot_jointly_exceed_the_shared_capacity() {
+        // One bucket shared by the tick-style caller and a creation-style
+        // caller: joint admissions over a window stay bounded by one
+        // capacity plus rate x window, no matter the interleaving.
+        let limiter = RequestLimiter::new(10, 2);
+        // The tick charges probe + lookups exactly as observe_tick does.
+        let available = limiter.available();
+        limiter.spend(PROBE_REQUESTS_PER_TICK);
+        limiter.spend(available - PROBE_REQUESTS_PER_TICK);
+        let mut admitted = available;
+        // A concurrent creation caller finds the shared bucket drained by
+        // the tick; there is no separate pool to draw from.
+        assert_eq!(
+            limiter.try_reserve(1).unwrap_err(),
+            BudgetExhausted {
+                requested: 1,
+                available: 0
+            }
+        );
+        // One second of wall time refills exactly two tokens; racing
+        // callers jointly admit no more than that.
+        limiter.rewind_refill_clock(Duration::from_secs(1));
+        let permit = limiter.try_reserve(2).expect("two tokens refilled");
+        assert_eq!(permit.granted(), 2);
+        admitted += 2;
+        assert!(limiter.try_reserve(1).is_err());
+        assert_eq!(limiter.available(), 0);
+        assert!(
+            admitted <= 10 + 2,
+            "capacity + rate x window bounds joint admissions: {admitted}"
+        );
+    }
+
+    #[test]
+    fn dropping_a_permit_neither_refunds_nor_double_charges() {
+        let limiter = RequestLimiter::new(10, 0);
+        let permit = limiter.try_reserve(4).expect("bucket starts full");
+        assert_eq!(limiter.available(), 6);
+        // Tokens were charged at reservation: dropping the permit leaves
+        // the balance untouched (no refund, no second charge).
+        drop(permit);
+        assert_eq!(limiter.available(), 6);
+    }
+
+    #[tokio::test]
+    async fn reserve_or_wait_waits_for_refill_until_the_deadline() {
+        // A drained bucket refills at 100/s: the next token arrives within
+        // ~10ms, well inside the deadline.
+        let limiter = RequestLimiter::new(1, 100);
+        let _taken = limiter.try_reserve(1).expect("bucket starts full");
+        let permit = limiter
+            .reserve_or_wait(1, Instant::now() + Duration::from_secs(2))
+            .await
+            .expect("refill arrives before the deadline");
+        assert_eq!(permit.granted(), 1);
+        // A deadline before the refill fails without charging.
+        let err = limiter
+            .reserve_or_wait(1, Instant::now() + Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert_eq!(err.requested, 1);
+        // A non-refilling bucket can never satisfy a reservation: fail
+        // fast instead of waiting out the deadline.
+        let dry = RequestLimiter::new(1, 0);
+        let _taken = dry.try_reserve(1).expect("bucket starts full");
+        let start = Instant::now();
+        assert!(
+            dry.reserve_or_wait(1, start + Duration::from_secs(60))
+                .await
+                .is_err()
+        );
+        assert!(start.elapsed() < Duration::from_secs(5));
+        // A reservation above capacity can never be satisfied.
+        assert!(
+            limiter
+                .reserve_or_wait(2, Instant::now() + Duration::from_secs(60))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

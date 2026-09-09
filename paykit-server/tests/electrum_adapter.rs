@@ -16,10 +16,10 @@ use std::{
     time::Duration,
 };
 
-use bdk_electrum::electrum_client::{ScriptHash, ToElectrumScriptHash};
 use bitcoin::{
     Address, CompressedPublicKey, Network, OutPoint, ScriptBuf, Txid, consensus::encode,
 };
+use electrum_client::{ScriptHash, ToElectrumScriptHash};
 use paykit_server::{
     bitcoin::{ObservationTarget, TrackedOutput},
     config::BitcoinNetwork,

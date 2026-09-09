@@ -15,7 +15,7 @@ async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 bitcoin = "=0.32.101"
-bdk_electrum = { version = "=0.24.0", default-features = false, features = ["use-rustls-ring"] }
+electrum-client = { version = "=0.25", default-features = false, features = ["proxy", "rustls-ring"] }
 blake3 = "1"
 chacha20poly1305 = "0.10"
 crypto_secretbox = "0.1"

@@ -117,7 +117,7 @@ mod tick {
         workers::observer::{
             AddressFailureReason, ElectrumPort, FailedObservation, ObservationBackend,
             ObservationReport, ObserverBackoff, ObserverError, ObserverPolicy, ObserverTickOutcome,
-            ObserverTickState, TipProbe, observe_tick,
+            ObserverTickState, RequestLimiter, TipProbe, observe_tick,
         },
     };
 
@@ -939,6 +939,73 @@ mod tick {
             encoded
                 .contains("paykit_electrum_observation_address_failures_total{reason=\"error\"} 1"),
             "the isolated failure must be counted under the error label: {encoded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_creation_caller_draining_the_shared_bucket_shrinks_the_next_tick() {
+        // The tick and non-tick callers share one pool, not separate
+        // pools: a creation caller that reserves most of the bucket leaves
+        // the next tick only the probe reservation, so it admits fewer
+        // lookups than the same tick would with the bucket to itself.
+        let port = FakeElectrum::healthy();
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![
+                FakeEntry::new("oldest", 600),
+                FakeEntry::new("second", 300),
+                FakeEntry::new("third", 120),
+            ]),
+            applied: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+        // Capacity 6, fast refill rewound away: the tick alone would
+        // charge 2 probe requests and admit 4 lookups.
+        let limiter = RequestLimiter::new(6, 0);
+        let mut state = ObserverTickState::with_limiter(limiter.clone());
+        let creation_permit = limiter
+            .try_reserve(4)
+            .expect("the creation caller reserves first");
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 0,
+                deferred: 3,
+                failed: 0,
+            },
+            "6 - 4 = 2 tokens left, exactly the probe reservation: the tick admits no lookups"
+        );
+        assert!(port.calls.lock().unwrap().is_empty());
+        drop(creation_permit);
+
+        // Without the creation reservation the same tick admits four.
+        let limiter = RequestLimiter::new(6, 0);
+        let mut state = ObserverTickState::with_limiter(limiter);
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 3,
+                deferred: 0,
+                failed: 0,
+            },
+            "6 - 2 probe = 4 lookups, admitting the whole three-target plan"
         );
     }
 

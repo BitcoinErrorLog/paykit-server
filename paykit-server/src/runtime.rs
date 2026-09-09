@@ -20,7 +20,7 @@ use axum::{
 use sqlx::PgPool;
 use tokio::{sync::Notify, time::timeout};
 
-use crate::{http::health, metrics::Metrics};
+use crate::{http::health, metrics::Metrics, workers::observer::RequestLimiter};
 
 const READY: u8 = 0;
 const DEGRADED: u8 = 1;
@@ -341,6 +341,7 @@ pub struct Runtime {
     outbox_enqueue: AtomicU8,
     outbox_reconciliation: AtomicU8,
     metrics: Arc<Metrics>,
+    electrum_request_limiter: Mutex<RequestLimiter>,
 }
 
 impl Runtime {
@@ -368,10 +369,33 @@ impl Runtime {
             outbox_enqueue: AtomicU8::new(NOT_READY),
             outbox_reconciliation: AtomicU8::new(NOT_READY),
             metrics,
+            // Fail-closed until startup installs the configured limiter: an
+            // empty, non-refilling bucket admits nothing, so no caller can
+            // issue unbudgeted Electrum requests before then.
+            electrum_request_limiter: Mutex::new(RequestLimiter::new(0, 0)),
         }
     }
     pub fn metrics(&self) -> Arc<Metrics> {
         self.metrics.clone()
+    }
+    /// The app-owned shared Electrum request limiter. The observer tick
+    /// charges it for probe + lookups; non-tick callers (invoice-creation
+    /// snapshot fetches, the first-bind candidate fetch, the claim-time
+    /// history scan) must clone it from here and reserve before dispatch.
+    pub fn electrum_request_limiter(&self) -> RequestLimiter {
+        self.electrum_request_limiter
+            .lock()
+            .expect("request limiter mutex is not poisoned")
+            .clone()
+    }
+    /// Installs the configured shared limiter (from
+    /// `electrum.max_requests_per_tick` / `electrum.max_requests_per_second`)
+    /// once at startup, replacing the fail-closed default.
+    pub fn set_electrum_request_limiter(&self, limiter: RequestLimiter) {
+        *self
+            .electrum_request_limiter
+            .lock()
+            .expect("request limiter mutex is not poisoned") = limiter;
     }
     pub fn stopping(&self) -> bool {
         self.stopping.load(Ordering::Acquire)

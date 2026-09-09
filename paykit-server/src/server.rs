@@ -29,7 +29,7 @@ use crate::{
     workers::{
         observer::{
             ElectrumAdapter, ElectrumPort, ObservationBackend, ObserverError, ObserverLeadership,
-            ObserverPolicy, observation_loop,
+            ObserverPolicy, RequestLimiter, observation_loop,
         },
         outbox::{ProcessingHealth, process_claim_with_health, process_reconciliation_with_health},
     },
@@ -248,6 +248,14 @@ impl Server {
             64,
         ));
         runtime.set_electrum_probe_interval(config.electrum.poll_interval);
+        // One app-owned Electrum request limiter, built from the validated
+        // budget config: the observer tick and every non-tick Electrum
+        // caller (creation snapshot fetches, first-bind candidate fetch,
+        // claim-time history scan) charge this single bucket.
+        runtime.set_electrum_request_limiter(RequestLimiter::new(
+            u64::from(config.electrum.max_requests_per_tick),
+            u64::from(config.electrum.max_requests_per_second),
+        ));
         // Regtest tips are mined on demand and can be arbitrarily old
         // without indicating endpoint trouble, so the tip-age check only
         // applies to networks with a live block cadence.
