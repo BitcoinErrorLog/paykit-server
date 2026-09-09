@@ -40,7 +40,7 @@ use crate::{
     config::{BitcoinNetwork, StackRole},
     domain::locks::{CreatorPubky, parse_creator},
     key_identity::{canonical_key_tail, key_fingerprint},
-    persistence::{CreatorAllocationStatus, CreatorStore},
+    persistence::{CreatorStatusRecord, CreatorStore},
     real_setup::{CreatorSetupCommit, MarkerPublisher, validate_xpub},
 };
 
@@ -64,8 +64,9 @@ pub struct ManualClaimRequest {
     pub account_xpub: String,
     pub account_index: u32,
     /// The channel the Shop client asserts (design §B.8.6): `manual` or
-    /// `bitkit_watch_only_v1`, recorded verbatim. `None` is treated — and
-    /// recorded — as `manual`: a bare key carries nothing to corroborate.
+    /// `bitkit_watch_only_v1`, recorded on the creator row. `None` is
+    /// treated — and recorded — as `manual`: a bare key carries nothing to
+    /// corroborate. Any other value is refused with `unknown_claim_channel`.
     pub claim_channel: Option<String>,
     /// The allocation mode the client requests, when it requests one. The
     /// server decides the mode from the §B.8.6 corroborating checks and
@@ -99,6 +100,32 @@ pub struct ManualClaimOutcome {
     /// The fixed §B.8.8 downgrade-reason identifier recorded on the creator
     /// row; `None` for an `exclusive` creator with no recorded reason.
     pub downgrade_reason: Option<String>,
+}
+
+/// The authenticated seller's own allocation status (design §B.8.6), as
+/// served by `GET /v0/accounts/{creator}/status`. The Ring-verification
+/// client fails closed without `key_fingerprint` (it compares the hash
+/// against its local key before enabling the Bitcoin rail) and
+/// `first_derived_address`; both derive from the persisted account record
+/// with the exact functions the claim response uses, so they equal the
+/// claim response's values for the same creator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SellerAllocationStatus {
+    /// The creator's persisted allocation mode: `exclusive` or
+    /// `shared_manual`.
+    pub allocation_mode: String,
+    /// The claim channel recorded at claim time; `None` for a companion-flow
+    /// setup, which carries no channel assertion.
+    pub claim_channel: Option<String>,
+    /// The fixed §B.8.8 downgrade-reason identifier recorded on the creator
+    /// row; `None` when no downgrade reason was ever assigned.
+    pub downgrade_reason: Option<String>,
+    /// Hex of the first 8 bytes of SHA-256 over the canonical 78-byte key
+    /// serialization — the same value the claim response emits.
+    pub key_fingerprint: String,
+    /// The account's derived address at the persisted derivation cursor, on
+    /// this stack's network — the same value the claim response emits.
+    pub first_derived_address: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +166,10 @@ pub enum ManualClaimError {
     /// unconditionally — on every code path, under every configuration, and
     /// with no enabling flag anywhere (design §B.8.6 r6, Sol P1).
     AllocationModeNotEnabled,
+    /// The claim asserted a `claim_channel` other than §B.8.6's two values
+    /// (`manual`, `bitkit_watch_only_v1`). Refused — fail closed: an unknown
+    /// channel is never canonicalized silently and never persisted verbatim.
+    UnknownClaimChannel,
 }
 
 /// Session minting is a narrow seam so unit tests can exercise validation,
@@ -300,10 +331,22 @@ impl ManualClaimService {
         if request.allocation_mode.as_deref() == Some(REQUESTED_MODE_PASTED_AUTO) {
             return Err(ManualClaimError::AllocationModeNotEnabled);
         }
+        // An unknown `claim_channel` is refused (fail closed, design §B.8.6:
+        // the field is one of `manual` | `bitkit_watch_only_v1`) — never
+        // canonicalized silently, never persisted verbatim. Like the
+        // `pasted_auto` refusal this is request-shape validation, so it
+        // precedes token verification and touches nothing.
+        if let Some(channel) = request.claim_channel.as_deref()
+            && !matches!(
+                channel,
+                CLAIM_CHANNEL_MANUAL | CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1
+            )
+        {
+            return Err(ManualClaimError::UnknownClaimChannel);
+        }
         let token = self.verify_claim_token(&request.auth_token)?;
         // A missing channel is treated — and recorded — as `manual`
-        // (design §B.8.6: a paste is "a bare key and nothing else", so
-        // anything that is not the Bitkit channel is manual entry).
+        // (design §B.8.6: a paste is "a bare key and nothing else").
         let channel = request
             .claim_channel
             .clone()
@@ -483,16 +526,49 @@ impl ManualClaimService {
     }
 
     /// The authenticated seller's own allocation status (design §B.8.6):
-    /// mode, recorded claim channel, downgrade reason if any. Detection
-    /// evidence metadata is §B.8.7's (W1.14) and not yet recorded.
+    /// mode, recorded claim channel, downgrade reason if any, and the two
+    /// evidence fields the Ring-verification client fails closed without —
+    /// `key_fingerprint` and `first_derived_address`, derived from the
+    /// persisted xpub by the exact functions the claim response uses (no
+    /// Electrum, no I/O beyond the creator row read). Detection evidence
+    /// metadata is §B.8.7's (W1.14) and not yet recorded.
     pub async fn allocation_status(
         &self,
         creator: &CreatorPubky,
-    ) -> Result<Option<CreatorAllocationStatus>, ManualClaimError> {
-        self.creators
+    ) -> Result<Option<SellerAllocationStatus>, ManualClaimError> {
+        let Some(record) = self
+            .creators
             .allocation_status(creator)
             .await
-            .map_err(|_| ManualClaimError::Unavailable)
+            .map_err(|_| ManualClaimError::Unavailable)?
+        else {
+            return Ok(None);
+        };
+        let CreatorStatusRecord {
+            allocation,
+            xpub,
+            account_index,
+            next_child_index,
+        } = record;
+        // The same canonical-78-byte fingerprint and cursor-address
+        // derivations the claim response emits (design §B.6).
+        let serialized_xpub = Xpub::from_str(&xpub)
+            .map_err(|_| ManualClaimError::Unavailable)?
+            .encode();
+        let first_derived_address = derive_bip84_p2wpkh_address(
+            &xpub,
+            account_index,
+            &self.bitcoin_network,
+            next_child_index,
+        )
+        .map_err(|_| ManualClaimError::Unavailable)?;
+        Ok(Some(SellerAllocationStatus {
+            allocation_mode: allocation.allocation_mode,
+            claim_channel: allocation.claim_channel,
+            downgrade_reason: allocation.downgrade_reason,
+            key_fingerprint: key_fingerprint(&serialized_xpub),
+            first_derived_address,
+        }))
     }
 
     /// Decodes and verifies the `AuthToken` and its exact capability set —

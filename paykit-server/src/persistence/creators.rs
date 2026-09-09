@@ -353,23 +353,46 @@ impl CreatorStore {
     }
 
     /// The creator's allocation status for the authenticated seller status
-    /// surface (design §B.8.6): the mode, the verbatim claim channel recorded
-    /// at claim time, and the downgrade reason if any. Secret-free plaintext
-    /// columns only; no key material is read. `None` when the creator never
-    /// claimed. Detection evidence metadata (§B.8.7) is W1.14's and is not
-    /// read here yet.
+    /// surface (design §B.8.6): the mode, the claim channel recorded at claim
+    /// time, the downgrade reason if any, and the persisted account key data
+    /// (`xpub`, `account_index`, derivation cursor) the status endpoint
+    /// derives the client's required evidence fields from — the same
+    /// derivations the claim response performs (`key_identity.rs`,
+    /// `derive_bip84_p2wpkh_address`). One row read; no key material leaves
+    /// the server (the fingerprint is a hash, the first address is what
+    /// invoices reveal anyway). `None` when the creator never claimed.
+    /// Detection evidence metadata (§B.8.7) is W1.14's and is not read here
+    /// yet.
     pub async fn allocation_status(
         &self,
         creator: &CreatorPubky,
-    ) -> Result<Option<CreatorAllocationStatus>, PersistenceError> {
+    ) -> Result<Option<CreatorStatusRecord>, PersistenceError> {
         let hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
-        sqlx::query_as::<_, CreatorAllocationStatus>(
-            "SELECT allocation_mode, claim_channel, downgrade_reason FROM creators WHERE creator_lookup_hash = $1",
+        let row = sqlx::query_as::<_, CreatorStatusRow>(
+            "SELECT id, creator_lookup_hash, credential_envelope, next_child_index, allocation_mode, claim_channel, downgrade_reason FROM creators WHERE creator_lookup_hash = $1",
         )
         .bind(hash.as_bytes().as_slice())
         .fetch_optional(&self.pool)
         .await
-        .map_err(|_| PersistenceError::Unavailable)
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let credentials = self.decrypt_credentials(&CreatorRow {
+            id: row.id,
+            creator_lookup_hash: row.creator_lookup_hash,
+            credential_envelope: row.credential_envelope,
+        })?;
+        Ok(Some(CreatorStatusRecord {
+            allocation: CreatorAllocationStatus {
+                allocation_mode: row.allocation_mode,
+                claim_channel: row.claim_channel,
+                downgrade_reason: row.downgrade_reason,
+            },
+            xpub: credentials.xpub().to_owned(),
+            account_index: credentials.account_index(),
+            next_child_index: row.next_child_index,
+        }))
     }
 
     /// Loads an existing creator when present. A present but unauthenticatable
@@ -574,6 +597,33 @@ pub struct CreatorAllocationStatus {
     pub allocation_mode: String,
     pub claim_channel: Option<String>,
     pub downgrade_reason: Option<String>,
+}
+
+/// Everything the authenticated seller status surface serves (design §B.8.6):
+/// the allocation columns plus the persisted account key data the client's
+/// evidence fields (`key_fingerprint`, `first_derived_address`) derive from.
+/// Neither derived field is key material: the fingerprint is a hash and the
+/// first address is what invoices reveal anyway.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatorStatusRecord {
+    pub allocation: CreatorAllocationStatus,
+    /// The exact persisted account xpub (canonical base58 form).
+    pub xpub: String,
+    pub account_index: u32,
+    /// The creator's derivation cursor; the status's `first_derived_address`
+    /// derives at this index, exactly as the claim response did.
+    pub next_child_index: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct CreatorStatusRow {
+    id: Uuid,
+    creator_lookup_hash: Vec<u8>,
+    credential_envelope: Vec<u8>,
+    next_child_index: i64,
+    allocation_mode: String,
+    claim_channel: Option<String>,
+    downgrade_reason: Option<String>,
 }
 impl CreatorRow {
     pub(crate) fn lookup_hash(&self) -> Result<LookupHash, PersistenceError> {
