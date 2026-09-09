@@ -303,6 +303,8 @@ fn parses_accepted_durations_and_uses_ledger_defaults() {
     assert_eq!(config.outbox.lease_duration, Duration::from_secs(30));
     assert_eq!(config.outbox.retry_initial, Duration::from_secs(1));
     assert_eq!(config.outbox.retry_max, Duration::from_secs(5 * 60));
+    assert_eq!(config.outbox.max_attempts, 50);
+    assert_eq!(config.outbox.max_age, Duration::from_secs(7 * 24 * 60 * 60));
 
     assert_eq!(config.limits.request_body_bytes, 16 * 1024);
     assert_eq!(config.limits.lock_resource_bytes, 256 * 1024);
@@ -321,6 +323,37 @@ fn parses_accepted_durations_and_uses_ledger_defaults() {
     );
     let configured = Config::from_toml_and_environment(&input, environment()).unwrap();
     assert_eq!(configured.electrum.poll_interval, Duration::from_secs(30));
+}
+
+#[test]
+fn parses_outbox_retry_budget_and_rejects_zero_values() {
+    let input = valid_toml().replace(
+        "poll_interval = \"5s\"",
+        "poll_interval = \"5s\"\nmax_attempts = 3\nmax_age = \"12h\"",
+    );
+    let config = Config::from_toml_and_environment(&input, environment()).unwrap();
+    assert_eq!(config.outbox.max_attempts, 3);
+    assert_eq!(config.outbox.max_age, Duration::from_secs(12 * 60 * 60));
+
+    for (field, value, expected) in [
+        (
+            "max_attempts",
+            "0",
+            "outbox.max_attempts must be greater than zero",
+        ),
+        (
+            "max_age",
+            "\"0s\"",
+            "outbox.max_age must be greater than zero",
+        ),
+    ] {
+        let input = valid_toml().replace(
+            "poll_interval = \"5s\"",
+            &format!("poll_interval = \"5s\"\n{field} = {value}"),
+        );
+        let error = Config::from_toml_and_environment(&input, environment()).unwrap_err();
+        assert_eq!(error.to_string(), expected, "{field}");
+    }
 }
 
 #[test]

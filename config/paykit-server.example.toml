@@ -97,6 +97,17 @@ batch_size = 16
 lease_duration = "30s"
 retry_initial = "1s"
 retry_max = "5m"
+# Retry budget: a row that reaches max_attempts claim attempts or is older
+# than max_age is transitioned to permanently_failed with error class
+# retry_budget_exhausted at its next retry scheduling (ERROR log naming the
+# row id, lane kind, and attempt count, plus one increment of the
+# paykit_outbox_permanent_failures{kind} counter). Ops note: terminal
+# permanently_failed rows never degrade /health/ready — they are retained
+# for operator review only, and their count is exposed as the informational
+# outbox_permanently_failed field. Requeue SQL is in
+# docs/task12-outbox-recovery.md. Both values must be greater than zero.
+# max_attempts = 50
+# max_age = "7d"
 
 [limits]
 request_body_bytes = 16384

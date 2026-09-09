@@ -140,6 +140,7 @@ impl Config {
             ("outbox.lease_duration", self.outbox.lease_duration),
             ("outbox.retry_initial", self.outbox.retry_initial),
             ("outbox.retry_max", self.outbox.retry_max),
+            ("outbox.max_age", self.outbox.max_age),
             ("limits.lock_fetch_timeout", self.limits.lock_fetch_timeout),
             ("shutdown.drain_timeout", self.shutdown.drain_timeout),
         ] {
@@ -149,6 +150,7 @@ impl Config {
         }
         for (name, value) in [
             ("outbox.batch_size", u64::from(self.outbox.batch_size)),
+            ("outbox.max_attempts", u64::from(self.outbox.max_attempts)),
             (
                 "electrum.max_requests_per_tick",
                 u64::from(self.electrum.max_requests_per_tick),
@@ -565,6 +567,15 @@ pub struct OutboxConfig {
     pub lease_duration: Duration,
     pub retry_initial: Duration,
     pub retry_max: Duration,
+    /// Retry budget attempt ceiling: when a claimed row reaches this many
+    /// attempts, the next retry scheduling transitions it to
+    /// `permanently_failed` with error class `retry_budget_exhausted`
+    /// instead of rescheduling it.
+    pub max_attempts: u32,
+    /// Retry budget age ceiling: a row older than this is transitioned to
+    /// `permanently_failed` at its next retry scheduling, regardless of its
+    /// attempt count.
+    pub max_age: Duration,
 }
 
 #[derive(Debug)]
@@ -865,6 +876,10 @@ struct RawOutboxConfig {
     retry_initial: Duration,
     #[serde(default = "default_outbox_retry_max", with = "humantime_serde")]
     retry_max: Duration,
+    #[serde(default = "default_outbox_max_attempts")]
+    max_attempts: u32,
+    #[serde(default = "default_outbox_max_age", with = "humantime_serde")]
+    max_age: Duration,
 }
 
 #[derive(Deserialize)]
@@ -944,6 +959,8 @@ impl From<RawOutboxConfig> for OutboxConfig {
             lease_duration: value.lease_duration,
             retry_initial: value.retry_initial,
             retry_max: value.retry_max,
+            max_attempts: value.max_attempts,
+            max_age: value.max_age,
         }
     }
 }
@@ -991,6 +1008,12 @@ const fn default_retry_initial() -> Duration {
 }
 const fn default_outbox_retry_max() -> Duration {
     Duration::from_secs(5 * 60)
+}
+const fn default_outbox_max_attempts() -> u32 {
+    50
+}
+const fn default_outbox_max_age() -> Duration {
+    Duration::from_secs(7 * 24 * 60 * 60)
 }
 
 const fn default_request_body_bytes() -> u64 {
