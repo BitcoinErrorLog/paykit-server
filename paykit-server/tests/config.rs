@@ -505,6 +505,33 @@ fn rejects_a_response_cap_above_the_16mib_ceiling_with_the_literal_message() {
     );
 }
 
+#[test]
+fn the_utxo_item_cap_must_fit_inside_the_response_byte_cap() {
+    // Default configuration: 200 items × 110 B + envelope ≪ 1 MiB.
+    assert!(Config::from_toml_and_environment(&valid_toml(), environment()).is_ok());
+    // 200 000 items × 110 B = 22 000 000 B > 16 MiB: the byte cap would
+    // poison the item cap's own maximum reply, so startup refuses the
+    // coupling with a literal diagnostic naming both fields and the
+    // arithmetic.
+    let error = Config::from_toml_and_environment(
+        &electrum_toml("max_utxos_per_address = 200000\nmax_response_bytes = 16777216"),
+        environment(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "electrum.max_utxos_per_address 200000 × 110 B exceeds electrum.max_response_bytes 16777216"
+    );
+    // 100 000 items × 110 B + envelope < 16 MiB: accepted.
+    assert!(
+        Config::from_toml_and_environment(
+            &electrum_toml("max_utxos_per_address = 100000\nmax_response_bytes = 16777216"),
+            environment(),
+        )
+        .is_ok()
+    );
+}
+
 fn mainnet_toml(endpoint: &str) -> String {
     valid_toml()
         .replace(

@@ -77,6 +77,11 @@ or unbounded response memory. Mitigations:
 - **Item-count cap.** A response listing more than
   `electrum.max_utxos_per_address` UTXOs (default 200) is rejected before
   any per-UTXO record is materialised — no record vector is built for it.
+  The two caps are coupled at startup: configuration load refuses an
+  `electrum.max_utxos_per_address` whose maximum reply (items × the
+  110-byte per-item wire bound, plus the JSON-RPC envelope) would exceed
+  `electrum.max_response_bytes`, so the item cap can never demand a
+  response the transport byte cap refuses.
 - **Per-address wall-clock deadline.** Connect + call + decode for one
   address must finish within `electrum.address_deadline` (default 5s). The
   blocking socket read cannot be cancelled, so on expiry the wait is

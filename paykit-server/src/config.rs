@@ -10,9 +10,16 @@ use thiserror::Error;
 use url::Url;
 
 use crate::workers::{
-    electrum::{MAX_MAX_RESPONSE_BYTES, MIN_MAX_RESPONSE_BYTES},
+    electrum::{
+        LISTUNSPENT_ITEM_BYTES_UPPER_BOUND, MAX_MAX_RESPONSE_BYTES, MIN_MAX_RESPONSE_BYTES,
+    },
     observer::{ObserverPolicy, PROBE_REQUESTS_PER_TICK},
 };
+
+/// Allowance for the JSON-RPC envelope around a `listunspent` reply
+/// (`{"jsonrpc":"2.0","id":<u64>,"result":[…]}` plus separators): well
+/// under 1 KiB. Used only by the item-cap/byte-cap coupling rule.
+const LISTUNSPENT_RESPONSE_ENVELOPE_BYTES: u64 = 1024;
 
 #[derive(Debug)]
 pub struct Config {
@@ -236,6 +243,23 @@ impl Config {
         }
         if self.electrum.max_response_bytes > MAX_MAX_RESPONSE_BYTES {
             return Err(ConfigError::ElectrumResponseCapAboveCeiling);
+        }
+        // Coupling rule: the item cap must never demand a reply the
+        // transport byte cap refuses. A maximal listunspent reply is
+        // max_utxos_per_address items of at most
+        // LISTUNSPENT_ITEM_BYTES_UPPER_BOUND bytes each plus the
+        // JSON-RPC envelope; if that exceeds max_response_bytes, the
+        // byte cap would poison the server's own largest legitimate
+        // response, so startup refuses the configuration. u32 × 110
+        // cannot overflow u64.
+        let largest_legitimate_response = u64::from(self.electrum.max_utxos_per_address)
+            * LISTUNSPENT_ITEM_BYTES_UPPER_BOUND
+            + LISTUNSPENT_RESPONSE_ENVELOPE_BYTES;
+        if largest_legitimate_response > self.electrum.max_response_bytes {
+            return Err(ConfigError::ElectrumUtxoCapExceedsResponseCap(
+                self.electrum.max_utxos_per_address,
+                self.electrum.max_response_bytes,
+            ));
         }
         // Plaintext Electrum carries the merchant's invoice addresses and
         // UTXO sets unauthenticated and in the clear; on mainnet the only
@@ -726,6 +750,10 @@ pub enum ConfigError {
     ElectrumResponseCapBelowFloor,
     #[error("electrum.max_response_bytes must be at most 16777216 bytes (16 MiB)")]
     ElectrumResponseCapAboveCeiling,
+    #[error(
+        "electrum.max_utxos_per_address {0} × {LISTUNSPENT_ITEM_BYTES_UPPER_BOUND} B exceeds electrum.max_response_bytes {1}"
+    )]
+    ElectrumUtxoCapExceedsResponseCap(u32, u64),
     #[error(
         "bitcoin.network mainnet requires an ssl:// electrum.endpoint; the {0}:// scheme is plaintext and refused"
     )]

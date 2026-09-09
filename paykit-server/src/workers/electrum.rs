@@ -55,15 +55,24 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 /// smaller value.
 pub const MIN_MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
+/// Wire-size upper bound for one `blockchain.scripthash.listunspent`
+/// item: `{"tx_hash":"<64 hex>","tx_pos":<u32>,"height":<u32>,`
+/// `"value":<u64>}` — 64 hex characters plus the field names, JSON
+/// punctuation, and the longest u32/u64 digit strings stays under 110
+/// bytes. Config validation refuses an `electrum.max_utxos_per_address`
+/// whose maximum reply (items × this bound, plus the JSON-RPC envelope)
+/// would exceed `electrum.max_response_bytes`, so the item cap can
+/// never demand a response the transport byte cap refuses.
+pub const LISTUNSPENT_ITEM_BYTES_UPPER_BOUND: u64 = 110;
+
 /// Ceiling for `electrum.max_response_bytes`: 16 MiB. Startup refuses a
 /// larger value. Justification from the design's own caps: the largest
 /// legitimate response this process ever reads is one
 /// `blockchain.scripthash.listunspent` reply of at most
-/// `electrum.max_utxos_per_address` items (default 200), and one item is
-/// `{"tx_hash":"<64 hex>","tx_pos":<u32>,"height":<u32>,"value":<u64>}`
-/// — under 110 bytes on the wire including JSON punctuation, so the
-/// default configuration's largest response is ~200 × 110 B ≈ 21 KiB and
-/// even a 100 000-item configuration stays under ~11 MiB. The only other
+/// `electrum.max_utxos_per_address` items (default 200) of at most
+/// [`LISTUNSPENT_ITEM_BYTES_UPPER_BOUND`] bytes each, so the default
+/// configuration's largest response is ≈ 21 KiB and even a
+/// 100 000-item configuration stays under ~11 MiB. The only other
 /// responses are the tick's probe replies (`headers.subscribe` and
 /// `block_header(0)`: an 80-byte header hex-encoded plus envelope, well
 /// under 1 KiB). 16 MiB therefore bounds every legitimate response with
@@ -97,8 +106,8 @@ pub struct CappedStream<S: Read + Write> {
     max_response_bytes: u64,
     /// Bytes read since the last newline (the current line's length so
     /// far, excluding the newline itself, which is never counted against
-    /// the cap: a line of exactly `max_response_bytes` INCLUDING its
-    /// newline terminator succeeds).
+    /// the cap: a line whose content is exactly `max_response_bytes`
+    /// bytes before its newline terminator succeeds).
     line_bytes: u64,
     poisoned: bool,
 }
@@ -127,6 +136,14 @@ impl<S: Read + Write> Read for CappedStream<S> {
         // ever consumed for a poisoned line — an over-cap line of any
         // length costs the source exactly `max_response_bytes + 1` bytes
         // of consumption before the read fails.
+        // The subtraction cannot underflow: an unpoisoned stream holds
+        // at most `max_response_bytes` bytes for the current line,
+        // because the check below poisons the stream and returns the
+        // error on the very increment that would push it over.
+        debug_assert!(
+            self.line_bytes <= self.max_response_bytes,
+            "an unpoisoned stream never holds more than the cap for the current line"
+        );
         let remaining_line_budget = self.max_response_bytes - self.line_bytes;
         let clamped_len = (remaining_line_budget + 1).min(buf.len() as u64) as usize;
         let n = self.inner.read(&mut buf[..clamped_len])?;
@@ -136,7 +153,7 @@ impl<S: Read + Write> Read for CappedStream<S> {
                 continue;
             }
             self.line_bytes += 1;
-            if self.line_bytes >= self.max_response_bytes {
+            if self.line_bytes > self.max_response_bytes {
                 // The current line exceeds the cap. Poison first so no
                 // later read can resume it, then hand back only the
                 // complete lines that precede it; with none to deliver,
@@ -364,9 +381,35 @@ mod tests {
     }
 
     #[test]
-    fn a_line_of_cap_plus_one_bytes_fails_with_the_literal_message_and_poisons() {
-        // CAP content bytes + the newline = CAP + 1 bytes: over the cap.
+    fn a_line_with_exactly_cap_content_bytes_before_the_newline_succeeds() {
+        // CAP content bytes + the newline: the newline is never counted
+        // against the cap, so the line is exactly AT the cap and must be
+        // delivered intact, not poisoned.
         let mut line = vec![b'x'; CAP as usize];
+        line.push(b'\n');
+        let mut stream = capped_cursor(&line);
+        let read = read_to_end(&mut stream).expect("exactly cap content bytes pass");
+        assert_eq!(read, line);
+        // Not poisoned: the next read sees a clean EOF, not the cap error.
+        assert_eq!(stream.read(&mut [0u8; 8]).unwrap(), 0);
+    }
+
+    #[test]
+    fn an_exactly_cap_line_followed_by_a_small_line_in_one_burst_both_pass() {
+        let mut exact = vec![b'x'; CAP as usize];
+        exact.push(b'\n');
+        let small = b"{\"id\":0,\"result\":[]}\n".to_vec();
+        let burst = [exact, small].concat();
+        let mut stream = capped_cursor(&burst);
+        let read = read_to_end(&mut stream).expect("both lines are delivered");
+        assert_eq!(read, burst);
+    }
+
+    #[test]
+    fn a_line_of_cap_plus_one_content_bytes_fails_with_the_literal_message_and_poisons() {
+        // CAP + 1 content bytes: one byte over the cap, the smallest
+        // line the cap must reject.
+        let mut line = vec![b'x'; (CAP + 1) as usize];
         line.push(b'\n');
         let mut stream = capped_cursor(&line);
         let error = stream.read(&mut [0u8; 256]).unwrap_err();
@@ -616,11 +659,11 @@ mod tests {
     }
 
     fn oversize_result_line() -> String {
-        // A result payload sized so the full response line is exactly
-        // CAP + 1 bytes (the second request on a connection has id 1):
-        // the smallest line the cap must reject.
+        // A result payload sized so the full response line's content is
+        // CAP + 1 bytes before its newline (the second request on a
+        // connection has id 1): the smallest line the cap must reject.
         let wrapper = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"\"}\n";
-        let pad = (CAP as usize + 1).saturating_sub(wrapper.len());
+        let pad = (CAP as usize + 2).saturating_sub(wrapper.len());
         format!("\"{}\"", "y".repeat(pad))
     }
 

@@ -93,7 +93,7 @@ The `[electrum]` keys the observer honours (see
 | `request_timeout` | `10s` | > 0 | Connect, read, and write timeout per connection. |
 | `max_requests_per_tick` | `1000` | > 2 effective | Token-bucket capacity (probe reservation included). |
 | `max_requests_per_second` | `5` | > 0 | Token-bucket refill rate. |
-| `max_utxos_per_address` | `200` | > 0 | Decoded list_unspent item cap per address. |
+| `max_utxos_per_address` | `200` | > 0, and items × 110 B + envelope ≤ `max_response_bytes` | Decoded list_unspent item cap per address; startup refuses an item cap whose maximum reply would exceed the transport byte cap. |
 | `address_deadline` | `5s` | > 0 | Per-address wall-clock deadline. |
 | `max_response_bytes` | `1048576` (1 MiB) | `65536`–`16777216` (64 KiB–16 MiB) | Transport cap on one response line; an over-cap line of any length consumes exactly cap + 1 bytes from the source before the read fails with `electrum response exceeds max_response_bytes` (before any decode), and the connection is torn down. |
 | `max_tip_age` | `4h` | > 0 | Stale-tip readiness bound. |
