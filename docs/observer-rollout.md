@@ -71,6 +71,32 @@ panels and alerts that reference them:
   (`paykit-server/src/workers/observer.rs:39`), past which the observer
   also emits a WARN log (`paykit-server/src/workers/observer.rs:772`):
   the budget is saturated or a target is failing repeatedly.
+- The transport byte cap surfaces as
+  `paykit_electrum_observation_address_failures{reason="error"}` (or a
+  probe `Unavailable` when the oversize line answers a probe request):
+  an Electrum response line over `electrum.max_response_bytes` fails the
+  read with the literal loggable error `electrum response exceeds
+  max_response_bytes` before any JSON decode, and the connection is torn
+  down and re-established on the next lookup. A sustained rise against
+  one address means the endpoint is serving oversize responses — raise
+  `electrum.max_response_bytes` only if the address is legitimately
+  heavy; otherwise suspect the endpoint.
+
+## Configuration
+
+The `[electrum]` keys the observer honours (see
+`config/paykit-server.example.toml` for the full comments):
+
+| Key | Default | Floor | Effect |
+| --- | --- | --- | --- |
+| `poll_interval` | `10s` | `1s` | Base tick cadence (±20% jitter). |
+| `request_timeout` | `10s` | > 0 | Connect, read, and write timeout per connection. |
+| `max_requests_per_tick` | `1000` | > 2 effective | Token-bucket capacity (probe reservation included). |
+| `max_requests_per_second` | `5` | > 0 | Token-bucket refill rate. |
+| `max_utxos_per_address` | `200` | > 0 | Decoded list_unspent item cap per address. |
+| `address_deadline` | `5s` | > 0 | Per-address wall-clock deadline. |
+| `max_response_bytes` | `1048576` (1 MiB) | `65536` (64 KiB) | Transport cap on one response line; over-cap reads fail with `electrum response exceeds max_response_bytes` before decode and the connection is torn down. |
+| `max_tip_age` | `4h` | > 0 | Stale-tip readiness bound. |
 
 ## Shared request limiter
 

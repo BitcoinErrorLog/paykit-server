@@ -45,21 +45,34 @@ therefore costs **exactly one request per tracked address** and never calls
 
 **Residual risk:** the request *count* is O(1) per address, but the
 *response size* grows with the address's UTXO count, so a heavily dusted
-address can still produce a large or slow response. The per-address
-wall-clock deadline below (`electrum.address_deadline`) bounds how long
-the tick *waits*, but the blocking socket read behind it cannot be
-cancelled: an over-deadline response keeps one blocking-pool thread and
-its socket occupied until the read returns — bounded at latest by
-`electrum.request_timeout` on the wire — so the residual is thread/socket
-occupancy by abandoned reads, never unbounded tick latency. Mitigations:
+address can still produce a large or slow response. The transport byte
+cap below bounds the memory a large response can occupy, and the
+per-address wall-clock deadline (`electrum.address_deadline`) bounds how
+long the tick *waits*, but the blocking socket read behind the deadline
+cannot be cancelled: an over-deadline response keeps one blocking-pool
+thread and its socket occupied until the read returns — bounded at
+latest by `electrum.request_timeout` on the wire — so the residual is
+thread/socket occupancy by abandoned reads, never unbounded tick latency
+or unbounded response memory. Mitigations:
 
+- **Transport byte cap.** Every Electrum connection wraps its TCP/TLS
+  stream in a byte-capped reader (`CappedStream`,
+  `paykit-server/src/workers/electrum.rs`) constructed through
+  electrum-client's `From<S: Read + Write>` `RawClient` constructor, so
+  the cap applies BEFORE the client's `BufReader::read_line` buffers the
+  line and before any JSON decode: **no single Electrum response line
+  larger than `electrum.max_response_bytes` (default 1 MiB, floor
+  64 KiB) is ever held in memory; the connection is torn down.** An
+  over-cap read fails with the literal `electrum response exceeds
+  max_response_bytes` error and poisons the stream, so a half-read line
+  can never be resumed — the next lookup reconnects on a fresh capped
+  connection (connecting sends no Electrum RPC: the TLS handshake is
+  transport I/O, not an Electrum request, and the client performs no
+  `server.version` negotiation, so a reconnect is never a budgeted
+  send).
 - **Item-count cap.** A response listing more than
   `electrum.max_utxos_per_address` UTXOs (default 200) is rejected before
   any per-UTXO record is materialised — no record vector is built for it.
-  (electrum-client 0.25 does not expose its transport stream — it buffers
-  the whole response line and parses JSON internally — so the response
-  line itself is still read and JSON-decoded by the client; the cap plus
-  the deadline is the strongest bound the pinned client permits.)
 - **Per-address wall-clock deadline.** Connect + call + decode for one
   address must finish within `electrum.address_deadline` (default 5s). The
   blocking socket read cannot be cancelled, so on expiry the wait is
@@ -93,7 +106,7 @@ lookups forever.
 The bucket is process-wide and shared (`RequestLimiter`, owned by the
 runtime and installed once at startup), and the guarantee is strict:
 **every Electrum request the process sends is reserved from this bucket
-before it is sent.** The callers are exactly:
+before it is sent.** In THIS tree the callers are exactly:
 
 - **the observer tick's active probe** — two requests
   (`headers.subscribe` + `block_header(0)`) reserved with `try_reserve`
@@ -104,10 +117,15 @@ before it is sent.** The callers are exactly:
   the next poll interval;
 - **the observer tick's per-address `list_unspent` lookups** — one
   atomic reserve-up-to against the post-probe balance admits the
-  oldest-first prefix and charges exactly what is dispatched;
-- **invoice-creation snapshot fetches, the first-bind candidate fetch,
-  and the claim-time history scan** — `try_reserve` (or
-  `reserve_or_wait` with a bounded deadline) before dispatch.
+  oldest-first prefix and charges exactly what is dispatched.
+
+The **invoice-creation snapshot fetch, the first-bind candidate fetch,
+and the claim-time history scan** are sibling slices (W1.1/W1.2) that do
+not exist in this tree; when they rebase onto this HEAD they inherit the
+same capped connection (`workers/electrum.rs` is the only connection
+constructor, so their `get_history` scan is byte-capped identically) and
+must charge `try_reserve` (or `reserve_or_wait` with a bounded deadline)
+before dispatch.
 
 The configured rate therefore bounds the joint load, and a busy non-tick
 caller shrinks — or, when it drains the bucket, wholly defers — the next
