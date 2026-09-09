@@ -91,7 +91,7 @@ struct CreatorSpec {
 type OutboxDiagnostic = (String, bool, i32, Option<String>);
 
 struct DeterministicElectrum {
-    outputs: HashMap<String, (u64, OutPoint)>,
+    outputs: std::sync::Mutex<HashMap<String, (u64, OutPoint)>>,
     requests: Mutex<Vec<String>>,
     active_creation_snapshots: AtomicUsize,
     max_active_creation_snapshots: AtomicUsize,
@@ -100,23 +100,34 @@ struct DeterministicElectrum {
 impl DeterministicElectrum {
     fn new(fixtures: &[&CreatorFixture]) -> Self {
         Self {
-            outputs: fixtures
-                .iter()
-                .enumerate()
-                .map(|(index, fixture)| {
-                    (
-                        fixture.address.clone(),
+            outputs: std::sync::Mutex::new(
+                fixtures
+                    .iter()
+                    .enumerate()
+                    .map(|(index, fixture)| {
                         (
-                            fixture.amount_sats,
-                            OutPoint::new(Txid::from_byte_array([(index + 11) as u8; 32]), 0),
-                        ),
-                    )
-                })
-                .collect(),
+                            fixture.address.clone(),
+                            (
+                                fixture.amount_sats,
+                                OutPoint::new(Txid::from_byte_array([(index + 11) as u8; 32]), 0),
+                            ),
+                        )
+                    })
+                    .collect(),
+            ),
             requests: Mutex::new(Vec::new()),
             active_creation_snapshots: AtomicUsize::new(0),
             max_active_creation_snapshots: AtomicUsize::new(0),
         }
+    }
+
+    /// Reprices a fixture output to the nonce'd total its invoice binds at
+    /// (§B.8.2): the lock price alone is an underpayment once the invoice's
+    /// CSPRNG nonce is added.
+    fn set_amount(&self, address: &str, sats: u64) {
+        let mut outputs = self.outputs.lock().unwrap();
+        let (_, outpoint) = outputs.get(address).unwrap().to_owned();
+        outputs.insert(address.to_owned(), (sats, outpoint));
     }
 }
 
@@ -177,11 +188,12 @@ impl ElectrumPort for DeterministicElectrum {
             .lock()
             .unwrap()
             .push(format!("observer_list_unspent targets={}", targets.len()));
+        let outputs = self.outputs.lock().unwrap();
         Ok(ObservationReport {
             outputs: targets
                 .iter()
                 .filter_map(|target| {
-                    self.outputs
+                    outputs
                         .get(target.address())
                         .map(|(sats, outpoint)| ObservedOutput {
                             network: BitcoinNetwork::Testnet,
@@ -731,12 +743,28 @@ async fn raw_database_bytes(pool: &PgPool) -> Vec<Vec<u8>> {
     values
 }
 
+/// Deserialization mirror of the sealed invoice payment record written from
+/// W1.1b on; field order must match the product struct exactly.
+#[derive(serde::Deserialize)]
+struct InvoicePaymentRecordV3 {
+    version: u8,
+    derivation_index: i64,
+    bitcoin_address: String,
+    required_sats: u64,
+    nonce_sats: u64,
+    creation_chain_height: u32,
+    baseline_set_hash: [u8; 32],
+}
+
+/// Asserts the persisted workflow inputs and returns each fixture's
+/// `(address, total_sats)` pair, where the total is the nonce'd amount the
+/// invoice binds at (§B.8.2).
 async fn assert_persisted_workflow_inputs(
     pool: &PgPool,
     crypto: &Crypto,
     reader: &ReaderPubky,
     fixtures: &[(&CreatorFixture, &str)],
-) {
+) -> Vec<(String, u64)> {
     type Row = (
         Vec<u8>,
         i64,
@@ -769,6 +797,7 @@ async fn assert_persisted_workflow_inputs(
 
     let mut ids = HashSet::new();
     let mut envelopes = HashSet::new();
+    let mut totals = Vec::new();
     for (
         creator_hash,
         next_child_index,
@@ -798,7 +827,7 @@ async fn assert_persisted_workflow_inputs(
         envelopes.extend([
             assignment_envelope,
             invoice_envelope,
-            payment_record_envelope,
+            payment_record_envelope.clone(),
             endpoint_envelope.clone(),
             payment_envelope.clone(),
         ]);
@@ -850,10 +879,37 @@ async fn assert_persisted_workflow_inputs(
             "paykit/server"
         );
         assert_eq!(payment.marker_fingerprint(), endpoint.marker_fingerprint());
+        // The sealed payment record carries the CSPRNG nonce and the nonce'd
+        // total (§B.8.2): the total the marketplace would record equals the
+        // lock price plus the nonce, and the buyer-facing Payment Request
+        // amount is that same total.
+        let record_plaintext = crypto
+            .decrypt(
+                &EnvelopeContext::invoice_payment_record(creator_hash, invoice_id),
+                &EncryptedEnvelope::from_bytes(payment_record_envelope),
+            )
+            .unwrap();
+        let record: InvoicePaymentRecordV3 = postcard::from_bytes(&record_plaintext).unwrap();
+        assert_eq!(record.version, 3);
+        assert_eq!(record.derivation_index, 0);
+        assert_eq!(record.bitcoin_address, fixture.address);
+        assert_eq!(record.creation_chain_height, 300);
+        assert_eq!(
+            record.baseline_set_hash,
+            bitcoin::hashes::sha256::Hash::hash(b"").to_byte_array()
+        );
+        assert!(
+            (1..=999).contains(&record.nonce_sats),
+            "nonce {} outside [1, 999]",
+            record.nonce_sats
+        );
+        let total_sats = fixture.amount_sats + record.nonce_sats;
+        assert_eq!(record.required_sats, total_sats);
+        totals.push((fixture.address.clone(), total_sats));
         let amount = format!(
             "{}.{:08}",
-            fixture.amount_sats / 100_000_000,
-            fixture.amount_sats % 100_000_000
+            total_sats / 100_000_000,
+            total_sats % 100_000_000
         );
         assert!(matches!(
             payment.operation(),
@@ -877,6 +933,7 @@ async fn assert_persisted_workflow_inputs(
         10,
         "Creator-bound envelopes must be distinct"
     );
+    totals
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -986,13 +1043,18 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         "Creator B invoice body: {}",
         String::from_utf8_lossy(&invoice_b.body)
     );
-    assert_persisted_workflow_inputs(
+    let totals = assert_persisted_workflow_inputs(
         &first_pool,
         &crypto,
         &reader,
         &[(&creator_a, BUNDLE_A), (&creator_b, BUNDLE_B)],
     )
     .await;
+    // Pay what each invoice actually binds at: the nonce'd total, not the
+    // bare lock price (an exact-amount predicate underpays otherwise).
+    for (address, total_sats) in totals {
+        observer.set_amount(&address, total_sats);
+    }
 
     let queued_before: Vec<(String, i32)> =
         sqlx::query_as("SELECT status, attempt_count FROM outbox ORDER BY id")

@@ -1,8 +1,21 @@
 use bitcoin::{OutPoint, Txid, hashes::Hash};
 use paykit_server::{
-    bitcoin::{DirectBinding, ObservationAction, ObservationTarget, ObservedOutput, TrackedOutput},
+    bitcoin::{
+        DirectBinding, ObservationAction, ObservationTarget, ObservedOutput, TrackedOutput,
+        amount_matches,
+    },
     config::BitcoinNetwork,
 };
+
+#[test]
+fn amount_match_is_exact_and_overpayment_is_a_mismatch() {
+    // §B.8.2: `observed_sats == required` binds; one satoshi over or under is
+    // a mismatch, as is any absent output.
+    assert!(amount_matches(true, 100, 100));
+    assert!(!amount_matches(true, 101, 100));
+    assert!(!amount_matches(true, 99, 100));
+    assert!(!amount_matches(false, 100, 100));
+}
 
 fn outpoint(label: u8) -> OutPoint {
     OutPoint::new(Txid::from_byte_array([label; 32]), 0)
@@ -62,6 +75,23 @@ fn underpayment_remains_replaceable_at_every_confirmation_count() {
     let underpaid = binding(1, 99, 42, true);
     assert_eq!(
         underpaid.action_for(&output(2, 100, 0, true), 100),
+        ObservationAction::Replace
+    );
+}
+
+#[test]
+fn overpayment_takes_the_same_replaceable_never_final_path_as_underpayment() {
+    let overpaid = binding(1, 101, 42, true);
+    assert!(!overpaid.is_final(100));
+    assert_eq!(overpaid.reported_confirmations(100), 42);
+    assert_eq!(
+        overpaid.action_for(&output(2, 100, 0, true), 100),
+        ObservationAction::Replace
+    );
+    let overpaid_six_confirmations = binding(1, 101, 6, true);
+    assert!(!overpaid_six_confirmations.is_final(100));
+    assert_eq!(
+        overpaid_six_confirmations.action_for(&output(2, 100, 0, true), 100),
         ObservationAction::Replace
     );
 }

@@ -298,7 +298,9 @@ rotation but can never starve it), the
 shared endpoint's request rate stays inside the configured sustained
 budget, and `bitcoin_offer_available` never degrades because of
 per-address failures. Payment semantics (outpoint/value/presence,
-`observed_sats >= required`, six-confirmation finality) are unchanged.
+the exact `observed_sats == required` match of W1.1b / §B.8.2 —
+overpayment is a mismatch routed to manual review — six-confirmation
+finality) are unchanged.
 
 ## Cluster-single observer
 

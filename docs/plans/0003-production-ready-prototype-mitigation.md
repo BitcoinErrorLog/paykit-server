@@ -28,7 +28,7 @@ Where `0002` marks an isolated seam implemented but this plan identifies missing
 - Setup and SDK-state mutation are serialized per Creator; different Creators may proceed concurrently within global capacity limits.
 - Every invoice receives an address identified by `(creator, reader, bundle_id)`.
 - Different Creators may allocate the same numeric child index from different xpubs; addresses and state must never cross Creator boundaries.
-- One direct Bitcoin output must satisfy the invoice amount; overpayment is accepted and underpayments are factual but are not accumulated.
+- One direct Bitcoin output must equal the invoice amount exactly (W1.1b, design §B.8.2); overpayment and underpayment are both factual mismatches routed to manual review and are not accumulated.
 - Amount-matched observations freeze at one confirmation and finalize at six.
 - Paykit delivery is at least once; the documented ambiguous handoff window may produce duplicate Payment Requests.
 - Restart recovery and bounded shutdown are supported.

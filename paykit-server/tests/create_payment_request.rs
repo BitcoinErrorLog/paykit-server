@@ -228,6 +228,7 @@ struct CapturedInput {
     bundle_binding: Vec<u8>,
     payment_request_binding: Vec<u8>,
     required_sats: u64,
+    nonce_sats: u64,
     payment_request_intent: DeliveryIntentV1,
     new_reader_bitcoin_address: String,
 }
@@ -294,6 +295,7 @@ impl InvoicePersistence for CapturingStore {
             bundle_binding: input.bundle_binding.to_vec(),
             payment_request_binding: input.payment_request_binding.to_vec(),
             required_sats: input.required_sats,
+            nonce_sats: input.nonce_sats,
             payment_request_intent: input.payment_request_intent.clone(),
             new_reader_bitcoin_address: payloads.bitcoin_address,
         });
@@ -384,7 +386,9 @@ async fn persists_exact_terms_bindings_and_derived_address_without_a_lock() {
     let captured = store.captured.lock().unwrap();
     let input = &captured[0];
     assert_eq!(input.bundle_binding, REFERENCE.as_bytes());
-    assert_eq!(input.required_sats, 50_000);
+    // §B.8.2: the invoice binds at exactly the nonce'd total.
+    assert!((1..=999).contains(&input.nonce_sats));
+    assert_eq!(input.required_sats, 50_000 + input.nonce_sats);
     assert_eq!(
         input.payment_request_binding,
         serde_json_canonicalizer::to_vec(&serde_json::json!({
@@ -401,7 +405,12 @@ async fn persists_exact_terms_bindings_and_derived_address_without_a_lock() {
     );
     match input.payment_request_intent.operation() {
         DeliveryOperationV1::PaymentRequestProposal { terms } => {
-            assert_eq!(terms.amount, "0.00050000");
+            // The buyer-facing Payment Request amount is the same total.
+            let total = 50_000 + input.nonce_sats;
+            assert_eq!(
+                terms.amount,
+                format!("{}.{:08}", total / 100_000_000, total % 100_000_000)
+            );
             assert_eq!(terms.asset, "btc");
             let reference = uuid::Uuid::parse_str(&terms.payment_reference).unwrap();
             assert_eq!(reference.get_version_num(), 4);

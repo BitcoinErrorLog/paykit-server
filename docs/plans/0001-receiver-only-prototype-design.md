@@ -367,7 +367,7 @@ Rules:
 
 - The invoice-specific address is the sole attribution key; payer-originated
   messages are out of scope.
-- Output amount matches when `output_sats >= invoice_sats`; overpayment is accepted.
+- Output amount matches when `output_sats == invoice_sats` exactly (W1.1b, design §B.8.2 — this reversed the original `>=` rule); overpayment reports `amount_matched: false` and routes to manual review, the same path as underpayment.
 - No aggregation or top-up semantics: one output must satisfy the full invoice amount.
 - Wrong-address output or no observed output leaves the invoice `undetected`.
 - One `txid:vout` is owned by only one invoice globally, including replaced

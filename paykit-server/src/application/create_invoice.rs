@@ -20,6 +20,7 @@ use paykit_lib::{
     PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier,
     PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
 };
+use rand::Rng;
 use serde_json::{Map, Value};
 
 use crate::{
@@ -37,6 +38,17 @@ use crate::{
 };
 
 const REQUEST_DEADLINE: Duration = Duration::from_secs(15);
+
+/// Draws one invoice's amount nonce from the operating system's CSPRNG
+/// (design §B.8.2): `nonce_sats ∈ [1, 999]`, never derived from the order
+/// id, the price, a counter, or time, because a predictable nonce is not a
+/// nonce. The invoice then binds at exactly `price + nonce_sats`, and the
+/// nonce is absorbed in the price — never refunded on chain.
+pub fn draw_nonce_sats() -> u64 {
+    rand::rng().random_range(
+        crate::domain::invoice::NONCE_SATS_MIN..=crate::domain::invoice::NONCE_SATS_MAX,
+    )
+}
 
 #[derive(Clone, Debug)]
 pub struct CreateInvoiceRequest {
@@ -180,10 +192,14 @@ impl InvoicePersistence for InvoiceStore {
 
 /// Builds canonical paykit-lib inputs without allocating SDK-owned wire IDs.
 pub trait IntentBuilder: Send + Sync {
+    /// Builds the Payment Request terms. The amount is the nonce'd total
+    /// (`lock price + nonce_sats`, design §B.8.2): the buyer's checkout
+    /// figure, the Payment Request amount and the recorded total all agree.
     fn payment_request_terms(
         &self,
         request: &CreateInvoiceRequest,
         lock: &ContentLock,
+        nonce_sats: u64,
     ) -> Result<PaymentRequestTerms, CreateInvoiceError>;
     fn receiving_details(
         &self,
@@ -229,9 +245,13 @@ impl IntentBuilder for PaykitIntentBuilder {
         &self,
         request: &CreateInvoiceRequest,
         lock: &ContentLock,
+        nonce_sats: u64,
     ) -> Result<PaymentRequestTerms, CreateInvoiceError> {
         let amount = extract_terms(lock)?;
-        let sats = amount.as_sats();
+        let sats = amount
+            .as_sats()
+            .checked_add(nonce_sats)
+            .ok_or(CreateInvoiceError::InvalidRequest)?;
         let mut metadata = Map::new();
         metadata.insert(
             "bundle_id".into(),
@@ -570,7 +590,14 @@ impl CreateInvoiceService {
                 .await
                 .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
                 .map_err(map_store)?;
-        let terms = self.intents.payment_request_terms(&request, &lock)?;
+        let nonce_sats = draw_nonce_sats();
+        let price_sats = extract_terms(&lock)?.as_sats();
+        let total_sats = price_sats
+            .checked_add(nonce_sats)
+            .ok_or(CreateInvoiceError::InvalidRequest)?;
+        let terms = self
+            .intents
+            .payment_request_terms(&request, &lock, nonce_sats)?;
         let payment_request_intent = DeliveryIntentV1::payment_request(
             request.reader.to_string(),
             &selected.marker,
@@ -600,7 +627,8 @@ impl CreateInvoiceService {
                 payment_request_binding: &payment_request_binding,
                 new_reader_payloads: &new_reader_payloads,
                 payment_request_intent,
-                required_sats: extract_terms(&lock)?.as_sats(),
+                required_sats: total_sats,
+                nonce_sats,
             })
             .await
             .map_err(map_store)?;

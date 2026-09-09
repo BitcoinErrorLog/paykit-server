@@ -174,9 +174,10 @@ fn capable_marker() -> paykit_lib::PaykitReceiverMarker {
 fn library_payment_request_has_exact_terms_amount_and_metadata() {
     let request = request();
     let terms = PaykitIntentBuilder::default()
-        .payment_request_terms(&request, &valid_lock())
+        .payment_request_terms(&request, &valid_lock(), 500)
         .unwrap();
-    assert_eq!(terms.amount.value, "0.00050000");
+    // The terms amount is the nonce'd total: lock price 50000 + nonce 500.
+    assert_eq!(terms.amount.value, "0.00050500");
     assert_eq!(terms.amount.asset, "btc");
     assert_eq!(terms.proposal_expires_at, None);
     assert_eq!(terms.recurrence, None);
@@ -1432,5 +1433,133 @@ fn delivery_intent_is_closed_and_contains_complete_sdk_inputs_not_final_wire_ids
         !serialized
             .windows(b"payment_request_id".len())
             .any(|window| window == b"payment_request_id")
+    );
+}
+
+struct CapturedAmounts {
+    nonce_sats: u64,
+    required_sats: u64,
+    terms_amount: String,
+}
+
+struct CapturingAmountsStore {
+    captured: Mutex<Vec<CapturedAmounts>>,
+}
+
+#[async_trait]
+impl InvoicePersistence for CapturingAmountsStore {
+    async fn preflight(
+        &self,
+        _creator: &CreatorPubky,
+        _bundle_binding: &[u8],
+        _payment_binding: &[u8],
+    ) -> Result<InvoicePreflight, PersistenceError> {
+        Ok(InvoicePreflight::New)
+    }
+
+    async fn exact_replay(
+        &self,
+        _creator: &CreatorPubky,
+        _reader: &paykit_server::domain::locks::ReaderPubky,
+        _bundle_binding: &[u8],
+        _payment_binding: &[u8],
+    ) -> Result<AtomicInvoiceResult, PersistenceError> {
+        Err(PersistenceError::CorruptOrMissing)
+    }
+
+    async fn create_atomic(
+        &self,
+        input: AtomicInvoiceInput<'_>,
+    ) -> Result<AtomicInvoiceResult, PersistenceError> {
+        let terms_amount = match input.payment_request_intent.operation() {
+            DeliveryOperationV1::PaymentRequestProposal { terms } => terms.amount.clone(),
+            DeliveryOperationV1::EndpointPublication { .. } => {
+                panic!("payment request intent expected")
+            }
+        };
+        self.captured.lock().unwrap().push(CapturedAmounts {
+            nonce_sats: input.nonce_sats,
+            required_sats: input.required_sats,
+            terms_amount,
+        });
+        Ok(AtomicInvoiceResult::new(
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            Some(uuid::Uuid::new_v4()),
+            uuid::Uuid::new_v4(),
+            0,
+            false,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn every_invoice_draws_a_csprng_nonce_and_binds_at_price_plus_nonce() {
+    let store = Arc::new(CapturingAmountsStore {
+        captured: Mutex::new(vec![]),
+    });
+    let service = CreateInvoiceService::with_delivery_intents(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        store.clone(),
+        Arc::new(EmptyBaselineElectrum),
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+    );
+
+    // Two hundred invoices for one seller: every nonce is in [1, 999], the
+    // amount the marketplace would record (required_sats) is price + nonce,
+    // and the buyer-facing terms amount is the same total (§B.8.2).
+    for _ in 0..200 {
+        service.create(request()).await.unwrap();
+    }
+    let captured = store.captured.lock().unwrap();
+    assert_eq!(captured.len(), 200);
+    for draw in captured.iter() {
+        assert!(
+            (1..=999).contains(&draw.nonce_sats),
+            "nonce {} outside [1, 999]",
+            draw.nonce_sats
+        );
+        assert_eq!(draw.required_sats, 50_000 + draw.nonce_sats);
+        assert_eq!(
+            draw.terms_amount,
+            format!(
+                "{}.{:08}",
+                draw.required_sats / 100_000_000,
+                draw.required_sats % 100_000_000
+            )
+        );
+    }
+    let nonces = captured
+        .iter()
+        .map(|draw| draw.nonce_sats)
+        .collect::<Vec<_>>();
+    assert!(
+        nonces.iter().any(|nonce| *nonce != nonces[0]),
+        "200 independent CSPRNG draws are all equal"
+    );
+    let nondecreasing = nonces.windows(2).all(|pair| pair[0] <= pair[1]);
+    let nonincreasing = nonces.windows(2).all(|pair| pair[0] >= pair[1]);
+    assert!(
+        !(nondecreasing || nonincreasing),
+        "200 independent CSPRNG draws are monotonic"
     );
 }

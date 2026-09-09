@@ -112,11 +112,21 @@ impl ObservedOutput {
     }
 }
 
+/// The exact-amount settlement predicate (design §B.8.2): an observed output
+/// settles an invoice only when it pays exactly the required amount. An
+/// overpayment is a mismatch and takes the same manual-review path as an
+/// underpayment; the per-invoice amount nonce is absorbed in the price and
+/// is never refunded on chain.
+pub fn amount_matches(present: bool, observed_sats: u64, required_sats: u64) -> bool {
+    present && observed_sats == required_sats
+}
+
 /// The durable binding currently associated with an invoice address.
 ///
-/// A matching output freezes after its first confirmation, but a confirmed
-/// underpayment remains replaceable. A matching output finalizes at six
-/// confirmations; callers report its count as exactly six thereafter.
+/// An exact-amount output freezes after its first confirmation, but a
+/// confirmed amount mismatch (under- or overpayment) remains replaceable. An
+/// exact-amount output finalizes at six confirmations; callers report its
+/// count as exactly six thereafter.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DirectBinding {
     outpoint: String,
@@ -152,11 +162,11 @@ impl DirectBinding {
     }
 
     pub fn is_final(&self, required_sats: u64) -> bool {
-        self.present && self.sats >= required_sats && self.confirmations >= 6
+        amount_matches(self.present, self.sats, required_sats) && self.confirmations >= 6
     }
 
     pub fn reported_confirmations(&self, required_sats: u64) -> u32 {
-        if self.sats >= required_sats {
+        if amount_matches(self.present, self.sats, required_sats) {
             self.confirmations.min(6)
         } else {
             self.confirmations
@@ -189,7 +199,7 @@ impl DirectBinding {
         if self.is_final(required_sats) {
             return ObservationAction::Ignore;
         }
-        if self.sats < required_sats || !self.present || self.confirmations == 0 {
+        if self.sats != required_sats || !self.present || self.confirmations == 0 {
             ObservationAction::Replace
         } else {
             ObservationAction::Ignore

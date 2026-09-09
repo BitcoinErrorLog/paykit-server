@@ -24,7 +24,7 @@ use crate::{
             CreateInvoiceError, CreatorXpubProvider, DeadlineClock, DerivedNewReaderPayloads,
             InvoicePersistence, MarkerDiscovery, PaykitIntentBuilder, SessionValidationError,
             SessionValidator, SystemDeadlineClock, complete_creation_baseline_within_deadline,
-            map_store, remaining,
+            draw_nonce_sats, map_store, remaining,
         },
         reader_marker::select_reader_marker,
         semantic_intent::DeliveryIntentV1,
@@ -215,7 +215,12 @@ impl MarketplacePaymentRequestService {
         .await
         .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
         .map_err(map_store)?;
-        let terms = self.payment_request_terms(&request)?;
+        let nonce_sats = draw_nonce_sats();
+        let total_sats = request
+            .amount_sats
+            .checked_add(nonce_sats)
+            .ok_or(CreateInvoiceError::InvalidRequest)?;
+        let terms = self.payment_request_terms(&request, nonce_sats)?;
         let payment_request_intent = DeliveryIntentV1::payment_request(
             request.reader.to_string(),
             &selected.marker,
@@ -245,7 +250,8 @@ impl MarketplacePaymentRequestService {
                 payment_request_binding: &payment_request_binding,
                 new_reader_payloads: &new_reader_payloads,
                 payment_request_intent,
-                required_sats: request.amount_sats,
+                required_sats: total_sats,
+                nonce_sats,
             })
             .await
             .map_err(map_store)?;
@@ -269,11 +275,18 @@ impl MarketplacePaymentRequestService {
         Ok(created)
     }
 
+    /// The amount on the terms is the nonce'd total (`amount_sats` +
+    /// `nonce_sats`, design §B.8.2): the buyer's checkout figure, the Payment
+    /// Request amount and the recorded total all agree.
     fn payment_request_terms(
         &self,
         request: &MarketplacePaymentRequest,
+        nonce_sats: u64,
     ) -> Result<PaymentRequestTerms, CreateInvoiceError> {
-        let sats = request.amount_sats;
+        let sats = request
+            .amount_sats
+            .checked_add(nonce_sats)
+            .ok_or(CreateInvoiceError::InvalidRequest)?;
         let mut metadata = Map::new();
         metadata.insert(
             "order_reference".into(),

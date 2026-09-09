@@ -261,8 +261,10 @@ fn domain_matching_overpayment_and_underpayment_follow_finality_and_replacement_
 
     assert!(matching.observation().amount_matched());
     assert!(matching.is_replaceable());
-    assert!(overpayment.observation().amount_matched());
-    assert!(!overpayment.is_replaceable());
+    // §B.8.2: the match is exact, so an overpayment is a mismatch and takes
+    // the same replaceable, never-final path as an underpayment.
+    assert!(!overpayment.observation().amount_matched());
+    assert!(overpayment.is_replaceable());
     assert!(!overpayment.is_final());
     assert!(!underpayment.observation().amount_matched());
     assert!(underpayment.is_replaceable());

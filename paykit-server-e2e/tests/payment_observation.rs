@@ -6,7 +6,7 @@ use paykit_sdk::{ReceiverNoiseSecretKey, storage::StorageState};
 use paykit_server::{
     bitcoin::{ObservationTarget, ObservedOutput, TrackedOutput},
     config::BitcoinNetwork,
-    crypto::{Crypto, EnvelopeContext},
+    crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
     domain::payment::BitcoinOutpoint,
     persistence::{
@@ -105,6 +105,7 @@ async fn invoice_for(
             new_reader_payloads: &PAYLOADS,
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
+            nonce_sats: 1,
         })
         .await
         .unwrap();
@@ -152,6 +153,7 @@ async fn other_creator_invoice(
             new_reader_payloads: &FixedPayloads(address),
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
+            nonce_sats: 1,
         })
         .await
         .unwrap()
@@ -201,6 +203,7 @@ async fn awaiting_invoice(
             new_reader_payloads: &FixedPayloads(address),
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
+            nonce_sats: 1,
         })
         .await
         .unwrap()
@@ -222,6 +225,7 @@ async fn awaiting_other_creator_invoice(
             new_reader_payloads: &FixedPayloads(address),
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
+            nonce_sats: 1,
         })
         .await
         .unwrap()
@@ -1007,6 +1011,7 @@ async fn batch_invoice(database: &TestDatabase) -> (InvoiceStore, uuid::Uuid) {
             new_reader_payloads: &FixedPayloads(REGTEST_ADDRESS),
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
+            nonce_sats: 1,
         })
         .await
         .unwrap()
@@ -1534,7 +1539,7 @@ async fn direct_observation_persists_replacement_reorg_and_six_confirmation_fina
         .await
         .unwrap();
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("rbf-new"), 101, 0, None, true)
+        .apply_bitcoin_observation(&address, &persisted_outpoint("rbf-new"), 100, 0, None, true)
         .await
         .unwrap();
     assert_eq!(
@@ -1566,7 +1571,7 @@ async fn direct_observation_persists_replacement_reorg_and_six_confirmation_fina
     );
 
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("rbf-new"), 101, 1, None, true)
+        .apply_bitcoin_observation(&address, &persisted_outpoint("rbf-new"), 100, 1, None, true)
         .await
         .unwrap();
     store
@@ -1598,7 +1603,7 @@ async fn direct_observation_persists_replacement_reorg_and_six_confirmation_fina
         .apply_bitcoin_observation(
             &address,
             &persisted_outpoint("rbf-new"),
-            101,
+            100,
             1,
             None,
             false,
@@ -1636,7 +1641,7 @@ async fn direct_observation_persists_replacement_reorg_and_six_confirmation_fina
         .await
         .unwrap();
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("rbf-new"), 101, 0, None, true)
+        .apply_bitcoin_observation(&address, &persisted_outpoint("rbf-new"), 100, 0, None, true)
         .await
         .unwrap();
     store
@@ -2156,6 +2161,7 @@ async fn observation_plan_orders_oldest_observed_first_and_stamp_rotates_the_pla
             new_reader_payloads: &FixedPayloads("plan-address-b"),
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
+            nonce_sats: 1,
         })
         .await
         .unwrap();
@@ -2197,6 +2203,7 @@ async fn a_failed_observation_attempt_rotates_the_plan_without_marking_the_targe
             new_reader_payloads: &FixedPayloads("plan-address-c"),
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
+            nonce_sats: 1,
         })
         .await
         .unwrap();
@@ -2237,5 +2244,449 @@ async fn a_failed_observation_attempt_rotates_the_plan_without_marking_the_targe
             .await
             .unwrap();
     assert!(attempted, "a failed attempt carries the attempt stamp");
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn overpayment_reports_confirmed_amount_mismatch_and_remains_replaceable() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let (invoice_id, address) = invoice(&store).await;
+
+    // required + 1 reports confirmed with amount_matched = false: the exact
+    // facts an underpayment produces, so the marketplace manual-review path
+    // is the same existing one (§B.8.2). Nothing is refunded on chain.
+    store
+        .apply_bitcoin_observation(
+            &address,
+            &persisted_outpoint("overpaid"),
+            101,
+            20,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 20, false)
+    );
+    store
+        .apply_bitcoin_observation(
+            &address,
+            &persisted_outpoint("overpaid"),
+            101,
+            42,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 42, false)
+    );
+
+    // The overpaid binding never finalizes and stays replaceable: an exact
+    // payment afterwards binds and finalizes at six confirmations.
+    store
+        .apply_bitcoin_observation(&address, &persisted_outpoint("exact"), 100, 1, None, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 1, true)
+    );
+    store
+        .apply_bitcoin_observation(&address, &persisted_outpoint("exact"), 100, 9, None, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 6, true)
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn first_bind_candidate_gate_uses_the_exact_required_amount() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let invoice_id =
+        awaiting_invoice(&store, b"gate-bundle", b"gate-request", REGTEST_ADDRESS).await;
+    store
+        .complete_creation_baseline(invoice_id, 100, &[], &[])
+        .await
+        .unwrap();
+
+    // required - 1 is never a first-bind candidate (behaviour unchanged).
+    store
+        .apply_bitcoin_observation_at_height(
+            REGTEST_ADDRESS,
+            &BitcoinOutpoint::from_bitcoin(provider_outpoint(210)),
+            99,
+            1,
+            Some(101),
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(store.pending_candidates().await.unwrap().is_empty());
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 1, false)
+    );
+
+    // The exact required amount is candidated and, once the candidate is
+    // resolved, binds over the underpayment.
+    let exact = provider_outpoint(211);
+    store
+        .apply_bitcoin_observation_at_height(
+            REGTEST_ADDRESS,
+            &BitcoinOutpoint::from_bitcoin(exact),
+            100,
+            1,
+            Some(102),
+            true,
+        )
+        .await
+        .unwrap();
+    let candidates = store.pending_candidates().await.unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].outpoint, exact);
+    store.resolve_candidate(&candidates[0], &[]).await.unwrap();
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 1, true)
+    );
+
+    // required + 1 is never a candidate either: it binds directly as a
+    // confirmed amount mismatch, taking the same path as an underpayment.
+    let overpaid_id = awaiting_invoice(
+        &store,
+        b"gate-over-bundle",
+        b"gate-over-request",
+        "bcrt1q6rz28mcfaxtmdy5rme7l2ae6f4h0d2sgzvv5u0",
+    )
+    .await;
+    store
+        .complete_creation_baseline(overpaid_id, 100, &[], &[])
+        .await
+        .unwrap();
+    store
+        .apply_bitcoin_observation_at_height(
+            "bcrt1q6rz28mcfaxtmdy5rme7l2ae6f4h0d2sgzvv5u0",
+            &BitcoinOutpoint::from_bitcoin(provider_outpoint(212)),
+            101,
+            1,
+            Some(101),
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(store.pending_candidates().await.unwrap().is_empty());
+    assert_eq!(
+        facts(&database, overpaid_id).await,
+        ("confirmed".into(), 1, false)
+    );
+    database.cleanup().await;
+}
+
+/// Deserialization mirror of the sealed payment record written from W1.1b
+/// on; field order must match the product struct exactly.
+#[derive(serde::Deserialize)]
+struct InvoicePaymentRecordV3 {
+    version: u8,
+    derivation_index: i64,
+    bitcoin_address: String,
+    required_sats: u64,
+    nonce_sats: u64,
+    creation_chain_height: u32,
+    baseline_set_hash: [u8; 32],
+}
+
+fn decrypt_payment_record(
+    crypto: &Crypto,
+    pool_row: &(uuid::Uuid, Vec<u8>),
+) -> InvoicePaymentRecordV3 {
+    let creator_hash = crypto.lookup_hash(creator().to_string().as_bytes());
+    let plaintext = crypto
+        .decrypt(
+            &EnvelopeContext::invoice_payment_record(creator_hash, pool_row.0),
+            &EncryptedEnvelope::from_bytes(pool_row.1.clone()),
+        )
+        .unwrap();
+    postcard::from_bytes(&plaintext).unwrap()
+}
+
+async fn payment_record_row(
+    database: &TestDatabase,
+    invoice_id: uuid::Uuid,
+) -> (uuid::Uuid, Vec<u8>) {
+    sqlx::query_as("SELECT id, payment_record_envelope FROM invoices WHERE id = $1")
+        .bind(invoice_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn invoice_payment_record_seals_nonce_and_nonce_d_total() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let price_sats = 93_u64;
+    let nonce_sats = 7_u64;
+    let invoice_id = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator(),
+            reader: &reader(),
+            bundle_binding: b"seal-bundle",
+            payment_request_binding: b"seal-request",
+            new_reader_payloads: &PAYLOADS,
+            payment_request_intent: common::payment_intent(&reader()),
+            required_sats: price_sats + nonce_sats,
+            nonce_sats,
+        })
+        .await
+        .unwrap()
+        .invoice_id();
+
+    // The persisted invoice record seals both the nonce and the total the
+    // marketplace would record, and the total equals price + nonce (§B.8.2).
+    let record =
+        decrypt_payment_record(&crypto(), &payment_record_row(&database, invoice_id).await);
+    assert_eq!(record.version, 3);
+    assert_eq!(record.derivation_index, 0);
+    assert_eq!(record.bitcoin_address, "bitcoin-address-0");
+    assert_eq!(record.creation_chain_height, 0);
+    assert_eq!(
+        record.baseline_set_hash,
+        bitcoin::hashes::sha256::Hash::hash(b"").to_byte_array()
+    );
+    assert_eq!(record.nonce_sats, nonce_sats);
+    assert_eq!(record.required_sats, price_sats + nonce_sats);
+    store.scan_payment_record_integrity().await.unwrap();
+
+    // A nonce outside [1, 999] is never persisted.
+    for bad_nonce in [0, 1_000] {
+        let error = store
+            .create_atomic(AtomicInvoiceInput {
+                creator: &creator(),
+                reader: &reader(),
+                bundle_binding: format!("seal-bad-{bad_nonce}").into_bytes().leak(),
+                payment_request_binding: format!("seal-bad-{bad_nonce}-request")
+                    .into_bytes()
+                    .leak(),
+                new_reader_payloads: &PAYLOADS,
+                payment_request_intent: common::payment_intent(&reader()),
+                required_sats: 100,
+                nonce_sats: bad_nonce,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error, PersistenceError::CorruptOrMissing);
+    }
+
+    // The nonce arithmetic contract (§B.8.2): a payment of the bare price is
+    // an underpayment against the nonce'd total and never matches; only the
+    // full price + nonce binds.
+    store
+        .apply_bitcoin_observation(
+            "bitcoin-address-0",
+            &persisted_outpoint("bare-price"),
+            price_sats,
+            6,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 6, false)
+    );
+    store
+        .apply_bitcoin_observation(
+            "bitcoin-address-0",
+            &persisted_outpoint("nonce-total"),
+            price_sats + nonce_sats,
+            6,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 6, true)
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn replay_by_state_returns_the_same_nonce_total_and_address() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+
+    let first = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator(),
+            reader: &reader(),
+            bundle_binding: b"replay-bundle",
+            payment_request_binding: b"replay-request",
+            new_reader_payloads: &PAYLOADS,
+            payment_request_intent: common::payment_intent(&reader()),
+            required_sats: 108,
+            nonce_sats: 8,
+        })
+        .await
+        .unwrap();
+    assert!(!first.replayed());
+
+    // A replay by state serves the stored record: even if the retry carries
+    // a different nonce and total, neither is re-drawn or re-persisted, and
+    // the derived address (allocated by the per-creator child-index cursor,
+    // never by the amount) is the creation one.
+    let replay = store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator(),
+            reader: &reader(),
+            bundle_binding: b"replay-bundle",
+            payment_request_binding: b"replay-request",
+            new_reader_payloads: &PAYLOADS,
+            payment_request_intent: common::payment_intent(&reader()),
+            required_sats: 999_999,
+            nonce_sats: 999,
+        })
+        .await
+        .unwrap();
+    assert!(replay.replayed());
+    assert_eq!(replay.invoice_id(), first.invoice_id());
+    assert_eq!(replay.reader_child_index(), first.reader_child_index());
+
+    let record = decrypt_payment_record(
+        &crypto(),
+        &payment_record_row(&database, first.invoice_id()).await,
+    );
+    assert_eq!(record.nonce_sats, 8);
+    assert_eq!(record.required_sats, 108);
+    assert_eq!(record.bitcoin_address, "bitcoin-address-0");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM invoices")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        1
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn pre_nonce_v2_invoice_binds_exactly_at_its_stored_required_amount() {
+    #[derive(Serialize)]
+    struct InvoicePaymentRecordV2<'a> {
+        version: u8,
+        derivation_index: i64,
+        bitcoin_address: &'a str,
+        required_sats: u64,
+        creation_chain_height: u32,
+        baseline_set_hash: [u8; 32],
+    }
+
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let (invoice_id, address) = invoice(&store).await;
+
+    // Rewrite the freshly sealed record as a pre-W1.1b version-2 record:
+    // nonce 0, required amount as stored at creation.
+    let crypto = crypto();
+    let creator_hash = crypto.lookup_hash(creator().to_string().as_bytes());
+    let v2_plaintext = postcard::to_allocvec(&InvoicePaymentRecordV2 {
+        version: 2,
+        derivation_index: 0,
+        bitcoin_address: &address,
+        required_sats: 100,
+        creation_chain_height: 0,
+        baseline_set_hash: bitcoin::hashes::sha256::Hash::hash(b"").to_byte_array(),
+    })
+    .unwrap();
+    let v2_envelope = crypto
+        .encrypt(
+            &EnvelopeContext::invoice_payment_record(creator_hash, invoice_id),
+            &v2_plaintext,
+        )
+        .unwrap();
+    sqlx::query("UPDATE invoices SET payment_record_envelope = $1 WHERE id = $2")
+        .bind(v2_envelope.as_bytes())
+        .bind(invoice_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    store.scan_payment_record_integrity().await.unwrap();
+
+    // required - 1 stays a mismatch, exactly as for a nonce'd invoice.
+    store
+        .apply_bitcoin_observation(&address, &persisted_outpoint("v2-under"), 99, 1, None, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 1, false)
+    );
+    // The stored required amount binds exactly (nonce 0 legacy behaviour).
+    store
+        .apply_bitcoin_observation(
+            &address,
+            &persisted_outpoint("v2-exact"),
+            100,
+            1,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 1, true)
+    );
+
+    // A legacy record that completes its baseline afterwards stays version 2.
+    // (This is the creator's second invoice, so its child index is 1.)
+    let awaiting_id = awaiting_invoice(&store, b"v2-bundle", b"v2-request", REGTEST_ADDRESS).await;
+    let v2_awaiting = postcard::to_allocvec(&InvoicePaymentRecordV2 {
+        version: 2,
+        derivation_index: 1,
+        bitcoin_address: REGTEST_ADDRESS,
+        required_sats: 100,
+        creation_chain_height: 0,
+        baseline_set_hash: bitcoin::hashes::sha256::Hash::hash(b"").to_byte_array(),
+    })
+    .unwrap();
+    let v2_awaiting_envelope = crypto
+        .encrypt(
+            &EnvelopeContext::invoice_payment_record(creator_hash, awaiting_id),
+            &v2_awaiting,
+        )
+        .unwrap();
+    sqlx::query("UPDATE invoices SET payment_record_envelope = $1 WHERE id = $2")
+        .bind(v2_awaiting_envelope.as_bytes())
+        .bind(awaiting_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    store
+        .complete_creation_baseline(awaiting_id, 100, &[], &[])
+        .await
+        .unwrap();
+    let row = payment_record_row(&database, awaiting_id).await;
+    let plaintext = crypto
+        .decrypt(
+            &EnvelopeContext::invoice_payment_record(creator_hash, row.0),
+            &EncryptedEnvelope::from_bytes(row.1),
+        )
+        .unwrap();
+    // The record version is the first postcard byte.
+    assert_eq!(plaintext[0], 2);
+    store.scan_payment_record_integrity().await.unwrap();
     database.cleanup().await;
 }

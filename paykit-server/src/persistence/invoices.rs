@@ -51,8 +51,14 @@ pub struct AtomicInvoiceInput<'a> {
     pub new_reader_payloads: &'a dyn NewReaderPayloadFactory,
     /// Complete Payment Request proposal intent. Exact replay does not rebuild it.
     pub payment_request_intent: DeliveryIntentV1,
-    /// Settlement-authoritative integer satoshi amount captured from the lock.
+    /// Settlement-authoritative integer satoshi amount the invoice binds at:
+    /// the lock or marketplace price plus `nonce_sats` (design §B.8.2).
     pub required_sats: u64,
+    /// CSPRNG-drawn amount nonce in [1, 999], persisted inside the sealed
+    /// payment record so the exact-amount predicate and the phase-1 prepare
+    /// response can report it. Never derived from the order id, the price, a
+    /// counter, or time.
+    pub nonce_sats: u64,
 }
 
 /// Private payloads for a newly allocated `(creator, reader)` assignment.
@@ -70,6 +76,120 @@ struct InvoicePaymentRecordV2 {
     required_sats: u64,
     creation_chain_height: u32,
     baseline_set_hash: [u8; 32],
+}
+
+/// Version 3 adds the CSPRNG-drawn amount nonce (design §B.8.2). For records
+/// written from W1.1b on, `required_sats` is the nonce'd total the buyer was
+/// told: the lock or marketplace price plus `nonce_sats`. The nonce is an
+/// amount fact, so it lives only inside this AEAD-sealed record, never in a
+/// plaintext column (amounts are sealed at rest under PAYKIT_MASTER_KEY).
+#[derive(Serialize, Deserialize)]
+struct InvoicePaymentRecordV3 {
+    version: u8,
+    derivation_index: i64,
+    bitcoin_address: String,
+    required_sats: u64,
+    nonce_sats: u64,
+    creation_chain_height: u32,
+    baseline_set_hash: [u8; 32],
+}
+
+/// One decrypted invoice payment record at whichever version it was sealed.
+/// Version-2 records predate the amount nonce and read as `nonce_sats = 0`,
+/// so their exact-amount predicate runs against their stored required
+/// amount. That is a behaviour change for exactly one in-flight case: a
+/// version-2 overpayment at fewer than six confirmations, which had
+/// `amount_matched = true` under the old `>=` predicate, flips to false and
+/// takes the `manual_review` path — seller-recoverable, not stranded.
+/// Finalized version-2 rows are frozen by the finalization guard (six
+/// confirmations and `amount_matched` short-circuit before the predicate is
+/// re-evaluated) and never flip.
+enum InvoicePaymentRecord {
+    V2(InvoicePaymentRecordV2),
+    V3(InvoicePaymentRecordV3),
+}
+
+impl InvoicePaymentRecord {
+    fn parse(plaintext: &[u8]) -> Result<Self, PersistenceError> {
+        match plaintext.first() {
+            Some(2) => {
+                let record: InvoicePaymentRecordV2 = postcard::from_bytes(plaintext)
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                if record.version != 2 {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                Ok(Self::V2(record))
+            }
+            Some(3) => {
+                let record: InvoicePaymentRecordV3 = postcard::from_bytes(plaintext)
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                if record.version != 3 {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                Ok(Self::V3(record))
+            }
+            _ => Err(PersistenceError::CorruptOrMissing),
+        }
+    }
+
+    fn seal(&self) -> Result<Vec<u8>, PersistenceError> {
+        match self {
+            Self::V2(record) => {
+                postcard::to_allocvec(record).map_err(|_| PersistenceError::CorruptOrMissing)
+            }
+            Self::V3(record) => {
+                postcard::to_allocvec(record).map_err(|_| PersistenceError::CorruptOrMissing)
+            }
+        }
+    }
+
+    fn derivation_index(&self) -> i64 {
+        match self {
+            Self::V2(record) => record.derivation_index,
+            Self::V3(record) => record.derivation_index,
+        }
+    }
+
+    fn bitcoin_address(&self) -> &str {
+        match self {
+            Self::V2(record) => &record.bitcoin_address,
+            Self::V3(record) => &record.bitcoin_address,
+        }
+    }
+
+    fn required_sats(&self) -> u64 {
+        match self {
+            Self::V2(record) => record.required_sats,
+            Self::V3(record) => record.required_sats,
+        }
+    }
+
+    fn creation_chain_height(&self) -> u32 {
+        match self {
+            Self::V2(record) => record.creation_chain_height,
+            Self::V3(record) => record.creation_chain_height,
+        }
+    }
+
+    fn baseline_set_hash(&self) -> &[u8; 32] {
+        match self {
+            Self::V2(record) => &record.baseline_set_hash,
+            Self::V3(record) => &record.baseline_set_hash,
+        }
+    }
+
+    fn complete_baseline(&mut self, creation_chain_height: u32, baseline_set_hash: [u8; 32]) {
+        match self {
+            Self::V2(record) => {
+                record.creation_chain_height = creation_chain_height;
+                record.baseline_set_hash = baseline_set_hash;
+            }
+            Self::V3(record) => {
+                record.creation_chain_height = creation_chain_height;
+                record.baseline_set_hash = baseline_set_hash;
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -92,10 +212,6 @@ pub(crate) struct BitcoinObservationInput {
 pub struct PendingCandidate {
     pub invoice_id: Uuid,
     pub outpoint: bitcoin::OutPoint,
-}
-
-fn output_can_bind(observed_sats: u64, required_sats: u64) -> bool {
-    observed_sats >= required_sats
 }
 
 /// Produces payloads after the creator-row lock determines the child index.
@@ -296,18 +412,28 @@ impl InvoiceStore {
                     &EncryptedEnvelope::from_bytes(envelope),
                 )
                 .map_err(|_| PersistenceError::CorruptOrMissing)?;
-            let record: InvoicePaymentRecordV2 =
-                postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
-            if record.version != 2
-                || address_hash
-                    != self
-                        .crypto
-                        .bitcoin_address_lookup_hash(record.bitcoin_address.as_bytes())
-                        .as_bytes()
+            let record = InvoicePaymentRecord::parse(&plaintext)?;
+            // A version-3 record always carries a nonce drawn at creation;
+            // one outside [1, 999] was never written by this code.
+            if let InvoicePaymentRecord::V3(record) = &record
+                && !(crate::domain::invoice::NONCE_SATS_MIN
+                    ..=crate::domain::invoice::NONCE_SATS_MAX)
+                    .contains(&record.nonce_sats)
+            {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+            if address_hash
+                != self
+                    .crypto
+                    .bitcoin_address_lookup_hash(record.bitcoin_address().as_bytes())
+                    .as_bytes()
                 || index_hash
                     != self
                         .crypto
-                        .bitcoin_derivation_index_lookup_hash(creator_hash, record.derivation_index)
+                        .bitcoin_derivation_index_lookup_hash(
+                            creator_hash,
+                            record.derivation_index(),
+                        )
                         .as_bytes()
             {
                 return Err(PersistenceError::CorruptOrMissing);
@@ -476,18 +602,16 @@ impl InvoiceStore {
                 &EncryptedEnvelope::from_bytes(row.payment_record_envelope),
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let payment: InvoicePaymentRecordV2 =
-            postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
-        if payment.version != 2
-            || row.bitcoin_address_lookup_hash
-                != self
-                    .crypto
-                    .bitcoin_address_lookup_hash(payment.bitcoin_address.as_bytes())
-                    .as_bytes()
+        let payment = InvoicePaymentRecord::parse(&plaintext)?;
+        if row.bitcoin_address_lookup_hash
+            != self
+                .crypto
+                .bitcoin_address_lookup_hash(payment.bitcoin_address().as_bytes())
+                .as_bytes()
             || row.derivation_index_lookup_hash
                 != self
                     .crypto
-                    .bitcoin_derivation_index_lookup_hash(creator_hash, payment.derivation_index)
+                    .bitcoin_derivation_index_lookup_hash(creator_hash, payment.derivation_index())
                     .as_bytes()
         {
             return Err(PersistenceError::CorruptOrMissing);
@@ -533,7 +657,10 @@ impl InvoiceStore {
             }
             _ => return Err(PersistenceError::CorruptOrMissing),
         };
-        Ok(ObservationTarget::new(payment.bitcoin_address, current))
+        Ok(ObservationTarget::new(
+            payment.bitcoin_address().to_owned(),
+            current,
+        ))
     }
 
     /// Checks durable invoice idempotency before mutable external validation.
@@ -704,11 +831,7 @@ impl InvoiceStore {
                 &EncryptedEnvelope::from_bytes(row.1),
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let mut record: InvoicePaymentRecordV2 =
-            postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
-        if record.version != 2 {
-            return Err(PersistenceError::CorruptOrMissing);
-        }
+        let mut record = InvoicePaymentRecord::parse(&plaintext)?;
         let mut entries = baseline_outputs
             .iter()
             .map(|outpoint| {
@@ -751,10 +874,8 @@ impl InvoiceStore {
             .await
             .map_err(|_| PersistenceError::Conflict)?;
         }
-        record.creation_chain_height = creation_chain_height;
-        record.baseline_set_hash = hasher.finalize().into();
-        let record_plaintext =
-            postcard::to_allocvec(&record).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        record.complete_baseline(creation_chain_height, hasher.finalize().into());
+        let record_plaintext = record.seal()?;
         let envelope = self
             .crypto
             .encrypt(
@@ -1065,11 +1186,7 @@ impl InvoiceStore {
                     &EncryptedEnvelope::from_bytes(row.3),
                 )
                 .map_err(|_| PersistenceError::CorruptOrMissing)?;
-            let record: InvoicePaymentRecordV2 =
-                postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
-            if record.version != 2 {
-                return Err(PersistenceError::CorruptOrMissing);
-            }
+            let record = InvoicePaymentRecord::parse(&plaintext)?;
             sqlx::query(
                 "UPDATE bitcoin_observation_candidates
                  SET approved = TRUE, state = 'approved', updated_at = NOW()
@@ -1085,8 +1202,8 @@ impl InvoiceStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
             approved_binding = Some((
-                record.bitcoin_address,
-                record.required_sats,
+                record.bitcoin_address().to_owned(),
+                record.required_sats(),
                 u32::try_from(row.0).map_err(|_| PersistenceError::CorruptOrMissing)?,
                 u32::try_from(row.1).map_err(|_| PersistenceError::CorruptOrMissing)?,
             ));
@@ -1300,19 +1417,16 @@ impl InvoiceStore {
                 &EncryptedEnvelope::from_bytes(invoice.payment_record_envelope),
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let payment_record: InvoicePaymentRecordV2 =
-            postcard::from_bytes(&payment_record_plaintext)
-                .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        if payment_record.version != 2
-            || payment_record.bitcoin_address != address
-            || payment_record.creation_chain_height
+        let payment_record = InvoicePaymentRecord::parse(&payment_record_plaintext)?;
+        if payment_record.bitcoin_address() != address
+            || payment_record.creation_chain_height()
                 != u32::try_from(invoice.creation_chain_height)
                     .map_err(|_| PersistenceError::CorruptOrMissing)?
             || invoice.bitcoin_address_lookup_hash != address_lookup_hash.as_bytes()
         {
             return Err(PersistenceError::CorruptOrMissing);
         }
-        let required = payment_record.required_sats;
+        let required = payment_record.required_sats();
         // Final matching outputs are no longer monitored. Keep their persisted
         // six-confirmation fact immutable even if a stale observer reports later.
         if invoice.payment_status == "confirmed"
@@ -1346,7 +1460,7 @@ impl InvoiceStore {
             hasher.update(format!("{entry_txid}:{entry_vout}").as_bytes());
             hasher.update(b"\n");
         }
-        if payment_record.baseline_set_hash != <[u8; 32]>::from(hasher.finalize()) {
+        if payment_record.baseline_set_hash() != &<[u8; 32]>::from(hasher.finalize()) {
             return Err(PersistenceError::CorruptOrMissing);
         }
         let baseline_member: bool = sqlx::query_scalar(
@@ -1371,8 +1485,7 @@ impl InvoiceStore {
         {
             return Ok(true);
         }
-        if present
-            && output_can_bind(observed_sats, required)
+        if crate::bitcoin::amount_matches(present, observed_sats, required)
             && confirmations > 0
             && !approved_candidate
             && require_candidate
@@ -1521,7 +1634,10 @@ impl InvoiceStore {
         if observation_write.rows_affected() != 1 {
             return Err(PersistenceError::Conflict);
         }
-        let amount_matched = present && output_can_bind(observed_sats, required);
+        // §B.8.2: the match is exact. An overpayment reports confirmed with
+        // amount_matched = false and takes the same manual-review path as an
+        // underpayment; the nonce is absorbed in the price, never refunded.
+        let amount_matched = crate::bitcoin::amount_matches(present, observed_sats, required);
         let reported_confirmations = if amount_matched {
             incoming_confirmations.min(6)
         } else if present {
@@ -1709,14 +1825,20 @@ impl InvoiceStore {
             }
         };
 
+        if !(crate::domain::invoice::NONCE_SATS_MIN..=crate::domain::invoice::NONCE_SATS_MAX)
+            .contains(&input.nonce_sats)
+        {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
         let payment_request_plaintext = postcard::to_allocvec(&input.payment_request_intent)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         let invoice_id = Uuid::new_v4();
-        let payment_record_plaintext = postcard::to_allocvec(&InvoicePaymentRecordV2 {
-            version: 2,
+        let payment_record_plaintext = postcard::to_allocvec(&InvoicePaymentRecordV3 {
+            version: 3,
             derivation_index: assignment.child_index,
             bitcoin_address: bitcoin_address.clone(),
             required_sats: input.required_sats,
+            nonce_sats: input.nonce_sats,
             creation_chain_height: 0,
             baseline_set_hash: Sha256::digest([]).into(),
         })
