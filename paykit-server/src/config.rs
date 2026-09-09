@@ -1,6 +1,6 @@
 use std::{fmt, time::Duration};
 
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::VerifyingKey;
 use paykit_lib::PaykitReceiverPath;
 use pubky::PublicKey;
@@ -98,6 +98,8 @@ impl Config {
                 max_utxos_per_address: raw.electrum.max_utxos_per_address,
                 address_deadline: raw.electrum.address_deadline,
                 max_tip_age: raw.electrum.max_tip_age,
+                max_creation_history_entries: raw.electrum.max_creation_history_entries,
+                max_transaction_bytes: raw.electrum.max_transaction_bytes,
             },
             outbox: OutboxConfig::from(raw.outbox),
             limits: LimitsConfig::from(raw.limits),
@@ -162,6 +164,14 @@ impl Config {
             (
                 "electrum.max_utxos_per_address",
                 u64::from(self.electrum.max_utxos_per_address),
+            ),
+            (
+                "electrum.max_creation_history_entries",
+                u64::from(self.electrum.max_creation_history_entries),
+            ),
+            (
+                "electrum.max_transaction_bytes",
+                u64::from(self.electrum.max_transaction_bytes),
             ),
             ("limits.request_body_bytes", self.limits.request_body_bytes),
             (
@@ -563,6 +573,10 @@ pub struct ElectrumConfig {
     /// regtest, whose tips are mined on demand and can be arbitrarily old
     /// without indicating endpoint trouble.
     pub max_tip_age: Duration,
+    /// Maximum complete history entries accepted by one creation snapshot.
+    pub max_creation_history_entries: u32,
+    /// Maximum raw transaction response accepted by bounded transaction fetches.
+    pub max_transaction_bytes: u32,
 }
 
 #[derive(Debug)]
@@ -662,7 +676,9 @@ pub enum ConfigError {
     InvalidReceiverPath,
     #[error("paykit.network must be mainnet or testnet")]
     InvalidPaykitNetwork,
-    #[error("paykit.receiver_path_priority entries must be canonical Paykit receiver app segments")]
+    #[error(
+        "paykit.receiver_path_priority entries must be canonical Paykit receiver app segments"
+    )]
     InvalidReceiverPathPriority,
     #[error("paykit.receiver_path_priority must not be empty")]
     EmptyReceiverPathPriority,
@@ -832,6 +848,10 @@ struct RawElectrumConfig {
     address_deadline: Duration,
     #[serde(default = "default_electrum_max_tip_age", with = "humantime_serde")]
     max_tip_age: Duration,
+    #[serde(default = "default_electrum_max_creation_history_entries")]
+    max_creation_history_entries: u32,
+    #[serde(default = "default_electrum_max_transaction_bytes")]
+    max_transaction_bytes: u32,
 }
 
 const fn default_electrum_max_requests_per_tick() -> u32 {
@@ -848,6 +868,14 @@ const fn default_electrum_max_utxos_per_address() -> u32 {
 
 const fn default_electrum_address_deadline() -> Duration {
     Duration::from_secs(5)
+}
+
+const fn default_electrum_max_creation_history_entries() -> u32 {
+    50
+}
+
+const fn default_electrum_max_transaction_bytes() -> u32 {
+    400_000
 }
 
 const fn default_electrum_max_tip_age() -> Duration {

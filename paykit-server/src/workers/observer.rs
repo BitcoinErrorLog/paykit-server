@@ -20,7 +20,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bitcoin::{Address, Network, hex::DisplayHex};
+use bitcoin::{Address, Network, OutPoint, Txid, consensus::deserialize, hex::DisplayHex};
 use electrum_client::{
     Client, ConfigBuilder, ElectrumApi, Error as ElectrumError, ListUnspentRes, Param,
     ToElectrumScriptHash,
@@ -31,7 +31,7 @@ use crate::{
     bitcoin::{ObservationTarget, ObservedOutput, PlannedObservation},
     config::BitcoinNetwork,
     domain::payment::BitcoinOutpoint,
-    persistence::{BitcoinObservationInput, InvoiceStore, PersistenceError},
+    persistence::{BitcoinObservationInput, InvoiceStore, PendingCandidate, PersistenceError},
     runtime::{ElectrumProbe, Runtime},
 };
 
@@ -113,6 +113,19 @@ pub struct FailedObservation {
     pub reason: AddressFailureReason,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreationSnapshot {
+    pub tip_height: u32,
+    pub baseline_outputs: Vec<OutPoint>,
+    pub unconfirmed_inputs: Vec<OutPoint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidateTransaction {
+    pub txid: Txid,
+    pub inputs: Vec<OutPoint>,
+}
+
 /// One tick's observation response with per-address outcomes. `outputs`
 /// holds the matched outputs of every successfully looked-up address;
 /// `observed` and `failed` partition the requested target addresses so the
@@ -133,6 +146,23 @@ pub struct ObservationReport {
 /// does not prescribe an Electrum wire protocol or invent payer messages.
 #[async_trait]
 pub trait ElectrumPort: Send + Sync {
+    async fn creation_snapshot(
+        &self,
+        _address: &str,
+        _max_history_entries: usize,
+        _max_transaction_bytes: usize,
+    ) -> Result<CreationSnapshot, ObserverError> {
+        Err(ObserverError::Unavailable)
+    }
+
+    async fn candidate_transaction(
+        &self,
+        _txid: Txid,
+        _max_transaction_bytes: usize,
+    ) -> Result<CandidateTransaction, ObserverError> {
+        Err(ObserverError::Unavailable)
+    }
+
     /// Observes each target independently with one `list_unspent` lookup per
     /// address, deriving confirmations from `tip_height` (the tip returned
     /// by this tick's probe). A per-address failure is reported in the
@@ -179,6 +209,16 @@ pub trait ObservationBackend: Send + Sync {
     /// number of records whose stamp matched no invoice row; misses are
     /// logged and counted but never abort the other records.
     async fn record_observation_tick(&self, addresses: &[String]) -> Result<u64, ObserverError>;
+    async fn pending_candidates(&self) -> Result<Vec<PendingCandidate>, ObserverError> {
+        Ok(Vec::new())
+    }
+    async fn resolve_candidate(
+        &self,
+        _candidate: &PendingCandidate,
+        _inputs: &[OutPoint],
+    ) -> Result<(), ObserverError> {
+        Err(ObserverError::Persistence)
+    }
 }
 
 #[async_trait]
@@ -203,6 +243,22 @@ impl ObservationBackend for InvoiceStore {
 
     async fn record_observation_tick(&self, addresses: &[String]) -> Result<u64, ObserverError> {
         InvoiceStore::record_observation_tick(self, addresses)
+            .await
+            .map_err(map_persistence)
+    }
+
+    async fn pending_candidates(&self) -> Result<Vec<PendingCandidate>, ObserverError> {
+        InvoiceStore::pending_candidates(self)
+            .await
+            .map_err(map_persistence)
+    }
+
+    async fn resolve_candidate(
+        &self,
+        candidate: &PendingCandidate,
+        inputs: &[OutPoint],
+    ) -> Result<(), ObserverError> {
+        InvoiceStore::resolve_candidate(self, candidate, inputs)
             .await
             .map_err(map_persistence)
     }
@@ -243,6 +299,7 @@ pub struct ObserverPolicy {
     /// this rate, so no loop cadence — including the shortest jitter
     /// interval — can sustain more requests per second.
     pub max_requests_per_second: u32,
+    pub max_transaction_bytes: usize,
 }
 
 impl ObserverPolicy {
@@ -844,6 +901,20 @@ pub async fn observe_tick(
         runtime.set_electrum_available(false);
         return ObserverTickOutcome::ObservationFailed(error);
     }
+    if u64::try_from(processed).unwrap_or(u64::MAX) < lookup_budget
+        && let Ok(candidates) = backend.pending_candidates().await
+        && let Some(candidate) = candidates.first()
+        && let Ok(transaction) = port
+            .candidate_transaction(candidate.outpoint.txid, policy.max_transaction_bytes)
+            .await
+        && transaction.txid == candidate.outpoint.txid
+        && let Err(error) = backend
+            .resolve_candidate(candidate, &transaction.inputs)
+            .await
+    {
+        runtime.set_electrum_available(false);
+        return ObserverTickOutcome::ObservationFailed(error);
+    }
     let misses = match backend.record_observation_tick(&report.observed).await {
         Ok(misses) => misses,
         Err(error) => {
@@ -967,6 +1038,15 @@ pub struct ElectrumAdapter {
 }
 
 impl ElectrumAdapter {
+    fn clone_for_fetch(&self) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            network: self.network.clone(),
+            timeout: self.timeout,
+            retries: self.retries,
+        }
+    }
+
     /// Constructs a production adapter without requiring the remote endpoint to be online.
     pub fn configured(
         endpoint: impl Into<String>,
@@ -1051,6 +1131,85 @@ enum AddressAttempt {
 
 #[async_trait]
 impl ElectrumPort for ElectrumAdapter {
+    async fn creation_snapshot(
+        &self,
+        address: &str,
+        max_history_entries: usize,
+        max_transaction_bytes: usize,
+    ) -> Result<CreationSnapshot, ObserverError> {
+        let adapter = self.clone_for_fetch();
+        let address = address.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let client = adapter.raw_client_blocking().map_err(map_electrum)?;
+            let address = parse_address(&address, adapter.network.as_bitcoin_network())?;
+            let notification = client.block_headers_subscribe().map_err(map_electrum)?;
+            let history = client
+                .script_get_history(address.script_pubkey().as_script())
+                .map_err(map_electrum)?;
+            if history.len() > max_history_entries {
+                return Err(ObserverError::Unavailable);
+            }
+            let unspent = client
+                .script_list_unspent(address.script_pubkey().as_script())
+                .map_err(map_electrum)?;
+            let mut baseline_outputs = unspent
+                .into_iter()
+                .map(|item| {
+                    Ok(OutPoint::new(
+                        item.tx_hash,
+                        u32::try_from(item.tx_pos)
+                            .map_err(|_| ObserverError::InvalidObservation)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, ObserverError>>()?;
+            let mut unconfirmed_inputs = Vec::new();
+            for entry in history.into_iter().filter(|entry| entry.height <= 0) {
+                let transaction =
+                    fetch_transaction_blocking(&client, entry.tx_hash, max_transaction_bytes)?;
+                unconfirmed_inputs.extend(
+                    transaction
+                        .input
+                        .into_iter()
+                        .map(|input| input.previous_output),
+                );
+            }
+            baseline_outputs.sort_unstable();
+            baseline_outputs.dedup();
+            unconfirmed_inputs.sort_unstable();
+            unconfirmed_inputs.dedup();
+            Ok(CreationSnapshot {
+                tip_height: u32::try_from(notification.height)
+                    .map_err(|_| ObserverError::InvalidObservation)?,
+                baseline_outputs,
+                unconfirmed_inputs,
+            })
+        })
+        .await
+        .map_err(|_| ObserverError::Unavailable)?
+    }
+
+    async fn candidate_transaction(
+        &self,
+        txid: Txid,
+        max_transaction_bytes: usize,
+    ) -> Result<CandidateTransaction, ObserverError> {
+        let adapter = self.clone_for_fetch();
+        tokio::task::spawn_blocking(move || {
+            let client = adapter.raw_client_blocking().map_err(map_electrum)?;
+            let transaction = fetch_transaction_blocking(&client, txid, max_transaction_bytes)?;
+            Ok(CandidateTransaction {
+                txid,
+                inputs: transaction
+                    .input
+                    .into_iter()
+                    .map(|input| input.previous_output)
+                    .collect(),
+            })
+        })
+        .await
+        .map_err(|_| ObserverError::Unavailable)?
+    }
+
     async fn observations(
         &self,
         tip_height: u32,
@@ -1221,6 +1380,10 @@ fn observe_address_blocking(
             outpoint,
             sats: item.value,
             confirmations,
+            confirmed_height: (item.height != 0)
+                .then(|| u32::try_from(item.height))
+                .transpose()
+                .map_err(|_| ObserverError::InvalidObservation)?,
             present: true,
         });
     }
@@ -1233,6 +1396,7 @@ fn observe_address_blocking(
             outpoint: current.outpoint(),
             sats: current.sats(),
             confirmations: 0,
+            confirmed_height: None,
             present: false,
         });
     }
@@ -1241,6 +1405,18 @@ fn observe_address_blocking(
 
 fn map_electrum(_: ElectrumError) -> ObserverError {
     ObserverError::Unavailable
+}
+
+fn fetch_transaction_blocking(
+    client: &Client,
+    txid: Txid,
+    max_transaction_bytes: usize,
+) -> Result<bitcoin::Transaction, ObserverError> {
+    let raw = client.transaction_get_raw(&txid).map_err(map_electrum)?;
+    if raw.len() > max_transaction_bytes {
+        return Err(ObserverError::Unavailable);
+    }
+    deserialize(&raw).map_err(|_| ObserverError::InvalidObservation)
 }
 
 fn parse_address(address: &str, network: Network) -> Result<Address, ObserverError> {
@@ -1276,6 +1452,7 @@ fn validate_batch(
             }
             if i32::try_from(output.confirmations).is_err()
                 || (!output.present && output.confirmations != 0)
+                || (output.confirmations == 0) != output.confirmed_height.is_none()
             {
                 return Err(ObserverError::InvalidObservation);
             }
@@ -1302,6 +1479,7 @@ fn validate_batch(
                 outpoint,
                 observed_sats: output.sats,
                 confirmations: output.confirmations,
+                confirmed_height: output.confirmed_height,
                 present: output.present,
             })
         })
@@ -1560,6 +1738,7 @@ mod tests {
             poll_interval: Duration::from_secs(10),
             max_requests_per_tick: 1000,
             max_requests_per_second: 5,
+            max_transaction_bytes: 400_000,
         };
         assert_eq!(policy.per_tick_budget(), 50);
         let capped = ObserverPolicy {
