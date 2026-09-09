@@ -15,6 +15,7 @@ pub enum ApiError {
     CreatorSessionUnavailable,
     DependencyTimeout,
     InvoiceConflict,
+    InvoiceBaselineInProgress,
     InvoiceNotFound,
     InternalError,
     LockNotFound,
@@ -74,6 +75,11 @@ impl ApiError {
                 StatusCode::CONFLICT,
                 "invoice_conflict",
                 "invoice binding conflicts with an existing invoice",
+            ),
+            Self::InvoiceBaselineInProgress => (
+                StatusCode::CONFLICT,
+                "invoice_baseline_in_progress",
+                "invoice creation baseline is still resolving; retry the identical request",
             ),
             Self::InvoiceNotFound => (
                 StatusCode::NOT_FOUND,

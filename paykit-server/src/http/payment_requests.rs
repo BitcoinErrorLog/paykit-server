@@ -72,6 +72,9 @@ fn payment_request_error(error: CreateInvoiceError) -> Response {
         | CreateInvoiceError::Unavailable => ApiError::CreatorSessionUnavailable.into_response(),
         CreateInvoiceError::LockNotFound => ApiError::LockNotFound.into_response(),
         CreateInvoiceError::Conflict => ApiError::InvoiceConflict.into_response(),
+        CreateInvoiceError::BaselineInProgress => {
+            ApiError::InvoiceBaselineInProgress.into_response()
+        }
         CreateInvoiceError::DeadlineExceeded => ApiError::DependencyTimeout.into_response(),
         CreateInvoiceError::BitcoinCreationDisabled => {
             ApiError::BitcoinCreationDisabled.into_response()

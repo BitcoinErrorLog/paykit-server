@@ -42,7 +42,9 @@ use paykit_server::{
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
-    persistence::{CreatorCredentials, CreatorStore, PostgresStorageAdapter, SdkStateStore},
+    persistence::{
+        CreatorCredentials, CreatorStore, InvoiceStore, PostgresStorageAdapter, SdkStateStore,
+    },
     startup::initialize_database,
     workers::observer::{
         CandidateTransaction, CreationSnapshot, ElectrumPort, ObservationReport, ObserverError,
@@ -1208,5 +1210,203 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
 
     first_pool.close().await;
     second_pool.close().await;
+    database.cleanup().await;
+}
+
+/// A fault-injection port whose creation snapshot parks on a gate, so a
+/// test can drop the HTTP request (client disconnect) after
+/// `create_atomic` has committed but before the baseline resolves.
+struct GatedSnapshotElectrum {
+    snapshot_starts: AtomicUsize,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl ElectrumPort for GatedSnapshotElectrum {
+    async fn creation_snapshot(
+        &self,
+        _address: &str,
+        _max_history_entries: usize,
+        _max_transaction_bytes: usize,
+        _request_limiter: &RequestLimiter,
+        _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<CreationSnapshot, ObserverError> {
+        self.snapshot_starts.fetch_add(1, Ordering::SeqCst);
+        self.release.notified().await;
+        Ok(CreationSnapshot {
+            tip_height: 300,
+            baseline_outputs: Vec::new(),
+            unconfirmed_inputs: Vec::new(),
+        })
+    }
+
+    async fn observations(
+        &self,
+        _tip_height: u32,
+        _targets: &[ObservationTarget],
+    ) -> Result<ObservationReport, ObserverError> {
+        Ok(ObservationReport::default())
+    }
+
+    async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        Ok(TipProbe {
+            height: 300,
+            time_unix: fresh_tip_time(),
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_creation_cancelled_after_commit_is_in_progress_on_retry_and_voided_by_the_sweeper() {
+    parse_bundle_id(BUNDLE_A).unwrap();
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    let signing_key = SigningKey::from_bytes(&[9; 32]);
+    let server_config = config(database.database_url(), &signing_key, "1h");
+    let pool = initialize_database(&server_config).await.unwrap();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone());
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(&pool, crypto.clone());
+
+    let (reader, peer_key, peer_sdk) = create_peer(&bootstrap, &homeserver).await;
+    let creator = create_creator(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        &pool,
+        crypto.clone(),
+        CreatorSpec {
+            seed: 51,
+            account_index: 0,
+            amount_sats: 100,
+            counter_seed: 500,
+        },
+    )
+    .await;
+    link(
+        &creator.sdk,
+        PubkyPublicKey::from_raw_or_app_key(creator.creator.to_string()).unwrap(),
+        &peer_sdk,
+        peer_key,
+    )
+    .await;
+
+    let electrum = Arc::new(GatedSnapshotElectrum {
+        snapshot_starts: AtomicUsize::new(0),
+        release: tokio::sync::Notify::new(),
+    });
+    let server =
+        Server::build_with_transports(server_config, pool.clone(), pubky, electrum.clone())
+            .await
+            .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(server.run_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_until_listening(address).await;
+    wait_until_ready(address).await;
+
+    // Drive the creation until the invoice row is committed
+    // (`awaiting_baseline`) and the snapshot read is parked on the gate —
+    // synchronized on database state and the port counter, not on sleeps.
+    let request_task = tokio::spawn(send_http(
+        address,
+        invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if request_task.is_finished() {
+            let response = request_task.await.unwrap();
+            panic!(
+                "creation request finished before the parked snapshot: {} {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            );
+        }
+        let awaiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM invoices WHERE baseline_state = 'awaiting_baseline'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if awaiting == 1 && electrum.snapshot_starts.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "creation never reached the parked snapshot"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Client disconnect: the request future is dropped after create_atomic
+    // committed, orphaning the awaiting_baseline row.
+    request_task.abort();
+    let _ = request_task.await;
+
+    // The identical retry must NEVER be an exact replay of an unpublished
+    // invoice: it is told the baseline is still resolving.
+    let retry = send_http(
+        address,
+        invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
+    )
+    .await;
+    assert_eq!(
+        retry.status,
+        StatusCode::CONFLICT,
+        "retry body: {}",
+        String::from_utf8_lossy(&retry.body)
+    );
+    let retry_body: serde_json::Value = serde_json::from_slice(&retry.body).unwrap();
+    assert_eq!(retry_body["error"]["code"], "invoice_baseline_in_progress");
+
+    // Nothing published: both outbox intents stay `prepared`.
+    let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM outbox ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(statuses, vec!["prepared".to_owned(), "prepared".to_owned()]);
+
+    // The sweeper is the terminal fallback: the orphan is voided and the
+    // outbox is never queued.
+    let store = InvoiceStore::new(&pool, crypto.clone());
+    assert_eq!(
+        store
+            .sweep_stale_creation_baselines(Duration::ZERO)
+            .await
+            .unwrap(),
+        1
+    );
+    let state: String = sqlx::query_scalar("SELECT baseline_state FROM invoices")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "void_baseline_failed");
+    let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbox WHERE status = 'queued'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(queued, 0, "a voided orphan's outbox is never queued");
+
+    // The voided binding is spent: a further retry is a conflict, still
+    // never replay success for an invoice that never published.
+    let after_void = send_http(
+        address,
+        invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
+    )
+    .await;
+    assert_eq!(after_void.status, StatusCode::CONFLICT);
+    let after_void_body: serde_json::Value = serde_json::from_slice(&after_void.body).unwrap();
+    assert_eq!(after_void_body["error"]["code"], "invoice_conflict");
+
+    electrum.release.notify_waiters();
+    let _ = shutdown_tx.send(());
+    running.await.unwrap().unwrap();
+    pool.close().await;
     database.cleanup().await;
 }

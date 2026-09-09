@@ -64,6 +64,11 @@ pub enum CreateInvoiceError {
     LockNotFound,
     LockUnavailable,
     Conflict,
+    /// The idempotent payload matches an invoice whose creation baseline
+    /// is still unresolved: its outcome (published or voided) is not yet
+    /// knowable, so the retry gets a machine-readable in-progress answer
+    /// instead of replay success for an invoice that never published.
+    BaselineInProgress,
     DeadlineExceeded,
     Unavailable,
     /// New Bitcoin binds are administratively disabled on this stack.
@@ -522,6 +527,9 @@ impl CreateInvoiceService {
                 .map_err(map_store);
             }
             InvoicePreflight::Conflict => return Err(CreateInvoiceError::Conflict),
+            InvoicePreflight::BaselineInProgress => {
+                return Err(CreateInvoiceError::BaselineInProgress);
+            }
             // An exact replay above binds nothing new; only first-time binds
             // are gated by the creation kill switch.
             InvoicePreflight::New if !self.bitcoin_creation_enabled => {

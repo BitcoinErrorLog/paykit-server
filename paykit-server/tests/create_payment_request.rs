@@ -607,6 +607,25 @@ async fn exact_replay_returns_without_session_validation() {
 }
 
 #[tokio::test]
+async fn unresolved_baseline_is_in_progress_and_never_an_exact_replay() {
+    let session = ok_session();
+    let store = Arc::new(CapturingStore::with_preflight(
+        InvoicePreflight::BaselineInProgress,
+    ));
+    assert_eq!(
+        service(session.clone(), store.clone(), BitcoinNetwork::Mainnet)
+            .create(request(50_000))
+            .await,
+        Err(CreateInvoiceError::BaselineInProgress)
+    );
+    // The retry must not replay, must not create a second invoice, and
+    // must not spend any downstream validation work.
+    assert_eq!(store.replay_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(session.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn changed_binding_is_a_conflict_without_store_mutation() {
     let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::Conflict));
     assert_eq!(

@@ -838,6 +838,34 @@ async fn exact_replay_returns_without_validator_or_lock_fetch() {
 }
 
 #[tokio::test]
+async fn unresolved_baseline_is_in_progress_and_never_an_exact_replay() {
+    let session = Arc::new(FakeSession {
+        result: Ok(()),
+        calls: AtomicUsize::default(),
+        creators: Mutex::new(vec![]),
+    });
+    let locks = Arc::new(FakeLocks {
+        result: Ok(valid_lock()),
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(
+        InvoicePreflight::BaselineInProgress,
+    ));
+
+    assert_eq!(
+        service(session.clone(), locks.clone(), store.clone())
+            .create(request())
+            .await,
+        Err(CreateInvoiceError::BaselineInProgress)
+    );
+    // The retry must not replay, must not create a second invoice, and
+    // must not spend any downstream validation work.
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(session.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(locks.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn changed_binding_returns_conflict_without_validator_or_lock_fetch() {
     let session = Arc::new(FakeSession {
         result: Ok(()),

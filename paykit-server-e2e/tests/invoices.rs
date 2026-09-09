@@ -11,7 +11,7 @@ use paykit_server::{
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
     persistence::{
-        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
+        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePreflight, InvoiceStore,
         NewReaderPayloadFactory, NewReaderPayloads, PersistenceError, run_migrations,
     },
 };
@@ -547,6 +547,94 @@ async fn failed_snapshot_voids_without_delivery_or_target_membership() {
             .unwrap();
     assert_eq!(statuses, vec!["prepared", "prepared"]);
     assert!(store.observation_plan().await.unwrap().is_empty());
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn preflight_never_replays_an_unpublished_baseline_row() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let created = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"preflight-orphan-bundle",
+            b"preflight-orphan-request",
+        ))
+        .await
+        .unwrap();
+
+    // An orphaned `awaiting_baseline` row never published: the preflight
+    // reports in-progress, NEVER ExactReplay (design r13).
+    assert_eq!(
+        store
+            .preflight(
+                &creator,
+                b"preflight-orphan-bundle",
+                b"preflight-orphan-request"
+            )
+            .await
+            .unwrap(),
+        InvoicePreflight::BaselineInProgress
+    );
+    // A different payload over the same bundle stays a conflict.
+    assert_eq!(
+        store
+            .preflight(
+                &creator,
+                b"preflight-orphan-bundle",
+                b"preflight-other-request"
+            )
+            .await
+            .unwrap(),
+        InvoicePreflight::Conflict
+    );
+
+    // The sweeper's void is terminal: the spent binding maps to Conflict,
+    // still never ExactReplay, so the client mints a fresh payment request.
+    store
+        .fail_creation_baseline(created.invoice_id())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .preflight(
+                &creator,
+                b"preflight-orphan-bundle",
+                b"preflight-orphan-request"
+            )
+            .await
+            .unwrap(),
+        InvoicePreflight::Conflict
+    );
+
+    // A published invoice (baseline completed, outbox queued) replays.
+    let published = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"preflight-published-bundle",
+            b"preflight-published-request",
+        ))
+        .await
+        .unwrap();
+    store
+        .complete_creation_baseline(published.invoice_id(), 100, &[], &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .preflight(
+                &creator,
+                b"preflight-published-bundle",
+                b"preflight-published-request"
+            )
+            .await
+            .unwrap(),
+        InvoicePreflight::ExactReplay
+    );
     database.cleanup().await;
 }
 

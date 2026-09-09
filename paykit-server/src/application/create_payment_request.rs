@@ -180,6 +180,9 @@ impl MarketplacePaymentRequestService {
                 .map_err(map_store);
             }
             InvoicePreflight::Conflict => return Err(CreateInvoiceError::Conflict),
+            InvoicePreflight::BaselineInProgress => {
+                return Err(CreateInvoiceError::BaselineInProgress);
+            }
             // An exact replay above binds nothing new; only first-time binds
             // are gated by the creation kill switch.
             InvoicePreflight::New if !self.bitcoin_creation_enabled => {

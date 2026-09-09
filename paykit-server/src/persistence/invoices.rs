@@ -120,6 +120,17 @@ pub enum InvoicePreflight {
     New,
     ExactReplay,
     Conflict,
+    /// The idempotent payload matches an invoice whose creation baseline
+    /// is still unresolved (`awaiting_baseline`): an earlier attempt
+    /// committed the invoice row but its outcome — published or voided —
+    /// is not yet known, either because it is still running or because it
+    /// was orphaned by a dropped request and awaits the sweeper. The
+    /// design forbids reporting success for an invoice that has not
+    /// published, so this row is NEVER an [`InvoicePreflight::ExactReplay`]:
+    /// the caller answers with a machine-readable in-progress outcome and
+    /// the client retries until the row resolves (a completed baseline
+    /// replays exactly; the sweeper's void is the terminal fallback).
+    BaselineInProgress,
 }
 
 impl AtomicInvoiceResult {
@@ -535,8 +546,9 @@ impl InvoiceStore {
         let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
         let bundle_hash = self.crypto.lookup_hash(bundle_binding);
         let payment_hash = self.crypto.lookup_hash(payment_request_binding);
-        let existing = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT invoices.id, invoices.payment_request_lookup_hash FROM invoices \
+        let existing = sqlx::query_as::<_, (Vec<u8>, String)>(
+            "SELECT invoices.payment_request_lookup_hash, invoices.baseline_state \
+             FROM invoices \
              JOIN creators ON creators.id = invoices.creator_id \
              WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
         )
@@ -547,10 +559,20 @@ impl InvoiceStore {
         .map_err(|_| PersistenceError::Unavailable)?;
         Ok(match existing {
             None => InvoicePreflight::New,
-            Some(existing) if existing.payment_request_lookup_hash == payment_hash.as_bytes() => {
-                InvoicePreflight::ExactReplay
+            Some((request_hash, _)) if request_hash != payment_hash.as_bytes() => {
+                InvoicePreflight::Conflict
             }
-            Some(_) => InvoicePreflight::Conflict,
+            // An unresolved or terminally voided baseline never published:
+            // neither may report replay success (design r13). The voided
+            // binding is spent — it maps to Conflict so the client mints a
+            // fresh payment request instead of retrying a dead invoice.
+            Some((_, baseline_state)) if baseline_state == "awaiting_baseline" => {
+                InvoicePreflight::BaselineInProgress
+            }
+            Some((_, baseline_state)) if baseline_state == "void_baseline_failed" => {
+                InvoicePreflight::Conflict
+            }
+            Some(_) => InvoicePreflight::ExactReplay,
         })
     }
 
