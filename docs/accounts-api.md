@@ -7,6 +7,19 @@ serves the authenticated seller their own allocation record. Both routes are
 called directly from browser clients, so the router answers CORS preflights
 for the setup flow's configured origins.
 
+## The claim gate order
+
+`POST /v0/accounts/claim` evaluates its gates in a fixed order: **shape →
+rate-limit → token → scan → persist**. Pure request-shape validation (the
+`pasted_auto` refusal, the unknown-`claim_channel` refusal) needs no I/O and
+runs before the per-minute claim rate limit is charged, so unauthenticated
+garbage never consumes claim capacity. Everything I/O-bearing — token
+verification, the claim-time history scan, marker publication and
+persistence — runs behind the rate limit. The claim response carries the
+persisted `account_index`, the claim-time `first_child_index`, the current
+`next_child_index` cursor, `key_fingerprint`, and `first_derived_address`
+derived at (`account_index`, `first_child_index`).
+
 ## The seller status endpoint
 
 `GET /v0/accounts/{creator}/status` returns the addressed seller's own
@@ -83,9 +96,9 @@ have been in — but no code path, flag, migration, or seller action ever
 writes it, and there is deliberately no enum variant to construct. A claim
 requesting `allocation_mode = 'pasted_auto'` is refused unconditionally, on
 every code path and under every configuration, with 422
-`allocation_mode_not_enabled`, before token verification, before any gate,
-persisting nothing. Enabling the mode requires a separately approved design
-revision.
+`allocation_mode_not_enabled`, before the rate-limit charge, before token
+verification, before any gate, persisting nothing. Enabling the mode
+requires a separately approved design revision.
 
 ## `claim_channel`: two values, fail closed
 
@@ -95,7 +108,9 @@ by a database CHECK to those two values or NULL. A missing channel is
 treated — and recorded — as `manual` (a paste is a bare key and nothing
 else). Any other value is refused with 422 `unknown_claim_channel`: unknown
 channels fail closed, are never canonicalized silently, and are never
-persisted verbatim.
+persisted verbatim. Like the `pasted_auto` refusal this is pure
+request-shape validation, so it runs before the claim rate limit is charged
+(see *The claim gate order*).
 
 ## CORS
 

@@ -247,8 +247,20 @@ impl Fixture {
     }
 
     fn router(&self, service: ManualClaimService) -> axum::Router {
+        self.router_with_budget(service, 100)
+    }
+
+    fn router_with_budget(
+        &self,
+        service: ManualClaimService,
+        claims_per_minute: u64,
+    ) -> axum::Router {
         paykit_server::http::accounts::accounts_router(
-            paykit_server::http::accounts::AccountsState::new(Arc::new(service), 100, vec![]),
+            paykit_server::http::accounts::AccountsState::new(
+                Arc::new(service),
+                claims_per_minute,
+                vec![],
+            ),
         )
     }
 
@@ -944,6 +956,57 @@ async fn status_first_address_is_stable_across_invoice_allocation() {
             0
         )
         .unwrap()
+    );
+
+    fixture.database.cleanup().await;
+}
+
+/// W1.13 r3 P2: pure request-shape validation runs BEFORE the claim
+/// rate-limit charge, so unauthenticated unknown-channel garbage never
+/// consumes claim capacity — a subsequent valid claim is admitted, not 429.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unknown_channel_requests_do_not_consume_the_claim_rate_limit() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let fixture = fixture().await;
+    let seller = fixture.seller().await;
+    // A one-claim-per-minute budget: a single charged garbage request would
+    // exhaust it.
+    let router = fixture.router_with_budget(
+        fixture.service(StackRole::Proof, ScriptedHistory::clean()),
+        1,
+    );
+    for attempt in 0..5 {
+        let (status, body) = post_claim(
+            &router,
+            &seller,
+            &fixture.required_capabilities,
+            &account_xpub(171, 1),
+            1,
+            Some("carrier_pigeon"),
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"]["code"].as_str()),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some("unknown_claim_channel")
+            ),
+            "garbage request {attempt} is shape-refused before any rate-limit charge: {body}"
+        );
+    }
+    let (status, body) = post_claim(
+        &router,
+        &seller,
+        &fixture.required_capabilities,
+        &account_xpub(171, 1),
+        1,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the valid claim is admitted — the garbage consumed no budget: {body}"
     );
 
     fixture.database.cleanup().await;
