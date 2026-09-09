@@ -40,10 +40,12 @@ use paykit_server::{
         CLAIM_SCAN_MAX_WINDOWS, CLAIM_SCAN_WINDOW, ChainHistoryPort, ClaimScanError,
         scan_claim_start_index,
     },
-    config::BitcoinNetwork,
+    config::{BitcoinNetwork, StackRole},
     crypto::Crypto,
+    domain::locks::CreatorPubky,
     http::accounts::{AccountsState, accounts_router},
-    manual_claim::{ManualClaimError, ManualClaimService, SessionMinter},
+    key_identity::deny_list_account_xpub,
+    manual_claim::{ClaimedKeyLookup, ManualClaimError, ManualClaimService, SessionMinter},
     persistence::CreatorStore,
     real_setup::DirectMarkerPublisher,
     workers::observer::ElectrumAdapter,
@@ -237,7 +239,32 @@ impl SessionMinter for RefusingMinter {
     }
 }
 
+/// Scripted fingerprint↔seller pre-check: `claimed` reports every key tail
+/// as claimed by a different seller.
+struct ScriptedClaimedKeys {
+    claimed: bool,
+}
+
+#[async_trait::async_trait]
+impl ClaimedKeyLookup for ScriptedClaimedKeys {
+    async fn key_tail_claimed_by_other(
+        &self,
+        _key_tail: &[u8; 65],
+        _creator: &CreatorPubky,
+    ) -> Result<bool, ManualClaimError> {
+        Ok(self.claimed)
+    }
+}
+
 fn claim_router(history: Arc<ScriptedHistory>) -> axum::Router {
+    claim_router_with(StackRole::Proof, history, false)
+}
+
+fn claim_router_with(
+    stack_role: StackRole,
+    history: Arc<ScriptedHistory>,
+    tail_claimed_by_other: bool,
+) -> axum::Router {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy("postgres://127.0.0.1:1/paykit")
         .unwrap();
@@ -247,15 +274,27 @@ fn claim_router(history: Arc<ScriptedHistory>) -> axum::Router {
         pubky::Pubky::new().unwrap(),
         Arc::new(RefusingMinter),
         CreatorStore::new(&pool, crypto),
+        Arc::new(ScriptedClaimedKeys {
+            claimed: tail_claimed_by_other,
+        }),
         Arc::new(DirectMarkerPublisher),
         history,
         BitcoinNetwork::Regtest,
+        stack_role,
+        format!(
+            "{}:6f1d0c2a-9b47-4e35-8a10-73c5e2d84b19",
+            stack_role.as_str()
+        ),
         receiver_path.clone(),
     ));
     accounts_router(AccountsState::new(service, 10, vec![]))
 }
 
 fn claim_request() -> Request<Body> {
+    claim_request_for(&regtest_account_tpub(), 0)
+}
+
+fn claim_request_for(account_xpub: &str, account_index: u32) -> Request<Body> {
     let receiver_path = PaykitReceiverPath::new("paykit/server").unwrap();
     let capabilities = PaykitSdkConfig::new(receiver_path).required_session_capabilities();
     let capabilities = Capabilities::try_from(capabilities.as_str()).unwrap();
@@ -268,8 +307,8 @@ fn claim_request() -> Request<Body> {
         .body(Body::from(
             serde_json::json!({
                 "auth_token": auth_token,
-                "account_xpub": regtest_account_tpub(),
-                "account_index": 0,
+                "account_xpub": account_xpub,
+                "account_index": account_index,
             })
             .to_string(),
         ))
@@ -348,6 +387,121 @@ async fn manual_claim_passing_scan_proceeds_to_session_minting() {
         (StatusCode::SERVICE_UNAVAILABLE, "session_unavailable")
     );
     assert_eq!(*history.calls.lock().unwrap(), 1);
+}
+
+/// A deny-listed tpub: account 0 of `m/84'/1'/0'` of the public BIP39
+/// `abandon … about` test-vector mnemonic, in regtest (tpub) form.
+fn deny_listed_tpub(account_index: u32) -> String {
+    deny_list_account_xpub(1, account_index).to_string()
+}
+
+#[tokio::test]
+async fn manual_claim_of_a_deny_listed_key_is_refused_before_any_electrum_call() {
+    let history = Arc::new(ScriptedHistory {
+        calls: Mutex::new(0),
+        fail: false,
+        used_in_every_window: false,
+    });
+    let router = claim_router_with(StackRole::Production, history.clone(), false);
+
+    let (status, code) = error_code(
+        router
+            .oneshot(claim_request_for(&deny_listed_tpub(0), 0))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, "key_deny_listed")
+    );
+    assert_eq!(
+        *history.calls.lock().unwrap(),
+        0,
+        "the deny-list gate refuses before the chain scan: zero Electrum calls"
+    );
+}
+
+#[tokio::test]
+async fn manual_claim_of_a_deny_listed_key_is_accepted_under_the_proof_role() {
+    let history = Arc::new(ScriptedHistory {
+        calls: Mutex::new(0),
+        fail: false,
+        used_in_every_window: false,
+    });
+    let router = claim_router_with(StackRole::Proof, history.clone(), false);
+
+    let (status, code) = error_code(
+        router
+            .oneshot(claim_request_for(&deny_listed_tpub(0), 0))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    // Under proof the deny-list gate does not apply, so the claim scans and
+    // advances to the session-minter boundary.
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::SERVICE_UNAVAILABLE, "session_unavailable")
+    );
+    assert_eq!(*history.calls.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn manual_claim_account_index_a_hundred_is_a_named_refusal_before_any_electrum_call() {
+    let history = Arc::new(ScriptedHistory {
+        calls: Mutex::new(0),
+        fail: false,
+        used_in_every_window: false,
+    });
+    let router = claim_router(history.clone());
+
+    // A well-formed key whose hardened child number IS 100: only the bounded
+    // account range refuses it.
+    let (status, code) = error_code(
+        router
+            .oneshot(claim_request_for(&deny_listed_tpub(100), 100))
+            .await
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(
+        (status, code.as_str()),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "account_index_out_of_range"
+        )
+    );
+    assert_eq!(
+        *history.calls.lock().unwrap(),
+        0,
+        "the account-range gate refuses before the chain scan"
+    );
+}
+
+#[tokio::test]
+async fn manual_claim_of_a_key_claimed_by_another_seller_is_refused_before_any_electrum_call() {
+    let history = Arc::new(ScriptedHistory {
+        calls: Mutex::new(0),
+        fail: false,
+        used_in_every_window: false,
+    });
+    let router = claim_router_with(StackRole::Production, history.clone(), true);
+
+    let (status, code) = error_code(router.oneshot(claim_request()).await.unwrap()).await;
+
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::CONFLICT, "key_claimed_by_other_seller")
+    );
+    assert_eq!(
+        *history.calls.lock().unwrap(),
+        0,
+        "the fingerprint-to-seller gate refuses before the chain scan"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -17,13 +17,14 @@ use paykit_sdk::{PaykitSdkConfig, PubkyPublicKey};
 use paykit_server::{
     application::create_invoice::derive_bip84_p2wpkh_address,
     chain_history::{ChainHistoryPort, ClaimScanError},
-    config::BitcoinNetwork,
+    config::{BitcoinNetwork, StackRole},
     crypto::Crypto,
     domain::locks::parse_creator,
+    key_identity::key_fingerprint,
     manual_claim::{
         ManualClaimError, ManualClaimRequest, ManualClaimService, RelayLoopbackSessionMinter,
     },
-    persistence::{CreatorStore, run_migrations},
+    persistence::{CreatorStore, DeploymentStore, run_migrations},
     real_setup::DirectMarkerPublisher,
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -90,6 +91,19 @@ fn account_xpub(seed: u8, account_index: u32) -> String {
     Xpub::from_priv(&secp, &account).to_string()
 }
 
+/// E2E fixtures boot proof-stack compositions.
+const STACK_ROLE: StackRole = StackRole::Proof;
+
+/// Mints (once) and reads this test database's stack identity, as the
+/// production boot path does inside `initialize_database`.
+async fn stack_id(pool: &sqlx::PgPool, role: StackRole) -> String {
+    DeploymentStore::new(pool)
+        .stack_identity(role)
+        .await
+        .unwrap()
+        .stack_id()
+}
+
 async fn build_pubky_testnet() -> EphemeralTestnet {
     let postgres = std::env::var("TEST_DATABASE_URL").unwrap();
     let postgres = pubky_testnet::pubky_homeserver::ConnectionString::new(&postgres).unwrap();
@@ -124,9 +138,12 @@ async fn manual_claim_persists_account_publishes_marker_and_refuses_replacement(
         pubky.clone(),
         Arc::new(RelayLoopbackSessionMinter::new(pubky.clone(), relay_inbox)),
         creators.clone(),
+        Arc::new(creators.clone()),
         Arc::new(DirectMarkerPublisher),
         Arc::new(ScriptedHistory::unused()),
         BitcoinNetwork::Testnet,
+        STACK_ROLE,
+        stack_id(database.pool(), STACK_ROLE).await,
         receiver_path.clone(),
     );
     assert_eq!(service.required_capabilities(), required_capabilities);
@@ -157,6 +174,21 @@ async fn manual_claim_persists_account_publishes_marker_and_refuses_replacement(
     assert_eq!(
         outcome.next_child_index, 0,
         "an unused account's scan keeps the derivation cursor at 0"
+    );
+    // The §B.6 identity fields: the fingerprint over the canonical 78 bytes,
+    // the address at the returned cursor, and this stack's minted stack_id.
+    assert_eq!(
+        outcome.key_fingerprint,
+        key_fingerprint(&Xpub::from_str(&xpub).unwrap().encode())
+    );
+    assert_eq!(
+        outcome.first_derived_address,
+        derive_bip84_p2wpkh_address(&xpub, 0, &BitcoinNetwork::Testnet, 0).unwrap()
+    );
+    assert_eq!(
+        outcome.stack_id,
+        stack_id(database.pool(), STACK_ROLE).await,
+        "the claim response carries the stack_identity row's stack_id"
     );
 
     // The persisted record is the exact watch-only account: fresh invoice
@@ -301,6 +333,7 @@ async fn manual_claim_persists_the_scanned_start_index_and_refuses_unscanned_cla
             relay_inbox.clone(),
         )),
         creators.clone(),
+        Arc::new(creators.clone()),
         Arc::new(DirectMarkerPublisher),
         // Usage through index 3: window 0 is non-empty, window 1 is empty.
         Arc::new(ScriptedHistory {
@@ -309,6 +342,8 @@ async fn manual_claim_persists_the_scanned_start_index_and_refuses_unscanned_cla
             calls: std::sync::Mutex::new(0),
         }),
         BitcoinNetwork::Testnet,
+        STACK_ROLE,
+        stack_id(database.pool(), STACK_ROLE).await,
         receiver_path.clone(),
     );
 
@@ -365,6 +400,7 @@ async fn manual_claim_persists_the_scanned_start_index_and_refuses_unscanned_cla
         pubky.clone(),
         Arc::new(RelayLoopbackSessionMinter::new(pubky.clone(), relay_inbox)),
         creators.clone(),
+        Arc::new(creators.clone()),
         Arc::new(DirectMarkerPublisher),
         Arc::new(ScriptedHistory {
             fail: true,
@@ -372,6 +408,8 @@ async fn manual_claim_persists_the_scanned_start_index_and_refuses_unscanned_cla
             calls: std::sync::Mutex::new(0),
         }),
         BitcoinNetwork::Testnet,
+        STACK_ROLE,
+        stack_id(database.pool(), STACK_ROLE).await,
         receiver_path.clone(),
     );
     let stranger = Keypair::random();
@@ -403,6 +441,167 @@ async fn manual_claim_persists_the_scanned_start_index_and_refuses_unscanned_cla
         .await
         .unwrap();
     assert_eq!(rows, 1, "only the successful claim's creator exists");
+
+    database.cleanup().await;
+}
+
+/// End-to-end fingerprint↔seller binding (design §B.8.5) over the exact
+/// production HTTP path: a claimed key tail binds to its seller forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_claim_binds_the_key_tail_to_one_seller_forever() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let relay_inbox = testnet.http_relay().local_url().join("inbox").unwrap();
+
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(database.pool(), crypto);
+    let receiver_path = PaykitReceiverPath::new("paykit/server").unwrap();
+    let required_capabilities =
+        PaykitSdkConfig::new(receiver_path.clone()).required_session_capabilities();
+    let stack_id = stack_id(database.pool(), STACK_ROLE).await;
+    let build_service = |history: Arc<ScriptedHistory>| {
+        Arc::new(ManualClaimService::new(
+            pubky.clone(),
+            Arc::new(RelayLoopbackSessionMinter::new(
+                pubky.clone(),
+                relay_inbox.clone(),
+            )),
+            creators.clone(),
+            Arc::new(creators.clone()),
+            Arc::new(DirectMarkerPublisher),
+            history,
+            BitcoinNetwork::Testnet,
+            STACK_ROLE,
+            stack_id.clone(),
+            receiver_path.clone(),
+        ))
+    };
+    let router = |service: Arc<ManualClaimService>| {
+        paykit_server::http::accounts::accounts_router(
+            paykit_server::http::accounts::AccountsState::new(service, 100, vec![]),
+        )
+    };
+    let post_claim = |router: axum::Router, token: String, xpub: String| async move {
+        use tower::ServiceExt;
+        let response = router
+            .oneshot(
+                axum::http::Request::post("/v0/accounts/claim")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({
+                            "auth_token": token,
+                            "account_xpub": xpub,
+                            "account_index": 0,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        )
+    };
+
+    // Seller A claims the account over the real HTTP path; the response
+    // carries the §B.6 identity fields.
+    let seller_a = Keypair::random();
+    pubky
+        .signer(seller_a.clone())
+        .signup(&testnet.homeserver_app().public_key(), None)
+        .await
+        .unwrap();
+    let xpub = account_xpub(71, 0);
+    let (status, body) = post_claim(
+        router(build_service(Arc::new(ScriptedHistory::unused()))),
+        claim_token(&seller_a, &required_capabilities),
+        xpub.clone(),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "A's claim: {body}");
+    assert_eq!(body["status"], "claimed");
+    assert_eq!(body["next_child_index"], 0);
+    assert_eq!(
+        body["key_fingerprint"],
+        key_fingerprint(&Xpub::from_str(&xpub).unwrap().encode())
+    );
+    assert_eq!(
+        body["first_derived_address"],
+        derive_bip84_p2wpkh_address(&xpub, 0, &BitcoinNetwork::Testnet, 0).unwrap()
+    );
+    assert_eq!(body["stack_id"], stack_id);
+
+    // Seller B claiming the same key is refused with the named 409 — before
+    // any Electrum call (B's history port is never invoked).
+    let seller_b = Keypair::random();
+    let b_history = Arc::new(ScriptedHistory::unused());
+    let (status, body) = post_claim(
+        router(build_service(b_history.clone())),
+        claim_token(&seller_b, &required_capabilities),
+        xpub.clone(),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (
+            axum::http::StatusCode::CONFLICT,
+            Some("key_claimed_by_other_seller")
+        )
+    );
+    assert_eq!(
+        *b_history.calls.lock().unwrap(),
+        0,
+        "the binding gate refuses before the chain scan"
+    );
+
+    // A re-claim by the same seller is accepted.
+    let (status, body) = post_claim(
+        router(build_service(Arc::new(ScriptedHistory::unused()))),
+        claim_token(&seller_a, &required_capabilities),
+        xpub.clone(),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::OK, "A's re-claim: {body}");
+
+    // HEAD has no deactivation: a claim becomes "inactive" only by the
+    // creator record disappearing. Simulate that directly; the binding must
+    // still refuse B, because it never expires.
+    sqlx::query("DELETE FROM sdk_states")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM creators")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let (status, body) = post_claim(
+        router(build_service(Arc::new(ScriptedHistory::unused()))),
+        claim_token(&seller_b, &required_capabilities),
+        xpub.clone(),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (
+            axum::http::StatusCode::CONFLICT,
+            Some("key_claimed_by_other_seller")
+        ),
+        "the binding never expires, even after the original claim is inactive"
+    );
+    let bound_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claimed_key_fingerprints")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(bound_rows, 1, "one never-expiring binding row");
 
     database.cleanup().await;
 }
