@@ -258,6 +258,12 @@ pub struct Readiness {
     pub postgres: ComponentState,
     pub electrum: ComponentState,
     pub electrum_probe: ElectrumProbeReport,
+    /// Whether the server can currently take and observe a new Bitcoin
+    /// bind. This is the only field the marketplace-service contract
+    /// consumes, so it folds every input a bind depends on: the creation
+    /// kill switch, three consecutive successful Electrum probes, the
+    /// resolved Electrum component being ready, and postgres being ready
+    /// (paykit cannot bind or observe without it).
     pub bitcoin_offer_available: bool,
     /// Observation targets currently flagged `observation_overrun` and
     /// excluded from the head-of-line budget bypass.
@@ -338,10 +344,7 @@ impl Runtime {
             electrum: AtomicU8::new(NOT_READY),
             electrum_overrun_targets: AtomicU64::new(0),
             bitcoin_creation_enabled: AtomicBool::new(true),
-            electrum_probe: Mutex::new(ElectrumProbeState {
-                offer_available: true,
-                ..ElectrumProbeState::default()
-            }),
+            electrum_probe: Mutex::new(ElectrumProbeState::default()),
             electrum_probe_freshness: Mutex::new(DEFAULT_ELECTRUM_PROBE_FRESHNESS),
             electrum_max_tip_age: Mutex::new(Some(DEFAULT_ELECTRUM_MAX_TIP_AGE)),
             paykit_enqueue: AtomicU8::new(NOT_READY),
@@ -559,7 +562,8 @@ impl Runtime {
             bitcoin_creation_enabled: self.bitcoin_creation_enabled.load(Ordering::Acquire),
             bitcoin_offer_available: self.bitcoin_creation_enabled.load(Ordering::Acquire)
                 && offer_available
-                && probe_verdict != ProbeVerdict::NotReady,
+                && electrum == ComponentState::Ready
+                && postgres == ComponentState::Ready,
             paykit_delivery,
             outbox,
         }

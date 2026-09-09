@@ -114,11 +114,16 @@ async fn task9_components_start_not_ready_until_runtime_evidence_arrives() {
 #[tokio::test]
 async fn bitcoin_offer_availability_uses_three_probe_hysteresis() {
     let runtime = runtime(true, 1);
+    runtime.set_electrum_available(true);
+    runtime.set_paykit_delivery_available(true);
+    runtime.set_outbox_available(true);
 
-    assert!(runtime.readiness().await.bitcoin_offer_available);
+    // Fail-closed from boot: the offer is false before the first probe and
+    // turns true only after three consecutive successful probes.
+    assert!(!runtime.readiness().await.bitcoin_offer_available);
     runtime.record_electrum_probe_failure();
     runtime.record_electrum_probe_failure();
-    assert!(runtime.readiness().await.bitcoin_offer_available);
+    assert!(!runtime.readiness().await.bitcoin_offer_available);
     runtime.record_electrum_probe_failure();
     assert!(!runtime.readiness().await.bitcoin_offer_available);
 
@@ -127,6 +132,27 @@ async fn bitcoin_offer_availability_uses_three_probe_hysteresis() {
     assert!(!runtime.readiness().await.bitcoin_offer_available);
     runtime.record_electrum_probe(ElectrumProbe::success(3, fresh_tip_time()));
     assert!(runtime.readiness().await.bitcoin_offer_available);
+}
+
+#[tokio::test]
+async fn postgres_not_ready_forces_the_offer_off_while_status_is_not_ready() {
+    let check = Arc::new(Check(AtomicBool::new(true)));
+    let runtime = Arc::new(Runtime::new(check.clone(), 1));
+    runtime.set_electrum_available(true);
+    runtime.set_paykit_delivery_available(true);
+    runtime.set_outbox_available(true);
+    for height in 1..=3 {
+        runtime.record_electrum_probe(ElectrumProbe::success(height, fresh_tip_time()));
+    }
+    assert!(runtime.readiness().await.bitcoin_offer_available);
+
+    // The contract consumer reads only this field, and paykit cannot bind
+    // or observe without postgres: the offer folds postgres in.
+    check.0.store(false, Ordering::Release);
+    let report = runtime.readiness().await;
+    assert_eq!(report.status, ComponentState::NotReady);
+    assert_eq!(report.postgres, ComponentState::NotReady);
+    assert!(!report.bitcoin_offer_available);
 }
 
 #[tokio::test]
@@ -315,7 +341,9 @@ async fn task9_panicking_request_releases_admission_for_shutdown_drain() {
 async fn health_schemas_and_status_codes_are_secret_free() {
     let runtime = runtime(true, 1);
     runtime.set_electrum_available(true);
-    runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
+    for _ in 0..3 {
+        runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
+    }
     runtime.set_paykit_delivery_available(true);
     runtime.set_outbox_available(true);
     let app = operational_router(Router::new(), runtime);
@@ -371,10 +399,13 @@ async fn health_reports_electrum_unavailable_without_a_fresh_probe() {
 async fn creation_kill_switch_only_changes_offer_field() {
     let runtime = runtime(true, 1);
     runtime.set_electrum_available(true);
-    runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
+    for _ in 0..3 {
+        runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
+    }
     runtime.set_paykit_delivery_available(true);
     runtime.set_outbox_available(true);
     let before = runtime.readiness().await;
+    assert!(before.bitcoin_offer_available);
     runtime.set_bitcoin_creation_enabled(false);
     let after = runtime.readiness().await;
     assert_eq!(after.status, before.status);
