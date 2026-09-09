@@ -516,16 +516,6 @@ impl RequestLimiter {
         Permit { granted }
     }
 
-    /// Spends up to `requests` tokens without a permit (saturating at
-    /// what is available). No production caller remains: the observer
-    /// tick reserves through [`Self::try_reserve`] and
-    /// [`Self::reserve_up_to`], so every request is charged before it is
-    /// sent. Retained for budget-accounting tests only.
-    #[cfg(test)]
-    pub fn spend(&self, requests: u64) {
-        self.lock().spend(requests);
-    }
-
     /// Rewinds the refill clock by `elapsed`, so deterministic tests can
     /// simulate wall time passing exactly as the production loop's real
     /// sleep between ticks would. Not for production callers.
@@ -1506,36 +1496,47 @@ mod tests {
 
     #[test]
     fn concurrent_callers_cannot_jointly_exceed_the_shared_capacity() {
-        // One bucket shared by the tick-style caller and a creation-style
-        // caller: joint admissions over a window stay bounded by one
-        // capacity plus rate x window, no matter the interleaving.
-        let limiter = RequestLimiter::new(10, 2);
-        // The tick charges probe + lookups exactly as observe_tick does.
-        let available = limiter.available();
-        limiter.spend(PROBE_REQUESTS_PER_TICK);
-        limiter.spend(available - PROBE_REQUESTS_PER_TICK);
-        let mut admitted = available;
-        // A concurrent creation caller finds the shared bucket drained by
-        // the tick; there is no separate pool to draw from.
+        // Real contention: 16 threads race try_reserve(1) against one
+        // non-refilling bucket of capacity 5. Exactly 5 permits are
+        // granted and 11 callers see BudgetExhausted, no matter the
+        // interleaving; the bucket ends empty. Deterministic: every
+        // thread is joined and the assertions are over counts, never
+        // over timing.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CALLERS: usize = 16;
+        const CAPACITY: u64 = 5;
+        let limiter = RequestLimiter::new(CAPACITY, 0);
+        let granted = Arc::new(AtomicUsize::new(0));
+        let exhausted = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(CALLERS);
+        for _ in 0..CALLERS {
+            let limiter = limiter.clone();
+            let granted = granted.clone();
+            let exhausted = exhausted.clone();
+            handles.push(std::thread::spawn(move || match limiter.try_reserve(1) {
+                Ok(_permit) => {
+                    granted.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(BudgetExhausted { .. }) => {
+                    exhausted.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("caller thread panicked");
+        }
         assert_eq!(
-            limiter.try_reserve(1).unwrap_err(),
-            BudgetExhausted {
-                requested: 1,
-                available: 0
-            }
+            granted.load(Ordering::Relaxed),
+            usize::try_from(CAPACITY).unwrap(),
+            "exactly the bucket capacity is granted under contention"
         );
-        // One second of wall time refills exactly two tokens; racing
-        // callers jointly admit no more than that.
-        limiter.rewind_refill_clock(Duration::from_secs(1));
-        let permit = limiter.try_reserve(2).expect("two tokens refilled");
-        assert_eq!(permit.granted(), 2);
-        admitted += 2;
-        assert!(limiter.try_reserve(1).is_err());
+        assert_eq!(
+            exhausted.load(Ordering::Relaxed),
+            CALLERS - usize::try_from(CAPACITY).unwrap(),
+            "every other caller fails without charging"
+        );
         assert_eq!(limiter.available(), 0);
-        assert!(
-            admitted <= 10 + 2,
-            "capacity + rate x window bounds joint admissions: {admitted}"
-        );
     }
 
     #[test]

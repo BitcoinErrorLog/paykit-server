@@ -814,4 +814,83 @@ poll_interval = "1s"
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }
+
+    #[tokio::test]
+    async fn startup_installs_the_configured_limiter_over_the_fail_closed_default() {
+        use crate::{runtime::DependencyCheck, workers::observer::BudgetExhausted};
+
+        struct ReadyPostgres;
+        #[async_trait]
+        impl DependencyCheck for ReadyPostgres {
+            async fn postgres_ready(&self) -> bool {
+                true
+            }
+        }
+
+        // The pre-install state Server::build starts from: Runtime::new's
+        // limiter is fail-closed (an empty, non-refilling bucket), so no
+        // caller can issue unbudgeted Electrum requests before startup
+        // installs the configured one.
+        let before = Runtime::new(Arc::new(ReadyPostgres), 64);
+        assert_eq!(
+            before.electrum_request_limiter().try_reserve(1),
+            Err(BudgetExhausted {
+                requested: 1,
+                available: 0
+            }),
+            "the fail-closed default admits nothing before install"
+        );
+
+        // The same build path as production: Server::build installs one
+        // app-owned limiter from the validated electrum budget config.
+        let config = Config::from_toml_and_environment(
+            &format!(
+                r#"
+[http]
+listen_addr = "127.0.0.1:0"
+[locks]
+trusted_public_key = "{CONFIG_KEY}"
+[setup]
+allowed_origins = ["https://app.example"]
+[paykit]
+receiver_path = "paykit/server"
+network = "testnet"
+[bitcoin]
+network = "testnet"
+[deployment]
+stack_role = "proof"
+[electrum]
+endpoint = "tcp://127.0.0.1:1"
+request_timeout = "1s"
+max_requests_per_tick = 7
+max_requests_per_second = 3
+[outbox]
+poll_interval = "1s"
+"#
+            ),
+            ConfigEnvironment {
+                database_url: Some("postgres://127.0.0.1:1/paykit".into()),
+                master_key: Some(CONFIG_MASTER_KEY.into()),
+            },
+        )
+        .unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1:1/paykit")
+            .unwrap();
+        let server = Server::build(config, pool).await.unwrap();
+        let installed = server.runtime.electrum_request_limiter();
+        assert_eq!(
+            installed.available(),
+            7,
+            "the installed limiter is the configured one: a fresh bucket holds the full \
+             max_requests_per_tick capacity"
+        );
+        assert!(
+            installed.try_reserve(1).is_ok(),
+            "admission succeeds after startup installs the configured limiter"
+        );
+        // The installed limiter is the runtime's one shared bucket: the
+        // reservation above is visible to every other holder.
+        assert_eq!(server.runtime.electrum_request_limiter().available(), 6);
+    }
 }
