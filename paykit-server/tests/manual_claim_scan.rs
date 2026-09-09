@@ -560,6 +560,97 @@ async fn manual_claim_scan_refuses_scans_beyond_the_concurrency_bound_without_an
     );
 }
 
+// Multi-threaded: the timed-out claim's orphaned blocking read and the
+// follow-up claim must be able to run on separate workers while the read
+// is still outstanding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_out_scan_holds_its_permit_until_the_orphaned_read_returns() {
+    let xpub = regtest_account_tpub();
+    let server = GatedHistoryServer::start().await;
+    // Concurrency bound ONE and a short window deadline: the first claim's
+    // window fetch is held past its deadline behind the server's closed
+    // gate.
+    let adapter = Arc::new(
+        ElectrumAdapter::connect(
+            server.endpoint(),
+            BitcoinNetwork::Regtest,
+            Duration::from_secs(5),
+            1,
+        )
+        .await
+        .unwrap()
+        .with_claim_scan_bounds(2_000, Duration::from_millis(200), 1),
+    );
+    // Claim A takes the only permit and blocks mid-window behind the gate;
+    // its 200ms deadline expires while the blocking socket read is still
+    // outstanding, so the claim is refused Unavailable...
+    let scan_a = {
+        let adapter = adapter.clone();
+        let xpub = xpub.clone();
+        tokio::spawn(async move {
+            scan_claim_start_index(adapter.as_ref(), &xpub, 0, &BitcoinNetwork::Regtest).await
+        })
+    };
+    server.wait_in_flight(1);
+    assert_eq!(scan_a.await.unwrap(), Err(ClaimScanError::Unavailable));
+    // ...but its socket read is STILL outstanding behind the closed gate.
+    assert_eq!(
+        server.in_flight(),
+        1,
+        "the first claim's orphaned blocking read is still outstanding"
+    );
+    let version_before = server.rpc_count("server.version");
+    let history_before = server.rpc_count("blockchain.scripthash.get_history");
+
+    // A second concurrent claim WHILE that read is still open: the permit
+    // is owned by the orphaned blocking call, not by the awaiting side
+    // that already gave up, so this claim is refused
+    // `claim_scan_unavailable` IMMEDIATELY with ZERO Electrum calls. (Were
+    // the permit dropped when the deadline fired, this claim would take
+    // the freed slot and join the gate with its own connection and
+    // batched get_history.)
+    let result_b =
+        scan_claim_start_index(adapter.as_ref(), &xpub, 0, &BitcoinNetwork::Regtest).await;
+
+    assert_eq!(result_b, Err(ClaimScanError::Unavailable));
+    assert_eq!(
+        server.in_flight(),
+        1,
+        "no second window fetch joined the gate while the first read was orphaned"
+    );
+    assert_eq!(
+        server.rpc_count("server.version"),
+        version_before,
+        "the refused claim opened no Electrum connection"
+    );
+    assert_eq!(
+        server.rpc_count("blockchain.scripthash.get_history"),
+        history_before,
+        "the refused claim made no Electrum call"
+    );
+
+    // Release the orphaned read: its blocking call returns and frees the
+    // slot, so a later claim is admitted again. The read's completion is
+    // only observable through admission, so poll for it (bounded).
+    server.open_gate();
+    server.wait_idle();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let start = loop {
+        match scan_claim_start_index(adapter.as_ref(), &xpub, 0, &BitcoinNetwork::Regtest).await {
+            Err(ClaimScanError::Unavailable) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the orphaned read's permit was never released"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            result => break result,
+        }
+    };
+
+    assert_eq!(start, Ok(0), "the freed slot admits the next claim");
+}
+
 // ---------------------------------------------------------------------------
 // Gated mock Electrum server: blocks each connection's first get_history
 // response behind a test-controlled gate, so concurrent scans can be held
@@ -631,6 +722,19 @@ impl GatedHistoryServer {
 
     fn in_flight(&self) -> usize {
         self.in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Waits until no window fetch is blocked behind the gate, panicking
+    /// after five seconds.
+    fn wait_idle(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.in_flight.load(Ordering::SeqCst) > 0 {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for the gated window fetch to drain"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn open_gate(&self) {
