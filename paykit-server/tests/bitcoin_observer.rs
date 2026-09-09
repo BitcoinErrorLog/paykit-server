@@ -115,7 +115,8 @@ mod tick {
         runtime::{DependencyCheck, Runtime},
         workers::observer::{
             ElectrumPort, ObservationBackend, ObservationReport, ObserverBackoff, ObserverError,
-            ObserverPolicy, ObserverTickOutcome, TargetHistory, TipProbe, observe_tick,
+            ObserverPolicy, ObserverTickOutcome, OverrunLane, TargetHistory, TipProbe,
+            observe_tick,
         },
     };
 
@@ -148,7 +149,13 @@ mod tick {
             max_requests_per_tick: budget,
             max_requests_per_second: 100,
             max_target_requests: 500,
+            overrun_lane_interval_ticks: 10,
         }
+    }
+
+    /// A lane that never opens, for ticks that do not exercise the slow lane.
+    fn closed_lane() -> OverrunLane {
+        OverrunLane::new(u32::MAX)
     }
 
     struct FakeElectrum {
@@ -326,6 +333,7 @@ mod tick {
         async fn record_observation_tick(
             &self,
             records: &[TargetTickRecord],
+            overrun_clear_bound: u32,
         ) -> Result<u64, ObserverError> {
             let mut entries = self.entries.lock().unwrap();
             let mut misses = 0_u64;
@@ -338,6 +346,11 @@ mod tick {
                         entry.staleness_secs = 0;
                         entry.history_tx_count = Some(record.history_tx_count());
                         entry.last_request_count = Some(record.request_count());
+                        // Mirrors the store's UPDATE: a stamped structural
+                        // estimate at or below the bound clears the flag.
+                        if u64::from(record.history_tx_count()) < u64::from(overrun_clear_bound) {
+                            entry.observation_overrun = false;
+                        }
                     }
                     None => misses += 1,
                 }
@@ -358,6 +371,7 @@ mod tick {
             &BitcoinNetwork::Regtest,
             &policy(100),
             &runtime,
+            &mut closed_lane(),
         )
         .await;
 
@@ -390,6 +404,7 @@ mod tick {
                 &BitcoinNetwork::Regtest,
                 &policy(100),
                 &runtime,
+                &mut closed_lane(),
             )
             .await;
             assert_eq!(
@@ -408,6 +423,7 @@ mod tick {
             &BitcoinNetwork::Regtest,
             &policy(100),
             &runtime,
+            &mut closed_lane(),
         )
         .await;
         assert_eq!(
@@ -448,6 +464,7 @@ mod tick {
             &BitcoinNetwork::Regtest,
             &policy(7),
             &runtime,
+            &mut closed_lane(),
         )
         .await;
         assert_eq!(
@@ -470,6 +487,7 @@ mod tick {
             &BitcoinNetwork::Regtest,
             &policy(7),
             &runtime,
+            &mut closed_lane(),
         )
         .await;
         assert_eq!(
@@ -521,6 +539,7 @@ mod tick {
                 &BitcoinNetwork::Regtest,
                 &policy(5),
                 &runtime,
+                &mut closed_lane(),
             )
             .await;
             assert_eq!(
@@ -565,6 +584,7 @@ mod tick {
                 &BitcoinNetwork::Regtest,
                 &policy(5),
                 &runtime,
+                &mut closed_lane(),
             )
             .await;
             assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
@@ -614,6 +634,7 @@ mod tick {
             &BitcoinNetwork::Regtest,
             &policy(100),
             &runtime,
+            &mut closed_lane(),
         )
         .await;
         assert!(
@@ -650,6 +671,7 @@ mod tick {
             &BitcoinNetwork::Regtest,
             &policy(100),
             &runtime,
+            &mut closed_lane(),
         )
         .await;
         assert!(
@@ -689,6 +711,7 @@ mod tick {
             &BitcoinNetwork::Regtest,
             &policy(100),
             &runtime,
+            &mut closed_lane(),
         )
         .await;
         assert_eq!(
@@ -722,6 +745,7 @@ mod tick {
             &BitcoinNetwork::Regtest,
             &policy(100),
             &runtime,
+            &mut closed_lane(),
         )
         .await;
         assert_eq!(
@@ -759,6 +783,7 @@ mod tick {
             &BitcoinNetwork::Regtest,
             &policy(100),
             &runtime,
+            &mut closed_lane(),
         )
         .await;
         assert_eq!(
@@ -772,5 +797,177 @@ mod tick {
             "the known record must still be stamped"
         );
         assert_eq!(entries[0].history_tx_count, Some(0));
+    }
+
+    #[tokio::test]
+    async fn a_flagged_head_does_not_block_the_next_over_budget_target() {
+        // Tick 1 flags the over-bound head. On tick 2 the bypass passes over
+        // the flagged head and admits the second over-budget target instead
+        // of letting the flag starve every expensive target behind it.
+        let port = FakeElectrum::healthy_with_history([("huge", 600), ("second", 100)]);
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![
+                FakeEntry::new("huge", Some(600), 600),
+                FakeEntry::new("second", Some(100), 300),
+                FakeEntry::new("cheap", Some(0), 120),
+            ]),
+            applied: Mutex::new(Vec::new()),
+            marked_overrun: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(100),
+            &runtime,
+            &mut closed_lane(),
+        )
+        .await;
+        assert!(
+            matches!(outcome, ObserverTickOutcome::Observed { .. }),
+            "tick 1 must observe: {outcome:?}"
+        );
+        assert!(
+            backend.entries.lock().unwrap()[0].observation_overrun,
+            "tick 1 must flag the over-bound head"
+        );
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(100),
+            &runtime,
+            &mut closed_lane(),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 2,
+                deferred: 1
+            },
+            "the second over-budget target must be observed on the next tick"
+        );
+        let calls = port.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1], vec!["second".to_owned(), "cheap".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn the_overrun_slow_lane_admits_one_flagged_target_every_interval_ticks() {
+        let port = FakeElectrum::healthy_with_history([("flagged", 600)]);
+        let mut flagged = FakeEntry::new("flagged", Some(600), 600);
+        flagged.observation_overrun = true;
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![flagged]),
+            applied: Mutex::new(Vec::new()),
+            marked_overrun: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+        let mut lane = OverrunLane::new(2);
+
+        for tick in 1..=6 {
+            let outcome = observe_tick(
+                &port,
+                &backend,
+                &BitcoinNetwork::Regtest,
+                &policy(100),
+                &runtime,
+                &mut lane,
+            )
+            .await;
+            let admitted = matches!(
+                outcome,
+                ObserverTickOutcome::Observed {
+                    processed: 1,
+                    deferred: 0
+                }
+            );
+            assert_eq!(
+                admitted,
+                tick % 3 == 0,
+                "tick {tick} admission must follow the slow-lane cadence: {outcome:?}"
+            );
+        }
+        let calls = port.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], vec!["flagged".to_owned()]);
+        assert_eq!(calls[1], vec!["flagged".to_owned()]);
+        let encoded = runtime.metrics().encode().unwrap();
+        assert!(
+            encoded.contains("paykit_electrum_overrun_lane_admissions_total 2"),
+            "each slow-lane admission must be counted: {encoded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_overrun_flag_clears_when_the_stamped_estimate_drops_below_the_bound() {
+        // The flagged target's fresh history is small again: the same stamp
+        // that records it clears the flag, so the target rejoins the regular
+        // budgeted plan without operator action.
+        let port = FakeElectrum::healthy_with_history([("flagged", 3)]);
+        let mut flagged = FakeEntry::new("flagged", Some(600), 600);
+        flagged.observation_overrun = true;
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![flagged]),
+            applied: Mutex::new(Vec::new()),
+            marked_overrun: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+        let mut lane = OverrunLane::new(1);
+
+        for _ in 0..2 {
+            let outcome = observe_tick(
+                &port,
+                &backend,
+                &BitcoinNetwork::Regtest,
+                &policy(100),
+                &runtime,
+                &mut lane,
+            )
+            .await;
+            assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
+        }
+        let entries = backend.entries.lock().unwrap();
+        assert_eq!(entries[0].history_tx_count, Some(3));
+        assert!(
+            !entries[0].observation_overrun,
+            "a stamped estimate within the bound must clear the flag"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_backlog_gauge_ignores_overrun_flagged_targets() {
+        // The flagged target is the stalest, but it is only admitted on the
+        // slow lane: its age must not pin the backlog gauge and mask the
+        // regularly observed backlog behind it.
+        let port = FakeElectrum::healthy();
+        let mut flagged = FakeEntry::new("flagged", Some(600), 600);
+        flagged.observation_overrun = true;
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![flagged, FakeEntry::new("fresh", Some(0), 120)]),
+            applied: Mutex::new(Vec::new()),
+            marked_overrun: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(100),
+            &runtime,
+            &mut closed_lane(),
+        )
+        .await;
+        assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
+        let encoded = runtime.metrics().encode().unwrap();
+        assert!(
+            encoded.contains("paykit_electrum_backlog_oldest_age_seconds 120"),
+            "the gauge must track the oldest non-overrun target: {encoded}"
+        );
     }
 }

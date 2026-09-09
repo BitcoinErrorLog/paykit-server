@@ -95,6 +95,7 @@ impl Config {
                 max_requests_per_tick: raw.electrum.max_requests_per_tick,
                 max_requests_per_second: raw.electrum.max_requests_per_second,
                 max_target_requests: raw.electrum.max_target_requests,
+                overrun_lane_interval_ticks: raw.electrum.overrun_lane_interval_ticks,
                 max_tip_age: raw.electrum.max_tip_age,
             },
             outbox: OutboxConfig::from(raw.outbox),
@@ -159,6 +160,10 @@ impl Config {
             (
                 "electrum.max_target_requests",
                 u64::from(self.electrum.max_target_requests),
+            ),
+            (
+                "electrum.overrun_lane_interval_ticks",
+                u64::from(self.electrum.overrun_lane_interval_ticks),
             ),
             ("limits.request_body_bytes", self.limits.request_body_bytes),
             (
@@ -531,6 +536,12 @@ pub struct ElectrumConfig {
     /// metrics) and excluded from the bypass on later ticks, so one
     /// unbounded-history address cannot monopolise the endpoint.
     pub max_target_requests: u32,
+    /// Slow-lane cadence for overrun-flagged observation targets: at most
+    /// one flagged target is observed every this many ticks, so a flagged
+    /// target keeps converging towards a fresh stamp — and towards the
+    /// flag clearing once its structural estimate drops back to or below
+    /// `max_target_requests` — instead of starving at the head of the plan.
+    pub overrun_lane_interval_ticks: u32,
     /// Maximum accepted chain-tip age for readiness. On networks with a
     /// live block cadence, /health/ready answers 503 (not_ready) when the
     /// probed tip is older than this, when the tip height regresses, or
@@ -799,6 +810,8 @@ struct RawElectrumConfig {
     max_requests_per_second: u32,
     #[serde(default = "default_electrum_max_target_requests")]
     max_target_requests: u32,
+    #[serde(default = "default_electrum_overrun_lane_interval_ticks")]
+    overrun_lane_interval_ticks: u32,
     #[serde(default = "default_electrum_max_tip_age", with = "humantime_serde")]
     max_tip_age: Duration,
 }
@@ -813,6 +826,10 @@ const fn default_electrum_max_requests_per_second() -> u32 {
 
 const fn default_electrum_max_target_requests() -> u32 {
     500
+}
+
+const fn default_electrum_overrun_lane_interval_ticks() -> u32 {
+    10
 }
 
 const fn default_electrum_max_tip_age() -> Duration {

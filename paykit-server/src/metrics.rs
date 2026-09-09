@@ -28,6 +28,7 @@ pub struct Metrics {
     electrum_bypassed_head_budget_violations: Counter,
     electrum_observation_overrun_targets: Gauge,
     electrum_observation_stamp_misses: Counter,
+    electrum_overrun_lane_admissions: Counter,
     payment_states: Gauge,
     runtime_active: Gauge,
     session_validation_results: Counter,
@@ -48,6 +49,7 @@ impl Metrics {
         let electrum_bypassed_head_budget_violations = Counter::default();
         let electrum_observation_overrun_targets = Gauge::default();
         let electrum_observation_stamp_misses = Counter::default();
+        let electrum_overrun_lane_admissions = Counter::default();
         let payment_states = Gauge::default();
         let runtime_active = Gauge::default();
         let session_validation_results = Counter::default();
@@ -112,6 +114,11 @@ impl Metrics {
             electrum_observation_stamp_misses.clone(),
         );
         registry.register(
+            "paykit_electrum_overrun_lane_admissions",
+            "Overrun-flagged observation targets admitted through the slow lane.",
+            electrum_overrun_lane_admissions.clone(),
+        );
+        registry.register(
             "paykit_payment_states",
             "Aggregate persisted payment-state count.",
             payment_states.clone(),
@@ -140,6 +147,7 @@ impl Metrics {
             electrum_bypassed_head_budget_violations,
             electrum_observation_overrun_targets,
             electrum_observation_stamp_misses,
+            electrum_overrun_lane_admissions,
             payment_states,
             runtime_active,
             session_validation_results,
@@ -179,6 +187,9 @@ impl Metrics {
     }
     pub fn electrum_observation_stamp_misses(&self, misses: u64) {
         self.electrum_observation_stamp_misses.inc_by(misses);
+    }
+    pub fn electrum_overrun_lane_admission(&self) {
+        self.electrum_overrun_lane_admissions.inc();
     }
     pub fn set_payment_states(&self, value: i64) {
         self.payment_states.set(value);

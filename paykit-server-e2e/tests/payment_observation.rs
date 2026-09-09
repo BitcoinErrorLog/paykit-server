@@ -1231,10 +1231,13 @@ async fn record_observation_tick_reports_stamp_misses_without_aborting_known_rec
     // A record whose address lookup hash matches no invoice row, followed
     // by a valid record: the miss is reported and the valid record stamps.
     let misses = store
-        .record_observation_tick(&[
-            paykit_server::bitcoin::TargetTickRecord::new("address-never-bound", 3, 2),
-            paykit_server::bitcoin::TargetTickRecord::new(REGTEST_ADDRESS, 7, 3),
-        ])
+        .record_observation_tick(
+            &[
+                paykit_server::bitcoin::TargetTickRecord::new("address-never-bound", 3, 2),
+                paykit_server::bitcoin::TargetTickRecord::new(REGTEST_ADDRESS, 7, 3),
+            ],
+            500,
+        )
         .await
         .unwrap();
     assert_eq!(misses, 1);
@@ -1282,6 +1285,60 @@ async fn observation_overrun_marks_once_and_the_plan_reports_the_flag() {
 }
 
 #[tokio::test]
+async fn record_observation_tick_clears_the_overrun_flag_when_the_estimate_drops_below_the_bound() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+    let persisted_flag = || async {
+        sqlx::query_scalar::<_, bool>("SELECT observation_overrun FROM invoices WHERE id = $1")
+            .bind(invoice_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap()
+    };
+
+    store
+        .mark_observation_overrun(&[REGTEST_ADDRESS.to_owned()])
+        .await
+        .unwrap();
+    assert!(persisted_flag().await);
+
+    // A stamped structural estimate within the bound (1 + 7 <= 500) clears
+    // the flag in the same UPDATE that stamps the target.
+    store
+        .record_observation_tick(
+            &[paykit_server::bitcoin::TargetTickRecord::new(
+                REGTEST_ADDRESS,
+                7,
+                3,
+            )],
+            500,
+        )
+        .await
+        .unwrap();
+    assert!(!persisted_flag().await);
+
+    // Re-flagged: a stamped estimate beyond the bound (1 + 500 > 500)
+    // keeps the flag set.
+    store
+        .mark_observation_overrun(&[REGTEST_ADDRESS.to_owned()])
+        .await
+        .unwrap();
+    store
+        .record_observation_tick(
+            &[paykit_server::bitcoin::TargetTickRecord::new(
+                REGTEST_ADDRESS,
+                500,
+                3,
+            )],
+            500,
+        )
+        .await
+        .unwrap();
+    assert!(persisted_flag().await);
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn observation_plan_orders_oldest_observed_first_and_records_tick_budget_facts() {
     let database = TestDatabase::create().await;
     let (store, invoice_id) = batch_invoice(&database).await;
@@ -1306,11 +1363,14 @@ async fn observation_plan_orders_oldest_observed_first_and_records_tick_budget_f
     assert_eq!(plan[1].history_tx_count(), None);
 
     store
-        .record_observation_tick(&[paykit_server::bitcoin::TargetTickRecord::new(
-            REGTEST_ADDRESS,
-            7,
-            3,
-        )])
+        .record_observation_tick(
+            &[paykit_server::bitcoin::TargetTickRecord::new(
+                REGTEST_ADDRESS,
+                7,
+                3,
+            )],
+            500,
+        )
         .await
         .unwrap();
 

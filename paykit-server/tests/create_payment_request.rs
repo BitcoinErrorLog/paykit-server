@@ -781,6 +781,7 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
         async fn record_observation_tick(
             &self,
             _records: &[TargetTickRecord],
+            _overrun_clear_bound: u32,
         ) -> Result<u64, ObserverError> {
             Ok(0)
         }
@@ -806,8 +807,10 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
             max_requests_per_tick: 100,
             max_requests_per_second: 5,
             max_target_requests: 500,
+            overrun_lane_interval_ticks: 10,
         },
         &runtime,
+        &mut paykit_server::workers::observer::OverrunLane::new(10),
     )
     .await;
     assert_eq!(

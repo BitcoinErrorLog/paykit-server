@@ -276,6 +276,7 @@ impl Server {
                 max_requests_per_tick: config.electrum.max_requests_per_tick,
                 max_requests_per_second: config.electrum.max_requests_per_second,
                 max_target_requests: config.electrum.max_target_requests,
+                overrun_lane_interval_ticks: config.electrum.overrun_lane_interval_ticks,
             },
         };
 

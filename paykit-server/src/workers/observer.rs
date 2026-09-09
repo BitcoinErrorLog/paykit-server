@@ -133,9 +133,13 @@ pub trait ObservationBackend: Send + Sync {
     /// Persists per-target history sizes and stamps the targets observed.
     /// Returns the number of records whose stamp matched no invoice row;
     /// misses are logged and counted but never abort the other records.
+    /// `overrun_clear_bound` is the configured per-target request bound: a
+    /// stamped structural estimate (`1 + history_tx_count`) at or below it
+    /// clears the target's `observation_overrun` flag in the same UPDATE.
     async fn record_observation_tick(
         &self,
         records: &[TargetTickRecord],
+        overrun_clear_bound: u32,
     ) -> Result<u64, ObserverError>;
 }
 
@@ -171,8 +175,9 @@ impl ObservationBackend for InvoiceStore {
     async fn record_observation_tick(
         &self,
         records: &[TargetTickRecord],
+        overrun_clear_bound: u32,
     ) -> Result<u64, ObserverError> {
-        InvoiceStore::record_observation_tick(self, records)
+        InvoiceStore::record_observation_tick(self, records, overrun_clear_bound)
             .await
             .map_err(map_persistence)
     }
@@ -185,11 +190,13 @@ pub struct ObserverPolicy {
     /// Cap on Electrum requests admitted to one tick's budgeted batch. The
     /// tick's probe requests ([`PROBE_REQUESTS_PER_TICK`]) are reserved
     /// from this cap before observation targets are admitted. This bounds
-    /// only the budgeted tail: the single oldest target is always observed
-    /// (head-of-line bypass) even when its estimate exceeds the cap, to
-    /// preserve liveness. The bypassed head is bounded separately by
+    /// only the budgeted tail: the first non-overrun target whose estimate
+    /// alone exceeds the budget is always observed (head-of-line bypass)
+    /// to preserve liveness. The bypassed target is bounded separately by
     /// `max_target_requests` and the overrun exclusion, and a bypass cost
-    /// above twice the budget raises an ERROR log and a metric.
+    /// above twice the budget raises an ERROR log and a metric. Overrun-
+    /// flagged targets are admitted separately through the slow lane (see
+    /// `overrun_lane_interval_ticks`) and do not consume this budget.
     pub max_requests_per_tick: u32,
     /// Sustained rate budget; the per-tick allowance is this rate times the
     /// poll interval, so estimated requests per second stay at or below it.
@@ -200,6 +207,47 @@ pub struct ObserverPolicy {
     /// metrics) and excluded from the bypass on later ticks, so one
     /// unbounded-history address cannot monopolise the endpoint.
     pub max_target_requests: u32,
+    /// Slow-lane cadence for overrun-flagged targets: at most one flagged
+    /// target is admitted every this many ticks, so a flagged target still
+    /// converges towards a fresh stamp (and flag clearing) instead of
+    /// starving at the head of the plan forever.
+    pub overrun_lane_interval_ticks: u32,
+}
+
+/// Slow-lane state for overrun-flagged observation targets. The lane opens
+/// every `interval_ticks` observer ticks and stays open until one flagged
+/// target is admitted through it; an admission closes it for the next
+/// `interval_ticks` ticks. The interval is configured nonzero.
+#[derive(Clone, Debug)]
+pub struct OverrunLane {
+    interval_ticks: u32,
+    ticks_since_admission: u32,
+}
+
+impl OverrunLane {
+    /// Starts the lane closed; the first admission can happen after
+    /// `interval_ticks` ticks without one.
+    pub fn new(interval_ticks: u32) -> Self {
+        Self {
+            interval_ticks,
+            ticks_since_admission: 0,
+        }
+    }
+
+    /// Whether this tick may admit one overrun-flagged target.
+    fn is_open(&self) -> bool {
+        self.ticks_since_admission >= self.interval_ticks
+    }
+
+    /// Advances the lane by one tick that admitted no flagged target.
+    fn advance(&mut self) {
+        self.ticks_since_admission = self.ticks_since_admission.saturating_add(1);
+    }
+
+    /// Closes the lane after an admission for the next interval.
+    fn record_admission(&mut self) {
+        self.ticks_since_admission = 0;
+    }
 }
 
 impl ObserverPolicy {
@@ -218,31 +266,49 @@ pub struct BudgetSelection {
     pub deferred: Vec<PlannedObservation>,
     /// Estimated requests for the whole plan before trimming.
     pub estimated_requests: u64,
-    /// Estimated cost of the oldest target when it alone exceeded the budget
-    /// and was admitted by the head-of-line bypass; `None` when the head fit
-    /// within the budget or the plan was empty.
+    /// Estimated cost of the first non-overrun target admitted by the
+    /// head-of-line bypass after it alone exceeded the budget; `None` when
+    /// no bypass was used or the plan was empty.
     pub bypassed_head_cost: Option<u64>,
+    /// Address of the bypassed target, so the caller can flag it when its
+    /// cost exceeds the per-target bound.
+    pub bypassed_head_address: Option<String>,
+    /// Whether an overrun-flagged target was admitted through the slow lane
+    /// on this selection.
+    pub overrun_lane_admitted: bool,
 }
 
 /// Walks the oldest-first plan and admits targets until the budget is
-/// exhausted; the remainder is deferred to the next tick. Two liveness rules
-/// keep one expensive target from starving observation:
+/// exhausted; the remainder is deferred to the next tick. Three liveness
+/// rules keep expensive targets from starving observation:
 ///
-/// * The single oldest target is always admitted, even when its estimated
-///   cost alone exceeds `budget` (head-of-line bypass). A bypassed head does
-///   not consume the budget, so cheaper targets are still admitted this
-///   tick; its cost is reported via `bypassed_head_cost` so the caller can
-///   log the overrun against the per-tick cap. A target flagged
-///   `observation_overrun` (its cost exceeded the per-target bound on an
-///   earlier bypass) is excluded from the bypass and deferred like any
-///   other over-budget entry, so it can no longer monopolise the endpoint.
-/// * A later over-budget entry is skipped without blocking: entries behind
-///   it that still fit are admitted.
+/// * The first non-overrun target whose estimated cost alone exceeds
+///   `budget` is admitted anyway (head-of-line bypass, at most one per
+///   tick). A bypassed target does not consume the budget, so cheaper
+///   targets are still admitted this tick; its cost and address are
+///   reported so the caller can log the overrun against the per-tick cap
+///   and flag it when it exceeds the per-target bound. A target flagged
+///   `observation_overrun` never takes the bypass, but it does not block
+///   it either: the bypass passes over it to the next over-budget entry.
+/// * A later entry that does not fit the remaining budget is skipped
+///   without blocking: entries behind it that still fit are admitted.
+/// * When the caller opens the overrun slow lane (`overrun_lane_open`), the
+///   first overrun-flagged entry that would defer is admitted anyway
+///   without consuming the budget, and `overrun_lane_admitted` is set. The
+///   lane admits at most one flagged target per opening; the caller bounds
+///   the opening cadence and counts each admission.
 ///
-/// Observing the head stamps it, so a permanently over-budget target rotates
-/// behind the deferred tail and every target is observed within a bounded
-/// number of ticks.
-pub fn select_within_budget(plan: Vec<PlannedObservation>, budget: u64) -> BudgetSelection {
+/// Observing a target stamps it, so a permanently over-budget non-overrun
+/// target rotates behind the deferred tail and is observed again within a
+/// bounded number of ticks. Overrun-flagged targets do not rotate on their
+/// own: they are observed once per slow-lane admission (at most one
+/// flagged target every `overrun_lane_interval_ticks` ticks), which is
+/// what bounds their time between observations.
+pub fn select_within_budget(
+    plan: Vec<PlannedObservation>,
+    budget: u64,
+    overrun_lane_open: bool,
+) -> BudgetSelection {
     let estimated_requests = plan
         .iter()
         .map(PlannedObservation::estimated_requests)
@@ -251,13 +317,19 @@ pub fn select_within_budget(plan: Vec<PlannedObservation>, budget: u64) -> Budge
     let mut batch = Vec::new();
     let mut deferred = Vec::new();
     let mut bypassed_head_cost = None;
-    for (position, entry) in plan.into_iter().enumerate() {
+    let mut bypassed_head_address = None;
+    let mut overrun_lane_admitted = false;
+    for entry in plan.into_iter() {
         let cost = entry.estimated_requests();
         if used.saturating_add(cost) <= budget {
             used += cost;
             batch.push(entry);
-        } else if position == 0 && !entry.is_observation_overrun() {
+        } else if cost > budget && !entry.is_observation_overrun() && bypassed_head_cost.is_none() {
             bypassed_head_cost = Some(cost);
+            bypassed_head_address = Some(entry.target().address().to_owned());
+            batch.push(entry);
+        } else if entry.is_observation_overrun() && overrun_lane_open && !overrun_lane_admitted {
+            overrun_lane_admitted = true;
             batch.push(entry);
         } else {
             deferred.push(entry);
@@ -268,6 +340,8 @@ pub fn select_within_budget(plan: Vec<PlannedObservation>, budget: u64) -> Budge
         deferred,
         estimated_requests,
         bypassed_head_cost,
+        bypassed_head_address,
+        overrun_lane_admitted,
     }
 }
 
@@ -371,13 +445,16 @@ pub enum ObserverTickOutcome {
 
 /// Runs one bounded observer tick: active probe, plan, budgeted batch,
 /// persistence, and health publication. The empty-target case still probes
-/// and reports availability from the probe alone.
+/// and reports availability from the probe alone. `overrun_lane` carries
+/// the cross-tick slow-lane cadence for overrun-flagged targets; the tick
+/// advances it, and it is reset when the lane admits a flagged target.
 pub async fn observe_tick(
     port: &dyn ElectrumPort,
     backend: &dyn ObservationBackend,
     network: &BitcoinNetwork,
     policy: &ObserverPolicy,
     runtime: &Runtime,
+    overrun_lane: &mut OverrunLane,
 ) -> ObserverTickOutcome {
     match port.probe().await {
         Ok(tip) => runtime.record_electrum_probe(ElectrumProbe::success(tip.height, tip.time_unix)),
@@ -403,8 +480,12 @@ pub async fn observe_tick(
             return ObserverTickOutcome::PlanUnavailable;
         }
     };
+    // Overrun-flagged targets are excluded from the backlog gauge: they are
+    // admitted only on the slow lane, so their staleness would pin the gauge
+    // and mask the real backlog of regularly observed targets.
     let oldest_staleness = plan
-        .first()
+        .iter()
+        .find(|entry| !entry.is_observation_overrun())
         .map(|entry| entry.staleness())
         .unwrap_or_default();
     runtime.metrics().set_electrum_backlog_oldest_age_seconds(
@@ -427,7 +508,17 @@ pub async fn observe_tick(
     let target_budget = policy
         .per_tick_budget()
         .saturating_sub(PROBE_REQUESTS_PER_TICK);
-    let selection = select_within_budget(plan, target_budget);
+    let selection = select_within_budget(plan, target_budget, overrun_lane.is_open());
+    if selection.overrun_lane_admitted {
+        // The production adapter fetches a target's full history in one BDK
+        // sync and cannot bound the fetch length, so a slow-lane target is
+        // admitted whole and counted instead of hard-capped.
+        overrun_lane.record_admission();
+        runtime.metrics().electrum_overrun_lane_admission();
+        tracing::info!("overrun slow lane admitted one flagged observation target this tick");
+    } else {
+        overrun_lane.advance();
+    }
     match selection.bypassed_head_cost {
         Some(cost) => {
             runtime
@@ -449,15 +540,14 @@ pub async fn observe_tick(
                 );
             }
             // The bypass preserves liveness but must not be unbounded: a
-            // head beyond the per-target bound is flagged so later ticks
-            // defer it instead of re-syncing its unbounded history. The
-            // flag is persisted before the fetch so even a failed sync
-            // (e.g. the endpoint disconnecting mid-history) cannot reset
-            // the exclusion.
+            // bypassed target beyond the per-target bound is flagged so
+            // later ticks defer it (apart from the slow lane) instead of
+            // re-syncing its unbounded history. The flag is persisted before
+            // the fetch so even a failed sync (e.g. the endpoint
+            // disconnecting mid-history) cannot reset the exclusion.
             if cost > u64::from(policy.max_target_requests)
-                && let Some(head) = selection.batch.first()
+                && let Some(head_address) = selection.bypassed_head_address.clone()
             {
-                let head_address = head.target().address().to_owned();
                 match backend
                     .mark_observation_overrun(std::slice::from_ref(&head_address))
                     .await
@@ -556,7 +646,10 @@ pub async fn observe_tick(
             )
         })
         .collect();
-    let misses = match backend.record_observation_tick(&records).await {
+    let misses = match backend
+        .record_observation_tick(&records, policy.max_target_requests)
+        .await
+    {
         Ok(misses) => misses,
         Err(error) => {
             runtime.set_electrum_available(false);
@@ -588,6 +681,7 @@ pub async fn observation_loop(
     runtime: Arc<Runtime>,
 ) {
     let mut backoff = ObserverBackoff::new();
+    let mut overrun_lane = OverrunLane::new(policy.overrun_lane_interval_ticks);
     let mut first_tick = true;
     loop {
         let delay = if first_tick {
@@ -605,7 +699,16 @@ pub async fn observation_loop(
         if !runtime.may_start_worker_claim() {
             break;
         }
-        match observe_tick(port.as_ref(), backend.as_ref(), &network, &policy, &runtime).await {
+        match observe_tick(
+            port.as_ref(),
+            backend.as_ref(),
+            &network,
+            &policy,
+            &runtime,
+            &mut overrun_lane,
+        )
+        .await
+        {
             ObserverTickOutcome::ProbeFailed(ObserverError::Unavailable)
             | ObserverTickOutcome::ObservationFailed(ObserverError::Unavailable) => {
                 backoff.record_failure();
@@ -973,7 +1076,7 @@ mod tests {
             planned("b", Some(0)),
             planned("c", Some(4)),
         ];
-        let selection = select_within_budget(plan, u64::MAX);
+        let selection = select_within_budget(plan, u64::MAX, false);
         // 1+1 (unknown counts as 1), 1+0, 1+4.
         assert_eq!(selection.estimated_requests, 8);
     }
@@ -994,7 +1097,7 @@ mod tests {
             planned("fresh", Some(1)),
         ];
         // Costs 3, 2, 2: budget 5 admits the first two only.
-        let selection = select_within_budget(plan, 5);
+        let selection = select_within_budget(plan, 5, false);
         assert_eq!(labels(&selection.batch), vec!["addr-stale", "addr-middle"]);
         assert_eq!(labels(&selection.deferred), vec!["addr-fresh"]);
         assert_eq!(selection.estimated_requests, 7);
@@ -1002,7 +1105,7 @@ mod tests {
 
         // An over-budget oldest target is admitted by the liveness bypass
         // rather than starving the whole tick.
-        let bypass = select_within_budget(vec![planned("big", Some(10))], 2);
+        let bypass = select_within_budget(vec![planned("big", Some(10))], 2, false);
         assert_eq!(labels(&bypass.batch), vec!["addr-big"]);
         assert!(bypass.deferred.is_empty());
         assert_eq!(bypass.bypassed_head_cost, Some(11));
@@ -1013,14 +1116,19 @@ mod tests {
         let plan = vec![
             planned("oldest", Some(0)),
             planned("expensive", Some(10)),
+            planned("expensive-b", Some(10)),
             planned("cheap", Some(1)),
         ];
-        // Costs 1, 11, 2 with budget 3: the expensive middle entry is
-        // deferred while the cheap tail is still admitted.
-        let selection = select_within_budget(plan, 3);
-        assert_eq!(labels(&selection.batch), vec!["addr-oldest", "addr-cheap"]);
-        assert_eq!(labels(&selection.deferred), vec!["addr-expensive"]);
-        assert_eq!(selection.bypassed_head_cost, None);
+        // Costs 1, 11, 11, 2 with budget 3: the first over-budget entry
+        // takes the bypass, the second is deferred, and the cheap tail is
+        // still admitted rather than blocked behind either of them.
+        let selection = select_within_budget(plan, 3, false);
+        assert_eq!(
+            labels(&selection.batch),
+            vec!["addr-oldest", "addr-expensive", "addr-cheap"]
+        );
+        assert_eq!(labels(&selection.deferred), vec!["addr-expensive-b"]);
+        assert_eq!(selection.bypassed_head_cost, Some(11));
     }
 
     #[test]
@@ -1046,7 +1154,7 @@ mod tests {
                     )
                 })
                 .collect();
-            let selection = select_within_budget(plan, 3);
+            let selection = select_within_budget(plan, 3, false);
             assert_eq!(
                 selection.batch.len(),
                 1,
@@ -1075,16 +1183,87 @@ mod tests {
             planned("big", Some(10)).with_observation_overrun(true),
             planned("cheap", Some(0)),
         ];
-        let selection = select_within_budget(flagged, 2);
+        let selection = select_within_budget(flagged, 2, false);
         assert_eq!(labels(&selection.batch), vec!["addr-cheap"]);
         assert_eq!(labels(&selection.deferred), vec!["addr-big"]);
         assert_eq!(selection.bypassed_head_cost, None);
 
         // Without the flag the same head bypasses the budget.
         let unflagged = vec![planned("big", Some(10)), planned("cheap", Some(0))];
-        let selection = select_within_budget(unflagged, 2);
+        let selection = select_within_budget(unflagged, 2, false);
         assert_eq!(labels(&selection.batch), vec!["addr-big", "addr-cheap"]);
         assert_eq!(selection.bypassed_head_cost, Some(11));
+    }
+
+    #[test]
+    fn a_flagged_head_passes_the_bypass_to_the_next_over_budget_target() {
+        // The flagged head defers, but the bypass is not pinned to plan
+        // position 0: the next non-overrun over-budget entry takes it, so a
+        // second expensive target is still observed on this tick.
+        let plan = vec![
+            planned("flagged", Some(10)).with_observation_overrun(true),
+            planned("second", Some(10)),
+            planned("cheap", Some(0)),
+        ];
+        let selection = select_within_budget(plan, 2, false);
+        assert_eq!(labels(&selection.batch), vec!["addr-second", "addr-cheap"]);
+        assert_eq!(labels(&selection.deferred), vec!["addr-flagged"]);
+        assert_eq!(selection.bypassed_head_cost, Some(11));
+        assert_eq!(
+            selection.bypassed_head_address.as_deref(),
+            Some("addr-second")
+        );
+        assert!(!selection.overrun_lane_admitted);
+    }
+
+    #[test]
+    fn an_open_overrun_lane_admits_exactly_one_flagged_target() {
+        let plan = || {
+            vec![
+                planned("flagged-a", Some(10)).with_observation_overrun(true),
+                planned("flagged-b", Some(10)).with_observation_overrun(true),
+                planned("cheap", Some(0)),
+            ]
+        };
+        // Lane open: the first flagged target is admitted without consuming
+        // the budget; the second flagged target defers.
+        let selection = select_within_budget(plan(), 2, true);
+        assert_eq!(
+            labels(&selection.batch),
+            vec!["addr-flagged-a", "addr-cheap"]
+        );
+        assert_eq!(labels(&selection.deferred), vec!["addr-flagged-b"]);
+        assert!(selection.overrun_lane_admitted);
+        assert_eq!(selection.bypassed_head_cost, None);
+
+        // Lane closed: both flagged targets defer.
+        let selection = select_within_budget(plan(), 2, false);
+        assert_eq!(labels(&selection.batch), vec!["addr-cheap"]);
+        assert_eq!(
+            labels(&selection.deferred),
+            vec!["addr-flagged-a", "addr-flagged-b"]
+        );
+        assert!(!selection.overrun_lane_admitted);
+    }
+
+    #[test]
+    fn the_overrun_lane_opens_every_interval_ticks_and_closes_after_an_admission() {
+        let mut lane = OverrunLane::new(3);
+        assert!(!lane.is_open(), "the lane starts closed");
+        for tick in 1..=3 {
+            lane.advance();
+            assert_eq!(lane.is_open(), tick == 3, "after {tick} quiet ticks");
+        }
+        lane.record_admission();
+        assert!(!lane.is_open(), "an admission closes the lane");
+        lane.advance();
+        lane.advance();
+        assert!(!lane.is_open());
+        lane.advance();
+        assert!(lane.is_open(), "the lane reopens after the interval");
+        // An open lane stays open until an admission uses it.
+        lane.advance();
+        assert!(lane.is_open());
     }
 
     #[test]
@@ -1141,6 +1320,7 @@ mod tests {
             max_requests_per_tick: 1000,
             max_requests_per_second: 5,
             max_target_requests: 500,
+            overrun_lane_interval_ticks: 10,
         };
         assert_eq!(policy.per_tick_budget(), 50);
         let capped = ObserverPolicy {

@@ -333,13 +333,21 @@ impl InvoiceStore {
     /// re-sync it forever. Misses are reported at WARN (with the truncated
     /// lookup hash; no invoice id exists for an unmatched hash) and counted
     /// in the return value, but never abort the remaining records.
+    ///
+    /// `overrun_clear_bound` is the configured per-target request bound: a
+    /// stamped structural estimate (`1 + history_tx_count`) at or below it
+    /// clears the invoice's `observation_overrun` flag in the same UPDATE,
+    /// so a target whose history is fetchable again rejoins the regular
+    /// budgeted plan without operator action.
     pub async fn record_observation_tick(
         &self,
         records: &[TargetTickRecord],
+        overrun_clear_bound: u32,
     ) -> Result<u64, PersistenceError> {
         if records.is_empty() {
             return Ok(0);
         }
+        let overrun_clear_bound = i64::from(overrun_clear_bound);
         let mut tx = self
             .pool
             .begin()
@@ -357,12 +365,15 @@ impl InvoiceStore {
             let stamped = sqlx::query(
                 "UPDATE invoices SET observation_history_tx_count = $1, \
                  observation_request_count = $2, \
-                 last_observed_at = NOW(), updated_at = NOW() \
+                 last_observed_at = NOW(), updated_at = NOW(), \
+                 observation_overrun = observation_overrun \
+                     AND ($1::BIGINT + 1 > $4) \
                  WHERE bitcoin_address_lookup_hash = $3",
             )
             .bind(history_tx_count)
             .bind(request_count)
             .bind(address_lookup_hash.as_bytes().as_slice())
+            .bind(overrun_clear_bound)
             .execute(&mut *tx)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
