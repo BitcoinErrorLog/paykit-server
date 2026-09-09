@@ -14,6 +14,8 @@ pub mod crypto;
 /// Side-effect-free protocol and business value objects.
 pub mod domain;
 pub mod http;
+/// Canonical key identity (tail, display fingerprint) and the claim deny-list.
+pub mod key_identity;
 /// Manual watch-only account claims authenticated by capability-scoped AuthTokens.
 pub mod manual_claim;
 /// Identifier-free operational metrics.
