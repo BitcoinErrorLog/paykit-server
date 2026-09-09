@@ -300,6 +300,10 @@ mod tests {
     use std::{
         io::{BufRead, BufReader, Cursor},
         net::TcpListener,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         thread,
     };
 
@@ -476,11 +480,15 @@ mod tests {
     }
 
     /// One in-process fake Electrum server over a real 127.0.0.1 TCP
-    /// listener: reads one request line, answers with `response`, and
-    /// (when `keep_open`) stays up for the reconnect that follows.
+    /// listener with deterministic shutdown: the accept loop is
+    /// nonblocking behind a stop flag and every spawned thread (acceptor
+    /// and per-connection handlers) is joined on drop, so a failing test
+    /// can never leak a listener thread.
     struct FakeServer {
         endpoint: String,
-        handle: Option<thread::JoinHandle<()>>,
+        stop: Arc<AtomicBool>,
+        accept_handle: Option<thread::JoinHandle<()>>,
+        connection_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
     }
 
     impl FakeServer {
@@ -490,64 +498,101 @@ mod tests {
         /// the reconnect path.
         fn start(small: String, oversize: String) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
             let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
-            let handle = thread::spawn(move || {
-                let mut connections = 0_u32;
-                while let Ok((stream, _)) = listener.accept() {
-                    connections += 1;
-                    let first = connections == 1;
-                    let small = small.clone();
-                    let oversize = oversize.clone();
-                    thread::spawn(move || {
-                        let mut writer = stream.try_clone().unwrap();
-                        let mut reader = BufReader::new(stream);
-                        let mut line = String::new();
-                        let mut answered = 0_u32;
-                        loop {
-                            line.clear();
-                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                                return;
+            let stop = Arc::new(AtomicBool::new(false));
+            let connection_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let accept_handle = {
+                let stop = Arc::clone(&stop);
+                let connection_handles = Arc::clone(&connection_handles);
+                thread::spawn(move || {
+                    let mut connections = 0_u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                connections += 1;
+                                let first = connections == 1;
+                                let small = small.clone();
+                                let oversize = oversize.clone();
+                                let handle = thread::spawn(move || {
+                                    Self::serve(stream, first, &small, &oversize);
+                                });
+                                connection_handles.lock().unwrap().push(handle);
                             }
-                            let id: serde_json::Value =
-                                serde_json::from_str::<serde_json::Value>(&line)
-                                    .unwrap()
-                                    .get("id")
-                                    .cloned()
-                                    .unwrap_or(serde_json::Value::Null);
-                            answered += 1;
-                            let result = if first && answered == 2 {
-                                &oversize
-                            } else {
-                                &small
-                            };
-                            let response = format!(
-                                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}\n"
-                            );
-                            if writer.write_all(response.as_bytes()).is_err() {
-                                return;
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(5));
                             }
-                            let _ = writer.flush();
+                            Err(_) => return,
                         }
-                    });
-                    if connections >= 2 {
-                        return;
                     }
-                }
-            });
+                })
+            };
             Self {
                 endpoint,
-                handle: Some(handle),
+                stop,
+                accept_handle: Some(accept_handle),
+                connection_handles,
+            }
+        }
+
+        /// Answers request lines until client EOF. The read-timeout
+        /// backstop guarantees the handler exits even if a test fails
+        /// while its client connection is still open, so the drop-time
+        /// join can never wedge.
+        fn serve(stream: TcpStream, first: bool, small: &str, oversize: &str) {
+            // Accepted sockets inherit the listener's nonblocking flag
+            // on some platforms (e.g. macOS); the handler needs a
+            // blocking socket behind its read-timeout backstop.
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            let mut answered = 0_u32;
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    return;
+                }
+                let id: serde_json::Value = serde_json::from_str::<serde_json::Value>(&line)
+                    .unwrap()
+                    .get("id")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                answered += 1;
+                let result = if first && answered == 2 {
+                    oversize
+                } else {
+                    small
+                };
+                let response = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}\n");
+                if writer.write_all(response.as_bytes()).is_err() {
+                    return;
+                }
+                let _ = writer.flush();
             }
         }
     }
 
     impl Drop for FakeServer {
         fn drop(&mut self) {
-            // Detach: the accept loop may still be blocked (e.g. when a
-            // test panicked before the reconnect), and joining it would
-            // hang. Dropping the handle lets the thread die with the
-            // test process.
-            let _ = self.handle.take();
+            // Deterministic shutdown: flag the accept loop (it observes
+            // the flag within one 5 ms poll), join it, then join every
+            // connection handler. Handlers exit on client EOF (clients
+            // drop before the server in every test) or on the
+            // read-timeout backstop, so the joins always return. No
+            // thread is left detached.
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.accept_handle.take() {
+                let _ = handle.join();
+            }
+            let handles = std::mem::take(&mut *self.connection_handles.lock().unwrap());
+            for handle in handles {
+                let _ = handle.join();
+            }
         }
     }
 
@@ -562,6 +607,26 @@ mod tests {
         let wrapper = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"\"}\n";
         let pad = (CAP as usize + 1).saturating_sub(wrapper.len());
         format!("\"{}\"", "y".repeat(pad))
+    }
+
+    #[test]
+    fn the_fake_server_shuts_down_deterministically() {
+        // Dropping the server joins the accept thread and every
+        // connection handler: this test completing at all proves a
+        // failing test can never leak a listener thread or hang the
+        // test process on shutdown.
+        let server = FakeServer::start(small_result_line(), oversize_result_line());
+        let client = connect(&server.endpoint, Duration::from_secs(5), CAP)
+            .expect("connect to the fake server");
+        let first = client
+            .raw_call(
+                "blockchain.scripthash.listunspent",
+                [Param::String("aa".into())],
+            )
+            .expect("small response succeeds");
+        assert_eq!(first, serde_json::json!([]));
+        drop(client);
+        drop(server);
     }
 
     #[test]
