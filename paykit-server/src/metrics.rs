@@ -3,24 +3,36 @@
 use std::sync::Mutex;
 
 use prometheus_client::{
-    encoding::text::encode,
+    encoding::{EncodeLabelSet, text::encode},
     metrics::{
         counter::Counter,
+        family::Family,
         gauge::Gauge,
         histogram::{Histogram, exponential_buckets},
     },
     registry::Registry,
 };
 
-/// Metrics intentionally have no labels: routes, identifiers, and caller input
-/// must never become metric cardinality or data-exposure boundaries.
+/// Closed-set label for the outbox lane whose retry budget ran out. Only
+/// server-owned constants may become label values: routes, identifiers, and
+/// caller input must never become metric cardinality or data-exposure
+/// boundaries.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct OutboxFailureKind {
+    kind: &'static str,
+}
+
+/// Metrics intentionally have no caller-controlled labels: routes, identifiers,
+/// and caller input must never become metric cardinality or data-exposure
+/// boundaries. The only label in use is the closed outbox-lane `kind` set.
 pub struct Metrics {
     registry: Mutex<Registry>,
     http_requests: Counter,
     http_latency_seconds: Histogram,
     outbox_depth: Gauge,
     outbox_retries: Counter,
-    outbox_permanent_failures: Counter,
+    outbox_permanent_failures: Family<OutboxFailureKind, Counter>,
+    outbox_permanently_failed_rows: Gauge,
     electrum_available: Gauge,
     electrum_last_success_age_seconds: Gauge,
     electrum_backlog_oldest_age_seconds: Gauge,
@@ -41,7 +53,8 @@ impl Metrics {
         let http_latency_seconds = Histogram::new(exponential_buckets(0.001, 2.0, 16));
         let outbox_depth = Gauge::default();
         let outbox_retries = Counter::default();
-        let outbox_permanent_failures = Counter::default();
+        let outbox_permanent_failures = Family::<OutboxFailureKind, Counter>::default();
+        let outbox_permanently_failed_rows = Gauge::default();
         let electrum_available = Gauge::default();
         let electrum_last_success_age_seconds = Gauge::default();
         let electrum_backlog_oldest_age_seconds = Gauge::default();
@@ -75,8 +88,13 @@ impl Metrics {
         );
         registry.register(
             "paykit_outbox_permanent_failures",
-            "Permanent outbox failures.",
+            "Outbox rows transitioned to permanently_failed when their retry budget was exhausted, by lane kind.",
             outbox_permanent_failures.clone(),
+        );
+        registry.register(
+            "paykit_outbox_permanently_failed_rows",
+            "Outbox rows currently retained as permanently_failed.",
+            outbox_permanently_failed_rows.clone(),
         );
         registry.register(
             "paykit_electrum_available",
@@ -140,6 +158,7 @@ impl Metrics {
             outbox_depth,
             outbox_retries,
             outbox_permanent_failures,
+            outbox_permanently_failed_rows,
             electrum_available,
             electrum_last_success_age_seconds,
             electrum_backlog_oldest_age_seconds,
@@ -164,8 +183,16 @@ impl Metrics {
     pub fn outbox_retry(&self) {
         self.outbox_retries.inc();
     }
-    pub fn outbox_permanent_failure(&self) {
-        self.outbox_permanent_failures.inc();
+    pub fn outbox_permanent_failure(&self, kind: &'static str) {
+        self.outbox_permanent_failures
+            .get_or_create(&OutboxFailureKind { kind })
+            .inc();
+    }
+    pub fn set_outbox_permanently_failed_rows(&self, count: i64) {
+        self.outbox_permanently_failed_rows.set(count.max(0));
+    }
+    pub fn outbox_permanently_failed_rows(&self) -> u64 {
+        u64::try_from(self.outbox_permanently_failed_rows.get()).unwrap_or(0)
     }
     pub fn set_electrum_available(&self, available: bool) {
         self.electrum_available.set(i64::from(available));
@@ -216,5 +243,34 @@ impl Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outbox_permanent_failures_are_counted_per_closed_kind_label() {
+        let metrics = Metrics::new();
+        metrics.outbox_permanent_failure("delivery");
+        metrics.outbox_permanent_failure("delivery");
+        metrics.outbox_permanent_failure("reconciliation");
+        metrics.set_outbox_permanently_failed_rows(3);
+
+        let encoded = metrics.encode().unwrap();
+        assert!(
+            encoded.contains("paykit_outbox_permanent_failures_total{kind=\"delivery\"} 2"),
+            "{encoded}"
+        );
+        assert!(
+            encoded.contains("paykit_outbox_permanent_failures_total{kind=\"reconciliation\"} 1"),
+            "{encoded}"
+        );
+        assert!(
+            encoded.contains("paykit_outbox_permanently_failed_rows 3"),
+            "{encoded}"
+        );
+        assert_eq!(metrics.outbox_permanently_failed_rows(), 3);
     }
 }

@@ -17,10 +17,11 @@ use crate::{
     domain::locks::{CreatorPubky, PubkyLockResource, ReaderPubky},
     http::{self, accounts::AccountsState, auth::SignedLocksAuth},
     manual_claim::{ManualClaimService, RelayLoopbackSessionMinter},
+    metrics::Metrics,
     paykit::{CreatorSessionProvider, PaykitAdapter},
     persistence::{
         CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PersistenceError,
-        PostgresStorageAdapter, SdkStateStore,
+        PostgresStorageAdapter, RetryBudget, SdkStateStore,
     },
     real_setup::RealSetupCompleter,
     runtime::{PostgresDependency, Runtime, operational_router},
@@ -31,7 +32,10 @@ use crate::{
             ElectrumAdapter, ElectrumPort, ObservationBackend, ObserverError, ObserverPolicy,
             observation_loop,
         },
-        outbox::{ProcessingHealth, process_claim_with_health, process_reconciliation_with_health},
+        outbox::{
+            DELIVERY_KIND, ProcessingHealth, RECONCILIATION_KIND, process_claim_with_health,
+            process_reconciliation_with_health, retry_health,
+        },
     },
 };
 use async_trait::async_trait;
@@ -79,6 +83,8 @@ struct WorkerComponents {
     outbox_lease_duration: Duration,
     outbox_retry_initial: Duration,
     outbox_retry_max: Duration,
+    outbox_retry_budget: RetryBudget,
+    metrics: Arc<Metrics>,
     electrum_policy: ObserverPolicy,
 }
 
@@ -271,6 +277,11 @@ impl Server {
             outbox_lease_duration: config.outbox.lease_duration,
             outbox_retry_initial: config.outbox.retry_initial,
             outbox_retry_max: config.outbox.retry_max,
+            outbox_retry_budget: RetryBudget::new(
+                config.outbox.max_attempts,
+                config.outbox.max_age,
+            ),
+            metrics: runtime.metrics(),
             electrum_policy: ObserverPolicy {
                 poll_interval: config.electrum.poll_interval,
                 max_requests_per_tick: config.electrum.max_requests_per_tick,
@@ -469,7 +480,15 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                 );
                 match creator_adapter(&workers, claim.creator_id()).await {
                     Ok(adapter) => {
-                        process_claim_with_health(&workers.outbox, &adapter, &claim, delay).await
+                        process_claim_with_health(
+                            &workers.outbox,
+                            &adapter,
+                            &claim,
+                            delay,
+                            &workers.outbox_retry_budget,
+                            &workers.metrics,
+                        )
+                        .await
                     }
                     Err(AdapterBuildError::Permanent) => workers
                         .outbox
@@ -478,9 +497,22 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                         .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
                     Err(AdapterBuildError::Unavailable) => workers
                         .outbox
-                        .mark_retryable(&claim, delay, OutboxRetryClass::AdapterUnavailable)
+                        .mark_retryable(
+                            &claim,
+                            delay,
+                            OutboxRetryClass::AdapterUnavailable,
+                            &workers.outbox_retry_budget,
+                        )
                         .await
-                        .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+                        .map(|outcome| {
+                            retry_health(
+                                &workers.metrics,
+                                DELIVERY_KIND,
+                                claim.id(),
+                                claim.attempt_count(),
+                                outcome,
+                            )
+                        }),
                 }
             });
         }
@@ -488,15 +520,19 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
         let mut outbox_available = true;
         while let Some(result) = batch.join_next().await {
             match result {
-                Ok(Ok((_, ProcessingHealth::Available))) => {}
-                Ok(Ok((_, ProcessingHealth::Retryable | ProcessingHealth::PermanentFailure))) => {
+                Ok(Ok((_, ProcessingHealth::Available | ProcessingHealth::PermanentFailure))) => {}
+                Ok(Ok((_, ProcessingHealth::Retryable))) => {
                     delivery_available = false;
                 }
                 Ok(Err(_)) => outbox_available = false,
                 Err(_) => panic!("owned outbox claim task exited unexpectedly"),
             }
         }
-        match workers.outbox.delivery_available().await {
+        match workers
+            .outbox
+            .delivery_available(&workers.outbox_retry_budget)
+            .await
+        {
             Ok(persisted_available) => {
                 delivery_available &= persisted_available;
             }
@@ -504,6 +540,9 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                 delivery_available = false;
                 outbox_available = false;
             }
+        }
+        if let Ok(count) = workers.outbox.permanently_failed_count().await {
+            runtime.metrics().set_outbox_permanently_failed_rows(count);
         }
         runtime.set_paykit_enqueue_available(delivery_available);
         runtime.set_outbox_enqueue_available(outbox_available);
@@ -551,8 +590,15 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
                 );
                 match creator_adapter(&workers, claim.creator_id()).await {
                     Ok(adapter) => {
-                        process_reconciliation_with_health(&workers.outbox, &adapter, &claim, delay)
-                            .await
+                        process_reconciliation_with_health(
+                            &workers.outbox,
+                            &adapter,
+                            &claim,
+                            delay,
+                            &workers.outbox_retry_budget,
+                            &workers.metrics,
+                        )
+                        .await
                     }
                     Err(AdapterBuildError::Permanent) => workers
                         .outbox
@@ -561,9 +607,22 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
                         .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
                     Err(AdapterBuildError::Unavailable) => workers
                         .outbox
-                        .retry_reconciliation(&claim, delay, OutboxRetryClass::AdapterUnavailable)
+                        .retry_reconciliation(
+                            &claim,
+                            delay,
+                            OutboxRetryClass::AdapterUnavailable,
+                            &workers.outbox_retry_budget,
+                        )
                         .await
-                        .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+                        .map(|outcome| {
+                            retry_health(
+                                &workers.metrics,
+                                RECONCILIATION_KIND,
+                                claim.id(),
+                                claim.attempt_count(),
+                                outcome,
+                            )
+                        }),
                 }
             });
         }
@@ -571,15 +630,19 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
         let mut outbox_available = true;
         while let Some(result) = batch.join_next().await {
             match result {
-                Ok(Ok((_, ProcessingHealth::Available))) => {}
-                Ok(Ok((_, ProcessingHealth::Retryable | ProcessingHealth::PermanentFailure))) => {
+                Ok(Ok((_, ProcessingHealth::Available | ProcessingHealth::PermanentFailure))) => {}
+                Ok(Ok((_, ProcessingHealth::Retryable))) => {
                     delivery_available = false;
                 }
                 Ok(Err(_)) => outbox_available = false,
                 Err(_) => panic!("owned outbox reconciliation task exited unexpectedly"),
             }
         }
-        match workers.outbox.delivery_available().await {
+        match workers
+            .outbox
+            .delivery_available(&workers.outbox_retry_budget)
+            .await
+        {
             Ok(persisted_available) => {
                 delivery_available &= persisted_available;
             }

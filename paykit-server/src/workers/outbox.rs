@@ -11,11 +11,54 @@ use paykit_sdk::OutboundPrivateMessageStatus;
 
 use crate::{
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
-    persistence::{ClaimedHandoff, ClaimedOutbox, OutboxStore, PersistenceError},
+    metrics::Metrics,
+    persistence::{
+        ClaimedHandoff, ClaimedOutbox, OutboxStore, PersistenceError, RetryBudget, RetryTransition,
+    },
 };
 use std::time::Duration;
 
 pub use crate::persistence::{HandoffResult, OutboxRetryClass as RetryableHandoffStage};
+
+/// Metric/log label for the enqueue delivery lane (closed set).
+pub const DELIVERY_KIND: &str = "delivery";
+/// Metric/log label for the reconciliation lane (closed set).
+pub const RECONCILIATION_KIND: &str = "reconciliation";
+
+/// Reports a retry-budget exhaustion exactly once: the fenced statement that
+/// released the lease already transitioned the row, so concurrent workers see
+/// [`RetryTransition::FenceLost`] and never reach this path for the same row.
+fn report_budget_exhausted(
+    metrics: &Metrics,
+    kind: &'static str,
+    row_id: uuid::Uuid,
+    attempt_count: i32,
+) {
+    tracing::error!(
+        row_id = %row_id,
+        kind,
+        attempt_count,
+        "outbox retry budget exhausted; row transitioned to permanently_failed"
+    );
+    metrics.outbox_permanent_failure(kind);
+}
+
+pub(crate) fn retry_health(
+    metrics: &Metrics,
+    kind: &'static str,
+    row_id: uuid::Uuid,
+    attempt_count: i32,
+    outcome: RetryTransition,
+) -> (bool, ProcessingHealth) {
+    match outcome {
+        RetryTransition::Scheduled => (true, ProcessingHealth::Retryable),
+        RetryTransition::BudgetExhausted => {
+            report_budget_exhausted(metrics, kind, row_id, attempt_count);
+            (true, ProcessingHealth::PermanentFailure)
+        }
+        RetryTransition::FenceLost => (false, ProcessingHealth::Retryable),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandoffError {
@@ -154,8 +197,10 @@ pub async fn process_claim(
     adapter: &dyn Adapter,
     claim: &ClaimedOutbox,
     retry_delay: Duration,
+    budget: &RetryBudget,
+    metrics: &Metrics,
 ) -> Result<bool, PersistenceError> {
-    process_claim_with_health(store, adapter, claim, retry_delay)
+    process_claim_with_health(store, adapter, claim, retry_delay, budget, metrics)
         .await
         .map(|(transitioned, _)| transitioned)
 }
@@ -165,6 +210,8 @@ pub async fn process_claim_with_health(
     adapter: &dyn Adapter,
     claim: &ClaimedOutbox,
     retry_delay: Duration,
+    budget: &RetryBudget,
+    metrics: &Metrics,
 ) -> Result<(bool, ProcessingHealth), PersistenceError> {
     let intent = match store.delivery_intent(claim) {
         Ok(intent) => intent,
@@ -181,9 +228,17 @@ pub async fn process_claim_with_health(
             .await
             .map(|transitioned| (transitioned, ProcessingHealth::Available)),
         Err(HandoffFailure::Retryable(stage)) => store
-            .mark_retryable(claim, retry_delay, stage)
+            .mark_retryable(claim, retry_delay, stage, budget)
             .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+            .map(|outcome| {
+                retry_health(
+                    metrics,
+                    DELIVERY_KIND,
+                    claim.id(),
+                    claim.attempt_count(),
+                    outcome,
+                )
+            }),
         Err(HandoffFailure::Permanent) => store
             .mark_permanently_failed(claim)
             .await
@@ -200,8 +255,10 @@ pub async fn process_reconciliation(
     adapter: &dyn Adapter,
     claim: &ClaimedHandoff,
     retry_delay: Duration,
+    budget: &RetryBudget,
+    metrics: &Metrics,
 ) -> Result<bool, PersistenceError> {
-    process_reconciliation_with_health(store, adapter, claim, retry_delay)
+    process_reconciliation_with_health(store, adapter, claim, retry_delay, budget, metrics)
         .await
         .map(|(transitioned, _)| transitioned)
 }
@@ -211,6 +268,8 @@ pub async fn process_reconciliation_with_health(
     adapter: &dyn Adapter,
     claim: &ClaimedHandoff,
     retry_delay: Duration,
+    budget: &RetryBudget,
+    metrics: &Metrics,
 ) -> Result<(bool, ProcessingHealth), PersistenceError> {
     let outbound_message_id = match claim.sdk_outbound_message_id() {
         Ok(value) => value,
@@ -239,13 +298,35 @@ pub async fn process_reconciliation_with_health(
                 claim,
                 retry_delay,
                 RetryableHandoffStage::ReconciliationPending,
+                budget,
             )
             .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+            .map(|outcome| {
+                retry_health(
+                    metrics,
+                    RECONCILIATION_KIND,
+                    claim.id(),
+                    claim.attempt_count(),
+                    outcome,
+                )
+            }),
         Err(HandoffError::Retryable(_)) => store
-            .retry_reconciliation(claim, retry_delay, RetryableHandoffStage::Reconciliation)
+            .retry_reconciliation(
+                claim,
+                retry_delay,
+                RetryableHandoffStage::Reconciliation,
+                budget,
+            )
             .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+            .map(|outcome| {
+                retry_health(
+                    metrics,
+                    RECONCILIATION_KIND,
+                    claim.id(),
+                    claim.attempt_count(),
+                    outcome,
+                )
+            }),
         Err(HandoffError::Permanent) => store
             .mark_reconciliation_permanently_failed(claim)
             .await
