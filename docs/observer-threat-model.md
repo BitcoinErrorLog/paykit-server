@@ -45,7 +45,13 @@ therefore costs **exactly one request per tracked address** and never calls
 
 **Residual risk:** the request *count* is O(1) per address, but the
 *response size* grows with the address's UTXO count, so a heavily dusted
-address can still produce a large or slow response. Mitigations:
+address can still produce a large or slow response. The per-address
+wall-clock deadline below (`electrum.address_deadline`) bounds how long
+the tick *waits*, but the blocking socket read behind it cannot be
+cancelled: an over-deadline response keeps one blocking-pool thread and
+its socket occupied until the read returns — bounded at latest by
+`electrum.request_timeout` on the wire — so the residual is thread/socket
+occupancy by abandoned reads, never unbounded tick latency. Mitigations:
 
 - **Item-count cap.** A response listing more than
   `electrum.max_utxos_per_address` UTXOs (default 200) is rejected before
@@ -82,6 +88,15 @@ rejects any configuration whose effective per-tick budget —
 seconds)` — does not exceed the two-request probe reservation, so no
 accepted configuration can probe successfully while admitting zero address
 lookups forever.
+
+The bucket is process-wide and shared (`RequestLimiter`, owned by the
+runtime and installed once at startup): the observer tick charges its
+probe and lookups against it, and non-tick Electrum callers —
+invoice-creation snapshot fetches, the first-bind candidate fetch, and
+the claim-time history scan — reserve from the same bucket before
+dispatch. The configured rate therefore bounds the joint load, and a busy
+non-tick caller shrinks the next tick's admission instead of drawing from
+a separate pool.
 
 Unadmitted and failed targets keep their staleness and lead the next
 tick's plan, and only successfully observed targets are stamped/rotated.
@@ -124,6 +139,12 @@ genuine endpoint-level conditions:
   repeatedly (WARN log past five minutes).
 - `paykit_electrum_available` and the Electrum section of `/health/ready` —
   endpoint-level degradation only, per the rule above.
+- `paykit_electrum_zero_success_ticks` — counter of ticks that attempted
+  ≥1 lookup and succeeded at none; with failures isolated from
+  availability, this is the signal that observation is silently doing no
+  work. Each such tick also logs ERROR once per streak (the streak resets
+  on the first tick with a successful lookup). No availability change, no
+  backoff.
 - Rate-limited WARN log per failing address (at most once per five minutes
   per address) naming the address and the failure reason, plus a per-tick
   summary WARN with the tick's failure count.

@@ -154,10 +154,10 @@ impl AtomicInvoiceResult {
 /// PostgreSQL advisory-lock key for cluster-single observer leadership.
 /// Fixed and documented: every replica of one deployment tries the same key,
 /// so exactly one observer is active cluster-wide. (Advisory locks are
-/// server-wide in PostgreSQL; stacks that share one PostgreSQL cluster must
-/// not co-locate two paykit observer deployments without overriding nothing
-/// — the second stack's observer simply idles, which is the designed
-/// fail-closed behaviour.)
+/// per-DATABASE in PostgreSQL — the lock tag is scoped by the database OID —
+/// so two deployments that share one PostgreSQL cluster contend on this key
+/// only when they share one database; in that case the second stack's
+/// observer simply idles, which is the designed fail-closed behaviour.)
 pub const OBSERVER_LEADERSHIP_LOCK_KEY: i64 = 7_216_043_388_155_778_021;
 
 /// Cluster-single observer leadership backed by a session-scoped

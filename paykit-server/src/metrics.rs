@@ -37,6 +37,7 @@ pub struct Metrics {
     electrum_backlog_oldest_age_seconds: Gauge,
     electrum_observation_stamp_misses: Counter,
     electrum_observation_address_failures: Family<AddressFailureLabels, Counter>,
+    electrum_zero_success_ticks: Counter,
     payment_states: Gauge,
     runtime_active: Gauge,
     session_validation_results: Counter,
@@ -55,6 +56,7 @@ impl Metrics {
         let electrum_backlog_oldest_age_seconds = Gauge::default();
         let electrum_observation_stamp_misses = Counter::default();
         let electrum_observation_address_failures = Family::default();
+        let electrum_zero_success_ticks = Counter::default();
         let payment_states = Gauge::default();
         let runtime_active = Gauge::default();
         let session_validation_results = Counter::default();
@@ -110,6 +112,11 @@ impl Metrics {
             electrum_observation_address_failures.clone(),
         );
         registry.register(
+            "paykit_electrum_zero_success_ticks",
+            "Observer ticks that attempted lookups and succeeded at none.",
+            electrum_zero_success_ticks.clone(),
+        );
+        registry.register(
             "paykit_payment_states",
             "Aggregate persisted payment-state count.",
             payment_states.clone(),
@@ -136,6 +143,7 @@ impl Metrics {
             electrum_backlog_oldest_age_seconds,
             electrum_observation_stamp_misses,
             electrum_observation_address_failures,
+            electrum_zero_success_ticks,
             payment_states,
             runtime_active,
             session_validation_results,
@@ -171,6 +179,9 @@ impl Metrics {
         self.electrum_observation_address_failures
             .get_or_create(&AddressFailureLabels { reason })
             .inc_by(failures);
+    }
+    pub fn electrum_zero_success_tick(&self) {
+        self.electrum_zero_success_ticks.inc();
     }
     pub fn set_payment_states(&self, value: i64) {
         self.payment_states.set(value);

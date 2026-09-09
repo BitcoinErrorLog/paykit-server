@@ -1010,6 +1010,133 @@ mod tick {
     }
 
     #[tokio::test]
+    async fn a_zero_success_tick_is_counted_but_keeps_electrum_available() {
+        // Every attempted lookup fails in isolation: the tick is visible
+        // through the zero-success counter, but availability stays up and
+        // no backoff triggers — the endpoint was reached and answered.
+        let port = FakeElectrum::failing_addresses(["stuck-a", "stuck-b"]);
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![
+                FakeEntry::new("stuck-a", 600),
+                FakeEntry::new("stuck-b", 300),
+            ]),
+            applied: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state(&policy(100)),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 2,
+                deferred: 0,
+                failed: 2,
+            }
+        );
+        let encoded = runtime.metrics().encode().unwrap();
+        assert!(
+            encoded.contains("paykit_electrum_zero_success_ticks_total 1"),
+            "the zero-success tick must be counted: {encoded}"
+        );
+        let report = runtime.readiness().await;
+        assert_eq!(
+            report.electrum,
+            paykit_server::runtime::ComponentState::Ready,
+            "isolated failures never degrade endpoint availability"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_tick_resets_the_zero_success_log_streak() {
+        // The ERROR log is rate-limited to once per zero-success streak:
+        // the gate (`zero_success_logged`) closes on the first
+        // zero-success tick, stays closed while ticks keep failing, and a
+        // tick with a successful lookup reopens it so the next
+        // zero-success tick logs again. The counter increments on every
+        // zero-success tick regardless.
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![
+                FakeEntry::new("stuck", 600),
+                FakeEntry::new("cheap", 300),
+            ]),
+            applied: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+        let mut state = state(&policy(100));
+
+        for tick in 1..=2 {
+            let port = FakeElectrum::failing_addresses(["stuck", "cheap"]);
+            let outcome = observe_tick(
+                &port,
+                &backend,
+                &BitcoinNetwork::Regtest,
+                &runtime,
+                &mut state,
+            )
+            .await;
+            assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
+            assert!(
+                state.zero_success_logged(),
+                "tick {tick}: the streak gate stays closed, suppressing a repeat ERROR log"
+            );
+            elapse_one_poll_interval(&mut state);
+        }
+        let encoded = runtime.metrics().encode().unwrap();
+        assert!(
+            encoded.contains("paykit_electrum_zero_success_ticks_total 2"),
+            "every zero-success tick is counted even within one streak: {encoded}"
+        );
+
+        // A tick with a successful lookup reopens the streak gate.
+        let port = FakeElectrum::healthy();
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state,
+        )
+        .await;
+        assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
+        assert!(
+            !state.zero_success_logged(),
+            "a successful tick resets the streak"
+        );
+
+        // So the next zero-success tick logs ERROR again (gate closes
+        // anew) and the counter keeps accruing.
+        elapse_one_poll_interval(&mut state);
+        let port = FakeElectrum::failing_addresses(["stuck", "cheap"]);
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state,
+        )
+        .await;
+        assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
+        assert!(
+            state.zero_success_logged(),
+            "the first zero-success tick of a new streak logs again"
+        );
+        let encoded = runtime.metrics().encode().unwrap();
+        assert!(
+            encoded.contains("paykit_electrum_zero_success_ticks_total 3"),
+            "the counter accrues across streaks: {encoded}"
+        );
+    }
+
+    #[tokio::test]
     async fn the_sustained_budget_admits_nothing_without_elapsed_refill() {
         // The token bucket refills from elapsed wall time, not from the
         // tick count: two back-to-back ticks admit only the first tick's

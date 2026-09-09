@@ -800,6 +800,26 @@ pub async fn observe_tick(
             "isolated per-address electrum lookup failures this tick; failed targets stay stale"
         );
     }
+    // Zero-success visibility: with per-address failures isolated from
+    // endpoint availability, a tick that attempted lookups and succeeded
+    // at none would otherwise be indistinguishable from health. Count
+    // every such tick and log ERROR once per streak (the streak resets on
+    // the first tick with a successful lookup). Availability is untouched
+    // and no backoff triggers: the endpoint was reached and answered.
+    let succeeded = processed.saturating_sub(failed_count);
+    if processed > 0 && succeeded == 0 {
+        runtime.metrics().electrum_zero_success_tick();
+        if !state.zero_success_logged {
+            tracing::error!(
+                attempted = processed,
+                deferred,
+                "every electrum lookup in this tick failed in isolation; targets stay stale"
+            );
+            state.zero_success_logged = true;
+        }
+    } else if succeeded > 0 {
+        state.zero_success_logged = false;
+    }
     tracing::info!(
         lookups = processed,
         deferred,
