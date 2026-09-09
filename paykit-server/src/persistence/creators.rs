@@ -345,6 +345,28 @@ impl CreatorStore {
         tx.commit().await.map_err(|_| PersistenceError::Unavailable)
     }
 
+    /// Advances the creator's derivation cursor to at least `floor` and
+    /// returns the resulting value. The update is monotonic (`GREATEST`), so
+    /// a re-claim can never move the cursor backwards over an already
+    /// allocated child index. Callers hold the creator's setup lock, so this
+    /// runs inside the same critical section as the claim commit.
+    pub async fn advance_next_child_index(
+        &self,
+        creator: &CreatorPubky,
+        floor: i64,
+    ) -> Result<i64, PersistenceError> {
+        let hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        sqlx::query_scalar(
+            "UPDATE creators SET next_child_index = GREATEST(next_child_index, $2), updated_at = NOW() \
+             WHERE creator_lookup_hash = $1 RETURNING next_child_index",
+        )
+        .bind(hash.as_bytes().as_slice())
+        .bind(floor)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)
+    }
+
     /// Authenticates every creator authority and SDK-state envelope required at boot.
     pub async fn scan_integrity(&self) -> Result<(), PersistenceError> {
         let rows = sqlx::query_as::<_, CreatorRow>(

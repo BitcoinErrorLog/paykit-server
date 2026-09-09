@@ -209,6 +209,9 @@ impl SetupCompleter for RealSetupCompleter {
             bitcoin_network: self.bitcoin_network.clone(),
             receiver_path: self.receiver_path.clone(),
             marker_capabilities: self.marker_capabilities,
+            // The companion flow performs no claim-time history scan (§B.5
+            // binds the manual claim endpoint); no cursor floor is applied.
+            next_child_index_floor: None,
         };
         match receive_verify_commit(
             self.relay.as_ref(),
@@ -244,20 +247,26 @@ pub(crate) struct CreatorSetupCommit {
     pub(crate) bitcoin_network: BitcoinNetwork,
     pub(crate) receiver_path: PaykitReceiverPath,
     pub(crate) marker_capabilities: PaykitReceiverCapabilities,
+    /// Claim-scan start index (design §B.5) applied to the creator's
+    /// derivation cursor inside the commit critical section. `None` for the
+    /// Bitkit companion flow, which does not scan; the manual claim endpoint
+    /// always sets it.
+    pub(crate) next_child_index_floor: Option<i64>,
 }
 
 impl CreatorSetupCommit {
     pub(crate) fn marker_capabilities() -> PaykitReceiverCapabilities {
         default_marker_capabilities()
     }
-}
 
-#[async_trait]
-impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
-    async fn publish_readback_and_commit(
+    /// The commit shared by both setup flows, additionally reporting the
+    /// creator's resulting derivation cursor when a claim-scan floor was
+    /// applied, so the manual claim response can return the actual
+    /// `next_child_index` (design §B.6).
+    pub(crate) async fn publish_readback_and_commit_reporting(
         &self,
         claim: WatchOnlyAccountClaim,
-    ) -> Result<(), ClaimError> {
+    ) -> Result<Option<i64>, ClaimError> {
         let xpub = validate_xpub(
             &claim.serialized_xpub,
             claim.account_index,
@@ -325,15 +334,39 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                     _ => ClaimError::InvalidEnvelope,
                 });
             }
-            Ok(())
+            // Apply the claim-scan start index inside the same critical
+            // section as the commit, monotonically: a re-claim of the same
+            // account never moves the cursor backwards over an already
+            // allocated child index.
+            match self.next_child_index_floor {
+                Some(floor) => self
+                    .creators
+                    .advance_next_child_index(&self.creator, floor)
+                    .await
+                    .map(Some)
+                    .map_err(|_| ClaimError::InvalidEnvelope),
+                None => Ok(None),
+            }
         }
         .await;
         let unlock_result = setup_lock.release().await;
         match (commit_result, unlock_result) {
             (Err(error), _) => Err(error),
-            (Ok(()), Err(_)) => Err(ClaimError::InvalidEnvelope),
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(_), Err(_)) => Err(ClaimError::InvalidEnvelope),
+            (Ok(next_child_index), Ok(())) => Ok(next_child_index),
         }
+    }
+}
+
+#[async_trait]
+impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
+    async fn publish_readback_and_commit(
+        &self,
+        claim: WatchOnlyAccountClaim,
+    ) -> Result<(), ClaimError> {
+        self.publish_readback_and_commit_reporting(claim)
+            .await
+            .map(|_| ())
     }
 }
 

@@ -170,6 +170,7 @@ async fn claim(State(state): State<AccountsState>, body: Json<ClaimBody>) -> Res
                 "status": "claimed",
                 "creator": outcome.creator,
                 "account_index": outcome.account_index,
+                "next_child_index": outcome.next_child_index,
             })),
         )
             .into_response(),
@@ -198,6 +199,16 @@ fn claim_error(error: ManualClaimError) -> Response {
             StatusCode::CONFLICT,
             "account_mismatch",
             "a different watch-only account is already claimed for this creator",
+        ),
+        ManualClaimError::ClaimScanUnavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "claim_scan_unavailable",
+            "the claim-time address history scan could not reach Electrum; the claim was refused",
+        ),
+        ManualClaimError::AccountHistoryTooDeep => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "account_history_too_deep",
+            "account history exceeds the claim scan bound; claim a fresh, dedicated account",
         ),
         ManualClaimError::SessionUnavailable => (
             StatusCode::SERVICE_UNAVAILABLE,
