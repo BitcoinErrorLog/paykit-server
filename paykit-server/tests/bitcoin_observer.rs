@@ -153,6 +153,7 @@ mod tick {
     struct FakeElectrum {
         probe: Result<TipProbe, ObserverError>,
         history_tx_counts: std::collections::HashMap<String, u32>,
+        request_count: u64,
         calls: Mutex<Vec<Vec<String>>>,
     }
 
@@ -171,14 +172,21 @@ mod tick {
                     .into_iter()
                     .map(|(address, tx_count)| (address.to_owned(), tx_count))
                     .collect(),
+                request_count: 0,
                 calls: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_request_count(mut self, request_count: u64) -> Self {
+            self.request_count = request_count;
+            self
         }
 
         fn failing(error: ObserverError) -> Self {
             Self {
                 probe: Err(error),
                 history_tx_counts: std::collections::HashMap::new(),
+                request_count: 0,
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -209,7 +217,7 @@ mod tick {
                             .unwrap_or(0),
                     })
                     .collect(),
-                request_count: 0,
+                request_count: self.request_count,
             })
         }
 
@@ -221,7 +229,19 @@ mod tick {
     struct FakeEntry {
         address: String,
         history_tx_count: Option<u32>,
+        last_request_count: Option<u32>,
         staleness_secs: u64,
+    }
+
+    impl FakeEntry {
+        fn new(address: &str, history_tx_count: Option<u32>, staleness_secs: u64) -> Self {
+            Self {
+                address: address.into(),
+                history_tx_count,
+                last_request_count: None,
+                staleness_secs,
+            }
+        }
     }
 
     #[derive(Default)]
@@ -241,7 +261,7 @@ mod tick {
                     PlannedObservation::new(
                         ObservationTarget::new(entry.address.clone(), None),
                         entry.history_tx_count,
-                        None,
+                        entry.last_request_count,
                         Duration::from_secs(entry.staleness_secs),
                     )
                 })
@@ -275,6 +295,7 @@ mod tick {
                     .expect("recorded target is in the plan");
                 entry.staleness_secs = 0;
                 entry.history_tx_count = Some(record.history_tx_count());
+                entry.last_request_count = Some(record.request_count());
             }
             Ok(())
         }
@@ -363,26 +384,10 @@ mod tick {
         let port = FakeElectrum::healthy();
         let backend = FakeBackend {
             entries: Mutex::new(vec![
-                FakeEntry {
-                    address: "oldest".into(),
-                    history_tx_count: None,
-                    staleness_secs: 600,
-                },
-                FakeEntry {
-                    address: "second".into(),
-                    history_tx_count: Some(2),
-                    staleness_secs: 300,
-                },
-                FakeEntry {
-                    address: "third".into(),
-                    history_tx_count: Some(0),
-                    staleness_secs: 120,
-                },
-                FakeEntry {
-                    address: "freshest".into(),
-                    history_tx_count: Some(0),
-                    staleness_secs: 60,
-                },
+                FakeEntry::new("oldest", None, 600),
+                FakeEntry::new("second", Some(2), 300),
+                FakeEntry::new("third", Some(0), 120),
+                FakeEntry::new("freshest", Some(0), 60),
             ]),
             applied: Mutex::new(Vec::new()),
         };
@@ -449,10 +454,12 @@ mod tick {
         let backend = FakeBackend {
             entries: Mutex::new(
                 (0..TARGETS)
-                    .map(|index| FakeEntry {
-                        address: format!("target-{index}"),
-                        history_tx_count: Some(9),
-                        staleness_secs: (1_000 - 100 * index) as u64,
+                    .map(|index| {
+                        FakeEntry::new(
+                            &format!("target-{index}"),
+                            Some(9),
+                            (1_000 - 100 * index) as u64,
+                        )
                     })
                     .collect(),
             ),
@@ -494,21 +501,9 @@ mod tick {
         let port = FakeElectrum::healthy_with_history([("dusted", 50)]);
         let backend = FakeBackend {
             entries: Mutex::new(vec![
-                FakeEntry {
-                    address: "dusted".into(),
-                    history_tx_count: Some(50),
-                    staleness_secs: 600,
-                },
-                FakeEntry {
-                    address: "cheap-a".into(),
-                    history_tx_count: Some(0),
-                    staleness_secs: 300,
-                },
-                FakeEntry {
-                    address: "cheap-b".into(),
-                    history_tx_count: Some(0),
-                    staleness_secs: 120,
-                },
+                FakeEntry::new("dusted", Some(50), 600),
+                FakeEntry::new("cheap-a", Some(0), 300),
+                FakeEntry::new("cheap-b", Some(0), 120),
             ]),
             applied: Mutex::new(Vec::new()),
         };
@@ -543,5 +538,82 @@ mod tick {
             dusted_ticks >= TICKS / 3,
             "the dusted target must be observed at least once per three ticks, got {dusted_ticks} of {TICKS}"
         );
+    }
+
+    #[tokio::test]
+    async fn measured_batch_cost_is_attributed_to_the_dusted_target_not_the_batch() {
+        const CHEAP: usize = 20;
+        // One target dusted to 200 history transactions batched with twenty
+        // cheap targets; the measured batch cost (242 requests) must be
+        // attributed to the targets' own structural estimates, not split
+        // evenly (even split would stamp every cheap target with
+        // ceil(242/21) = 12 and collapse the next tick's throughput).
+        let port = FakeElectrum::healthy_with_history([("dusted", 200)]).with_request_count(242);
+        let mut entries = vec![FakeEntry::new("dusted", Some(200), 600)];
+        entries.extend(
+            (0..CHEAP).map(|index| FakeEntry::new(&format!("cheap-{index}"), Some(0), 300)),
+        );
+        let backend = FakeBackend {
+            entries: Mutex::new(entries),
+            applied: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(100),
+            &runtime,
+        )
+        .await;
+        assert!(
+            matches!(outcome, ObserverTickOutcome::Observed { .. }),
+            "the mixed batch must be observed: {outcome:?}"
+        );
+        {
+            let entries = backend.entries.lock().unwrap();
+            let dusted = entries
+                .iter()
+                .find(|entry| entry.address == "dusted")
+                .expect("dusted target recorded");
+            assert!(
+                dusted.last_request_count.unwrap_or(0) >= 200,
+                "the dusted target must absorb its own measured cost, got {:?}",
+                dusted.last_request_count
+            );
+            for entry in entries.iter().filter(|entry| entry.address != "dusted") {
+                assert!(
+                    entry.last_request_count.unwrap_or(u32::MAX) <= 2,
+                    "cheap target {} must keep a small persisted request count, got {:?}",
+                    entry.address,
+                    entry.last_request_count
+                );
+            }
+        }
+
+        // Next tick: every cheap target's persisted request count is small,
+        // so the whole cheap set fits the budget behind the bypassed dusted
+        // head and is admitted.
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(100),
+            &runtime,
+        )
+        .await;
+        assert!(
+            matches!(outcome, ObserverTickOutcome::Observed { .. }),
+            "the next tick must observe: {outcome:?}"
+        );
+        let calls = port.calls.lock().unwrap();
+        let batch = calls.last().expect("a tick observes a batch");
+        for index in 0..CHEAP {
+            assert!(
+                batch.contains(&format!("cheap-{index}")),
+                "cheap target {index} must be admitted on the next tick"
+            );
+        }
     }
 }

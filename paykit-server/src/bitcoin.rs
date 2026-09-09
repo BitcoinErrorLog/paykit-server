@@ -273,7 +273,8 @@ impl fmt::Debug for PlannedObservation {
 /// Persisted budget facts for one successfully observed target: the number
 /// of transactions the previous history fetch returned for its address, and
 /// its share of the actual Electrum request count measured for that batch
-/// (the batch total divided by the batch size, rounded up).
+/// (attributed proportionally to each target's structural estimate, with
+/// the shares summing to the measured batch total).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetTickRecord {
     address: String,

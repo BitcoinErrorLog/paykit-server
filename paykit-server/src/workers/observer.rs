@@ -233,6 +233,48 @@ pub fn select_within_budget(plan: Vec<PlannedObservation>, budget: u64) -> Budge
     }
 }
 
+/// Splits one measured batch request count across the batch's targets
+/// proportionally to each target's structural estimate, so an expensive
+/// target absorbs its own cost instead of smearing it across the batch.
+///
+/// Each share is `max(1, ceil(total × est_i / Σ est_j))`; the remainder
+/// after summing the shares (negative when the ceiling overshoots) is
+/// assigned to the largest-estimate target, so the shares sum to `total`
+/// exactly whenever `total` is at least the target count. That always
+/// holds for a real Electrum sync, which costs at least one history
+/// request per script.
+pub fn attribute_request_count(total: u64, estimates: &[u64]) -> Vec<u64> {
+    if estimates.is_empty() {
+        return Vec::new();
+    }
+    let estimate_sum = estimates
+        .iter()
+        .map(|estimate| u128::from(*estimate))
+        .sum::<u128>()
+        .max(1);
+    let mut shares: Vec<u64> = estimates
+        .iter()
+        .map(|estimate| {
+            let scaled = u128::from(total).saturating_mul(u128::from(*estimate));
+            u64::try_from(scaled.div_ceil(estimate_sum))
+                .unwrap_or(u64::MAX)
+                .max(1)
+        })
+        .collect();
+    let assigned = shares.iter().map(|share| u128::from(*share)).sum::<u128>();
+    let remainder = i128::from(total) - i128::try_from(assigned).unwrap_or(i128::MAX);
+    if remainder != 0
+        && let Some((largest, _)) = estimates
+            .iter()
+            .enumerate()
+            .max_by_key(|(position, estimate)| (**estimate, *position))
+    {
+        let adjusted = i128::from(shares[largest]).saturating_add(remainder);
+        shares[largest] = u64::try_from(adjusted.max(1)).unwrap_or(u64::MAX);
+    }
+    shares
+}
+
 /// Poll interval with ±20% jitter so co-located observers do not synchronize
 /// their request bursts against a shared Electrum endpoint.
 pub fn jittered_interval(base: Duration) -> Duration {
@@ -391,20 +433,36 @@ pub async fn observe_tick(
         runtime.set_electrum_available(false);
         return ObserverTickOutcome::ObservationFailed(error);
     }
-    // Attribute the measured batch request count evenly across the batch's
-    // targets so a systematically under-estimated mix raises every target's
-    // next-tick estimate.
-    let batch_size = u64::try_from(targets.len()).unwrap_or(1).max(1);
-    let per_target_request_count =
-        u32::try_from(report.request_count.div_ceil(batch_size)).unwrap_or(u32::MAX);
+    // Attribute the measured batch request count proportionally to each
+    // target's own structural estimate so an expensive target absorbs its
+    // own cost: an evenly split share would stamp every cheap target with
+    // the dusted target's cost and collapse the next tick's throughput.
+    // The adapter fetches the whole batch in one BDK sync call, so the
+    // client request counter cannot attribute requests per script.
+    let estimates: Vec<u64> = selection
+        .batch
+        .iter()
+        .map(|entry| 1 + u64::from(entry.history_tx_count().unwrap_or(1)))
+        .collect();
+    let shares = attribute_request_count(report.request_count, &estimates);
+    let shares_by_address: HashMap<&str, u64> = selection
+        .batch
+        .iter()
+        .map(|entry| entry.target().address())
+        .zip(shares)
+        .collect();
     let records: Vec<TargetTickRecord> = report
         .history
         .iter()
         .map(|history| {
+            let share = shares_by_address
+                .get(history.address.as_str())
+                .copied()
+                .unwrap_or(1);
             TargetTickRecord::new(
                 history.address.clone(),
                 history.tx_count,
-                per_target_request_count,
+                u32::try_from(share).unwrap_or(u32::MAX),
             )
         })
         .collect();
@@ -908,6 +966,53 @@ mod tests {
             TARGETS,
             "every target must be observed within {TARGETS} ticks"
         );
+    }
+
+    #[test]
+    fn attribution_gives_the_expensive_target_its_own_cost() {
+        // One dusted target (structural estimate 201) in a batch of twenty
+        // cheap targets (estimate 1 each).
+        let mut estimates = vec![201_u64];
+        estimates.extend([1_u64; 20]);
+        let shares = attribute_request_count(242, &estimates);
+        assert_eq!(shares.len(), 21);
+        assert_eq!(shares.iter().sum::<u64>(), 242);
+        assert!(
+            shares[0] >= 200,
+            "the dusted target must absorb its own cost, got {}",
+            shares[0]
+        );
+        for share in &shares[1..] {
+            assert!(
+                *share <= 2,
+                "cheap targets must keep a small share, got {share}"
+            );
+        }
+    }
+
+    #[test]
+    fn attribution_remainder_lands_on_the_largest_estimate_target() {
+        // Ceil overshoot: 84 + 9 + 9 = 102 > 100, so the largest-estimate
+        // target absorbs the -2 remainder and the shares stay exact.
+        let shares = attribute_request_count(100, &[10, 1, 1]);
+        assert_eq!(shares, vec![82, 9, 9]);
+        // Undershoot-free equal split.
+        let shares = attribute_request_count(10, &[3, 3]);
+        assert_eq!(shares, vec![5, 5]);
+        // Every share is at least one, then the remainder rebalances.
+        let shares = attribute_request_count(7, &[1, 1, 1]);
+        assert_eq!(shares.iter().sum::<u64>(), 7);
+        assert!(shares.iter().all(|share| *share >= 1));
+        let shares = attribute_request_count(5, &[2, 1]);
+        assert_eq!(shares, vec![3, 2]);
+    }
+
+    #[test]
+    fn attribution_handles_empty_and_zero_totals() {
+        assert!(attribute_request_count(10, &[]).is_empty());
+        let shares = attribute_request_count(0, &[5, 1]);
+        assert_eq!(shares.len(), 2);
+        assert!(shares.iter().all(|share| *share >= 1));
     }
 
     #[test]
