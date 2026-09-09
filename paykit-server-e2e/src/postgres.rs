@@ -40,7 +40,6 @@ impl TestDatabase {
         let admin_options = PgConnectOptions::from_str(&database_url)
             .expect("TEST_DATABASE_URL must be a valid PostgreSQL URL");
         let database_name = format!("paykit_e2e_{}", Uuid::new_v4().simple());
-        let isolated_database_url = isolated_database_url(&database_url, &database_name);
 
         let mut admin_connection = PgConnection::connect_with(&admin_options)
             .await
@@ -54,6 +53,58 @@ impl TestDatabase {
             .await
             .expect("close E2E database administration connection");
 
+        Self::connect_created(database_name, &database_url, admin_options).await
+    }
+
+    /// Creates a unique database whose DEFAULT collation is a non-C libc
+    /// collation offered by this server, or `None` when the server offers
+    /// none — callers then skip the collation-variant proof. Collation
+    /// names come from the server's own `pg_collation` catalog; any name
+    /// that cannot be safely interpolated is skipped.
+    pub async fn create_with_non_c_collation() -> Option<Self> {
+        let database_url = std::env::var("TEST_DATABASE_URL")
+            .expect("TEST_DATABASE_URL must name the PostgreSQL server for E2E tests");
+        let admin_options = PgConnectOptions::from_str(&database_url)
+            .expect("TEST_DATABASE_URL must be a valid PostgreSQL URL");
+
+        let mut admin_connection = PgConnection::connect_with(&admin_options)
+            .await
+            .expect("connect to TEST_DATABASE_URL database to create isolated E2E database");
+        let collations: Vec<String> = sqlx::query_scalar(
+            "SELECT collname FROM pg_collation
+             WHERE collprovider = 'c' AND collname NOT IN ('C', 'POSIX')
+             ORDER BY collname",
+        )
+        .fetch_all(&mut admin_connection)
+        .await
+        .ok()?;
+        let database_name = format!("paykit_e2e_{}", Uuid::new_v4().simple());
+        let mut created = false;
+        for collation in collations.iter().filter(|name| !name.contains('\'')) {
+            if sqlx::query(&format!(
+                "CREATE DATABASE {database_name} TEMPLATE template0 LC_COLLATE '{collation}'"
+            ))
+            .execute(&mut admin_connection)
+            .await
+            .is_ok()
+            {
+                created = true;
+                break;
+            }
+        }
+        admin_connection.close().await.ok()?;
+        if !created {
+            return None;
+        }
+        Some(Self::connect_created(database_name, &database_url, admin_options).await)
+    }
+
+    async fn connect_created(
+        database_name: String,
+        database_url: &str,
+        admin_options: PgConnectOptions,
+    ) -> Self {
+        let isolated_database_url = isolated_database_url(database_url, &database_name);
         let database_options = admin_options.clone().database(&database_name);
         let pool = PgPoolOptions::new()
             .max_connections(8)

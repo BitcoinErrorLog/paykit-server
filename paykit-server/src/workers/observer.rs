@@ -193,6 +193,10 @@ pub enum ObserverError {
     WrongNetwork,
     InvalidObservation,
     Persistence,
+    /// A transaction response exceeded `electrum.max_transaction_bytes`.
+    /// Unlike a transport failure this is deterministic: refetching the
+    /// same transaction can never succeed under the configured cap.
+    TransactionTooLarge,
     /// A tick stamp matched no invoice row: the lookup hash derived from
     /// the observed address failed to match the stored hash. Other records
     /// were still stamped; the tick reports this named error so the miss
@@ -202,8 +206,16 @@ pub enum ObserverError {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CandidateFailureKind {
+    /// The bounded transaction fetch failed; consumes one of the
+    /// candidate's bounded retry-budget attempts.
     Fetch,
+    /// Persisting the resolution failed; never consumes the fetch retry
+    /// budget and never moves the invoice — diagnostic state only.
     Persistence,
+    /// The candidate transaction exceeds `electrum.max_transaction_bytes`
+    /// and is deterministically unresolvable: one attempt routes the
+    /// invoice to `manual_review`.
+    TransactionTooLarge,
 }
 
 impl CandidateFailureKind {
@@ -211,6 +223,7 @@ impl CandidateFailureKind {
         match self {
             Self::Fetch => "fetch",
             Self::Persistence => "persistence",
+            Self::TransactionTooLarge => "transaction_too_large",
         }
     }
 }
@@ -993,12 +1006,17 @@ pub async fn observe_tick(
             .candidate_transaction(candidate.outpoint.txid, state.max_transaction_bytes)
             .await
         {
-            Ok(transaction) if transaction.txid == candidate.outpoint.txid => backend
+            // The fetch verified the returned bytes against the requested
+            // txid, so an `Ok` transaction is the candidate's own.
+            Ok(transaction) => backend
                 .resolve_candidate(candidate, &transaction.inputs)
                 .await
                 .err()
                 .map(|_| CandidateFailureKind::Persistence),
-            Ok(_) | Err(_) => Some(CandidateFailureKind::Fetch),
+            Err(ObserverError::TransactionTooLarge) => {
+                Some(CandidateFailureKind::TransactionTooLarge)
+            }
+            Err(_) => Some(CandidateFailureKind::Fetch),
         };
         if let Some(kind) = failure
             && let Err(error) = backend.record_candidate_failure(candidate, kind).await
@@ -1518,6 +1536,11 @@ fn map_electrum(_: ElectrumError) -> ObserverError {
     ObserverError::Unavailable
 }
 
+/// Fetches one transaction and proves the returned bytes belong to the
+/// requested txid before any caller consumes its inputs: an endpoint that
+/// answers with a different (valid) transaction is a fetch failure, never
+/// a resolution input. Over-cap responses are reported separately because
+/// they are deterministically unresolvable under the configured byte cap.
 fn fetch_transaction_blocking(
     client: &Client,
     txid: Txid,
@@ -1525,9 +1548,14 @@ fn fetch_transaction_blocking(
 ) -> Result<bitcoin::Transaction, ObserverError> {
     let raw = client.transaction_get_raw(&txid).map_err(map_electrum)?;
     if raw.len() > max_transaction_bytes {
+        return Err(ObserverError::TransactionTooLarge);
+    }
+    let transaction: bitcoin::Transaction =
+        deserialize(&raw).map_err(|_| ObserverError::InvalidObservation)?;
+    if transaction.compute_txid() != txid {
         return Err(ObserverError::Unavailable);
     }
-    deserialize(&raw).map_err(|_| ObserverError::InvalidObservation)
+    Ok(transaction)
 }
 
 fn parse_address(address: &str, network: Network) -> Result<Address, ObserverError> {

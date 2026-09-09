@@ -18,7 +18,7 @@ use std::{
 
 use bitcoin::{
     Address, CompressedPublicKey, Network, OutPoint, ScriptBuf, Transaction, Txid,
-    absolute::LockTime, consensus::encode, transaction::Version,
+    absolute::LockTime, consensus::encode, hashes::Hash, transaction::Version,
 };
 use electrum_client::{ScriptHash, ToElectrumScriptHash};
 use paykit_server::{
@@ -262,9 +262,13 @@ async fn candidate_fetch_rejects_a_transaction_over_the_byte_cap() {
     .await;
     let adapter = connect(&server).await;
 
+    // The over-cap response is rejected with a named deterministic kind:
+    // refetching the same transaction can never succeed under the byte
+    // cap, so the candidate path routes it to manual review after one
+    // attempt instead of burning the bounded fetch retries.
     assert_eq!(
         adapter.candidate_transaction(txid, 0).await,
-        Err(ObserverError::Unavailable)
+        Err(ObserverError::TransactionTooLarge)
     );
     server.assert_rpc_counts(0, 0, 1);
 }
@@ -684,6 +688,7 @@ async fn creation_snapshot_rejects_history_over_the_entry_cap_before_transaction
         false,
         None,
         None,
+        None,
     )
     .await;
     let adapter = ElectrumAdapter::configured(
@@ -726,6 +731,7 @@ async fn creation_snapshot_permit_outlives_an_abandoned_await() {
         false,
         None,
         Some(gate.clone()),
+        None,
     )
     .await;
     // The client wire timeout (30s) far exceeds the test window, so the
@@ -789,6 +795,65 @@ async fn creation_snapshot_permit_outlives_an_abandoned_await() {
     );
 }
 
+#[tokio::test]
+async fn a_transaction_answered_under_the_wrong_txid_fails_both_fetch_paths() {
+    let address = fixture_address();
+    // The server holds valid raw bytes of transaction A; every request
+    // below asks for a different txid B.
+    let transaction_a = Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: Vec::new(),
+        output: Vec::new(),
+    };
+    let requested_txid = Txid::from_byte_array([7; 32]);
+    assert_ne!(transaction_a.compute_txid(), requested_txid);
+    let server = ProtocolServer::start_with_fixture(
+        Network::Regtest,
+        vec![(address.script_pubkey(), serde_json::json!([]))],
+        0,
+        false,
+        None,
+        false,
+        Some(encode::serialize_hex(&transaction_a)),
+        None,
+        Some(requested_txid.to_string()),
+    )
+    .await;
+    let adapter = connect(&server).await;
+
+    // First-bind candidate path: valid raw bytes of a different
+    // transaction are a fetch failure, never resolution input — no
+    // candidate approval can follow.
+    assert_eq!(
+        adapter.candidate_transaction(requested_txid, 400_000).await,
+        Err(ObserverError::Unavailable)
+    );
+
+    // Creation-snapshot path: the unconfirmed baseline entry's input
+    // capture fails the same way, so no baseline-input row can be built
+    // from foreign bytes.
+    assert_eq!(
+        adapter
+            .creation_snapshot(
+                &address.to_string(),
+                50,
+                400_000,
+                &RequestLimiter::new(100, 0),
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+            )
+            .await,
+        Err(ObserverError::Unavailable)
+    );
+    // One listunspent and one get_history for the snapshot, and exactly
+    // one transaction.get per fetch path; the snapshot failed before
+    // headers.subscribe and no observation ever happened.
+    server.assert_rpc_counts(1, 1, 2);
+}
+
 struct ProtocolServer {
     endpoint: String,
     wake_address: SocketAddr,
@@ -814,6 +879,9 @@ struct ProtocolFixture {
     /// When set, every `get_history` response parks on this gate until it
     /// is released, modelling a blocking read that outlives its caller.
     gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+    /// When set, `get_history` answers with this single unconfirmed entry
+    /// (height 0), driving the snapshot's unconfirmed-input fetch.
+    unconfirmed_history_txid: Option<String>,
     request_log: Mutex<Vec<String>>,
 }
 
@@ -830,7 +898,7 @@ impl ProtocolServer {
     }
 
     async fn start_multi(network: Network, unspent: Vec<(ScriptBuf, serde_json::Value)>) -> Self {
-        Self::start_with_fixture(network, unspent, 0, false, None, false, None, None).await
+        Self::start_with_fixture(network, unspent, 0, false, None, false, None, None, None).await
     }
 
     /// Starts a server that would answer get_history with `history_len`
@@ -845,6 +913,7 @@ impl ProtocolServer {
             false,
             None,
             false,
+            None,
             None,
             None,
         )
@@ -866,6 +935,7 @@ impl ProtocolServer {
             false,
             None,
             None,
+            None,
         )
         .await
     }
@@ -879,6 +949,7 @@ impl ProtocolServer {
             false,
             None,
             true,
+            None,
             None,
             None,
         )
@@ -895,6 +966,7 @@ impl ProtocolServer {
             false,
             Some(transaction_raw),
             None,
+            None,
         )
         .await
     }
@@ -907,6 +979,7 @@ impl ProtocolServer {
             true,
             None,
             false,
+            None,
             None,
             None,
         )
@@ -923,6 +996,7 @@ impl ProtocolServer {
         disconnect_after_unspent: bool,
         transaction_raw: Option<String>,
         gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+        unconfirmed_history_txid: Option<String>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let wake_address = listener.local_addr().unwrap();
@@ -939,6 +1013,7 @@ impl ProtocolServer {
             disconnect_after_unspent,
             transaction_raw,
             gate,
+            unconfirmed_history_txid,
             request_log: Mutex::new(Vec::new()),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1043,7 +1118,9 @@ fn serve_connection(mut stream: TcpStream, fixture: Arc<ProtocolFixture>) {
                         released = condvar.wait(released).unwrap();
                     }
                 }
-                if fixture.serve_history {
+                if let Some(txid) = &fixture.unconfirmed_history_txid {
+                    serde_json::json!([{"tx_hash": txid, "height": 0}])
+                } else if fixture.serve_history {
                     serde_json::Value::Array(
                         (0..fixture.history_len)
                             .map(|index| {

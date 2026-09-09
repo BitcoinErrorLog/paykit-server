@@ -610,6 +610,206 @@ async fn candidate_backoff_skips_a_then_exhaustion_routes_it_to_manual_review() 
 }
 
 #[tokio::test]
+async fn persistence_failures_never_consume_the_candidate_fetch_retry_budget() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let invoice_id = awaiting_invoice(
+        &store,
+        b"persist-fail-bundle",
+        b"persist-fail-request",
+        REGTEST_ADDRESS,
+    )
+    .await;
+    store
+        .complete_creation_baseline(invoice_id, 100, &[], &[])
+        .await
+        .unwrap();
+    let outpoint = provider_outpoint(216);
+    store
+        .apply_bitcoin_observation_at_height(
+            REGTEST_ADDRESS,
+            &BitcoinOutpoint::from_bitcoin(outpoint),
+            100,
+            1,
+            Some(101),
+            true,
+        )
+        .await
+        .unwrap();
+    let candidate = store.pending_candidates().await.unwrap().remove(0);
+    for _ in 0..12 {
+        store
+            .record_candidate_failure(&candidate, "persistence", 12)
+            .await
+            .unwrap();
+    }
+
+    // Twelve persistence failures: zero strikes, still pending, still
+    // observing — only diagnostic state was recorded.
+    let row: (i32, String, String, String) = sqlx::query_as(
+        "SELECT candidates.attempt_count, candidates.state, candidates.last_error_kind,
+                invoices.baseline_state
+         FROM bitcoin_observation_candidates candidates
+         JOIN invoices ON invoices.id = candidates.invoice_id
+         WHERE candidates.invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        (
+            0,
+            "pending".into(),
+            "persistence".into(),
+            "observing".into()
+        )
+    );
+
+    // The candidate resolves and binds normally afterwards.
+    store.resolve_candidate(&candidate, &[]).await.unwrap();
+    store
+        .apply_bitcoin_observation_at_height(
+            REGTEST_ADDRESS,
+            &BitcoinOutpoint::from_bitcoin(outpoint),
+            100,
+            1,
+            Some(101),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 1, true)
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn oversized_candidate_transaction_moves_to_manual_review_after_one_attempt() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let invoice_id = awaiting_invoice(
+        &store,
+        b"oversized-bundle",
+        b"oversized-request",
+        REGTEST_ADDRESS,
+    )
+    .await;
+    store
+        .complete_creation_baseline(invoice_id, 100, &[], &[])
+        .await
+        .unwrap();
+    let outpoint = provider_outpoint(217);
+    store
+        .apply_bitcoin_observation_at_height(
+            REGTEST_ADDRESS,
+            &BitcoinOutpoint::from_bitcoin(outpoint),
+            100,
+            1,
+            Some(101),
+            true,
+        )
+        .await
+        .unwrap();
+    let candidate = store.pending_candidates().await.unwrap().remove(0);
+
+    // A response over electrum.max_transaction_bytes is deterministically
+    // unresolvable: ONE attempt ends the candidate and routes the invoice
+    // to manual review — never the twelve-strike fetch path.
+    store
+        .record_candidate_failure(&candidate, "transaction_too_large", 12)
+        .await
+        .unwrap();
+    let row: (i32, String, String, String) = sqlx::query_as(
+        "SELECT candidates.attempt_count, candidates.state, candidates.last_error_kind,
+                invoices.baseline_state
+         FROM bitcoin_observation_candidates candidates
+         JOIN invoices ON invoices.id = candidates.invoice_id
+         WHERE candidates.invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        (
+            1,
+            "unfetchable".into(),
+            "transaction_too_large".into(),
+            "manual_review".into()
+        )
+    );
+    assert!(
+        store
+            .pending_candidates()
+            .await
+            .unwrap()
+            .iter()
+            .all(|entry| entry.invoice_id != invoice_id)
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn baseline_hash_recomputation_matches_under_a_non_c_database_collation() {
+    let Some(database) = TestDatabase::create_with_non_c_collation().await else {
+        eprintln!("no creatable non-C libc collation on this server; skipping collation proof");
+        return;
+    };
+    let store = store(&database).await;
+    let invoice_id = awaiting_invoice(
+        &store,
+        b"collate-bundle",
+        b"collate-request",
+        REGTEST_ADDRESS,
+    )
+    .await;
+    store
+        .complete_creation_baseline(
+            invoice_id,
+            100,
+            &[provider_outpoint(231)],
+            &[provider_outpoint(232)],
+        )
+        .await
+        .unwrap();
+
+    // Binding recomputes the baseline-set hash from SQL-ordered rows;
+    // under this database's non-C default collation only the explicit
+    // COLLATE "C" keeps the recomputation on the hashed byte order.
+    let output = provider_outpoint(233);
+    store
+        .apply_bitcoin_observation_at_height(
+            REGTEST_ADDRESS,
+            &BitcoinOutpoint::from_bitcoin(output),
+            100,
+            1,
+            Some(101),
+            true,
+        )
+        .await
+        .unwrap();
+    let candidate = store.pending_candidates().await.unwrap().remove(0);
+    store.resolve_candidate(&candidate, &[]).await.unwrap();
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 1, true)
+    );
+    let integrity_failed: bool =
+        sqlx::query_scalar("SELECT integrity_failed FROM invoices WHERE id = $1")
+            .bind(invoice_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert!(!integrity_failed);
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn stale_awaiting_baseline_is_voided_and_prepared_outbox_is_terminal() {
     let database = TestDatabase::create().await;
     let store = store(&database).await;

@@ -24,6 +24,14 @@ use crate::{
     persistence::PersistenceError,
 };
 
+/// Baseline-set recomputation must order rows byte-exactly the way the
+/// creation path hashed them. The text columns' collation is pinned to
+/// "C" so a database created with a non-C default collation cannot
+/// reorder the recomputation away from the hashed order.
+const BASELINE_ENTRIES_SQL: &str = "SELECT kind, txid, vout FROM invoice_baseline_outpoints
+     WHERE invoice_id = $1 AND kind IN ('output', 'replaced_input')
+     ORDER BY kind COLLATE \"C\", txid COLLATE \"C\", vout";
+
 /// Opaque inputs for one transactional invoice-allocation operation.
 ///
 /// `endpoint_publication_payload` is persisted only when the reader has no
@@ -820,38 +828,80 @@ impl InvoiceStore {
         error_kind: &str,
         max_attempts: u32,
     ) -> Result<(), PersistenceError> {
-        let max_attempts =
-            i32::try_from(max_attempts).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let vout = i32::try_from(candidate.outpoint.vout)
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let txid = candidate.outpoint.txid.to_string();
+        if error_kind == "persistence" {
+            // A persistence failure is not a fetch attempt: it never
+            // increments `attempt_count`, never transitions the candidate
+            // to `unfetchable`, and never moves the invoice to
+            // `manual_review`; only diagnostic state is recorded.
+            sqlx::query(
+                "UPDATE bitcoin_observation_candidates
+                 SET last_attempt_at = NOW(), last_error_kind = $4, updated_at = NOW()
+                 WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND state = 'pending'",
+            )
+            .bind(candidate.invoice_id)
+            .bind(&txid)
+            .bind(vout)
+            .bind(error_kind)
+            .execute(&self.pool)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(());
+        }
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
-        let row = sqlx::query_as::<_, (Uuid, i32, String)>(
-            "UPDATE bitcoin_observation_candidates
-             SET attempt_count = attempt_count + 1,
-                 last_attempt_at = NOW(),
-                 last_error_kind = $4,
-                 state = CASE WHEN attempt_count + 1 >= $5
-                              THEN 'unfetchable' ELSE 'pending' END,
-                 next_attempt_at = NOW() + make_interval(
-                     secs => LEAST(3600, 30 * power(2, LEAST(attempt_count, 7)))::INTEGER
-                 ),
-                 updated_at = NOW()
-             WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND state = 'pending'
-             RETURNING invoice_id, attempt_count, state",
-        )
-        .bind(candidate.invoice_id)
-        .bind(candidate.outpoint.txid.to_string())
-        .bind(
-            i32::try_from(candidate.outpoint.vout)
-                .map_err(|_| PersistenceError::CorruptOrMissing)?,
-        )
-        .bind(error_kind)
-        .bind(max_attempts)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|_| PersistenceError::Unavailable)?;
+        let row = if error_kind == "transaction_too_large" {
+            // A response over `electrum.max_transaction_bytes` is
+            // deterministically unresolvable: one attempt ends the
+            // candidate instead of burning the bounded fetch retries.
+            sqlx::query_as::<_, (Uuid, i32, String)>(
+                "UPDATE bitcoin_observation_candidates
+                 SET attempt_count = attempt_count + 1,
+                     last_attempt_at = NOW(),
+                     last_error_kind = $4,
+                     state = 'unfetchable',
+                     updated_at = NOW()
+                 WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND state = 'pending'
+                 RETURNING invoice_id, attempt_count, state",
+            )
+            .bind(candidate.invoice_id)
+            .bind(&txid)
+            .bind(vout)
+            .bind(error_kind)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?
+        } else {
+            let max_attempts =
+                i32::try_from(max_attempts).map_err(|_| PersistenceError::CorruptOrMissing)?;
+            sqlx::query_as::<_, (Uuid, i32, String)>(
+                "UPDATE bitcoin_observation_candidates
+                 SET attempt_count = attempt_count + 1,
+                     last_attempt_at = NOW(),
+                     last_error_kind = $4,
+                     state = CASE WHEN attempt_count + 1 >= $5
+                                   THEN 'unfetchable' ELSE 'pending' END,
+                     next_attempt_at = NOW() + make_interval(
+                         secs => LEAST(3600, 30 * power(2, LEAST(attempt_count, 7)))::INTEGER
+                     ),
+                     updated_at = NOW()
+                 WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND state = 'pending'
+                 RETURNING invoice_id, attempt_count, state",
+            )
+            .bind(candidate.invoice_id)
+            .bind(&txid)
+            .bind(vout)
+            .bind(error_kind)
+            .bind(max_attempts)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?
+        };
         if let Some((invoice_id, attempts, state)) = row
             && state == "unfetchable"
         {
@@ -867,7 +917,7 @@ impl InvoiceStore {
                 invoice_id = %invoice_id,
                 attempts,
                 error_kind,
-                "candidate transaction exhausted bounded retries; invoice requires manual review"
+                "candidate transaction is unresolvable; invoice requires manual review"
             );
         }
         tx.commit().await.map_err(|_| PersistenceError::Unavailable)
@@ -1234,15 +1284,11 @@ impl InvoiceStore {
         .fetch_one(&mut **tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        let baseline_entries = sqlx::query_as::<_, (String, String, i32)>(
-            "SELECT kind, txid, vout FROM invoice_baseline_outpoints
-             WHERE invoice_id = $1 AND kind IN ('output', 'replaced_input')
-             ORDER BY kind, txid, vout",
-        )
-        .bind(invoice.id)
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(|_| PersistenceError::Unavailable)?;
+        let baseline_entries = sqlx::query_as::<_, (String, String, i32)>(BASELINE_ENTRIES_SQL)
+            .bind(invoice.id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         let mut hasher = Sha256::new();
         for (kind, entry_txid, entry_vout) in &baseline_entries {
             hasher.update(kind.as_bytes());
@@ -2004,6 +2050,14 @@ fn decrypt_assignment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn baseline_hash_recomputation_orders_with_explicit_c_collation() {
+        assert!(
+            BASELINE_ENTRIES_SQL.contains("ORDER BY kind COLLATE \"C\", txid COLLATE \"C\", vout"),
+            "baseline-hash recomputation ordering must pin byte-exact C collation, got: {BASELINE_ENTRIES_SQL}"
+        );
+    }
 
     #[test]
     fn read_status_rejects_unknown_text_and_invalid_confirmation_counts() {

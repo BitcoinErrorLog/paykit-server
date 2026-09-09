@@ -179,6 +179,8 @@ mod tick {
         /// requested, modelling an observation stamp whose lookup hash
         /// matches no invoice row.
         ghost_observed: Vec<String>,
+        /// When set, every candidate fetch fails with this error.
+        candidate_error: Option<ObserverError>,
         calls: Mutex<Vec<Vec<String>>>,
         candidate_calls: Mutex<Vec<Txid>>,
     }
@@ -192,6 +194,7 @@ mod tick {
                 }),
                 failing_addresses: HashSet::new(),
                 ghost_observed: Vec::new(),
+                candidate_error: None,
                 calls: Mutex::new(Vec::new()),
                 candidate_calls: Mutex::new(Vec::new()),
             }
@@ -209,11 +212,17 @@ mod tick {
             self
         }
 
+        fn with_candidate_error(mut self, error: ObserverError) -> Self {
+            self.candidate_error = Some(error);
+            self
+        }
+
         fn failing(error: ObserverError) -> Self {
             Self {
                 probe: Err(error),
                 failing_addresses: HashSet::new(),
                 ghost_observed: Vec::new(),
+                candidate_error: None,
                 calls: Mutex::new(Vec::new()),
                 candidate_calls: Mutex::new(Vec::new()),
             }
@@ -228,6 +237,9 @@ mod tick {
             _max_transaction_bytes: usize,
         ) -> Result<CandidateTransaction, ObserverError> {
             self.candidate_calls.lock().unwrap().push(txid);
+            if let Some(error) = self.candidate_error {
+                return Err(error);
+            }
             Ok(CandidateTransaction {
                 txid,
                 inputs: Vec::new(),
@@ -285,6 +297,7 @@ mod tick {
         applied: Mutex<Vec<Vec<String>>>,
         stamped: Mutex<Vec<Vec<String>>>,
         candidates: Mutex<Vec<PendingCandidate>>,
+        recorded_failures: Mutex<Vec<CandidateFailureKind>>,
     }
 
     #[async_trait]
@@ -360,8 +373,9 @@ mod tick {
         async fn record_candidate_failure(
             &self,
             _candidate: &PendingCandidate,
-            _kind: CandidateFailureKind,
+            kind: CandidateFailureKind,
         ) -> Result<(), ObserverError> {
+            self.recorded_failures.lock().unwrap().push(kind);
             Ok(())
         }
     }
@@ -461,6 +475,109 @@ mod tick {
     }
 
     #[tokio::test]
+    async fn candidate_persistence_failure_is_recorded_under_its_own_kind() {
+        let port = FakeElectrum::healthy();
+        let backend = FakeBackend::default();
+        backend
+            .entries
+            .lock()
+            .unwrap()
+            .push(FakeEntry::new("candidate-persistence-kind", 30));
+        backend.candidates.lock().unwrap().push(PendingCandidate {
+            invoice_id: uuid::Uuid::nil(),
+            outpoint: OutPoint::new(Txid::from_byte_array([46; 32]), 0),
+        });
+        let runtime = runtime();
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state(&policy(4)),
+        )
+        .await;
+
+        assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
+        // A persistence failure is recorded under its own kind: it never
+        // consumes the bounded transaction-fetch retry budget.
+        assert_eq!(backend.candidates.lock().unwrap().len(), 1);
+        assert_eq!(
+            *backend.recorded_failures.lock().unwrap(),
+            vec![CandidateFailureKind::Persistence]
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_fetch_failure_records_a_fetch_strike_without_resolution() {
+        let port = FakeElectrum::healthy().with_candidate_error(ObserverError::Unavailable);
+        let backend = FakeBackend::default();
+        backend
+            .entries
+            .lock()
+            .unwrap()
+            .push(FakeEntry::new("candidate-fetch", 30));
+        backend.candidates.lock().unwrap().push(PendingCandidate {
+            invoice_id: uuid::Uuid::new_v4(),
+            outpoint: OutPoint::new(Txid::from_byte_array([44; 32]), 0),
+        });
+        let runtime = runtime();
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state(&policy(4)),
+        )
+        .await;
+
+        assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
+        // The candidate was neither approved nor resolved; the failed
+        // fetch consumed exactly one bounded retry-budget strike.
+        assert_eq!(backend.candidates.lock().unwrap().len(), 1);
+        assert_eq!(
+            *backend.recorded_failures.lock().unwrap(),
+            vec![CandidateFailureKind::Fetch]
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_candidate_transaction_takes_the_deterministic_manual_review_path() {
+        let port = FakeElectrum::healthy().with_candidate_error(ObserverError::TransactionTooLarge);
+        let backend = FakeBackend::default();
+        backend
+            .entries
+            .lock()
+            .unwrap()
+            .push(FakeEntry::new("candidate-oversized", 30));
+        backend.candidates.lock().unwrap().push(PendingCandidate {
+            invoice_id: uuid::Uuid::new_v4(),
+            outpoint: OutPoint::new(Txid::from_byte_array([45; 32]), 0),
+        });
+        let runtime = runtime();
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state(&policy(4)),
+        )
+        .await;
+
+        assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
+        // The over-cap response is deterministically unresolvable: the
+        // failure is recorded under its distinct kind after ONE attempt —
+        // the store routes it to manual review, never through the
+        // twelve-strike fetch budget.
+        assert_eq!(
+            *backend.recorded_failures.lock().unwrap(),
+            vec![CandidateFailureKind::TransactionTooLarge]
+        );
+    }
+
+    #[tokio::test]
     async fn wrong_genesis_probe_marks_health_unavailable_with_a_named_error() {
         let port = FakeElectrum::failing(ObserverError::WrongNetwork);
         let backend = FakeBackend::default();
@@ -552,6 +669,7 @@ mod tick {
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut state = state(&policy(4));
@@ -645,6 +763,7 @@ mod tick {
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         // Budget 3 minus the two reserved probe requests admits one lookup.
@@ -694,6 +813,7 @@ mod tick {
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut state = state(&policy(3));
@@ -743,6 +863,7 @@ mod tick {
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut state = state(&policy(100));
@@ -822,6 +943,7 @@ mod tick {
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut state = state(&policy(100));
@@ -870,6 +992,7 @@ mod tick {
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut state = state(&policy(100));
@@ -926,6 +1049,7 @@ mod tick {
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut state = state(&policy(100));
@@ -972,6 +1096,7 @@ mod tick {
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
 
@@ -1006,6 +1131,7 @@ mod tick {
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut backoff = ObserverBackoff::new();
@@ -1047,6 +1173,7 @@ mod tick {
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
 
@@ -1077,6 +1204,7 @@ mod tick {
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
 
@@ -1113,6 +1241,7 @@ mod tick {
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         // Capacity 6, fast refill rewound away: the tick alone would
@@ -1179,6 +1308,7 @@ mod tick {
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
 
@@ -1227,6 +1357,7 @@ mod tick {
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut state = state(&policy(100));
@@ -1310,6 +1441,7 @@ mod tick {
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         // Capacity 3 (one post-probe lookup), rate 1/s: an immediate second
