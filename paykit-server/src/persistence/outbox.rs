@@ -157,6 +157,48 @@ impl ClaimedHandoff {
     }
 }
 
+/// Bounded retry budget for outbox rows. A claimed row that reaches the
+/// attempt ceiling or outlives the age ceiling is transitioned to
+/// `permanently_failed` with error class `retry_budget_exhausted` at its
+/// next retry scheduling instead of being rescheduled forever.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetryBudget {
+    max_attempts: u32,
+    max_age: Duration,
+}
+
+impl RetryBudget {
+    pub const fn new(max_attempts: u32, max_age: Duration) -> Self {
+        Self {
+            max_attempts,
+            max_age,
+        }
+    }
+
+    fn max_attempts_i64(self) -> i64 {
+        i64::from(self.max_attempts)
+    }
+
+    fn max_age_seconds(self) -> Result<i64, PersistenceError> {
+        lease_seconds(self.max_age)
+    }
+}
+
+/// Error class persisted on rows whose retry budget ran out.
+pub const RETRY_BUDGET_EXHAUSTED_ERROR_CLASS: &str = "retry_budget_exhausted";
+
+/// Outcome of one fenced retry scheduling under a [`RetryBudget`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryTransition {
+    /// The live fence rescheduled the row for another attempt.
+    Scheduled,
+    /// The live fence transitioned the row to `permanently_failed` because
+    /// the retry budget was exhausted.
+    BudgetExhausted,
+    /// The fence was no longer live; a concurrent worker owns the row.
+    FenceLost,
+}
+
 #[derive(Clone, Debug)]
 pub struct OutboxStore {
     pool: PgPool,
@@ -171,17 +213,35 @@ impl OutboxStore {
         }
     }
 
-    /// Reports aggregate delivery availability without exposing row or Creator identifiers.
-    pub async fn delivery_available(&self) -> Result<bool, PersistenceError> {
+    /// Reports aggregate delivery availability without exposing row or Creator
+    /// identifiers. Terminal `permanently_failed` rows never degrade delivery:
+    /// they are retained for operators, not live work. `retryable` and
+    /// `handed_off` rows degrade delivery only while they are still inside the
+    /// retry budget; a row beyond the budget is already converging towards
+    /// `permanently_failed` at its next fenced scheduling and must not pin the
+    /// rail degraded.
+    pub async fn delivery_available(&self, budget: &RetryBudget) -> Result<bool, PersistenceError> {
         sqlx::query_scalar(
             "SELECT NOT EXISTS ( \
                  SELECT 1 FROM outbox \
-                 WHERE status IN ('retryable', 'handed_off', 'permanently_failed') \
+                 WHERE status IN ('retryable', 'handed_off') \
+                   AND attempt_count < $1 \
+                   AND created_at >= NOW() - ($2 * INTERVAL '1 second') \
              )",
         )
+        .bind(budget.max_attempts_i64())
+        .bind(budget.max_age_seconds()?)
         .fetch_one(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)
+    }
+
+    /// Counts retained terminal rows for the informational health surface.
+    pub async fn permanently_failed_count(&self) -> Result<i64, PersistenceError> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM outbox WHERE status = 'permanently_failed'")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)
     }
 
     /// Claims eligible rows while preserving endpoint-publication dependencies.
@@ -332,17 +392,21 @@ impl OutboxStore {
     }
 
     /// Releases a still-pending reconciliation claim with bounded retry delay.
+    /// When the row's retry budget is exhausted, the same fenced statement
+    /// transitions it to `permanently_failed` with error class
+    /// `retry_budget_exhausted` instead of rescheduling it.
     pub async fn retry_reconciliation(
         &self,
         claim: &ClaimedHandoff,
         delay: Duration,
         error_class: OutboxRetryClass,
-    ) -> Result<bool, PersistenceError> {
-        self.reconciliation_transition(
+        budget: &RetryBudget,
+    ) -> Result<RetryTransition, PersistenceError> {
+        self.budget_reconciliation_transition(
             claim,
-            "handed_off",
-            Some(error_class.as_str()),
-            Some(lease_seconds(delay)?),
+            error_class.as_str(),
+            lease_seconds(delay)?,
+            budget,
         )
         .await
     }
@@ -360,14 +424,32 @@ impl OutboxStore {
         claim: &ClaimedOutbox,
         delay: Duration,
         error_class: OutboxRetryClass,
-    ) -> Result<bool, PersistenceError> {
-        self.transition(
-            claim,
-            "retryable",
-            Some(error_class.as_str()),
-            Some(lease_seconds(delay)?),
+        budget: &RetryBudget,
+    ) -> Result<RetryTransition, PersistenceError> {
+        let final_status = sqlx::query_scalar::<_, Option<String>>(
+            "UPDATE outbox \
+             SET status = CASE \
+                     WHEN attempt_count >= $4 OR created_at < NOW() - ($5 * INTERVAL '1 second') \
+                     THEN 'permanently_failed' ELSE 'retryable' END, \
+                 error_class = CASE \
+                     WHEN attempt_count >= $4 OR created_at < NOW() - ($5 * INTERVAL '1 second') \
+                     THEN 'retry_budget_exhausted' ELSE $2 END, \
+                 next_attempt_at = NOW() + ($3 * INTERVAL '1 second'), \
+                 lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = NOW() \
+             WHERE id = $6 AND status = 'leased' AND claim_token = $7 AND lease_expires_at > NOW() \
+             RETURNING status",
         )
+        .bind("retryable")
+        .bind(error_class.as_str())
+        .bind(lease_seconds(delay)?)
+        .bind(budget.max_attempts_i64())
+        .bind(budget.max_age_seconds()?)
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .fetch_optional(&self.pool)
         .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(retry_transition(final_status.flatten()))
     }
 
     async fn transition(
@@ -395,6 +477,39 @@ impl OutboxStore {
         Ok(changed.rows_affected() == 1)
     }
 
+    async fn budget_reconciliation_transition(
+        &self,
+        claim: &ClaimedHandoff,
+        error_class: &str,
+        delay: i64,
+        budget: &RetryBudget,
+    ) -> Result<RetryTransition, PersistenceError> {
+        let final_status = sqlx::query_scalar::<_, Option<String>>(
+            "UPDATE outbox SET status = CASE \
+                     WHEN attempt_count >= $3 OR created_at < NOW() - ($4 * INTERVAL '1 second') \
+                     THEN 'permanently_failed' ELSE 'handed_off' END, \
+                 error_class = CASE \
+                     WHEN attempt_count >= $3 OR created_at < NOW() - ($4 * INTERVAL '1 second') \
+                     THEN 'retry_budget_exhausted' ELSE $1 END, \
+                 next_attempt_at = NOW() + ($2 * INTERVAL '1 second'), \
+                 lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = NOW() \
+             WHERE id = $5 AND status = 'handed_off' \
+               AND sdk_outbound_message_id = $6 AND claim_token = $7 AND lease_expires_at > NOW() \
+             RETURNING status",
+        )
+        .bind(error_class)
+        .bind(delay)
+        .bind(budget.max_attempts_i64())
+        .bind(budget.max_age_seconds()?)
+        .bind(claim.id)
+        .bind(&claim.sdk_outbound_message_id)
+        .bind(claim.claim_token)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(retry_transition(final_status.flatten()))
+    }
+
     async fn reconciliation_transition(
         &self,
         claim: &ClaimedHandoff,
@@ -419,6 +534,14 @@ impl OutboxStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         Ok(changed.rows_affected() == 1)
+    }
+}
+
+fn retry_transition(final_status: Option<String>) -> RetryTransition {
+    match final_status.as_deref() {
+        None => RetryTransition::FenceLost,
+        Some("permanently_failed") => RetryTransition::BudgetExhausted,
+        Some(_) => RetryTransition::Scheduled,
     }
 }
 

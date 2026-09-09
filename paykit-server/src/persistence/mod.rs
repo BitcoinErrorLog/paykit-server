@@ -15,5 +15,8 @@ pub use invoices::{
     NewReaderPayloadFactory, NewReaderPayloads,
 };
 pub use migrations::{MIGRATION_ADVISORY_LOCK_KEY, MigrationLock, run_migrations};
-pub use outbox::{ClaimedHandoff, ClaimedOutbox, HandoffResult, OutboxRetryClass, OutboxStore};
+pub use outbox::{
+    ClaimedHandoff, ClaimedOutbox, HandoffResult, OutboxRetryClass, OutboxStore,
+    RETRY_BUDGET_EXHAUSTED_ERROR_CLASS, RetryBudget, RetryTransition,
+};
 pub use sdk_state::{PostgresStorageAdapter, SdkStateStore};
