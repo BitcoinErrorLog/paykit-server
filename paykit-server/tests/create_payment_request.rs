@@ -43,6 +43,7 @@ impl ElectrumPort for EmptyBaselineElectrum {
         _max_history_entries: usize,
         _max_transaction_bytes: usize,
         _request_limiter: &RequestLimiter,
+        _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<CreationSnapshot, ObserverError> {
         Ok(CreationSnapshot {
             tip_height: 100,
@@ -77,6 +78,7 @@ impl ElectrumPort for FailingBaselineElectrum {
         _max_history_entries: usize,
         _max_transaction_bytes: usize,
         _request_limiter: &RequestLimiter,
+        _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<CreationSnapshot, ObserverError> {
         Err(ObserverError::Unavailable)
     }
@@ -104,6 +106,7 @@ impl ElectrumPort for StaleBaselineElectrum {
         _max_history_entries: usize,
         _max_transaction_bytes: usize,
         _request_limiter: &RequestLimiter,
+        _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<CreationSnapshot, ObserverError> {
         Ok(CreationSnapshot {
             tip_height: 96,
@@ -234,6 +237,7 @@ struct CapturingStore {
     preflight_calls: AtomicUsize,
     replay_calls: AtomicUsize,
     create_calls: AtomicUsize,
+    baseline_failures: AtomicUsize,
     captured: Mutex<Vec<CapturedInput>>,
 }
 
@@ -244,6 +248,7 @@ impl CapturingStore {
             preflight_calls: AtomicUsize::default(),
             replay_calls: AtomicUsize::default(),
             create_calls: AtomicUsize::default(),
+            baseline_failures: AtomicUsize::default(),
             captured: Mutex::new(vec![]),
         }
     }
@@ -300,6 +305,14 @@ impl InvoicePersistence for CapturingStore {
             0,
             false,
         ))
+    }
+
+    async fn fail_creation_baseline(
+        &self,
+        _invoice_id: uuid::Uuid,
+    ) -> Result<(), PersistenceError> {
+        self.baseline_failures.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -508,6 +521,73 @@ async fn snapshot_tip_more_than_three_blocks_stale_refuses_creation() {
         service.create(request(50_000)).await,
         Err(CreateInvoiceError::Unavailable)
     );
+}
+
+/// A deadline clock that returns `start` for the first `shift_after` calls
+/// and `start + shift` afterwards, so one chosen step's remaining budget
+/// shrinks to `REQUEST_DEADLINE - shift` while every earlier step sees the
+/// full budget.
+struct ShiftClock {
+    calls: AtomicUsize,
+    start: std::time::Instant,
+    shift_after: usize,
+    shift: std::time::Duration,
+}
+
+impl paykit_server::application::create_invoice::DeadlineClock for ShiftClock {
+    fn now(&self) -> std::time::Instant {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call < self.shift_after {
+            self.start
+        } else {
+            self.start + self.shift
+        }
+    }
+}
+
+#[tokio::test]
+async fn snapshot_slot_acquisition_is_bounded_by_the_request_deadline() {
+    // The only snapshot slot is already taken, so acquisition can only
+    // complete within the remaining request-deadline budget.
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let _held = slots.clone().acquire_owned().await.unwrap();
+    let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    // The eighth clock read (the slot step) is the first shifted one, so
+    // the acquisition has 300ms of budget left.
+    let clock = Arc::new(ShiftClock {
+        calls: AtomicUsize::new(0),
+        start: std::time::Instant::now(),
+        shift_after: 7,
+        shift: std::time::Duration::from_millis(14_700),
+    });
+    let service = MarketplacePaymentRequestService::with_clock(
+        ok_session(),
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        store.clone(),
+        Arc::new(EmptyBaselineElectrum),
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+        clock,
+    )
+    .with_electrum_controls(RequestLimiter::new(100, 100), slots);
+
+    let created = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        service.create(request(50_000)),
+    )
+    .await
+    .expect("the creation returns within the request-deadline bound");
+    assert_eq!(created, Err(CreateInvoiceError::DeadlineExceeded));
+    assert_eq!(store.baseline_failures.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

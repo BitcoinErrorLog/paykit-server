@@ -600,66 +600,109 @@ impl CreateInvoiceService {
             .for_child_index(created.reader_child_index())
             .map_err(map_store)?
             .bitcoin_address;
-        let reservation = self
-            .electrum_limiter
-            .reserve_or_wait(3, Instant::now() + Duration::from_secs(2))
-            .await;
-        let snapshot_slot = self.creation_snapshot_slots.clone().acquire_owned().await;
-        if reservation.is_err() || snapshot_slot.is_err() {
-            self.store
-                .fail_creation_baseline(created.invoice_id())
-                .await
-                .map_err(map_store)?;
-            return Err(CreateInvoiceError::Unavailable);
-        }
-        let _snapshot_slot = snapshot_slot.expect("checked creation snapshot semaphore");
-        let snapshot = self
-            .electrum
-            .creation_snapshot(
-                &address,
-                self.max_creation_history_entries,
-                self.max_transaction_bytes,
-                &self.electrum_limiter,
+        complete_creation_baseline_within_deadline(
+            self.store.as_ref(),
+            self.electrum.as_ref(),
+            &self.electrum_limiter,
+            &self.creation_snapshot_slots,
+            self.max_creation_history_entries,
+            self.max_transaction_bytes,
+            self.clock.as_ref(),
+            started,
+            created.invoice_id(),
+            &address,
+        )
+        .await?;
+        Ok(created)
+    }
+}
+
+/// Post-`create_atomic` baseline sequence shared by both creation paths.
+/// Every step — the shared-limiter reservations, the snapshot-slot
+/// acquisition, the snapshot itself, and the probe — runs inside the
+/// single [`REQUEST_DEADLINE`] budget that started with the request, so a
+/// stalled slot or a slow snapshot can no longer hold the handler past its
+/// deadline. On any timeout or unavailable outcome the baseline is failed
+/// to completion first (a started DB mutation is never cancelled), so no
+/// `observing` invoice and no `queued` outbox row can exist afterwards.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn complete_creation_baseline_within_deadline(
+    store: &dyn InvoicePersistence,
+    electrum: &dyn ElectrumPort,
+    electrum_limiter: &RequestLimiter,
+    creation_snapshot_slots: &Arc<tokio::sync::Semaphore>,
+    max_creation_history_entries: usize,
+    max_transaction_bytes: usize,
+    clock: &dyn DeadlineClock,
+    started: Instant,
+    invoice_id: uuid::Uuid,
+    address: &str,
+) -> Result<(), CreateInvoiceError> {
+    let baseline = async {
+        let reservation_remaining = remaining(started, clock.now())?;
+        electrum_limiter
+            .reserve_or_wait(
+                3,
+                Instant::now() + reservation_remaining.min(Duration::from_secs(2)),
             )
-            .await;
-        let snapshot = match snapshot {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                self.store
-                    .fail_creation_baseline(created.invoice_id())
-                    .await
-                    .map_err(map_store)?;
-                return Err(CreateInvoiceError::Unavailable);
-            }
+            .await
+            .map_err(|_| CreateInvoiceError::Unavailable)?;
+        let slot_remaining = remaining(started, clock.now())?;
+        let snapshot_slot = tokio::time::timeout(
+            slot_remaining,
+            creation_snapshot_slots.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
+        .map_err(|_| CreateInvoiceError::Unavailable)?;
+        let snapshot_remaining = remaining(started, clock.now())?;
+        let snapshot = match tokio::time::timeout(
+            snapshot_remaining,
+            electrum.creation_snapshot(
+                address,
+                max_creation_history_entries,
+                max_transaction_bytes,
+                electrum_limiter,
+                snapshot_slot,
+            ),
+        )
+        .await
+        {
+            Err(_) => return Err(CreateInvoiceError::DeadlineExceeded),
+            Ok(Err(_)) => return Err(CreateInvoiceError::Unavailable),
+            Ok(Ok(snapshot)) => snapshot,
         };
-        if self
-            .electrum_limiter
+        let probe_remaining = remaining(started, clock.now())?;
+        electrum_limiter
             .reserve_or_wait(
                 PROBE_REQUESTS_PER_TICK,
-                Instant::now() + Duration::from_secs(2),
+                Instant::now() + probe_remaining.min(Duration::from_secs(2)),
             )
             .await
-            .is_err()
-        {
-            self.store
-                .fail_creation_baseline(created.invoice_id())
-                .await
-                .map_err(map_store)?;
+            .map_err(|_| CreateInvoiceError::Unavailable)?;
+        let probe_remaining = remaining(started, clock.now())?;
+        let probe = match tokio::time::timeout(probe_remaining, electrum.probe()).await {
+            Err(_) => return Err(CreateInvoiceError::DeadlineExceeded),
+            Ok(Err(_)) => return Err(CreateInvoiceError::Unavailable),
+            Ok(Ok(probe)) => probe,
+        };
+        if probe.height.abs_diff(snapshot.tip_height) > 3 {
             return Err(CreateInvoiceError::Unavailable);
         }
-        let probe = self.electrum.probe().await;
-        if !matches!(probe, Ok(probe) if probe.height.abs_diff(snapshot.tip_height) <= 3) {
-            self.store
-                .fail_creation_baseline(created.invoice_id())
-                .await
-                .map_err(map_store)?;
-            return Err(CreateInvoiceError::Unavailable);
-        }
-        self.store
-            .complete_creation_baseline(created.invoice_id(), &snapshot)
+        Ok(snapshot)
+    };
+    match baseline.await {
+        Ok(snapshot) => store
+            .complete_creation_baseline(invoice_id, &snapshot)
             .await
-            .map_err(map_store)?;
-        Ok(created)
+            .map_err(map_store),
+        Err(error) => {
+            store
+                .fail_creation_baseline(invoice_id)
+                .await
+                .map_err(map_store)?;
+            Err(error)
+        }
     }
 }
 

@@ -9,7 +9,7 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     str::FromStr,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -640,6 +640,10 @@ async fn creation_snapshot_reads_tip_after_history_and_unspent() {
             50,
             400_000,
             &RequestLimiter::new(100, 0),
+            Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .unwrap(),
         )
         .await
         .unwrap();
@@ -679,6 +683,7 @@ async fn creation_snapshot_rejects_history_over_the_entry_cap_before_transaction
         None,
         false,
         None,
+        None,
     )
     .await;
     let adapter = ElectrumAdapter::configured(
@@ -697,11 +702,91 @@ async fn creation_snapshot_rejects_history_over_the_entry_cap_before_transaction
                 50,
                 400_000,
                 &RequestLimiter::new(100, 0),
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
             )
             .await,
         Err(ObserverError::Unavailable)
     );
     server.assert_rpc_counts(0, 1, 0);
+}
+
+#[tokio::test]
+async fn creation_snapshot_permit_outlives_an_abandoned_await() {
+    let address = fixture_address();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let server = ProtocolServer::start_with_fixture(
+        Network::Regtest,
+        vec![(address.script_pubkey(), serde_json::json!([]))],
+        0,
+        true,
+        None,
+        false,
+        None,
+        Some(gate.clone()),
+    )
+    .await;
+    // The client wire timeout (30s) far exceeds the test window, so the
+    // gated read stays parked until the gate is released.
+    let adapter = ElectrumAdapter::configured(
+        server.endpoint(),
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(30),
+        200,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = slots.clone().acquire_owned().await.unwrap();
+    let snapshot = {
+        let adapter = adapter.clone();
+        let address = address.to_string();
+        tokio::spawn(async move {
+            adapter
+                .creation_snapshot(&address, 50, 400_000, &RequestLimiter::new(100, 0), permit)
+                .await
+        })
+    };
+    for _ in 0..200 {
+        let parked = server
+            .fixture
+            .request_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method == "blockchain.scripthash.get_history");
+        if parked {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The awaiting side gives up (the request deadline passed); the
+    // blocking read is orphaned on the gated history response.
+    snapshot.abort();
+    let _ = snapshot.await;
+    assert_eq!(
+        slots.available_permits(),
+        0,
+        "the orphaned blocking read must retain its slot until the read returns"
+    );
+    assert!(slots.clone().try_acquire_owned().is_err());
+
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+    for _ in 0..500 {
+        if slots.available_permits() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        slots.available_permits(),
+        1,
+        "the slot is released only when the detached blocking read exits"
+    );
 }
 
 struct ProtocolServer {
@@ -726,6 +811,9 @@ struct ProtocolFixture {
     /// Close each connection after its first list_unspent response.
     disconnect_after_unspent: bool,
     transaction_raw: Option<String>,
+    /// When set, every `get_history` response parks on this gate until it
+    /// is released, modelling a blocking read that outlives its caller.
+    gate: Option<Arc<(Mutex<bool>, Condvar)>>,
     request_log: Mutex<Vec<String>>,
 }
 
@@ -742,7 +830,7 @@ impl ProtocolServer {
     }
 
     async fn start_multi(network: Network, unspent: Vec<(ScriptBuf, serde_json::Value)>) -> Self {
-        Self::start_with_fixture(network, unspent, 0, false, None, false, None).await
+        Self::start_with_fixture(network, unspent, 0, false, None, false, None, None).await
     }
 
     /// Starts a server that would answer get_history with `history_len`
@@ -757,6 +845,7 @@ impl ProtocolServer {
             false,
             None,
             false,
+            None,
             None,
         )
         .await
@@ -776,13 +865,24 @@ impl ProtocolServer {
             Some((stalled_script, stall)),
             false,
             None,
+            None,
         )
         .await
     }
 
     async fn start_disconnecting(network: Network, script: ScriptBuf) -> Self {
         let unspent = serde_json::json!([unspent_entry(11, 125_000, TIP_HEIGHT)]);
-        Self::start_with_fixture(network, vec![(script, unspent)], 0, false, None, true, None).await
+        Self::start_with_fixture(
+            network,
+            vec![(script, unspent)],
+            0,
+            false,
+            None,
+            true,
+            None,
+            None,
+        )
+        .await
     }
 
     async fn start_with_transaction(network: Network, transaction_raw: String) -> Self {
@@ -794,6 +894,7 @@ impl ProtocolServer {
             None,
             false,
             Some(transaction_raw),
+            None,
         )
         .await
     }
@@ -807,10 +908,12 @@ impl ProtocolServer {
             None,
             false,
             None,
+            None,
         )
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_with_fixture(
         network: Network,
         unspent_by_script: Vec<(ScriptBuf, serde_json::Value)>,
@@ -819,6 +922,7 @@ impl ProtocolServer {
         stall: Option<(ScriptBuf, Duration)>,
         disconnect_after_unspent: bool,
         transaction_raw: Option<String>,
+        gate: Option<Arc<(Mutex<bool>, Condvar)>>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let wake_address = listener.local_addr().unwrap();
@@ -834,6 +938,7 @@ impl ProtocolServer {
             stall,
             disconnect_after_unspent,
             transaction_raw,
+            gate,
             request_log: Mutex::new(Vec::new()),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -931,6 +1036,13 @@ fn serve_connection(mut stream: TcpStream, fixture: Arc<ProtocolFixture>) {
             // The adapter must never call these; if it ever does, fail the
             // test loudly instead of silently serving a fanout.
             "blockchain.scripthash.get_history" => {
+                if let Some(gate) = &fixture.gate {
+                    let (released, condvar) = &**gate;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = condvar.wait(released).unwrap();
+                    }
+                }
                 if fixture.serve_history {
                     serde_json::Value::Array(
                         (0..fixture.history_len)

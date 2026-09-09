@@ -126,6 +126,7 @@ impl ElectrumPort for DeterministicElectrum {
         max_history_entries: usize,
         max_transaction_bytes: usize,
         _request_limiter: &RequestLimiter,
+        _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<CreationSnapshot, ObserverError> {
         let active = self
             .active_creation_snapshots

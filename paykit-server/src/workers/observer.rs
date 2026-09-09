@@ -147,12 +147,18 @@ pub struct ObservationReport {
 /// does not prescribe an Electrum wire protocol or invent payer messages.
 #[async_trait]
 pub trait ElectrumPort: Send + Sync {
+    /// The caller hands over the owned creation-snapshot slot it acquired
+    /// (bounded by the request deadline) so the implementation can keep it
+    /// for exactly as long as the Electrum I/O it admits: the slot is
+    /// released only when the underlying blocking read returns, never when
+    /// the awaiting side gives up.
     async fn creation_snapshot(
         &self,
         _address: &str,
         _max_history_entries: usize,
         _max_transaction_bytes: usize,
         _request_limiter: &RequestLimiter,
+        _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<CreationSnapshot, ObserverError> {
         Err(ObserverError::Unavailable)
     }
@@ -1227,11 +1233,21 @@ impl ElectrumPort for ElectrumAdapter {
         max_history_entries: usize,
         max_transaction_bytes: usize,
         request_limiter: &RequestLimiter,
+        snapshot_slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<CreationSnapshot, ObserverError> {
         let adapter = self.clone_for_fetch();
         let address = address.to_owned();
         let request_limiter = request_limiter.clone();
         tokio::task::spawn_blocking(move || {
+            // The slot permit lives exactly as long as the Electrum I/O it
+            // admits: it is owned by this blocking call and released only
+            // when the call returns — never when the awaiting side gives up
+            // on the request deadline. A snapshot whose socket read
+            // outlives its handler therefore keeps its slot occupied until
+            // the read ends (bounded at latest by the client
+            // `electrum.request_timeout` on the wire), so the semaphore
+            // bounds live blocking reads, not just awaited snapshots.
+            let _snapshot_slot = snapshot_slot;
             let client = adapter.raw_client_blocking().map_err(map_electrum)?;
             let address = parse_address(&address, adapter.network.as_bitcoin_network())?;
             let history = client

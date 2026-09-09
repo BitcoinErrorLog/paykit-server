@@ -53,6 +53,7 @@ impl ElectrumPort for EmptyBaselineElectrum {
         _max_history_entries: usize,
         _max_transaction_bytes: usize,
         _request_limiter: &RequestLimiter,
+        _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<CreationSnapshot, ObserverError> {
         Ok(CreationSnapshot {
             tip_height: 100,
@@ -87,6 +88,7 @@ impl ElectrumPort for CountingBaselineElectrum {
         _max_history_entries: usize,
         _max_transaction_bytes: usize,
         _request_limiter: &RequestLimiter,
+        _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<CreationSnapshot, ObserverError> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(CreationSnapshot {
@@ -226,6 +228,7 @@ struct FakeStore {
     preflight_calls: AtomicUsize,
     create_calls: AtomicUsize,
     baseline_failures: AtomicUsize,
+    baseline_completions: AtomicUsize,
 }
 
 impl FakeStore {
@@ -235,6 +238,7 @@ impl FakeStore {
             preflight_calls: AtomicUsize::default(),
             create_calls: AtomicUsize::default(),
             baseline_failures: AtomicUsize::default(),
+            baseline_completions: AtomicUsize::default(),
         }
     }
 }
@@ -289,6 +293,15 @@ impl InvoicePersistence for FakeStore {
         _invoice_id: uuid::Uuid,
     ) -> Result<(), PersistenceError> {
         self.baseline_failures.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn complete_creation_baseline(
+        &self,
+        _invoice_id: uuid::Uuid,
+        _snapshot: &CreationSnapshot,
+    ) -> Result<(), PersistenceError> {
+        self.baseline_completions.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -481,6 +494,260 @@ async fn real_creation_path_charges_snapshot_and_probe_to_the_shared_pool() {
     service.create(request()).await.unwrap();
     assert_eq!(electrum.0.load(Ordering::SeqCst), 2);
     assert_eq!(limiter.available(), 0);
+}
+
+/// A fake port whose snapshot parks on a condvar inside a detached
+/// blocking read, mirroring the production adapter's contract: the owned
+/// snapshot slot is held by the blocking read itself and released only
+/// when that read returns — never when the awaiting side is dropped.
+struct GatedSnapshotElectrum {
+    rpc_calls: AtomicUsize,
+    gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl GatedSnapshotElectrum {
+    fn new() -> (Self, Arc<(Mutex<bool>, std::sync::Condvar)>) {
+        let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        (
+            Self {
+                rpc_calls: AtomicUsize::new(0),
+                gate: gate.clone(),
+            },
+            gate,
+        )
+    }
+
+    fn release(gate: &(Mutex<bool>, std::sync::Condvar)) {
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+    }
+}
+
+#[async_trait]
+impl ElectrumPort for GatedSnapshotElectrum {
+    async fn creation_snapshot(
+        &self,
+        _address: &str,
+        _max_history_entries: usize,
+        _max_transaction_bytes: usize,
+        _request_limiter: &RequestLimiter,
+        snapshot_slot: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<CreationSnapshot, ObserverError> {
+        self.rpc_calls.fetch_add(1, Ordering::SeqCst);
+        let gate = self.gate.clone();
+        tokio::task::spawn_blocking(move || {
+            let _snapshot_slot = snapshot_slot;
+            let (released, condvar) = &*gate;
+            let mut released = released.lock().unwrap();
+            while !*released {
+                released = condvar.wait(released).unwrap();
+            }
+            Ok(CreationSnapshot {
+                tip_height: 100,
+                baseline_outputs: Vec::new(),
+                unconfirmed_inputs: Vec::new(),
+            })
+        })
+        .await
+        .map_err(|_| ObserverError::Unavailable)?
+    }
+
+    async fn observations(
+        &self,
+        _tip_height: u32,
+        _targets: &[paykit_server::bitcoin::ObservationTarget],
+    ) -> Result<paykit_server::workers::observer::ObservationReport, ObserverError> {
+        unreachable!()
+    }
+
+    async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        Ok(TipProbe {
+            height: 100,
+            time_unix: 0,
+        })
+    }
+}
+
+/// A deadline clock that returns `start` for the first `shift_after` calls
+/// and `start + shift` afterwards, so one chosen step's remaining budget
+/// shrinks to `REQUEST_DEADLINE - shift` while every earlier step sees the
+/// full budget.
+struct ShiftClock {
+    calls: AtomicUsize,
+    start: Instant,
+    shift_after: usize,
+    shift: Duration,
+}
+
+impl DeadlineClock for ShiftClock {
+    fn now(&self) -> Instant {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call < self.shift_after {
+            self.start
+        } else {
+            self.start + self.shift
+        }
+    }
+}
+
+fn service_with_port(
+    store: Arc<FakeStore>,
+    electrum: Arc<dyn ElectrumPort>,
+    slots: Arc<tokio::sync::Semaphore>,
+) -> CreateInvoiceService {
+    CreateInvoiceService::new(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        store,
+        electrum,
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+    )
+    .with_electrum_controls(RequestLimiter::new(100, 100), slots)
+}
+
+#[tokio::test]
+async fn abandoned_snapshot_keeps_its_slot_until_the_blocking_read_returns() {
+    let (electrum, gate) = GatedSnapshotElectrum::new();
+    let electrum = Arc::new(electrum);
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let first_store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let first_service = service_with_port(first_store, electrum.clone(), slots.clone());
+    let first = tokio::spawn(async move { first_service.create(request()).await });
+    for _ in 0..200 {
+        if electrum.rpc_calls.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(electrum.rpc_calls.load(Ordering::SeqCst), 1);
+
+    // The first caller gives up (its request deadline passed); the HTTP
+    // handler future is dropped while the blocking read is still parked.
+    first.abort();
+    let _ = first.await;
+    assert_eq!(
+        slots.available_permits(),
+        0,
+        "the orphaned blocking read must retain the only snapshot slot"
+    );
+
+    // A second creation must make ZERO snapshot RPCs until the first
+    // blocking read returns.
+    let second_store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let second_service = service_with_port(second_store.clone(), electrum.clone(), slots.clone());
+    let second = tokio::spawn(async move { second_service.create(request()).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        electrum.rpc_calls.load(Ordering::SeqCst),
+        1,
+        "no second snapshot RPC may start while the first read holds the slot"
+    );
+
+    GatedSnapshotElectrum::release(&gate);
+    let created = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .expect("the second creation proceeds once the first read returns")
+        .expect("the second creation task is not cancelled");
+    assert!(created.is_ok());
+    assert_eq!(electrum.rpc_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(second_store.baseline_completions.load(Ordering::SeqCst), 1);
+    assert_eq!(slots.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn snapshot_slot_acquisition_is_bounded_by_the_request_deadline() {
+    let (electrum, gate) = GatedSnapshotElectrum::new();
+    let electrum = Arc::new(electrum);
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let first_store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let first_service = service_with_port(first_store, electrum.clone(), slots.clone());
+    let first = tokio::spawn(async move { first_service.create(request()).await });
+    for _ in 0..200 {
+        if electrum.rpc_calls.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(electrum.rpc_calls.load(Ordering::SeqCst), 1);
+
+    // The second creation reaches the snapshot-slot acquisition with only
+    // 300ms of request-deadline budget left (the ninth clock read — the
+    // slot step — is the first shifted one).
+    let start = Instant::now();
+    let clock = Arc::new(ShiftClock {
+        calls: AtomicUsize::new(0),
+        start,
+        shift_after: 8,
+        shift: Duration::from_millis(14_700),
+    });
+    let second_store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let second_service = CreateInvoiceService::with_clock(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        second_store.clone(),
+        electrum.clone(),
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+        clock,
+    )
+    .with_electrum_controls(RequestLimiter::new(100, 100), slots.clone());
+
+    let created = tokio::time::timeout(Duration::from_secs(3), second_service.create(request()))
+        .await
+        .expect("the creation returns within the request-deadline bound");
+    assert_eq!(created, Err(CreateInvoiceError::DeadlineExceeded));
+    // The baseline was failed to completion: no `observing` invoice and no
+    // `queued` outbox row can exist for this creation.
+    assert_eq!(second_store.baseline_failures.load(Ordering::SeqCst), 1);
+    assert_eq!(second_store.baseline_completions.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        slots.available_permits(),
+        0,
+        "the parked first read still owns the only slot"
+    );
+
+    GatedSnapshotElectrum::release(&gate);
+    let first_created = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("the first creation completes once its read is released")
+        .expect("the first creation task is not cancelled");
+    assert!(first_created.is_ok());
+    assert_eq!(slots.available_permits(), 1);
 }
 
 #[tokio::test]

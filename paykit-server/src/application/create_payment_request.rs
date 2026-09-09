@@ -23,7 +23,8 @@ use crate::{
         create_invoice::{
             CreateInvoiceError, CreatorXpubProvider, DeadlineClock, DerivedNewReaderPayloads,
             InvoicePersistence, MarkerDiscovery, PaykitIntentBuilder, SessionValidationError,
-            SessionValidator, SystemDeadlineClock, map_store, remaining,
+            SessionValidator, SystemDeadlineClock, complete_creation_baseline_within_deadline,
+            map_store, remaining,
         },
         reader_marker::select_reader_marker,
         semantic_intent::DeliveryIntentV1,
@@ -33,7 +34,7 @@ use crate::{
     persistence::{
         AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, NewReaderPayloadFactory,
     },
-    workers::observer::{ElectrumPort, PROBE_REQUESTS_PER_TICK, RequestLimiter},
+    workers::observer::{ElectrumPort, RequestLimiter},
 };
 
 /// One marketplace order's payment request. `reference` is the marketplace's
@@ -249,65 +250,19 @@ impl MarketplacePaymentRequestService {
             .for_child_index(created.reader_child_index())
             .map_err(map_store)?
             .bitcoin_address;
-        let reservation = self
-            .electrum_limiter
-            .reserve_or_wait(3, Instant::now() + Duration::from_secs(2))
-            .await;
-        let snapshot_slot = self.creation_snapshot_slots.clone().acquire_owned().await;
-        if reservation.is_err() || snapshot_slot.is_err() {
-            self.store
-                .fail_creation_baseline(created.invoice_id())
-                .await
-                .map_err(map_store)?;
-            return Err(CreateInvoiceError::Unavailable);
-        }
-        let _snapshot_slot = snapshot_slot.expect("checked creation snapshot semaphore");
-        let snapshot = self
-            .electrum
-            .creation_snapshot(
-                &address,
-                self.max_creation_history_entries,
-                self.max_transaction_bytes,
-                &self.electrum_limiter,
-            )
-            .await;
-        let snapshot = match snapshot {
-            Ok(snapshot) => snapshot,
-            Err(_) => {
-                self.store
-                    .fail_creation_baseline(created.invoice_id())
-                    .await
-                    .map_err(map_store)?;
-                return Err(CreateInvoiceError::Unavailable);
-            }
-        };
-        if self
-            .electrum_limiter
-            .reserve_or_wait(
-                PROBE_REQUESTS_PER_TICK,
-                Instant::now() + Duration::from_secs(2),
-            )
-            .await
-            .is_err()
-        {
-            self.store
-                .fail_creation_baseline(created.invoice_id())
-                .await
-                .map_err(map_store)?;
-            return Err(CreateInvoiceError::Unavailable);
-        }
-        if !matches!(self.electrum.probe().await, Ok(probe) if probe.height.abs_diff(snapshot.tip_height) <= 3)
-        {
-            self.store
-                .fail_creation_baseline(created.invoice_id())
-                .await
-                .map_err(map_store)?;
-            return Err(CreateInvoiceError::Unavailable);
-        }
-        self.store
-            .complete_creation_baseline(created.invoice_id(), &snapshot)
-            .await
-            .map_err(map_store)?;
+        complete_creation_baseline_within_deadline(
+            self.store.as_ref(),
+            self.electrum.as_ref(),
+            &self.electrum_limiter,
+            &self.creation_snapshot_slots,
+            self.max_creation_history_entries,
+            self.max_transaction_bytes,
+            self.clock.as_ref(),
+            started,
+            created.invoice_id(),
+            &address,
+        )
+        .await?;
         Ok(created)
     }
 
