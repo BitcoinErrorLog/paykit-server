@@ -155,6 +155,7 @@ mod tick {
         probe: Result<TipProbe, ObserverError>,
         history_tx_counts: std::collections::HashMap<String, u32>,
         request_count: u64,
+        extra_history: Vec<TargetHistory>,
         calls: Mutex<Vec<Vec<String>>>,
     }
 
@@ -174,6 +175,7 @@ mod tick {
                     .map(|(address, tx_count)| (address.to_owned(), tx_count))
                     .collect(),
                 request_count: 0,
+                extra_history: Vec::new(),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -183,11 +185,23 @@ mod tick {
             self
         }
 
+        /// Appends a history entry for an address that is not part of the
+        /// requested batch, modelling an observation stamp whose lookup
+        /// hash matches no invoice row.
+        fn with_ghost_history(mut self, address: &str) -> Self {
+            self.extra_history.push(TargetHistory {
+                address: address.into(),
+                tx_count: 0,
+            });
+            self
+        }
+
         fn failing(error: ObserverError) -> Self {
             Self {
                 probe: Err(error),
                 history_tx_counts: std::collections::HashMap::new(),
                 request_count: 0,
+                extra_history: Vec::new(),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -205,19 +219,21 @@ mod tick {
                     .map(|target| target.address().to_owned())
                     .collect(),
             );
+            let mut history: Vec<TargetHistory> = targets
+                .iter()
+                .map(|target| TargetHistory {
+                    address: target.address().to_owned(),
+                    tx_count: self
+                        .history_tx_counts
+                        .get(target.address())
+                        .copied()
+                        .unwrap_or(0),
+                })
+                .collect();
+            history.extend(self.extra_history.iter().cloned());
             Ok(ObservationReport {
                 outputs: Vec::new(),
-                history: targets
-                    .iter()
-                    .map(|target| TargetHistory {
-                        address: target.address().to_owned(),
-                        tx_count: self
-                            .history_tx_counts
-                            .get(target.address())
-                            .copied()
-                            .unwrap_or(0),
-                    })
-                    .collect(),
+                history,
                 request_count: self.request_count,
             })
         }
@@ -310,18 +326,23 @@ mod tick {
         async fn record_observation_tick(
             &self,
             records: &[TargetTickRecord],
-        ) -> Result<(), ObserverError> {
+        ) -> Result<u64, ObserverError> {
             let mut entries = self.entries.lock().unwrap();
+            let mut misses = 0_u64;
             for record in records {
-                let entry = entries
+                match entries
                     .iter_mut()
                     .find(|entry| entry.address == record.address())
-                    .expect("recorded target is in the plan");
-                entry.staleness_secs = 0;
-                entry.history_tx_count = Some(record.history_tx_count());
-                entry.last_request_count = Some(record.request_count());
+                {
+                    Some(entry) => {
+                        entry.staleness_secs = 0;
+                        entry.history_tx_count = Some(record.history_tx_count());
+                        entry.last_request_count = Some(record.request_count());
+                    }
+                    None => misses += 1,
+                }
             }
-            Ok(())
+            Ok(misses)
         }
     }
 
@@ -717,5 +738,39 @@ mod tick {
             assert_eq!(calls[1], vec!["cheap".to_owned()]);
         }
         assert_eq!(runtime.readiness().await.electrum_overrun_targets, 1);
+    }
+
+    #[tokio::test]
+    async fn a_stamp_miss_is_reported_without_blocking_the_other_records() {
+        // The adapter reports history for an address whose lookup hash
+        // matches no invoice row: the miss must surface as a named tick
+        // failure while the known target is still stamped.
+        let port = FakeElectrum::healthy().with_ghost_history("ghost");
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![FakeEntry::new("known", Some(0), 300)]),
+            applied: Mutex::new(Vec::new()),
+            marked_overrun: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(100),
+            &runtime,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::ObservationFailed(ObserverError::ObservationStampMiss),
+            "an unmatched stamp must fail the tick with the named error"
+        );
+        let entries = backend.entries.lock().unwrap();
+        assert_eq!(
+            entries[0].staleness_secs, 0,
+            "the known record must still be stamped"
+        );
+        assert_eq!(entries[0].history_tx_count, Some(0));
     }
 }

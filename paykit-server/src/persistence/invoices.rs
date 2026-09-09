@@ -325,18 +325,27 @@ impl InvoiceStore {
     /// Records the previous tick's per-target history sizes and measured
     /// request costs, and stamps every recorded target as successfully
     /// observed just now.
+    ///
+    /// Every record's UPDATE must match exactly one invoice row: a zero-row
+    /// stamp means the lookup hash derived from the observer's canonical
+    /// address string no longer matches any stored hash, so the invoice
+    /// would never rotate behind the plan and the head-of-line bypass would
+    /// re-sync it forever. Misses are reported at WARN (with the truncated
+    /// lookup hash; no invoice id exists for an unmatched hash) and counted
+    /// in the return value, but never abort the remaining records.
     pub async fn record_observation_tick(
         &self,
         records: &[TargetTickRecord],
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<u64, PersistenceError> {
         if records.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
+        let mut misses = 0_u64;
         for record in records {
             let address_lookup_hash = self
                 .crypto
@@ -345,7 +354,7 @@ impl InvoiceStore {
                 .map_err(|_| PersistenceError::CorruptOrMissing)?;
             let request_count = i32::try_from(record.request_count())
                 .map_err(|_| PersistenceError::CorruptOrMissing)?;
-            sqlx::query(
+            let stamped = sqlx::query(
                 "UPDATE invoices SET observation_history_tx_count = $1, \
                  observation_request_count = $2, \
                  last_observed_at = NOW(), updated_at = NOW() \
@@ -357,8 +366,22 @@ impl InvoiceStore {
             .execute(&mut *tx)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
+            if stamped.rows_affected() == 0 {
+                misses += 1;
+                let hash_prefix = address_lookup_hash.as_bytes()[..8]
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+                tracing::warn!(
+                    address_lookup_hash_prefix = %hash_prefix,
+                    "observation tick stamp matched no invoice row"
+                );
+            }
         }
-        tx.commit().await.map_err(|_| PersistenceError::Unavailable)
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(misses)
     }
 
     fn decrypt_target(

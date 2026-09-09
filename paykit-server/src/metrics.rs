@@ -27,6 +27,7 @@ pub struct Metrics {
     electrum_bypassed_head_requests: Gauge,
     electrum_bypassed_head_budget_violations: Counter,
     electrum_observation_overrun_targets: Gauge,
+    electrum_observation_stamp_misses: Counter,
     payment_states: Gauge,
     runtime_active: Gauge,
     session_validation_results: Counter,
@@ -46,6 +47,7 @@ impl Metrics {
         let electrum_bypassed_head_requests = Gauge::default();
         let electrum_bypassed_head_budget_violations = Counter::default();
         let electrum_observation_overrun_targets = Gauge::default();
+        let electrum_observation_stamp_misses = Counter::default();
         let payment_states = Gauge::default();
         let runtime_active = Gauge::default();
         let session_validation_results = Counter::default();
@@ -105,6 +107,11 @@ impl Metrics {
             electrum_observation_overrun_targets.clone(),
         );
         registry.register(
+            "paykit_electrum_observation_stamp_misses",
+            "Observation tick stamps that matched no invoice row.",
+            electrum_observation_stamp_misses.clone(),
+        );
+        registry.register(
             "paykit_payment_states",
             "Aggregate persisted payment-state count.",
             payment_states.clone(),
@@ -132,6 +139,7 @@ impl Metrics {
             electrum_bypassed_head_requests,
             electrum_bypassed_head_budget_violations,
             electrum_observation_overrun_targets,
+            electrum_observation_stamp_misses,
             payment_states,
             runtime_active,
             session_validation_results,
@@ -168,6 +176,9 @@ impl Metrics {
     }
     pub fn set_electrum_observation_overrun_targets(&self, count: i64) {
         self.electrum_observation_overrun_targets.set(count.max(0));
+    }
+    pub fn electrum_observation_stamp_misses(&self, misses: u64) {
+        self.electrum_observation_stamp_misses.inc_by(misses);
     }
     pub fn set_payment_states(&self, value: i64) {
         self.payment_states.set(value);

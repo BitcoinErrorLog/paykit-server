@@ -102,6 +102,11 @@ pub enum ObserverError {
     WrongNetwork,
     InvalidObservation,
     Persistence,
+    /// A tick stamp matched no invoice row: the lookup hash derived from
+    /// the observed address failed to match the stored hash. Other records
+    /// were still stamped; the tick reports this named error so the miss
+    /// cannot silently pin the same head target forever.
+    ObservationStampMiss,
 }
 
 /// Durable side of the observer: plans, applies, and records one tick. The
@@ -126,10 +131,12 @@ pub trait ObservationBackend: Send + Sync {
         addresses: &[String],
     ) -> Result<Vec<uuid::Uuid>, ObserverError>;
     /// Persists per-target history sizes and stamps the targets observed.
+    /// Returns the number of records whose stamp matched no invoice row;
+    /// misses are logged and counted but never abort the other records.
     async fn record_observation_tick(
         &self,
         records: &[TargetTickRecord],
-    ) -> Result<(), ObserverError>;
+    ) -> Result<u64, ObserverError>;
 }
 
 #[async_trait]
@@ -164,7 +171,7 @@ impl ObservationBackend for InvoiceStore {
     async fn record_observation_tick(
         &self,
         records: &[TargetTickRecord],
-    ) -> Result<(), ObserverError> {
+    ) -> Result<u64, ObserverError> {
         InvoiceStore::record_observation_tick(self, records)
             .await
             .map_err(map_persistence)
@@ -548,9 +555,20 @@ pub async fn observe_tick(
             )
         })
         .collect();
-    if let Err(error) = backend.record_observation_tick(&records).await {
-        runtime.set_electrum_available(false);
-        return ObserverTickOutcome::ObservationFailed(error);
+    let misses = match backend.record_observation_tick(&records).await {
+        Ok(misses) => misses,
+        Err(error) => {
+            runtime.set_electrum_available(false);
+            return ObserverTickOutcome::ObservationFailed(error);
+        }
+    };
+    if misses > 0 {
+        // A stamp miss means a target's lookup hash matched no invoice row:
+        // left silent, the head would never rotate and the bypass would
+        // re-sync the same target every tick with unbounded cost. The other
+        // records were stamped; surface the miss as a named tick failure.
+        runtime.metrics().electrum_observation_stamp_misses(misses);
+        return ObserverTickOutcome::ObservationFailed(ObserverError::ObservationStampMiss);
     }
     runtime.set_electrum_available(true);
     ObserverTickOutcome::Observed {

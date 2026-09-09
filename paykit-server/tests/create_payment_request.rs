@@ -781,8 +781,8 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
         async fn record_observation_tick(
             &self,
             _records: &[TargetTickRecord],
-        ) -> Result<(), ObserverError> {
-            Ok(())
+        ) -> Result<u64, ObserverError> {
+            Ok(0)
         }
     }
 

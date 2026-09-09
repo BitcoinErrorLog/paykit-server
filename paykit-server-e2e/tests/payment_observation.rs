@@ -1224,6 +1224,34 @@ async fn payment_record_integrity_rejects_row_and_type_envelope_swaps() {
 }
 
 #[tokio::test]
+async fn record_observation_tick_reports_stamp_misses_without_aborting_known_records() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+
+    // A record whose address lookup hash matches no invoice row, followed
+    // by a valid record: the miss is reported and the valid record stamps.
+    let misses = store
+        .record_observation_tick(&[
+            paykit_server::bitcoin::TargetTickRecord::new("address-never-bound", 3, 2),
+            paykit_server::bitcoin::TargetTickRecord::new(REGTEST_ADDRESS, 7, 3),
+        ])
+        .await
+        .unwrap();
+    assert_eq!(misses, 1);
+    let persisted: (Option<i32>, Option<i32>, bool) = sqlx::query_as(
+        "SELECT observation_history_tx_count, observation_request_count, \
+         last_observed_at IS NOT NULL \
+         FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(persisted, (Some(7), Some(3), true));
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn observation_overrun_marks_once_and_the_plan_reports_the_flag() {
     let database = TestDatabase::create().await;
     let (store, invoice_id) = batch_invoice(&database).await;
