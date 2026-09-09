@@ -1,6 +1,13 @@
-use std::{str::FromStr, sync::OnceLock, time::Duration};
+use std::{
+    str::FromStr,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
-use paykit_server::persistence::{MIGRATION_ADVISORY_LOCK_KEY, run_migrations};
+use paykit_server::{
+    crypto::Crypto,
+    persistence::{InvoiceStore, MIGRATION_ADVISORY_LOCK_KEY, run_migrations},
+};
 use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
 use uuid::Uuid;
@@ -57,7 +64,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 
     let retired_observation_budget_columns: Vec<String> = sqlx::query_scalar(
         "SELECT table_name || '.' || column_name
@@ -131,6 +138,74 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
     .unwrap();
     assert_ne!(creator_id, Uuid::nil());
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn legacy_invoice_is_never_defaulted_into_observation() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    for migration in [
+        include_str!("../../paykit-server/migrations/0001_initial.sql"),
+        include_str!("../../paykit-server/migrations/0002_deployment_stack_role.sql"),
+        include_str!("../../paykit-server/migrations/0003_invoice_observation_budget.sql"),
+        include_str!("../../paykit-server/migrations/0004_observation_request_count.sql"),
+        include_str!("../../paykit-server/migrations/0005_observation_overrun.sql"),
+        include_str!("../../paykit-server/migrations/0006_drop_observation_budget_columns.sql"),
+    ] {
+        sqlx::raw_sql(migration).execute(pool).await.unwrap();
+    }
+    let creator_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO creators (creator_lookup_hash, credential_envelope)
+         VALUES ($1, $2) RETURNING id",
+    )
+    .bind(b"legacy-creator".as_slice())
+    .bind(b"legacy-credential".as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let invoice_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO invoices
+         (id, creator_id, reader_lookup_hash, bundle_lookup_hash,
+          payment_request_lookup_hash, invoice_envelope, payment_record_envelope,
+          bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'undetected')",
+    )
+    .bind(invoice_id)
+    .bind(creator_id)
+    .bind(b"legacy-reader".as_slice())
+    .bind(b"legacy-bundle".as_slice())
+    .bind(b"legacy-payment".as_slice())
+    .bind(b"legacy-invoice-envelope".as_slice())
+    .bind(b"legacy-v1-payment-record".as_slice())
+    .bind(b"legacy-address".as_slice())
+    .bind(b"legacy-index".as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../paykit-server/migrations/0007_invoice_creation_baseline.sql"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../paykit-server/migrations/0008_observation_failure_isolation.sql"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let state: String = sqlx::query_scalar("SELECT baseline_state FROM invoices WHERE id = $1")
+        .bind(invoice_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "legacy_unbaselined");
+    let store = InvoiceStore::new(pool, Arc::new(Crypto::from_master_key(&[7; 32]).unwrap()));
+    assert!(store.observation_plan().await.unwrap().is_empty());
     database.cleanup().await;
 }
 

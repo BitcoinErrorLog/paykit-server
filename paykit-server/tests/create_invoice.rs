@@ -35,7 +35,7 @@ use paykit_server::{
     domain::locks::{CreatorPubky, parse_addressed_lock_resource, parse_bundle_id, parse_reader},
     http::{auth::SignedLocksAuth, invoices::invoices_router},
     persistence::{AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, PersistenceError},
-    workers::observer::{CreationSnapshot, ElectrumPort, ObserverError, TipProbe},
+    workers::observer::{CreationSnapshot, ElectrumPort, ObserverError, RequestLimiter, TipProbe},
 };
 use tower::ServiceExt;
 
@@ -52,6 +52,7 @@ impl ElectrumPort for EmptyBaselineElectrum {
         _address: &str,
         _max_history_entries: usize,
         _max_transaction_bytes: usize,
+        _request_limiter: &RequestLimiter,
     ) -> Result<CreationSnapshot, ObserverError> {
         Ok(CreationSnapshot {
             tip_height: 100,
@@ -69,6 +70,42 @@ impl ElectrumPort for EmptyBaselineElectrum {
     }
 
     async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        Ok(TipProbe {
+            height: 100,
+            time_unix: 0,
+        })
+    }
+}
+
+struct CountingBaselineElectrum(AtomicUsize);
+
+#[async_trait]
+impl ElectrumPort for CountingBaselineElectrum {
+    async fn creation_snapshot(
+        &self,
+        _address: &str,
+        _max_history_entries: usize,
+        _max_transaction_bytes: usize,
+        _request_limiter: &RequestLimiter,
+    ) -> Result<CreationSnapshot, ObserverError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(CreationSnapshot {
+            tip_height: 100,
+            baseline_outputs: Vec::new(),
+            unconfirmed_inputs: Vec::new(),
+        })
+    }
+
+    async fn observations(
+        &self,
+        _tip_height: u32,
+        _targets: &[paykit_server::bitcoin::ObservationTarget],
+    ) -> Result<paykit_server::workers::observer::ObservationReport, ObserverError> {
+        unreachable!()
+    }
+
+    async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
         Ok(TipProbe {
             height: 100,
             time_unix: 0,
@@ -188,6 +225,7 @@ struct FakeStore {
     preflight: Mutex<InvoicePreflight>,
     preflight_calls: AtomicUsize,
     create_calls: AtomicUsize,
+    baseline_failures: AtomicUsize,
 }
 
 impl FakeStore {
@@ -196,6 +234,7 @@ impl FakeStore {
             preflight: Mutex::new(preflight),
             preflight_calls: AtomicUsize::default(),
             create_calls: AtomicUsize::default(),
+            baseline_failures: AtomicUsize::default(),
         }
     }
 }
@@ -243,6 +282,14 @@ impl InvoicePersistence for FakeStore {
             0,
             true,
         ))
+    }
+
+    async fn fail_creation_baseline(
+        &self,
+        _invoice_id: uuid::Uuid,
+    ) -> Result<(), PersistenceError> {
+        self.baseline_failures.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -351,6 +398,89 @@ fn service_with_creation(
         400_000,
         Arc::new(PaykitIntentBuilder::default()),
     )
+}
+
+#[tokio::test]
+async fn exhausted_shared_limiter_voids_baseline_before_any_electrum_rpc() {
+    let session = Arc::new(FakeSession {
+        result: Ok(()),
+        calls: AtomicUsize::default(),
+        creators: Mutex::new(vec![]),
+    });
+    let locks = Arc::new(FakeLocks {
+        result: Ok(valid_lock()),
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let electrum = Arc::new(CountingBaselineElectrum(AtomicUsize::new(0)));
+    let service = CreateInvoiceService::new(
+        session,
+        locks,
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        store.clone(),
+        electrum.clone(),
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+    )
+    .with_electrum_controls(
+        RequestLimiter::new(0, 0),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+    );
+
+    assert_eq!(
+        service.create(request()).await,
+        Err(CreateInvoiceError::Unavailable)
+    );
+    assert_eq!(electrum.0.load(Ordering::SeqCst), 0);
+    assert_eq!(store.baseline_failures.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn real_creation_path_charges_snapshot_and_probe_to_the_shared_pool() {
+    let session = Arc::new(FakeSession {
+        result: Ok(()),
+        calls: AtomicUsize::default(),
+        creators: Mutex::new(vec![]),
+    });
+    let locks = Arc::new(FakeLocks {
+        result: Ok(valid_lock()),
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let electrum = Arc::new(CountingBaselineElectrum(AtomicUsize::new(0)));
+    let limiter = RequestLimiter::new(5, 0);
+    let service = CreateInvoiceService::new(
+        session,
+        locks,
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        store,
+        electrum.clone(),
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+    )
+    .with_electrum_controls(limiter.clone(), Arc::new(tokio::sync::Semaphore::new(1)));
+
+    service.create(request()).await.unwrap();
+    assert_eq!(electrum.0.load(Ordering::SeqCst), 2);
+    assert_eq!(limiter.available(), 0);
 }
 
 #[tokio::test]

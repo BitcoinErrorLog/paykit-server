@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     net::SocketAddr,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -43,7 +46,7 @@ use paykit_server::{
     startup::initialize_database,
     workers::observer::{
         CandidateTransaction, CreationSnapshot, ElectrumPort, ObservationReport, ObserverError,
-        TipProbe,
+        RequestLimiter, TipProbe,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -87,6 +90,9 @@ type OutboxDiagnostic = (String, bool, i32, Option<String>);
 
 struct DeterministicElectrum {
     outputs: HashMap<String, (u64, OutPoint)>,
+    requests: Mutex<Vec<String>>,
+    active_creation_snapshots: AtomicUsize,
+    max_active_creation_snapshots: AtomicUsize,
 }
 
 impl DeterministicElectrum {
@@ -105,6 +111,9 @@ impl DeterministicElectrum {
                     )
                 })
                 .collect(),
+            requests: Mutex::new(Vec::new()),
+            active_creation_snapshots: AtomicUsize::new(0),
+            max_active_creation_snapshots: AtomicUsize::new(0),
         }
     }
 }
@@ -114,9 +123,27 @@ impl ElectrumPort for DeterministicElectrum {
     async fn creation_snapshot(
         &self,
         _address: &str,
-        _max_history_entries: usize,
-        _max_transaction_bytes: usize,
+        max_history_entries: usize,
+        max_transaction_bytes: usize,
+        _request_limiter: &RequestLimiter,
     ) -> Result<CreationSnapshot, ObserverError> {
+        let active = self
+            .active_creation_snapshots
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        self.max_active_creation_snapshots
+            .fetch_max(active, Ordering::SeqCst);
+        {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(format!("script_get_history cap={max_history_entries}"));
+            requests.push("script_list_unspent".into());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        self.requests.lock().unwrap().push(format!(
+            "headers_subscribe tx_bytes={max_transaction_bytes}"
+        ));
+        self.active_creation_snapshots
+            .fetch_sub(1, Ordering::SeqCst);
         Ok(CreationSnapshot {
             tip_height: 300,
             baseline_outputs: Vec::new(),
@@ -127,8 +154,11 @@ impl ElectrumPort for DeterministicElectrum {
     async fn candidate_transaction(
         &self,
         txid: Txid,
-        _max_transaction_bytes: usize,
+        max_transaction_bytes: usize,
     ) -> Result<CandidateTransaction, ObserverError> {
+        self.requests.lock().unwrap().push(format!(
+            "transaction_get candidate tx_bytes={max_transaction_bytes}"
+        ));
         Ok(CandidateTransaction {
             txid,
             inputs: Vec::new(),
@@ -140,6 +170,10 @@ impl ElectrumPort for DeterministicElectrum {
         _tip_height: u32,
         targets: &[ObservationTarget],
     ) -> Result<ObservationReport, ObserverError> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(format!("observer_list_unspent targets={}", targets.len()));
         Ok(ObservationReport {
             outputs: targets
                 .iter()
@@ -166,6 +200,10 @@ impl ElectrumPort for DeterministicElectrum {
     }
 
     async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push("probe headers_subscribe+block_header".into());
         Ok(TipProbe {
             height: 300,
             time_unix: fresh_tip_time(),
@@ -418,6 +456,7 @@ stack_role = "proof"
 endpoint = "tcp://127.0.0.1:1"
 poll_interval = "1s"
 request_timeout = "1s"
+max_concurrent_creation_snapshots = 1
 [outbox]
 poll_interval = "{poll_interval}"
 batch_size = 16
@@ -986,7 +1025,7 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     let second_config = config(database.database_url(), &signing_key, "25ms");
     let second_pool = initialize_database(&second_config).await.unwrap();
     let second_server =
-        Server::build_with_transports(second_config, second_pool.clone(), pubky, observer)
+        Server::build_with_transports(second_config, second_pool.clone(), pubky, observer.clone())
             .await
             .unwrap();
     let second_runtime = second_server.runtime();
@@ -1009,6 +1048,52 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     )
     .await;
     assert_eq!(peer_sdk.payment_requests().await.unwrap().len(), 2);
+    assert_eq!(
+        observer
+            .max_active_creation_snapshots
+            .load(Ordering::SeqCst),
+        1,
+        "the configured creation-snapshot semaphore must serialize concurrent creations"
+    );
+    let requests = observer.requests.lock().unwrap().clone();
+    let creation_starts = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| request.as_str() == "script_get_history cap=50")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    assert_eq!(creation_starts.len(), 2, "request log: {requests:?}");
+    for start in creation_starts {
+        assert_eq!(requests[start + 1], "script_list_unspent");
+        assert_eq!(
+            requests[start + 2],
+            "headers_subscribe tx_bytes=400000",
+            "the creation floor tip must be taken after history and unspent"
+        );
+    }
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.starts_with("transaction_get candidate"))
+            .all(|request| request.ends_with("tx_bytes=400000")),
+        "candidate fetches must carry the configured byte cap: {requests:?}"
+    );
+    let mut candidates_since_tick = 0;
+    for request in &requests {
+        if request.starts_with("observer_list_unspent") {
+            assert!(
+                candidates_since_tick <= 1,
+                "more than one candidate fetch occurred in one observer interval: {requests:?}"
+            );
+            candidates_since_tick = 0;
+        } else if request.starts_with("transaction_get candidate") {
+            candidates_since_tick += 1;
+        }
+    }
+    assert!(
+        candidates_since_tick <= 1,
+        "more than one candidate fetch occurred after the final observer interval: {requests:?}"
+    );
 
     let outbox_rows: Vec<(String, bool)> = sqlx::query_as(
         "SELECT status, depends_on_id IS NOT NULL FROM outbox ORDER BY invoice_id, depends_on_id NULLS FIRST",

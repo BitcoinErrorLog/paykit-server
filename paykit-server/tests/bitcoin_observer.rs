@@ -1,4 +1,4 @@
-use bitcoin::{hashes::Hash, OutPoint, Txid};
+use bitcoin::{OutPoint, Txid, hashes::Hash};
 use paykit_server::{
     bitcoin::{DirectBinding, ObservationAction, ObservationTarget, ObservedOutput, TrackedOutput},
     config::BitcoinNetwork,
@@ -112,17 +112,17 @@ mod tick {
     };
 
     use async_trait::async_trait;
-    use bitcoin::{hashes::Hash, OutPoint, Txid};
+    use bitcoin::{OutPoint, Txid, hashes::Hash};
     use paykit_server::{
         bitcoin::{ObservationTarget, PlannedObservation},
         config::BitcoinNetwork,
         persistence::PendingCandidate,
         runtime::{DependencyCheck, Runtime},
         workers::observer::{
-            observe_tick, AddressFailureReason, CandidateTransaction, ElectrumPort,
+            AddressFailureReason, CandidateFailureKind, CandidateTransaction, ElectrumPort,
             FailedObservation, ObservationBackend, ObservationReport, ObserverBackoff,
             ObserverError, ObserverPolicy, ObserverTickOutcome, ObserverTickState, RequestLimiter,
-            TipProbe,
+            TipProbe, observe_tick,
         },
     };
 
@@ -155,6 +155,7 @@ mod tick {
             max_requests_per_tick: budget,
             max_requests_per_second: 100,
             max_transaction_bytes: 400_000,
+            baseline_completion_timeout: Duration::from_secs(60),
         }
     }
 
@@ -346,10 +347,21 @@ mod tick {
             candidate: &PendingCandidate,
             _inputs: &[OutPoint],
         ) -> Result<(), ObserverError> {
+            if candidate.invoice_id.is_nil() {
+                return Err(ObserverError::Persistence);
+            }
             self.candidates
                 .lock()
                 .unwrap()
                 .retain(|entry| entry != candidate);
+            Ok(())
+        }
+
+        async fn record_candidate_failure(
+            &self,
+            _candidate: &PendingCandidate,
+            _kind: CandidateFailureKind,
+        ) -> Result<(), ObserverError> {
             Ok(())
         }
     }
@@ -369,14 +381,14 @@ mod tick {
             outpoint: OutPoint::new(txid, 0),
         });
         let runtime = runtime();
+        let mut observer_state = state(&policy(4));
 
         let _ = observe_tick(
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(4),
             &runtime,
-            &mut failure_gate(),
+            &mut observer_state,
         )
         .await;
         let first_bind_requests = port.candidate_calls.lock().unwrap().len();
@@ -384,9 +396,8 @@ mod tick {
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(4),
             &runtime,
-            &mut failure_gate(),
+            &mut observer_state,
         )
         .await;
         let already_bound_requests =
@@ -401,9 +412,8 @@ mod tick {
             &port,
             &no_candidate_backend,
             &BitcoinNetwork::Regtest,
-            &policy(4),
             &runtime,
-            &mut failure_gate(),
+            &mut observer_state,
         )
         .await;
 
@@ -417,6 +427,37 @@ mod tick {
         assert_eq!(first_bind_requests, 1);
         assert_eq!(already_bound_requests, 0);
         assert_eq!(no_candidate_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn candidate_persistence_failure_does_not_degrade_electrum_availability() {
+        let port = FakeElectrum::healthy();
+        let backend = FakeBackend::default();
+        backend
+            .entries
+            .lock()
+            .unwrap()
+            .push(FakeEntry::new("candidate-persistence", 30));
+        backend.candidates.lock().unwrap().push(PendingCandidate {
+            invoice_id: uuid::Uuid::nil(),
+            outpoint: OutPoint::new(Txid::from_byte_array([43; 32]), 0),
+        });
+        let runtime = runtime();
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state(&policy(4)),
+        )
+        .await;
+        assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
+        assert_eq!(
+            runtime.readiness().await.electrum,
+            paykit_server::runtime::ComponentState::Ready
+        );
+        assert_eq!(backend.candidates.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -884,6 +925,7 @@ mod tick {
             entries: Mutex::new(vec![FakeEntry::new("a", 600), FakeEntry::new("b", 300)]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            candidates: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut state = state(&policy(100));
@@ -1070,6 +1112,7 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            candidates: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         // Capacity 6, fast refill rewound away: the tick alone would
@@ -1135,6 +1178,7 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            candidates: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
 
@@ -1182,6 +1226,7 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            candidates: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut state = state(&policy(100));
@@ -1264,6 +1309,7 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            candidates: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         // Capacity 3 (one post-probe lookup), rate 1/s: an immediate second
@@ -1272,6 +1318,8 @@ mod tick {
             poll_interval: Duration::from_secs(10),
             max_requests_per_tick: 3,
             max_requests_per_second: 1,
+            max_transaction_bytes: 400_000,
+            baseline_completion_timeout: Duration::from_secs(60),
         });
 
         let outcome = observe_tick(

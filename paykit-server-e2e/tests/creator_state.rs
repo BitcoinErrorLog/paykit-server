@@ -264,8 +264,8 @@ async fn startup_rejects_corrupt_encrypted_payment_records_before_readiness() {
          (id, creator_id, reader_lookup_hash, bundle_lookup_hash,
           payment_request_lookup_hash, invoice_envelope, payment_status,
           payment_record_envelope, bitcoin_address_lookup_hash,
-          derivation_index_lookup_hash)
-         VALUES ($1, $2, $3, $4, $5, $6, 'undetected', $7, $8, $9)",
+          derivation_index_lookup_hash, baseline_state)
+         VALUES ($1, $2, $3, $4, $5, $6, 'undetected', $7, $8, $9, 'observing')",
     )
     .bind(invoice_id)
     .bind(creator_id)

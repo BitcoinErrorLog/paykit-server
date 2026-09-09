@@ -1,31 +1,31 @@
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use async_trait::async_trait;
 use axum::{
+    Extension,
     body::Body,
     http::{Method, Request, StatusCode},
-    Extension,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
 use paykit_server::{
     application::create_invoice::{
-        derive_bip84_p2wpkh_address, CreateInvoiceError, CreatorXpubProvider, InvoicePersistence,
-        MarkerDiscovery, PaykitIntentBuilder, SessionValidationError, SessionValidator,
+        CreateInvoiceError, CreatorXpubProvider, InvoicePersistence, MarkerDiscovery,
+        PaykitIntentBuilder, SessionValidationError, SessionValidator, derive_bip84_p2wpkh_address,
     },
     application::create_payment_request::{
         MarketplacePaymentRequest, MarketplacePaymentRequestService,
     },
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     config::{BitcoinNetwork, Config, ConfigEnvironment},
-    domain::locks::{parse_bundle_id, parse_creator, parse_reader, CreatorPubky},
+    domain::locks::{CreatorPubky, parse_bundle_id, parse_creator, parse_reader},
     http::{auth::SignedLocksAuth, payment_requests::payment_requests_router},
     persistence::{AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, PersistenceError},
     workers::observer::{
-        CreationSnapshot, ElectrumPort, ObservationReport, ObserverError, TipProbe,
+        CreationSnapshot, ElectrumPort, ObservationReport, ObserverError, RequestLimiter, TipProbe,
     },
 };
 use tower::ServiceExt;
@@ -42,6 +42,7 @@ impl ElectrumPort for EmptyBaselineElectrum {
         _address: &str,
         _max_history_entries: usize,
         _max_transaction_bytes: usize,
+        _request_limiter: &RequestLimiter,
     ) -> Result<CreationSnapshot, ObserverError> {
         Ok(CreationSnapshot {
             tip_height: 100,
@@ -75,6 +76,7 @@ impl ElectrumPort for FailingBaselineElectrum {
         _address: &str,
         _max_history_entries: usize,
         _max_transaction_bytes: usize,
+        _request_limiter: &RequestLimiter,
     ) -> Result<CreationSnapshot, ObserverError> {
         Err(ObserverError::Unavailable)
     }
@@ -101,6 +103,7 @@ impl ElectrumPort for StaleBaselineElectrum {
         _address: &str,
         _max_history_entries: usize,
         _max_transaction_bytes: usize,
+        _request_limiter: &RequestLimiter,
     ) -> Result<CreationSnapshot, ObserverError> {
         Ok(CreationSnapshot {
             tip_height: 96,
@@ -192,9 +195,9 @@ struct FakeCredentials;
 
 fn account_xpub() -> String {
     use bitcoin::{
+        Network,
         bip32::{ChildNumber, Xpriv, Xpub},
         secp256k1::Secp256k1,
-        Network,
     };
     let secp = Secp256k1::new();
     let account = Xpriv::new_master(Network::Bitcoin, &[42; 32])
@@ -405,9 +408,9 @@ async fn persists_exact_terms_bindings_and_derived_address_without_a_lock() {
 #[tokio::test]
 async fn regtest_deployments_advertise_the_regtest_endpoint_identifier() {
     use bitcoin::{
+        Network,
         bip32::{ChildNumber, Xpriv, Xpub},
         secp256k1::Secp256k1,
-        Network,
     };
     struct RegtestCredentials;
     #[async_trait]
@@ -861,8 +864,8 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
         bitcoin::{ObservationTarget, PlannedObservation},
         runtime::{DependencyCheck, Runtime},
         workers::observer::{
-            observe_tick, ElectrumPort, ObservationBackend, ObservationReport, ObserverError,
-            ObserverPolicy, ObserverTickOutcome, ObserverTickState, TipProbe,
+            ElectrumPort, ObservationBackend, ObservationReport, ObserverError, ObserverPolicy,
+            ObserverTickOutcome, ObserverTickState, TipProbe, observe_tick,
         },
     };
 
@@ -948,6 +951,7 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
             max_requests_per_tick: 100,
             max_requests_per_second: 5,
             max_transaction_bytes: 400_000,
+            baseline_completion_timeout: std::time::Duration::from_secs(60),
         }),
     )
     .await;

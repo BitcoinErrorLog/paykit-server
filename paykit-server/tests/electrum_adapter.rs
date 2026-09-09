@@ -26,6 +26,7 @@ use paykit_server::{
     config::BitcoinNetwork,
     workers::observer::{
         AddressFailureReason, ElectrumAdapter, ElectrumPort, FailedObservation, ObserverError,
+        RequestLimiter,
     },
 };
 
@@ -242,6 +243,29 @@ async fn candidate_fetch_uses_exactly_one_distinct_transaction_request() {
 
     assert_eq!(fetched.txid, txid);
     assert!(fetched.inputs.is_empty());
+    server.assert_rpc_counts(0, 0, 1);
+}
+
+#[tokio::test]
+async fn candidate_fetch_rejects_a_transaction_over_the_byte_cap() {
+    let transaction = Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: Vec::new(),
+        output: Vec::new(),
+    };
+    let txid = transaction.compute_txid();
+    let server = ProtocolServer::start_with_transaction(
+        Network::Regtest,
+        encode::serialize_hex(&transaction),
+    )
+    .await;
+    let adapter = connect(&server).await;
+
+    assert_eq!(
+        adapter.candidate_transaction(txid, 0).await,
+        Err(ObserverError::Unavailable)
+    );
     server.assert_rpc_counts(0, 0, 1);
 }
 
@@ -596,6 +620,90 @@ async fn probe_classifies_endpoint_outage_as_retryable_unavailable() {
     assert_eq!(adapter.probe().await, Err(ObserverError::Unavailable));
 }
 
+#[tokio::test]
+async fn creation_snapshot_reads_tip_after_history_and_unspent() {
+    let address = fixture_address();
+    let server =
+        ProtocolServer::start_creation_snapshot(Network::Regtest, address.script_pubkey()).await;
+    let adapter = ElectrumAdapter::configured(
+        server.endpoint(),
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(1),
+        200,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+
+    let snapshot = adapter
+        .creation_snapshot(
+            &address.to_string(),
+            50,
+            400_000,
+            &RequestLimiter::new(100, 0),
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot.tip_height, u32::try_from(TIP_HEIGHT).unwrap());
+    let requests = server.fixture.request_log.lock().unwrap();
+    let ordered = requests
+        .iter()
+        .filter(|request| {
+            matches!(
+                request.as_str(),
+                "blockchain.scripthash.get_history"
+                    | "blockchain.scripthash.listunspent"
+                    | "blockchain.headers.subscribe"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ordered,
+        vec![
+            "blockchain.scripthash.get_history",
+            "blockchain.scripthash.listunspent",
+            "blockchain.headers.subscribe",
+        ],
+        "a transaction mined while history is read is either captured by the snapshot or at/below the later floor"
+    );
+}
+
+#[tokio::test]
+async fn creation_snapshot_rejects_history_over_the_entry_cap_before_transaction_fetches() {
+    let address = fixture_address();
+    let server = ProtocolServer::start_with_fixture(
+        Network::Regtest,
+        vec![(address.script_pubkey(), serde_json::json!([]))],
+        51,
+        true,
+        None,
+        false,
+        None,
+    )
+    .await;
+    let adapter = ElectrumAdapter::configured(
+        server.endpoint(),
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(1),
+        200,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+
+    assert_eq!(
+        adapter
+            .creation_snapshot(
+                &address.to_string(),
+                50,
+                400_000,
+                &RequestLimiter::new(100, 0),
+            )
+            .await,
+        Err(ObserverError::Unavailable)
+    );
+    server.assert_rpc_counts(0, 1, 0);
+}
+
 struct ProtocolServer {
     endpoint: String,
     wake_address: SocketAddr,
@@ -612,6 +720,7 @@ struct ProtocolFixture {
     unspent_by_script: Vec<(ScriptBuf, serde_json::Value)>,
     /// History length served if the adapter ever calls get_history.
     history_len: usize,
+    serve_history: bool,
     /// Script whose list_unspent response is delayed, and the delay.
     stall: Option<(ScriptBuf, Duration)>,
     /// Close each connection after its first list_unspent response.
@@ -633,7 +742,7 @@ impl ProtocolServer {
     }
 
     async fn start_multi(network: Network, unspent: Vec<(ScriptBuf, serde_json::Value)>) -> Self {
-        Self::start_with_fixture(network, unspent, 0, None, false, None).await
+        Self::start_with_fixture(network, unspent, 0, false, None, false, None).await
     }
 
     /// Starts a server that would answer get_history with `history_len`
@@ -645,6 +754,7 @@ impl ProtocolServer {
             network,
             vec![(script, unspent)],
             history_len,
+            false,
             None,
             false,
             None,
@@ -662,6 +772,7 @@ impl ProtocolServer {
             network,
             healthy,
             0,
+            false,
             Some((stalled_script, stall)),
             false,
             None,
@@ -671,17 +782,40 @@ impl ProtocolServer {
 
     async fn start_disconnecting(network: Network, script: ScriptBuf) -> Self {
         let unspent = serde_json::json!([unspent_entry(11, 125_000, TIP_HEIGHT)]);
-        Self::start_with_fixture(network, vec![(script, unspent)], 0, None, true, None).await
+        Self::start_with_fixture(network, vec![(script, unspent)], 0, false, None, true, None).await
     }
 
     async fn start_with_transaction(network: Network, transaction_raw: String) -> Self {
-        Self::start_with_fixture(network, Vec::new(), 0, None, false, Some(transaction_raw)).await
+        Self::start_with_fixture(
+            network,
+            Vec::new(),
+            0,
+            false,
+            None,
+            false,
+            Some(transaction_raw),
+        )
+        .await
+    }
+
+    async fn start_creation_snapshot(network: Network, script: ScriptBuf) -> Self {
+        Self::start_with_fixture(
+            network,
+            vec![(script, serde_json::json!([]))],
+            0,
+            true,
+            None,
+            false,
+            None,
+        )
+        .await
     }
 
     async fn start_with_fixture(
         network: Network,
         unspent_by_script: Vec<(ScriptBuf, serde_json::Value)>,
         history_len: usize,
+        serve_history: bool,
         stall: Option<(ScriptBuf, Duration)>,
         disconnect_after_unspent: bool,
         transaction_raw: Option<String>,
@@ -696,6 +830,7 @@ impl ProtocolServer {
             tip_height: TIP_HEIGHT,
             unspent_by_script,
             history_len,
+            serve_history,
             stall,
             disconnect_after_unspent,
             transaction_raw,
@@ -796,8 +931,21 @@ fn serve_connection(mut stream: TcpStream, fixture: Arc<ProtocolFixture>) {
             // The adapter must never call these; if it ever does, fail the
             // test loudly instead of silently serving a fanout.
             "blockchain.scripthash.get_history" => {
-                let _ = fixture.history_len;
-                panic!("adapter called blockchain.scripthash.get_history");
+                if fixture.serve_history {
+                    serde_json::Value::Array(
+                        (0..fixture.history_len)
+                            .map(|index| {
+                                serde_json::json!({
+                                    "tx_hash": format!("{:064x}", index + 1),
+                                    "height": 1
+                                })
+                            })
+                            .collect(),
+                    )
+                } else {
+                    let _ = fixture.history_len;
+                    panic!("adapter called blockchain.scripthash.get_history");
+                }
             }
             "blockchain.transaction.get" => serde_json::Value::String(
                 fixture

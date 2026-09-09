@@ -633,7 +633,12 @@ fn deployment_stack_role_is_required_and_named_when_missing_or_unrecognised() {
 
     let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
     assert_eq!(config.deployment_invariants().stack_role.as_str(), "proof");
-    let production = valid_toml().replace("stack_role = \"proof\"", "stack_role = \"production\"");
+    let production = valid_toml()
+        .replace("stack_role = \"proof\"", "stack_role = \"production\"")
+        .replace(
+            "network = \"testnet\"\n[deployment]",
+            "network = \"mainnet\"\n[deployment]",
+        );
     let config = Config::from_toml_and_environment(&production, environment()).unwrap();
     assert_eq!(
         config.deployment_invariants().stack_role.as_str(),

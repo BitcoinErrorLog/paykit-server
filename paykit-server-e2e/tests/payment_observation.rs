@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::{str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
-use bitcoin::{OutPoint, Txid, hashes::Hash};
+use bitcoin::{Address, CompressedPublicKey, Network, OutPoint, Txid, hashes::Hash};
 use paykit_sdk::{ReceiverNoiseSecretKey, storage::StorageState};
 use paykit_server::{
     bitcoin::{ObservationTarget, ObservedOutput, TrackedOutput},
@@ -207,6 +207,27 @@ async fn awaiting_invoice(
         .invoice_id()
 }
 
+async fn awaiting_other_creator_invoice(
+    store: &InvoiceStore,
+    bundle: &'static [u8],
+    request: &'static [u8],
+    address: &'static str,
+) -> uuid::Uuid {
+    store
+        .create_awaiting_baseline(AtomicInvoiceInput {
+            creator: &other_creator(),
+            reader: &reader(),
+            bundle_binding: bundle,
+            payment_request_binding: request,
+            new_reader_payloads: &FixedPayloads(address),
+            payment_request_intent: common::payment_intent(&reader()),
+            required_sats: 100,
+        })
+        .await
+        .unwrap()
+        .invoice_id()
+}
+
 #[tokio::test]
 async fn new_1_baseline_unconfirmed_later_confirmed_above_floor_never_binds() {
     let database = TestDatabase::create().await;
@@ -389,6 +410,245 @@ async fn output_at_or_below_creation_floor_writes_no_observation() {
     database.cleanup().await;
 }
 
+#[tokio::test]
+async fn confirmed_height_uses_chain_height_instead_of_confirmation_count() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let invoice_id =
+        awaiting_invoice(&store, b"height-bundle", b"height-request", REGTEST_ADDRESS).await;
+    store
+        .complete_creation_baseline(invoice_id, 850_000, &[], &[])
+        .await
+        .unwrap();
+    let below = provider_outpoint(208);
+    store
+        .apply_bitcoin_observation_at_height(
+            REGTEST_ADDRESS,
+            &BitcoinOutpoint::from_bitcoin(below),
+            100,
+            1,
+            Some(850_000),
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(store.pending_candidates().await.unwrap().is_empty());
+
+    let above = provider_outpoint(209);
+    store
+        .apply_bitcoin_observation_at_height(
+            REGTEST_ADDRESS,
+            &BitcoinOutpoint::from_bitcoin(above),
+            100,
+            1,
+            Some(850_001),
+            true,
+        )
+        .await
+        .unwrap();
+    let candidate = store.pending_candidates().await.unwrap().remove(0);
+    store.resolve_candidate(&candidate, &[]).await.unwrap();
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 1, true)
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn overpaying_replacement_inherits_baseline_and_requires_manual_review() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let invoice_id = awaiting_invoice(
+        &store,
+        b"overpay-bundle",
+        b"overpay-request",
+        REGTEST_ADDRESS,
+    )
+    .await;
+    let baseline_input = provider_outpoint(210);
+    store
+        .complete_creation_baseline(invoice_id, 100, &[], &[baseline_input])
+        .await
+        .unwrap();
+    let replacement = provider_outpoint(211);
+    store
+        .apply_bitcoin_observation_at_height(
+            REGTEST_ADDRESS,
+            &BitcoinOutpoint::from_bitcoin(replacement),
+            101,
+            1,
+            Some(101),
+            true,
+        )
+        .await
+        .unwrap();
+    let candidate = store.pending_candidates().await.unwrap().remove(0);
+    store
+        .resolve_candidate(&candidate, &[baseline_input])
+        .await
+        .unwrap();
+
+    let state: String = sqlx::query_scalar("SELECT baseline_state FROM invoices WHERE id = $1")
+        .bind(invoice_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(state, "manual_review");
+    assert_invoice_has_no_observation_writes(&database, invoice_id).await;
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn candidate_backoff_skips_a_then_exhaustion_routes_it_to_manual_review() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let invoice_a = awaiting_invoice(
+        &store,
+        b"candidate-a-bundle",
+        b"candidate-a-request",
+        REGTEST_ADDRESS,
+    )
+    .await;
+    store
+        .complete_creation_baseline(invoice_a, 100, &[], &[])
+        .await
+        .unwrap();
+    let outpoint_a = provider_outpoint(212);
+    store
+        .apply_bitcoin_observation_at_height(
+            REGTEST_ADDRESS,
+            &BitcoinOutpoint::from_bitcoin(outpoint_a),
+            100,
+            1,
+            Some(101),
+            true,
+        )
+        .await
+        .unwrap();
+    let candidate_a = store.pending_candidates().await.unwrap().remove(0);
+    store
+        .record_candidate_failure(&candidate_a, "fetch", 12)
+        .await
+        .unwrap();
+    assert!(store.pending_candidates().await.unwrap().is_empty());
+    let attempt: (i32, bool, String) = sqlx::query_as(
+        "SELECT attempt_count, next_attempt_at > last_attempt_at, last_error_kind
+         FROM bitcoin_observation_candidates WHERE invoice_id = $1",
+    )
+    .bind(invoice_a)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(attempt, (1, true, "fetch".into()));
+
+    let address_b = "bcrt1q6rz28mcfaxtmdy5rme7l2ae6f4h0d2sgzvv5u0";
+    let invoice_b = awaiting_invoice(
+        &store,
+        b"candidate-b-bundle",
+        b"candidate-b-request",
+        address_b,
+    )
+    .await;
+    store
+        .complete_creation_baseline(invoice_b, 100, &[], &[])
+        .await
+        .unwrap();
+    let outpoint_b = provider_outpoint(213);
+    store
+        .apply_bitcoin_observation_at_height(
+            address_b,
+            &BitcoinOutpoint::from_bitcoin(outpoint_b),
+            100,
+            1,
+            Some(101),
+            true,
+        )
+        .await
+        .unwrap();
+    let ready = store.pending_candidates().await.unwrap();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].invoice_id, invoice_b);
+
+    for _ in 1..12 {
+        sqlx::query(
+            "UPDATE bitcoin_observation_candidates SET next_attempt_at = NOW()
+             WHERE invoice_id = $1",
+        )
+        .bind(invoice_a)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        store
+            .record_candidate_failure(&candidate_a, "fetch", 12)
+            .await
+            .unwrap();
+    }
+    let exhausted: (i32, String, String) = sqlx::query_as(
+        "SELECT candidates.attempt_count, candidates.state, invoices.baseline_state
+         FROM bitcoin_observation_candidates candidates
+         JOIN invoices ON invoices.id = candidates.invoice_id
+         WHERE candidates.invoice_id = $1",
+    )
+    .bind(invoice_a)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        exhausted,
+        (12, "unfetchable".into(), "manual_review".into())
+    );
+    assert!(
+        store
+            .pending_candidates()
+            .await
+            .unwrap()
+            .iter()
+            .all(|candidate| candidate.invoice_id != invoice_a)
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn stale_awaiting_baseline_is_voided_and_prepared_outbox_is_terminal() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let invoice_id = awaiting_invoice(
+        &store,
+        b"sweeper-bundle",
+        b"sweeper-request",
+        REGTEST_ADDRESS,
+    )
+    .await;
+    sqlx::query("UPDATE invoices SET created_at = NOW() - INTERVAL '2 minutes' WHERE id = $1")
+        .bind(invoice_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .sweep_stale_creation_baselines(std::time::Duration::from_secs(60))
+            .await
+            .unwrap(),
+        1
+    );
+    let state: String = sqlx::query_scalar("SELECT baseline_state FROM invoices WHERE id = $1")
+        .bind(invoice_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(state, "void_baseline_failed");
+    let statuses: Vec<String> =
+        sqlx::query_scalar("SELECT status FROM outbox WHERE invoice_id = $1 ORDER BY id")
+            .bind(invoice_id)
+            .fetch_all(database.pool())
+            .await
+            .unwrap();
+    assert!(!statuses.is_empty() && statuses.iter().all(|status| status == "prepared"));
+    database.cleanup().await;
+}
+
 struct FixedBatch(Vec<ObservedOutput>);
 
 #[async_trait]
@@ -426,6 +686,104 @@ async fn observe_once(
 ) -> Result<usize, ObserverError> {
     let report = port.observations(0, targets).await?;
     ObservationBackend::apply_observations(store, network, targets, report.outputs).await
+}
+
+#[tokio::test]
+async fn corrupt_invoice_is_isolated_while_other_observation_commits() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    create_other_creator(&database).await;
+    let bad_address = REGTEST_ADDRESS;
+    let good_address: &'static str = Box::leak(
+        Address::p2wpkh(
+            &CompressedPublicKey::from_str(
+                "0379be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            )
+            .unwrap(),
+            Network::Regtest,
+        )
+        .to_string()
+        .into_boxed_str(),
+    );
+    let bad_id = awaiting_invoice(
+        &store,
+        b"bad-integrity-bundle",
+        b"bad-integrity-request",
+        bad_address,
+    )
+    .await;
+    store
+        .complete_creation_baseline(bad_id, 100, &[], &[])
+        .await
+        .unwrap();
+    let good_id = awaiting_other_creator_invoice(
+        &store,
+        b"good-integrity-bundle",
+        b"good-integrity-request",
+        good_address,
+    )
+    .await;
+    store
+        .complete_creation_baseline(good_id, 100, &[], &[])
+        .await
+        .unwrap();
+    let targets = observation_targets(&store).await;
+    sqlx::query("UPDATE invoices SET payment_record_envelope = $1 WHERE id = $2")
+        .bind(b"corrupt-v1".as_slice())
+        .bind(bad_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let outputs = vec![
+        ObservedOutput {
+            network: BitcoinNetwork::Regtest,
+            address: bad_address.into(),
+            outpoint: provider_outpoint(214),
+            sats: 100,
+            confirmations: 0,
+            confirmed_height: None,
+            present: true,
+        },
+        ObservedOutput {
+            network: BitcoinNetwork::Regtest,
+            address: good_address.into(),
+            outpoint: provider_outpoint(215),
+            sats: 100,
+            confirmations: 0,
+            confirmed_height: None,
+            present: true,
+        },
+    ];
+    assert_eq!(
+        observe_once(
+            &FixedBatch(outputs),
+            &store,
+            &BitcoinNetwork::Regtest,
+            &targets,
+        )
+        .await
+        .unwrap(),
+        1
+    );
+    let bad_integrity: (bool, i32) = sqlx::query_as(
+        "SELECT integrity_failed, integrity_failure_count FROM invoices WHERE id = $1",
+    )
+    .bind(bad_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(bad_integrity, (true, 1));
+    assert_eq!(
+        facts(&database, good_id).await,
+        ("detected".into(), 0, true)
+    );
+    assert!(
+        observation_targets(&store)
+            .await
+            .iter()
+            .all(|target| target.address() != bad_address)
+    );
+    database.cleanup().await;
 }
 
 /// Every non-final invoice as an observation target, via the durable plan.
@@ -490,7 +848,7 @@ async fn observation_targets_reconstruct_active_output_and_exclude_final_invoice
     let persisted = BitcoinOutpoint::from_bitcoin(provider_outpoint);
     assert!(
         store
-            .apply_bitcoin_observation(REGTEST_ADDRESS, &persisted, 100, 2, true)
+            .apply_bitcoin_observation(REGTEST_ADDRESS, &persisted, 100, 2, None, true)
             .await
             .unwrap()
     );
@@ -502,7 +860,7 @@ async fn observation_targets_reconstruct_active_output_and_exclude_final_invoice
 
     assert!(
         store
-            .apply_bitcoin_observation(REGTEST_ADDRESS, &persisted, 100, 6, true)
+            .apply_bitcoin_observation(REGTEST_ADDRESS, &persisted, 100, 6, None, true)
             .await
             .unwrap()
     );
@@ -809,7 +1167,7 @@ async fn unrepresentable_confirmation_late_in_batch_causes_no_database_write() {
 }
 
 #[tokio::test]
-async fn persistence_conflict_late_in_batch_rolls_back_earlier_observations() {
+async fn persistence_conflict_late_in_batch_keeps_earlier_invoice_commit() {
     let database = TestDatabase::create().await;
     let (store, invoice_id) = batch_invoice(&database).await;
     create_other_creator(&database).await;
@@ -829,6 +1187,7 @@ async fn persistence_conflict_late_in_batch_rolls_back_earlier_observations() {
                 &conflicting_outpoint,
                 100,
                 0,
+                None,
                 true,
             )
             .await
@@ -867,7 +1226,7 @@ async fn persistence_conflict_late_in_batch_rolls_back_earlier_observations() {
     );
     assert_eq!(
         facts(&database, invoice_id).await,
-        ("undetected".into(), 0, false)
+        ("detected".into(), 0, true)
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -877,7 +1236,7 @@ async fn persistence_conflict_late_in_batch_rolls_back_earlier_observations() {
         .fetch_one(database.pool())
         .await
         .unwrap(),
-        0
+        1
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -954,7 +1313,14 @@ async fn direct_observation_persists_replacement_reorg_and_six_confirmation_fina
 
     assert!(
         !store
-            .apply_bitcoin_observation("wrong-address", &persisted_outpoint("wrong"), 100, 0, true,)
+            .apply_bitcoin_observation(
+                "wrong-address",
+                &persisted_outpoint("wrong"),
+                100,
+                0,
+                None,
+                true,
+            )
             .await
             .unwrap()
     );
@@ -964,11 +1330,11 @@ async fn direct_observation_persists_replacement_reorg_and_six_confirmation_fina
     );
 
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("rbf-old"), 100, 0, true)
+        .apply_bitcoin_observation(&address, &persisted_outpoint("rbf-old"), 100, 0, None, true)
         .await
         .unwrap();
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("rbf-new"), 101, 0, true)
+        .apply_bitcoin_observation(&address, &persisted_outpoint("rbf-new"), 101, 0, None, true)
         .await
         .unwrap();
     assert_eq!(
@@ -1000,7 +1366,7 @@ async fn direct_observation_persists_replacement_reorg_and_six_confirmation_fina
     );
 
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("rbf-new"), 101, 1, true)
+        .apply_bitcoin_observation(&address, &persisted_outpoint("rbf-new"), 101, 1, None, true)
         .await
         .unwrap();
     store
@@ -1009,6 +1375,7 @@ async fn direct_observation_persists_replacement_reorg_and_six_confirmation_fina
             &persisted_outpoint("ignored-while-frozen"),
             100,
             0,
+            None,
             true,
         )
         .await
@@ -1028,7 +1395,14 @@ async fn direct_observation_persists_replacement_reorg_and_six_confirmation_fina
     );
 
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("rbf-new"), 101, 1, false)
+        .apply_bitcoin_observation(
+            &address,
+            &persisted_outpoint("rbf-new"),
+            101,
+            1,
+            None,
+            false,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1036,7 +1410,14 @@ async fn direct_observation_persists_replacement_reorg_and_six_confirmation_fina
         ("undetected".into(), 0, false)
     );
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("after-unseen"), 100, 1, true)
+        .apply_bitcoin_observation(
+            &address,
+            &persisted_outpoint("after-unseen"),
+            100,
+            1,
+            None,
+            true,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1044,15 +1425,29 @@ async fn direct_observation_persists_replacement_reorg_and_six_confirmation_fina
         ("confirmed".into(), 1, true)
     );
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("after-unseen"), 100, 0, true)
+        .apply_bitcoin_observation(
+            &address,
+            &persisted_outpoint("after-unseen"),
+            100,
+            0,
+            None,
+            true,
+        )
         .await
         .unwrap();
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("rbf-new"), 101, 0, true)
+        .apply_bitcoin_observation(&address, &persisted_outpoint("rbf-new"), 101, 0, None, true)
         .await
         .unwrap();
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("after-reorg"), 100, 1, true)
+        .apply_bitcoin_observation(
+            &address,
+            &persisted_outpoint("after-reorg"),
+            100,
+            1,
+            None,
+            true,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1061,11 +1456,25 @@ async fn direct_observation_persists_replacement_reorg_and_six_confirmation_fina
     );
 
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("after-reorg"), 100, 9, true)
+        .apply_bitcoin_observation(
+            &address,
+            &persisted_outpoint("after-reorg"),
+            100,
+            9,
+            None,
+            true,
+        )
         .await
         .unwrap();
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("ignored-final"), 100, 0, true)
+        .apply_bitcoin_observation(
+            &address,
+            &persisted_outpoint("ignored-final"),
+            100,
+            0,
+            None,
+            true,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1098,7 +1507,14 @@ async fn underpayment_is_nonfinal_replaceable_and_outpoints_stay_globally_unique
     let (invoice_id, address) = invoice(&store).await;
 
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("underpaid"), 99, 20, true)
+        .apply_bitcoin_observation(
+            &address,
+            &persisted_outpoint("underpaid"),
+            99,
+            20,
+            None,
+            true,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1106,7 +1522,14 @@ async fn underpayment_is_nonfinal_replaceable_and_outpoints_stay_globally_unique
         ("confirmed".into(), 20, false)
     );
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("underpaid"), 100, 0, true)
+        .apply_bitcoin_observation(
+            &address,
+            &persisted_outpoint("underpaid"),
+            100,
+            0,
+            None,
+            true,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1120,7 +1543,14 @@ async fn underpayment_is_nonfinal_replaceable_and_outpoints_stay_globally_unique
         1
     );
     store
-        .apply_bitcoin_observation(&address, &persisted_outpoint("replacement"), 100, 0, true)
+        .apply_bitcoin_observation(
+            &address,
+            &persisted_outpoint("replacement"),
+            100,
+            0,
+            None,
+            true,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1159,6 +1589,7 @@ async fn underpayment_is_nonfinal_replaceable_and_outpoints_stay_globally_unique
             &persisted_outpoint("replacement"),
             100,
             0,
+            None,
             true,
         )
         .await
@@ -1208,8 +1639,9 @@ async fn concurrent_first_attribution_of_one_outpoint_has_exactly_one_invoice_ow
     .unwrap();
 
     let race_outpoint = persisted_outpoint("race-outpoint");
-    let first = store.apply_bitcoin_observation(&first_address, &race_outpoint, 100, 1, true);
-    let second = store.apply_bitcoin_observation(second_address, &race_outpoint, 100, 1, true);
+    let first = store.apply_bitcoin_observation(&first_address, &race_outpoint, 100, 1, None, true);
+    let second =
+        store.apply_bitcoin_observation(second_address, &race_outpoint, 100, 1, None, true);
     let (first, second) = tokio::join!(first, second);
     assert!(matches!(
         (&first, &second),
@@ -1310,6 +1742,7 @@ async fn payment_record_integrity_rejects_row_and_type_envelope_swaps() {
             &persisted_outpoint("swap-first"),
             100,
             0,
+            None,
             true,
         )
         .await
@@ -1320,6 +1753,7 @@ async fn payment_record_integrity_rejects_row_and_type_envelope_swaps() {
             &persisted_outpoint("swap-second"),
             100,
             0,
+            None,
             true,
         )
         .await
