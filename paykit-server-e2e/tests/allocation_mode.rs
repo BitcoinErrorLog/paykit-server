@@ -271,6 +271,8 @@ async fn paste_is_shared_manual_bitkit_corroborated_is_exclusive_and_status_is_o
     assert_eq!(status, StatusCode::OK, "A's paste claim: {body}");
     assert_eq!(body["allocation_mode"], "shared_manual");
     assert_eq!(body["downgrade_reason"], "claim_channel_not_bitkit");
+    let claim_fingerprint_a = body["key_fingerprint"].clone();
+    let claim_address_a = body["first_derived_address"].clone();
     // Every pre-existing claim response field survives.
     assert_eq!(body["status"], "claimed");
     assert_eq!(body["account_index"], 1);
@@ -316,6 +318,8 @@ async fn paste_is_shared_manual_bitkit_corroborated_is_exclusive_and_status_is_o
     assert_eq!(status, StatusCode::OK, "B's bitkit claim: {body}");
     assert_eq!(body["allocation_mode"], "exclusive");
     assert!(body["downgrade_reason"].is_null());
+    let claim_fingerprint_b = body["key_fingerprint"].clone();
+    let claim_address_b = body["first_derived_address"].clone();
     assert_eq!(
         history_b.calls(),
         1,
@@ -343,6 +347,10 @@ async fn paste_is_shared_manual_bitkit_corroborated_is_exclusive_and_status_is_o
     assert_eq!(body["allocation_mode"], "exclusive");
     assert_eq!(body["claim_channel"], "bitkit_watch_only_v1");
     assert!(body["downgrade_reason"].is_null());
+    // The Ring-verification client's required evidence (it fails closed
+    // without both): exactly the claim response's values for this creator.
+    assert_eq!(body["key_fingerprint"], claim_fingerprint_b);
+    assert_eq!(body["first_derived_address"], claim_address_b);
     assert_eq!(body["evidence"], serde_json::json!([]));
     // No key material beyond the claim response's fields is present.
     let object = body.as_object().unwrap();
@@ -350,7 +358,13 @@ async fn paste_is_shared_manual_bitkit_corroborated_is_exclusive_and_status_is_o
         assert!(
             matches!(
                 key.as_str(),
-                "creator" | "allocation_mode" | "claim_channel" | "downgrade_reason" | "evidence"
+                "creator"
+                    | "allocation_mode"
+                    | "claim_channel"
+                    | "downgrade_reason"
+                    | "key_fingerprint"
+                    | "first_derived_address"
+                    | "evidence"
             ),
             "unexpected status field: {key}"
         );
@@ -398,6 +412,8 @@ async fn paste_is_shared_manual_bitkit_corroborated_is_exclusive_and_status_is_o
     assert_eq!(body["allocation_mode"], "shared_manual");
     assert_eq!(body["claim_channel"], "manual");
     assert_eq!(body["downgrade_reason"], "claim_channel_not_bitkit");
+    assert_eq!(body["key_fingerprint"], claim_fingerprint_a);
+    assert_eq!(body["first_derived_address"], claim_address_a);
 
     fixture.database.cleanup().await;
 }
@@ -539,6 +555,53 @@ async fn pasted_auto_is_refused_under_production_and_proof_roles() {
     fixture.database.cleanup().await;
 }
 
+/// An unknown `claim_channel` is refused with `unknown_claim_channel` (fail
+/// closed, §B.8.6: the field is one of `manual` | `bitkit_watch_only_v1`) —
+/// never canonicalized silently, never persisted verbatim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unknown_claim_channel_is_refused_and_persists_nothing() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let fixture = fixture().await;
+    let seller = fixture.seller().await;
+
+    let history = ScriptedHistory::clean();
+    let calls = history.clone();
+    let router = fixture.router(fixture.service(StackRole::Proof, history));
+    let (status, body) = post_claim(
+        &router,
+        &seller,
+        &fixture.required_capabilities,
+        &account_xpub(151, 1),
+        1,
+        Some("carrier_pigeon"),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("unknown_claim_channel")
+        ),
+        "unknown channel refused: {body}"
+    );
+    assert_eq!(calls.calls(), 0, "the refusal precedes the scan");
+    let creator_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM creators")
+        .fetch_one(fixture.database.pool())
+        .await
+        .unwrap();
+    let binding_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claimed_key_fingerprints")
+        .fetch_one(fixture.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        (creator_rows, binding_rows),
+        (0, 0),
+        "the refusal persists nothing"
+    );
+
+    fixture.database.cleanup().await;
+}
+
 /// The no-upgrade invariant, behaviourally: re-authentication may only keep
 /// or downgrade (design §B.8.6's transition table).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -585,9 +648,9 @@ async fn a_reclaim_may_only_keep_or_downgrade_never_upgrade() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(status_row.allocation_mode, "shared_manual");
+    assert_eq!(status_row.allocation.allocation_mode, "shared_manual");
     assert_eq!(
-        status_row.downgrade_reason.as_deref(),
+        status_row.allocation.downgrade_reason.as_deref(),
         Some("claim_channel_not_bitkit"),
         "a passing re-claim keeps the recorded reason"
     );
@@ -647,9 +710,9 @@ async fn a_reclaim_may_only_keep_or_downgrade_never_upgrade() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(status_row.allocation_mode, "shared_manual");
+    assert_eq!(status_row.allocation.allocation_mode, "shared_manual");
     assert_eq!(
-        status_row.downgrade_reason.as_deref(),
+        status_row.allocation.downgrade_reason.as_deref(),
         Some("account_has_history")
     );
 

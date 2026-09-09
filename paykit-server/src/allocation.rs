@@ -11,7 +11,10 @@
 //!
 //! The claim distinguishes a Bitkit exclusive claim from a paste by the
 //! `claim_channel` field on `POST /v0/accounts/claim` — `manual` or
-//! `bitkit_watch_only_v1`, recorded verbatim (§B.8.6). For
+//! `bitkit_watch_only_v1` (§B.8.6). A missing channel is treated — and
+//! recorded — as `manual`; any other value is refused with
+//! `unknown_claim_channel` (fail closed: unknown channels are never
+//! canonicalized silently and never persisted). For
 //! `bitkit_watch_only_v1` the server verifies four corroborating facts for
 //! itself — corroborated provenance, never proof (D7): the declared account
 //! index is at least 1, the declared index equals the key's own hardened
@@ -27,8 +30,9 @@ pub const CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1: &str = "bitkit_watch_only_v1";
 /// The `claim_channel` value a manual paste or file import asserts (§B.8.6).
 /// A missing `claim_channel` is treated — and recorded — as this channel:
 /// §B.8.6 gives the server nothing to corroborate for "a bare key and
-/// nothing else", so anything that is not the Bitkit channel is manual
-/// entry by construction.
+/// nothing else". A present channel that is neither this nor the Bitkit
+/// value never reaches the allocation decision: the claim refuses it with
+/// `unknown_claim_channel` (fail closed).
 pub const CLAIM_CHANNEL_MANUAL: &str = "manual";
 
 /// The `allocation_mode` request value that is refused unconditionally, on
@@ -94,13 +98,14 @@ impl DowngradeReason {
     }
 }
 
-/// The allocation decision one claim commit persists: the verbatim channel,
-/// the mode, and the downgrade reason when the mode is `shared_manual`
-/// because of a failed corroborating check.
+/// The allocation decision one claim commit persists: the channel, the
+/// mode, and the downgrade reason when the mode is `shared_manual` because
+/// of a failed corroborating check.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimAllocation {
-    /// The verbatim `claim_channel` from the claim request; `None` for the
-    /// Bitkit companion flow, which carries no channel assertion.
+    /// The `claim_channel` from the claim request (one of §B.8.6's two
+    /// values — unknown channels are refused before this point); `None` for
+    /// the Bitkit companion flow, which carries no channel assertion.
     pub channel: Option<String>,
     pub mode: AllocationMode,
     pub downgrade_reason: Option<DowngradeReason>,
@@ -134,8 +139,9 @@ impl ClaimAllocation {
 /// binding) and the §B.5 scan, from the scan result and key data already
 /// computed — it performs no I/O and no additional Electrum calls.
 ///
-/// * `channel`: the verbatim `claim_channel` submitted (already defaulted to
-///   `manual` when absent).
+/// * `channel`: the `claim_channel` submitted (already defaulted to `manual`
+///   when absent; unknown values are refused upstream, and any non-Bitkit
+///   value reaching here still fails safe to a downgrade).
 /// * `declared_index`: the `account_index` the client submitted.
 /// * `index_mismatch`: whether the declared index disagrees with the key's
 ///   own hardened child number.
@@ -189,6 +195,10 @@ mod tests {
 
     #[test]
     fn every_non_bitkit_channel_downgrades_with_claim_channel_not_bitkit() {
+        // Unknown channels never reach this function — the claim refuses
+        // them with `unknown_claim_channel` — but the decision itself stays
+        // fail-safe: anything that is not the Bitkit channel is not
+        // exclusive.
         for channel in [CLAIM_CHANNEL_MANUAL, "paste", "carrier_pigeon"] {
             // Even an otherwise-perfect claim: the channel alone decides.
             let allocation = decide_allocation(channel, 3, false, false);

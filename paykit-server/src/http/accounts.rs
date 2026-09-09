@@ -95,8 +95,11 @@ pub fn accounts_router(state: AccountsState) -> Router {
         .with_state(state)
 }
 
-/// Minimal CORS for the browser-called claim route: exact-origin (or `*`)
-/// allow-listing shared with the setup flow's configured origins.
+/// Minimal CORS for the browser-called claim and status routes: exact-origin
+/// (or `*`) allow-listing shared with the setup flow's configured origins.
+/// The allowed headers cover the JSON claim body (`content-type`) and the
+/// status endpoint's bearer token (`authorization`); the allowed-origin
+/// policy itself is unchanged by the header list.
 async fn apply_cors(state: AccountsState, request: axum::extract::Request, next: Next) -> Response {
     let origin = request
         .headers()
@@ -135,7 +138,7 @@ async fn apply_cors(state: AccountsState, request: axum::extract::Request, next:
         );
         headers.insert(
             header::ACCESS_CONTROL_ALLOW_HEADERS,
-            HeaderValue::from_static("content-type"),
+            HeaderValue::from_static("content-type, authorization"),
         );
         headers.insert(header::VARY, HeaderValue::from_static("Origin"));
     }
@@ -149,8 +152,8 @@ struct ClaimBody {
     account_xpub: String,
     account_index: u32,
     /// The channel the Shop client asserts (design §B.8.6): `manual` or
-    /// `bitkit_watch_only_v1`. Missing is treated as `manual`; any value is
-    /// recorded verbatim.
+    /// `bitkit_watch_only_v1`. Missing is treated as `manual`; any other
+    /// value is refused with `unknown_claim_channel` (fail closed).
     claim_channel: Option<String>,
     /// Optional requested mode. Honored only as a refusal: `pasted_auto` is
     /// rejected unconditionally with `allocation_mode_not_enabled`
@@ -256,6 +259,11 @@ fn claim_error(error: ManualClaimError) -> Response {
             "allocation_mode_not_enabled",
             "the requested allocation mode is not enabled on this stack",
         ),
+        ManualClaimError::UnknownClaimChannel => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown_claim_channel",
+            "claim_channel must be one of manual or bitkit_watch_only_v1 when present",
+        ),
     };
     (
         status,
@@ -277,12 +285,15 @@ async fn exists(State(state): State<AccountsState>, Path(creator): Path<String>)
 
 /// The authenticated seller's own allocation status (design §B.8.6): the
 /// mode, the claim channel recorded at claim time, the downgrade reason if
-/// any, and the detection evidence metadata (§B.8.7 is W1.14's, so the
-/// evidence list is always empty here). It is the seller's own data about
-/// their own creator record: authentication is the same capability-scoped
-/// Pubky AuthToken the claim carries (in the `Authorization: Bearer`
-/// header), the token's signer must BE the addressed creator, and the
-/// response carries no key material beyond what the claim response returns.
+/// any, the detection evidence metadata (§B.8.7 is W1.14's, so the evidence
+/// list is always empty here), and the two evidence fields the
+/// Ring-verification client fails closed without — `key_fingerprint` and
+/// `first_derived_address`, the same values the claim response emits. It is
+/// the seller's own data about their own creator record: authentication is
+/// the same capability-scoped Pubky AuthToken the claim carries (in the
+/// `Authorization: Bearer` header), the token's signer must BE the addressed
+/// creator, and the response carries no key material — the fingerprint is a
+/// hash and the first address is what invoices reveal anyway.
 /// 401 unauthenticated, 403 for any other authenticated identity.
 async fn allocation_status(
     State(state): State<AccountsState>,
@@ -329,6 +340,12 @@ async fn allocation_status(
                 "allocation_mode": status.allocation_mode,
                 "claim_channel": status.claim_channel,
                 "downgrade_reason": status.downgrade_reason,
+                // The Ring-verification client's required evidence: the same
+                // canonical-78-byte-hash fingerprint and cursor address the
+                // claim response emits. Not key material — the fingerprint
+                // is a hash and the first address is what invoices reveal.
+                "key_fingerprint": status.key_fingerprint,
+                "first_derived_address": status.first_derived_address,
                 // §B.8.7 detection evidence metadata: no evidence rows exist
                 // until W1.14's sentinel detection records them.
                 "evidence": [],

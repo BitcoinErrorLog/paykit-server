@@ -359,11 +359,12 @@ async fn a_bitkit_claim_with_scan_history_is_downgraded_not_refused() {
     );
 }
 
-/// An unknown channel is neither refused nor honored: recorded verbatim and
-/// treated as manual entry (§B.8.6 — anything that is not the Bitkit
-/// channel is a bare key).
+/// An unknown channel is refused with `unknown_claim_channel` (fail closed,
+/// §B.8.6: the field is one of `manual` | `bitkit_watch_only_v1`) — never
+/// canonicalized silently, never persisted verbatim, and never reaching the
+/// scan or any persistence.
 #[tokio::test]
-async fn an_unknown_claim_channel_is_treated_as_manual_not_refused() {
+async fn an_unknown_claim_channel_is_refused_fail_closed() {
     let history = Arc::new(ScriptedHistory {
         calls: Mutex::new(0),
         used_in_first_window: false,
@@ -374,10 +375,17 @@ async fn an_unknown_claim_channel_is_treated_as_manual_not_refused() {
     let (status, body) = response_parts(router.oneshot(claim_body(body)).await.unwrap()).await;
     assert_eq!(
         (status, body["error"]["code"].as_str()),
-        (StatusCode::SERVICE_UNAVAILABLE, Some("session_unavailable")),
-        "an unknown channel takes the manual path: {body}"
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("unknown_claim_channel")
+        ),
+        "an unknown channel is refused: {body}"
     );
-    assert_eq!(*history.calls.lock().unwrap(), 1);
+    assert_eq!(
+        *history.calls.lock().unwrap(),
+        0,
+        "the refusal precedes the scan"
+    );
 }
 
 // ---------------------------------------------------------------------------

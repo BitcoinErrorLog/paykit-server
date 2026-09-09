@@ -325,6 +325,74 @@ async fn cors_preflight_admits_allowed_origins_and_refuses_others() {
     );
 }
 
+/// The status endpoint's browser client sends `Authorization: Bearer …`, so
+/// the preflight must admit that header for an allowed origin — while the
+/// allowed-ORIGIN policy itself is unchanged (a disallowed origin is still
+/// refused).
+#[tokio::test]
+async fn cors_preflight_allows_the_authorization_header_for_an_allowed_origin() {
+    let router = router(10, vec!["https://shop.example".into()]);
+    let creator = format!("pubky{}", Keypair::random().public_key().z32());
+    let preflight = Request::builder()
+        .method(Method::OPTIONS)
+        .uri(format!("/v0/accounts/{creator}/status"))
+        .header(header::ORIGIN, "https://shop.example")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(preflight).await.unwrap();
+    assert!(
+        response.status().is_success(),
+        "preflight status: {}",
+        response.status()
+    );
+    let allow_headers = response
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        allow_headers
+            .split(',')
+            .map(str::trim)
+            .any(|allowed| allowed.eq_ignore_ascii_case("authorization")),
+        "access-control-allow-headers must contain authorization: {allow_headers}"
+    );
+    let allow_methods = response
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        allow_methods
+            .split(',')
+            .map(str::trim)
+            .any(|allowed| allowed.eq_ignore_ascii_case("GET")),
+        "access-control-allow-methods must contain GET: {allow_methods}"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|value| value.to_str().ok()),
+        Some("https://shop.example"),
+        "the allowed-origin policy is unchanged"
+    );
+
+    // A disallowed origin's preflight for the same header is still refused.
+    let refused = Request::builder()
+        .method(Method::OPTIONS)
+        .uri(format!("/v0/accounts/{creator}/status"))
+        .header(header::ORIGIN, "https://evil.example")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "authorization")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(refused).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
 #[tokio::test]
 async fn wildcard_origin_configuration_allows_any_origin() {
     let router = router(10, vec!["*".into()]);
