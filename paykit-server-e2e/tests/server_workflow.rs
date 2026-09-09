@@ -1334,7 +1334,9 @@ async fn a_creation_cancelled_after_commit_is_in_progress_on_retry_and_voided_by
     let database = TestDatabase::create().await;
     let signing_key = SigningKey::from_bytes(&[9; 32]);
     let server_config = config(database.database_url(), &signing_key, "1h");
-    let pool = initialize_database(&server_config).await.unwrap();
+    let initialized = initialize_database(&server_config).await.unwrap();
+    let pool = initialized.pool.clone();
+    let stack_identity = initialized.stack_identity.clone();
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
     let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone());
@@ -1369,10 +1371,15 @@ async fn a_creation_cancelled_after_commit_is_in_progress_on_retry_and_voided_by
         snapshot_starts: AtomicUsize::new(0),
         release: tokio::sync::Notify::new(),
     });
-    let server =
-        Server::build_with_transports(server_config, pool.clone(), pubky, electrum.clone())
-            .await
-            .unwrap();
+    let server = Server::build_with_transports(
+        server_config,
+        pool.clone(),
+        stack_identity,
+        pubky,
+        electrum.clone(),
+    )
+    .await
+    .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

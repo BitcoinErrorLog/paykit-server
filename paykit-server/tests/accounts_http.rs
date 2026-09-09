@@ -9,10 +9,11 @@ use paykit_lib::PaykitReceiverPath;
 use paykit_sdk::PaykitSdkConfig;
 use paykit_server::{
     chain_history::{ChainHistoryPort, ClaimScanError},
-    config::BitcoinNetwork,
+    config::{BitcoinNetwork, StackRole},
     crypto::Crypto,
+    domain::locks::CreatorPubky,
     http::accounts::{AccountsState, accounts_router},
-    manual_claim::{ManualClaimError, ManualClaimService, SessionMinter},
+    manual_claim::{ClaimedKeyLookup, ManualClaimError, ManualClaimService, SessionMinter},
     persistence::CreatorStore,
     real_setup::DirectMarkerPublisher,
 };
@@ -32,6 +33,21 @@ impl SessionMinter for RefusingMinter {
         _capabilities: &Capabilities,
     ) -> Result<PubkySession, ManualClaimError> {
         Err(ManualClaimError::SessionUnavailable)
+    }
+}
+
+/// No key tail is ever claimed by another seller in these validation-path
+/// tests (the authoritative binding write is covered by the E2E suite).
+struct UnclaimedKeys;
+
+#[async_trait::async_trait]
+impl ClaimedKeyLookup for UnclaimedKeys {
+    async fn key_tail_claimed_by_other(
+        &self,
+        _key_tail: &[u8; 65],
+        _creator: &CreatorPubky,
+    ) -> Result<bool, ManualClaimError> {
+        Ok(false)
     }
 }
 
@@ -58,6 +74,10 @@ fn required_capabilities() -> String {
 }
 
 fn service() -> Arc<ManualClaimService> {
+    service_with_role(StackRole::Production)
+}
+
+fn service_with_role(stack_role: StackRole) -> Arc<ManualClaimService> {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_lazy("postgres://127.0.0.1:1/paykit")
         .unwrap();
@@ -66,9 +86,15 @@ fn service() -> Arc<ManualClaimService> {
         pubky::Pubky::new().unwrap(),
         Arc::new(RefusingMinter),
         CreatorStore::new(&pool, crypto),
+        Arc::new(UnclaimedKeys),
         Arc::new(DirectMarkerPublisher),
         Arc::new(UnusedHistory),
         BitcoinNetwork::Regtest,
+        stack_role,
+        format!(
+            "{}:6f1d0c2a-9b47-4e35-8a10-73c5e2d84b19",
+            stack_role.as_str()
+        ),
         receiver_path(),
     ))
 }
