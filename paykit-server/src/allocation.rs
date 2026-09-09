@@ -204,18 +204,15 @@ mod tests {
     #[test]
     fn each_failed_check_downgrades_with_its_fixed_identifier() {
         assert_eq!(
-            decide_allocation(CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1, 0, false, false)
-                .downgrade_reason,
+            decide_allocation(CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1, 0, false, false).downgrade_reason,
             Some(DowngradeReason::AccountIndexZero)
         );
         assert_eq!(
-            decide_allocation(CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1, 5, true, false)
-                .downgrade_reason,
+            decide_allocation(CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1, 5, true, false).downgrade_reason,
             Some(DowngradeReason::AccountIndexMismatch)
         );
         assert_eq!(
-            decide_allocation(CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1, 5, false, true)
-                .downgrade_reason,
+            decide_allocation(CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1, 5, false, true).downgrade_reason,
             Some(DowngradeReason::AccountHasHistory)
         );
         // The design's listed order decides when several checks fail.
@@ -231,7 +228,10 @@ mod tests {
             DowngradeReason::ClaimChannelNotBitkit.as_str(),
             "claim_channel_not_bitkit"
         );
-        assert_eq!(DowngradeReason::AccountIndexZero.as_str(), "account_index_zero");
+        assert_eq!(
+            DowngradeReason::AccountIndexZero.as_str(),
+            "account_index_zero"
+        );
         assert_eq!(
             DowngradeReason::AccountIndexMismatch.as_str(),
             "account_index_mismatch"

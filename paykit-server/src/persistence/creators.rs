@@ -223,8 +223,8 @@ impl CreatorStore {
     /// the claim's canonical key tail to this creator in the same
     /// transaction (design B.8.5). The claim's allocation decision (design
     /// B.8.6) is written in that same transaction: the INSERT is the ONLY
-    /// statement in the system that can set `allocation_mode = 'exclusive'`,
-    /// and only when the claim-channel checks computed it — creation is the
+    /// statement in the system that can persist the `exclusive` mode, and
+    /// only when the claim-channel checks computed it — creation is the
     /// sole `— → exclusive` transition in the design's table.
     pub async fn create(
         &self,
@@ -374,7 +374,8 @@ impl CreatorStore {
 
     /// Loads an existing creator when present. A present but unauthenticatable
     /// row is an error rather than an invitation to overwrite it during setup.
-    pub async fn load_optional(        &self,
+    pub async fn load_optional(
+        &self,
         creator: &CreatorPubky,
     ) -> Result<Option<CreatorCredentials>, PersistenceError> {
         let hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
@@ -399,13 +400,17 @@ impl CreatorStore {
     /// every corroborating check keeps its mode (the UPDATE then touches no
     /// allocation columns); every other re-claim lands on the one UPDATE
     /// below, whose `allocation_mode` literal is `shared_manual` — no
-    /// re-claim path contains a statement that can write `exclusive`.
+    /// re-claim path contains a statement that can write `exclusive`. A
+    /// re-claim that computed no new downgrade reason keeps the reason
+    /// already recorded (`COALESCE`), so a passing re-claim never erases why
+    /// the seller is manual. Returns the persisted allocation status so the
+    /// claim response reports the row, not the request.
     pub async fn reauthenticate(
         &self,
         replacement: &CreatorCredentials,
         key_tail: &[u8; 65],
         allocation: &ClaimAllocation,
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<CreatorAllocationStatus, PersistenceError> {
         let hash = self
             .crypto
             .lookup_hash(replacement.creator().to_string().as_bytes());
@@ -461,9 +466,10 @@ impl CreatorStore {
         } else {
             // Downgrade (or stay shared): the re-claim's own decision is
             // recorded verbatim. The literal below is the ONLY mode this
-            // statement can write.
+            // statement can write, and a re-claim with no new reason keeps
+            // the recorded one.
             sqlx::query(
-                "UPDATE creators SET credential_envelope = $1, claim_channel = $2, allocation_mode = 'shared_manual', downgrade_reason = $3, updated_at = NOW() WHERE id = $4",
+                "UPDATE creators SET credential_envelope = $1, claim_channel = $2, allocation_mode = 'shared_manual', downgrade_reason = COALESCE($3, downgrade_reason), updated_at = NOW() WHERE id = $4",
             )
             .bind(envelope.as_bytes())
             .bind(allocation.channel.as_deref())
@@ -473,7 +479,17 @@ impl CreatorStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         }
-        tx.commit().await.map_err(|_| PersistenceError::Unavailable)
+        let status = sqlx::query_as::<_, CreatorAllocationStatus>(
+            "SELECT allocation_mode, claim_channel, downgrade_reason FROM creators WHERE id = $1",
+        )
+        .bind(row.id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(status)
     }
 
     /// Advances the creator's derivation cursor to at least `floor` and

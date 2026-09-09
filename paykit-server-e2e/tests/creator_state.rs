@@ -773,20 +773,20 @@ async fn reauthentication_preserves_noise_index_and_assignments_and_rejects_acco
     assert!(
         creators
             .reauthenticate(
-            &credentials("bad", "other-xpub", 7, [9; 32]),
-            &key_tail(1),
-            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
-        )
+                &credentials("bad", "other-xpub", 7, [9; 32]),
+                &key_tail(1),
+                &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            )
             .await
             .is_err()
     );
     assert!(
         creators
             .reauthenticate(
-            &credentials("bad", XPUB, 8, [9; 32]),
-            &key_tail(1),
-            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
-        )
+                &credentials("bad", XPUB, 8, [9; 32]),
+                &key_tail(1),
+                &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            )
             .await
             .is_err()
     );

@@ -93,12 +93,12 @@ pub struct ManualClaimOutcome {
     /// This stack's identity, `{stack_role}:{instance_uuid}` (the
     /// `stack_id` contract).
     pub stack_id: String,
-    /// The creator's allocation mode after this claim (design §B.8.6):
-    /// `exclusive` or `shared_manual`.
-    pub allocation_mode: &'static str,
-    /// The fixed §B.8.8 downgrade-reason identifier when the claim was
-    /// downgraded to `shared_manual`; `None` for an `exclusive` claim.
-    pub downgrade_reason: Option<&'static str>,
+    /// The creator's allocation mode after this claim (design §B.8.6), as
+    /// persisted on the creator row: `exclusive` or `shared_manual`.
+    pub allocation_mode: String,
+    /// The fixed §B.8.8 downgrade-reason identifier recorded on the creator
+    /// row; `None` for an `exclusive` creator with no recorded reason.
+    pub downgrade_reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -423,14 +423,16 @@ impl ManualClaimService {
             allocation: allocation.clone(),
         };
         let key_fingerprint = key_fingerprint(&claim.serialized_xpub);
-        let next_child_index = commit
+        let report = commit
             .publish_readback_and_commit_reporting(claim.clone())
             .await
             .map_err(|error| match error {
                 ClaimError::AccountMismatch => ManualClaimError::AccountMismatch,
                 ClaimError::KeyClaimedByOtherSeller => ManualClaimError::KeyClaimedByOtherSeller,
                 _ => ManualClaimError::Unavailable,
-            })?
+            })?;
+        let next_child_index = report
+            .next_child_index
             .unwrap_or(i64::from(scan.start_index));
         // The address at the returned cursor: derived with the same function
         // invoice addresses use, on this stack's network (design §B.6).
@@ -448,8 +450,12 @@ impl ManualClaimService {
             key_fingerprint,
             first_derived_address,
             stack_id: self.stack_id.clone(),
-            allocation_mode: allocation.mode.as_str(),
-            downgrade_reason: allocation.downgrade_reason.map(|reason| reason.as_str()),
+            // The PERSISTED mode: a re-claim may only keep or downgrade, so
+            // the response reports the creator row, never the request's own
+            // decision (design §B.8.6 — no edit moves a creator into
+            // `exclusive`).
+            allocation_mode: report.allocation_mode,
+            downgrade_reason: report.downgrade_reason,
         })
     }
 
