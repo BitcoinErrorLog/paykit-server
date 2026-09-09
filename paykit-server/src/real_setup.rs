@@ -272,19 +272,29 @@ pub(crate) struct CreatorSetupCommit {
     pub(crate) allocation: crate::allocation::ClaimAllocation,
 }
 
+/// What a claim commit persisted: the derivation cursor (when a claim-scan
+/// floor applied) and the creator row's allocation status after the commit
+/// — the values the claim response reports.
+pub(crate) struct ClaimCommitReport {
+    pub(crate) next_child_index: Option<i64>,
+    pub(crate) allocation_mode: String,
+    pub(crate) downgrade_reason: Option<String>,
+}
+
 impl CreatorSetupCommit {
     pub(crate) fn marker_capabilities() -> PaykitReceiverCapabilities {
         default_marker_capabilities()
     }
-
     /// The commit shared by both setup flows, additionally reporting the
     /// creator's resulting derivation cursor when a claim-scan floor was
-    /// applied, so the manual claim response can return the actual
-    /// `next_child_index` (design §B.6).
+    /// applied and the PERSISTED allocation status (design §B.8.6), so the
+    /// manual claim response returns the actual `next_child_index` (design
+    /// §B.6) and the row's mode — a re-claim may keep or downgrade, so the
+    /// response must reflect the record, not the request.
     pub(crate) async fn publish_readback_and_commit_reporting(
         &self,
         claim: WatchOnlyAccountClaim,
-    ) -> Result<Option<i64>, ClaimError> {
+    ) -> Result<ClaimCommitReport, ClaimError> {
         let xpub = validate_xpub(
             &claim.serialized_xpub,
             claim.account_index,
@@ -334,12 +344,12 @@ impl CreatorSetupCommit {
                 xpub,
                 claim.account_index,
             );
-            let persistence = match existing {
-                Some(_) => {
-                    self.creators
-                        .reauthenticate(&credentials, &key_tail, &self.allocation)
-                        .await
-                }
+            let persisted_allocation = match existing {
+                Some(_) => self
+                    .creators
+                    .reauthenticate(&credentials, &key_tail, &self.allocation)
+                    .await
+                    .map(|status| (status.allocation_mode, status.downgrade_reason)),
                 None => self
                     .creators
                     .create(
@@ -349,30 +359,40 @@ impl CreatorSetupCommit {
                         &self.allocation,
                     )
                     .await
-                    .map(|_| ()),
+                    .map(|_| {
+                        (
+                            self.allocation.mode.as_str().to_owned(),
+                            self.allocation
+                                .downgrade_reason
+                                .map(|reason| reason.as_str().to_owned()),
+                        )
+                    }),
             };
-            if let Err(error) = persistence {
-                // Publication and Postgres cannot share a transaction. This
-                // creator-scoped lock covers load, publication, persistence,
-                // and compensation, so a failed first creator cannot remove a
-                // concurrent winner's receiver marker. Reauth never removes
-                // its existing marker.
-                if existing.is_none() {
-                    let _ = self
-                        .marker_publisher
-                        .remove(&self.session, &self.receiver_path)
-                        .await;
+            let (allocation_mode, downgrade_reason) = match persisted_allocation {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    // Publication and Postgres cannot share a transaction. This
+                    // creator-scoped lock covers load, publication, persistence,
+                    // and compensation, so a failed first creator cannot remove a
+                    // concurrent winner's receiver marker. Reauth never removes
+                    // its existing marker.
+                    if existing.is_none() {
+                        let _ = self
+                            .marker_publisher
+                            .remove(&self.session, &self.receiver_path)
+                            .await;
+                    }
+                    return Err(match error {
+                        crate::persistence::PersistenceError::ReauthenticationMismatch => {
+                            ClaimError::AccountMismatch
+                        }
+                        crate::persistence::PersistenceError::KeyClaimedByOtherSeller => {
+                            ClaimError::KeyClaimedByOtherSeller
+                        }
+                        _ => ClaimError::InvalidEnvelope,
+                    });
                 }
-                return Err(match error {
-                    crate::persistence::PersistenceError::ReauthenticationMismatch => {
-                        ClaimError::AccountMismatch
-                    }
-                    crate::persistence::PersistenceError::KeyClaimedByOtherSeller => {
-                        ClaimError::KeyClaimedByOtherSeller
-                    }
-                    _ => ClaimError::InvalidEnvelope,
-                });
-            }
+            };
             // Apply the claim-scan start index inside the same critical
             // section as the commit, monotonically: a re-claim of the same
             // account never moves the cursor backwards over an already
@@ -382,9 +402,17 @@ impl CreatorSetupCommit {
                     .creators
                     .advance_next_child_index(&self.creator, floor)
                     .await
-                    .map(Some)
+                    .map(|next_child_index| ClaimCommitReport {
+                        next_child_index: Some(next_child_index),
+                        allocation_mode,
+                        downgrade_reason,
+                    })
                     .map_err(|_| ClaimError::InvalidEnvelope),
-                None => Ok(None),
+                None => Ok(ClaimCommitReport {
+                    next_child_index: None,
+                    allocation_mode,
+                    downgrade_reason,
+                }),
             }
         }
         .await;
@@ -392,7 +420,7 @@ impl CreatorSetupCommit {
         match (commit_result, unlock_result) {
             (Err(error), _) => Err(error),
             (Ok(_), Err(_)) => Err(ClaimError::InvalidEnvelope),
-            (Ok(next_child_index), Ok(())) => Ok(next_child_index),
+            (Ok(report), Ok(())) => Ok(report),
         }
     }
 }
