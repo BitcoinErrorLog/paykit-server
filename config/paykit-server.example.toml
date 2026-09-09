@@ -49,8 +49,11 @@ network = "testnet"
 stack_role = "proof"
 
 [electrum]
-# Use one CA-valid ssl:// endpoint in production. tcp:// is accepted but has no
-# server authentication or transport confidentiality. No failover pool exists.
+# Use one CA-valid ssl:// endpoint in production. When bitcoin.network is
+# mainnet, startup refuses anything but ssl:// — tcp:// has no server
+# authentication or transport confidentiality and is accepted only on
+# regtest/signet/testnet (local fulcrum-style endpoints). No failover pool
+# exists.
 endpoint = "ssl://electrum.example.invalid:50002"
 poll_interval = "10s"
 request_timeout = "10s"

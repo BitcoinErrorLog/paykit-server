@@ -234,6 +234,23 @@ impl Config {
         if self.electrum.max_response_bytes < MIN_MAX_RESPONSE_BYTES {
             return Err(ConfigError::ElectrumResponseCapBelowFloor);
         }
+        // Plaintext Electrum carries the merchant's invoice addresses and
+        // UTXO sets unauthenticated and in the clear; on mainnet the only
+        // acceptable transport is TLS (`tcp://` stays allowed on
+        // regtest/signet/testnet for local fulcrum-style endpoints).
+        if self.deployment_invariants.bitcoin_network == BitcoinNetwork::Mainnet {
+            let scheme = self
+                .electrum
+                .endpoint
+                .split("://")
+                .next()
+                .unwrap_or_default();
+            if scheme != "ssl" {
+                return Err(ConfigError::PlaintextElectrumEndpointOnMainnet(
+                    scheme.to_owned(),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -535,6 +552,12 @@ pub struct BitcoinConfig {
 
 #[derive(Debug)]
 pub struct ElectrumConfig {
+    /// `tcp://host:port` or `ssl://host:port`. When
+    /// `bitcoin.network == mainnet`, startup refuses anything but
+    /// `ssl://`: plaintext Electrum on mainnet would expose every
+    /// tracked invoice address and UTXO set unauthenticated and in the
+    /// clear. `tcp://` stays allowed on regtest/signet/testnet for
+    /// local fulcrum-style endpoints.
     pub endpoint: String,
     pub poll_interval: Duration,
     pub request_timeout: Duration,
@@ -697,6 +720,10 @@ pub enum ConfigError {
     InsufficientElectrumBudget,
     #[error("electrum.max_response_bytes must be at least 65536 bytes (64 KiB)")]
     ElectrumResponseCapBelowFloor,
+    #[error(
+        "bitcoin.network mainnet requires an ssl:// electrum.endpoint; the {0}:// scheme is plaintext and refused"
+    )]
+    PlaintextElectrumEndpointOnMainnet(String),
 }
 
 fn decode_base64url_no_pad(value: &str, error: ConfigError) -> Result<Vec<u8>, ConfigError> {

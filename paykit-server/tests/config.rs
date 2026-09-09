@@ -471,6 +471,53 @@ fn accepts_a_response_cap_at_the_64kib_floor() {
     );
 }
 
+fn mainnet_toml(endpoint: &str) -> String {
+    valid_toml()
+        .replace(
+            "network = \"testnet\"\n[deployment]",
+            "network = \"mainnet\"\n[deployment]",
+        )
+        .replace(
+            "endpoint = \"ssl://electrum.example:50002\"",
+            &format!("endpoint = \"{endpoint}\""),
+        )
+}
+
+#[test]
+fn refuses_a_plaintext_electrum_endpoint_on_mainnet_with_a_literal_diagnostic() {
+    let error = Config::from_toml_and_environment(
+        &mainnet_toml("tcp://electrum.example:50001"),
+        environment(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "bitcoin.network mainnet requires an ssl:// electrum.endpoint; \
+         the tcp:// scheme is plaintext and refused"
+    );
+}
+
+#[test]
+fn accepts_an_ssl_electrum_endpoint_on_mainnet() {
+    assert!(
+        Config::from_toml_and_environment(
+            &mainnet_toml("ssl://electrum.example:50002"),
+            environment()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn accepts_a_plaintext_electrum_endpoint_on_regtest() {
+    // Local fulcrum-style endpoints have no TLS: the plaintext refusal
+    // is a mainnet-only invariant.
+    let regtest = local_compose_toml();
+    let config = Config::from_toml_and_environment(&regtest, environment())
+        .expect("regtest keeps accepting tcp:// endpoints");
+    assert_eq!(config.electrum.endpoint, "tcp://fulcrum:50001");
+}
+
 #[test]
 fn accepts_electrum_budgets_one_above_the_post_probe_floor() {
     for (name, extra) in [
