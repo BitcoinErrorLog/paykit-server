@@ -623,3 +623,110 @@ async fn manual_claim_binds_the_key_tail_to_one_seller_forever() {
 
     database.cleanup().await;
 }
+
+/// Always-false fingerprint pre-check: the concurrent-claim race test needs
+/// BOTH racing claims to pass the read-only gate, so the authoritative
+/// binding write inside the claim-commit transaction is what serializes
+/// them.
+struct UnclaimedKeys;
+
+#[async_trait::async_trait]
+impl paykit_server::manual_claim::ClaimedKeyLookup for UnclaimedKeys {
+    async fn key_tail_claimed_by_other(
+        &self,
+        _key_tail: &[u8; 65],
+        _creator: &paykit_server::domain::locks::CreatorPubky,
+    ) -> Result<bool, ManualClaimError> {
+        Ok(false)
+    }
+}
+
+/// Service-level concurrent-claim race (W1.3 carry-over): two creators race
+/// a FIRST claim of the same key with an always-false `ClaimedKeyLookup`
+/// pre-check, so both reach the commit; the binding write inside the
+/// claim-commit transaction (primary key + ON CONFLICT) serializes them.
+/// Exactly one claim succeeds (the 200 path) and the loser gets the named
+/// refusal the HTTP layer maps to 409 `key_claimed_by_other_seller` — and
+/// both requests terminate. The persistence-level half of this race is
+/// covered in `claimed_key_fingerprints.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_first_claims_of_one_key_have_exactly_one_winner() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let relay_inbox = testnet.http_relay().local_url().join("inbox").unwrap();
+
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(database.pool(), crypto);
+    let receiver_path = PaykitReceiverPath::new("paykit/server").unwrap();
+    let required_capabilities =
+        PaykitSdkConfig::new(receiver_path.clone()).required_session_capabilities();
+    let service = Arc::new(ManualClaimService::new(
+        pubky.clone(),
+        Arc::new(RelayLoopbackSessionMinter::new(pubky.clone(), relay_inbox)),
+        creators.clone(),
+        // Always-false pre-check: both racers pass the read-only gate.
+        Arc::new(UnclaimedKeys),
+        Arc::new(DirectMarkerPublisher),
+        Arc::new(ScriptedHistory::unused()),
+        BitcoinNetwork::Testnet,
+        STACK_ROLE,
+        stack_id(database.pool(), STACK_ROLE).await,
+        receiver_path.clone(),
+    ));
+
+    let homeserver = testnet.homeserver_app().public_key();
+    let seller_a = Keypair::random();
+    let seller_b = Keypair::random();
+    for seller in [&seller_a, &seller_b] {
+        pubky
+            .signer(seller.clone())
+            .signup(&homeserver, None)
+            .await
+            .unwrap();
+    }
+    let xpub = account_xpub(81, 0);
+    let request = |seller: &Keypair| ManualClaimRequest {
+        auth_token: claim_token(seller, &required_capabilities),
+        account_xpub: xpub.clone(),
+        account_index: 0,
+        claim_channel: None,
+        allocation_mode: None,
+    };
+
+    // The outer timeout is the "both terminate" assertion: a deadlock or
+    // lost wakeup fails the test instead of hanging it.
+    let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        tokio::join!(
+            service.claim(request(&seller_a)),
+            service.claim(request(&seller_b))
+        )
+    })
+    .await
+    .expect("both concurrent claims terminate");
+    let outcomes = [a, b];
+    let winners = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    let losers = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, Err(ManualClaimError::KeyClaimedByOtherSeller)))
+        .count();
+    assert_eq!(
+        (winners, losers),
+        (1, 1),
+        "exactly one concurrent first claim wins (200); the loser is the 409 \
+         key_claimed_by_other_seller path: {outcomes:?}"
+    );
+    let creator_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM creators")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    let binding_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM claimed_key_fingerprints")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!((creator_rows, binding_rows), (1, 1));
+
+    database.cleanup().await;
+}
