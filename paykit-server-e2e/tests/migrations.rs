@@ -55,7 +55,24 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5]);
+    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5, 6]);
+
+    let retired_observation_budget_columns: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name || '.' || column_name
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND column_name IN
+               ('observation_history_tx_count', 'observation_request_count',
+                'observation_overrun')
+         ORDER BY table_name, column_name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert!(
+        retired_observation_budget_columns.is_empty(),
+        "retired observation budget columns remain: {retired_observation_budget_columns:?}"
+    );
 
     let plaintext_creator_pubky_columns: Vec<String> = sqlx::query_scalar(
         "SELECT table_name \

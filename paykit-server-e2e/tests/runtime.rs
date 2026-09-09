@@ -7,7 +7,7 @@ use paykit_server::{
     config::{Config, ConfigEnvironment},
     persistence::run_migrations,
     runtime::ComponentState,
-    workers::observer::{ElectrumPort, ObservationReport, ObserverError, TargetHistory, TipProbe},
+    workers::observer::{ElectrumPort, ObservationReport, ObserverError, TipProbe},
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use pubky_testnet::EphemeralTestnet;
@@ -99,18 +99,16 @@ fn fresh_tip_time() -> u32 {
 impl ElectrumPort for HealthyElectrum {
     async fn observations(
         &self,
+        _tip_height: u32,
         targets: &[ObservationTarget],
     ) -> Result<ObservationReport, ObserverError> {
         Ok(ObservationReport {
             outputs: Vec::new(),
-            history: targets
+            observed: targets
                 .iter()
-                .map(|target| TargetHistory {
-                    address: target.address().to_owned(),
-                    tx_count: 0,
-                })
+                .map(|target| target.address().to_owned())
                 .collect(),
-            request_count: 0,
+            failed: Vec::new(),
         })
     }
 

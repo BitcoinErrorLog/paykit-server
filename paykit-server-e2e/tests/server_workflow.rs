@@ -41,7 +41,7 @@ use paykit_server::{
     domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
     persistence::{CreatorCredentials, CreatorStore, PostgresStorageAdapter, SdkStateStore},
     startup::initialize_database,
-    workers::observer::{ElectrumPort, ObservationReport, ObserverError, TargetHistory, TipProbe},
+    workers::observer::{ElectrumPort, ObservationReport, ObserverError, TipProbe},
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
@@ -110,6 +110,7 @@ impl DeterministicElectrum {
 impl ElectrumPort for DeterministicElectrum {
     async fn observations(
         &self,
+        _tip_height: u32,
         targets: &[ObservationTarget],
     ) -> Result<ObservationReport, ObserverError> {
         Ok(ObservationReport {
@@ -128,14 +129,11 @@ impl ElectrumPort for DeterministicElectrum {
                         })
                 })
                 .collect(),
-            history: targets
+            observed: targets
                 .iter()
-                .map(|target| TargetHistory {
-                    address: target.address().to_owned(),
-                    tx_count: u32::from(self.outputs.contains_key(target.address())),
-                })
+                .map(|target| target.address().to_owned())
                 .collect(),
-            request_count: 0,
+            failed: Vec::new(),
         })
     }
 

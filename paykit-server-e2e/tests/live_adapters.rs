@@ -271,11 +271,15 @@ async fn live_electrum_observes_known_output_and_confirmations() {
     let adapter = ElectrumAdapter::connect(endpoint, network, Duration::from_secs(15), 1)
         .await
         .unwrap();
+    let tip = adapter.probe().await.unwrap();
     let observations = adapter
-        .observations(&[ObservationTarget::new(
-            address,
-            Some(TrackedOutput::new(outpoint, sats)),
-        )])
+        .observations(
+            tip.height,
+            &[ObservationTarget::new(
+                address,
+                Some(TrackedOutput::new(outpoint, sats)),
+            )],
+        )
         .await
         .unwrap()
         .outputs;

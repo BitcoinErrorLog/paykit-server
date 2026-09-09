@@ -191,18 +191,16 @@ struct FixedBatch(Vec<ObservedOutput>);
 impl ElectrumPort for FixedBatch {
     async fn observations(
         &self,
+        _tip_height: u32,
         targets: &[ObservationTarget],
     ) -> Result<ObservationReport, ObserverError> {
         Ok(ObservationReport {
             outputs: self.0.clone(),
-            history: targets
+            observed: targets
                 .iter()
-                .map(|target| paykit_server::workers::observer::TargetHistory {
-                    address: target.address().to_owned(),
-                    tx_count: 0,
-                })
+                .map(|target| target.address().to_owned())
                 .collect(),
-            request_count: 0,
+            failed: Vec::new(),
         })
     }
 
@@ -222,7 +220,7 @@ async fn observe_once(
     network: &BitcoinNetwork,
     targets: &[ObservationTarget],
 ) -> Result<usize, ObserverError> {
-    let report = port.observations(targets).await?;
+    let report = port.observations(0, targets).await?;
     ObservationBackend::apply_observations(store, network, targets, report.outputs).await
 }
 
@@ -1231,115 +1229,22 @@ async fn record_observation_tick_reports_stamp_misses_without_aborting_known_rec
     // A record whose address lookup hash matches no invoice row, followed
     // by a valid record: the miss is reported and the valid record stamps.
     let misses = store
-        .record_observation_tick(
-            &[
-                paykit_server::bitcoin::TargetTickRecord::new("address-never-bound", 3, 2),
-                paykit_server::bitcoin::TargetTickRecord::new(REGTEST_ADDRESS, 7, 3),
-            ],
-            500,
-        )
+        .record_observation_tick(&["address-never-bound".to_owned(), REGTEST_ADDRESS.to_owned()])
         .await
         .unwrap();
     assert_eq!(misses, 1);
-    let persisted: (Option<i32>, Option<i32>, bool) = sqlx::query_as(
-        "SELECT observation_history_tx_count, observation_request_count, \
-         last_observed_at IS NOT NULL \
-         FROM invoices WHERE id = $1",
-    )
-    .bind(invoice_id)
-    .fetch_one(database.pool())
-    .await
-    .unwrap();
-    assert_eq!(persisted, (Some(7), Some(3), true));
-    database.cleanup().await;
-}
-
-#[tokio::test]
-async fn observation_overrun_marks_once_and_the_plan_reports_the_flag() {
-    let database = TestDatabase::create().await;
-    let (store, invoice_id) = batch_invoice(&database).await;
-
-    let flagged = store
-        .mark_observation_overrun(&[REGTEST_ADDRESS.to_owned()])
-        .await
-        .unwrap();
-    assert_eq!(flagged, vec![invoice_id]);
-    // Already flagged: a repeat marks nothing new.
-    let flagged_again = store
-        .mark_observation_overrun(&[REGTEST_ADDRESS.to_owned()])
-        .await
-        .unwrap();
-    assert!(flagged_again.is_empty());
-
-    let persisted: bool =
-        sqlx::query_scalar("SELECT observation_overrun FROM invoices WHERE id = $1")
+    let stamped: bool =
+        sqlx::query_scalar("SELECT last_observed_at IS NOT NULL FROM invoices WHERE id = $1")
             .bind(invoice_id)
             .fetch_one(database.pool())
             .await
             .unwrap();
-    assert!(persisted);
-    let plan = store.observation_plan().await.unwrap();
-    assert_eq!(plan.len(), 1);
-    assert!(plan[0].is_observation_overrun());
+    assert!(stamped);
     database.cleanup().await;
 }
 
 #[tokio::test]
-async fn record_observation_tick_clears_the_overrun_flag_when_the_estimate_drops_below_the_bound() {
-    let database = TestDatabase::create().await;
-    let (store, invoice_id) = batch_invoice(&database).await;
-    let persisted_flag = || async {
-        sqlx::query_scalar::<_, bool>("SELECT observation_overrun FROM invoices WHERE id = $1")
-            .bind(invoice_id)
-            .fetch_one(database.pool())
-            .await
-            .unwrap()
-    };
-
-    store
-        .mark_observation_overrun(&[REGTEST_ADDRESS.to_owned()])
-        .await
-        .unwrap();
-    assert!(persisted_flag().await);
-
-    // A stamped structural estimate within the bound (1 + 7 <= 500) clears
-    // the flag in the same UPDATE that stamps the target.
-    store
-        .record_observation_tick(
-            &[paykit_server::bitcoin::TargetTickRecord::new(
-                REGTEST_ADDRESS,
-                7,
-                3,
-            )],
-            500,
-        )
-        .await
-        .unwrap();
-    assert!(!persisted_flag().await);
-
-    // Re-flagged: a stamped estimate beyond the bound (1 + 500 > 500)
-    // keeps the flag set.
-    store
-        .mark_observation_overrun(&[REGTEST_ADDRESS.to_owned()])
-        .await
-        .unwrap();
-    store
-        .record_observation_tick(
-            &[paykit_server::bitcoin::TargetTickRecord::new(
-                REGTEST_ADDRESS,
-                500,
-                3,
-            )],
-            500,
-        )
-        .await
-        .unwrap();
-    assert!(persisted_flag().await);
-    database.cleanup().await;
-}
-
-#[tokio::test]
-async fn observation_plan_orders_oldest_observed_first_and_records_tick_budget_facts() {
+async fn observation_plan_orders_oldest_observed_first_and_stamp_rotates_the_plan() {
     let database = TestDatabase::create().await;
     let (store, invoice_id) = batch_invoice(&database).await;
     store
@@ -1359,18 +1264,9 @@ async fn observation_plan_orders_oldest_observed_first_and_records_tick_budget_f
     assert_eq!(plan.len(), 2);
     assert_eq!(plan[0].target().address(), REGTEST_ADDRESS);
     assert_eq!(plan[1].target().address(), "plan-address-b");
-    assert_eq!(plan[0].history_tx_count(), None);
-    assert_eq!(plan[1].history_tx_count(), None);
 
     store
-        .record_observation_tick(
-            &[paykit_server::bitcoin::TargetTickRecord::new(
-                REGTEST_ADDRESS,
-                7,
-                3,
-            )],
-            500,
-        )
+        .record_observation_tick(&[REGTEST_ADDRESS.to_owned()])
         .await
         .unwrap();
 
@@ -1378,20 +1274,12 @@ async fn observation_plan_orders_oldest_observed_first_and_records_tick_budget_f
     assert_eq!(plan.len(), 2);
     assert_eq!(plan[0].target().address(), "plan-address-b");
     assert_eq!(plan[1].target().address(), REGTEST_ADDRESS);
-    assert_eq!(plan[1].history_tx_count(), Some(7));
-    assert_eq!(plan[1].last_request_count(), Some(3));
-    // The measured per-target request cost (3) is below the structural
-    // estimate (1 + 7), so the structural estimate still bounds the target.
-    assert_eq!(plan[1].estimated_requests(), 8);
-    let persisted: (Option<i32>, Option<i32>, bool) = sqlx::query_as(
-        "SELECT observation_history_tx_count, observation_request_count, \
-         last_observed_at IS NOT NULL \
-         FROM invoices WHERE id = $1",
-    )
-    .bind(invoice_id)
-    .fetch_one(database.pool())
-    .await
-    .unwrap();
-    assert_eq!(persisted, (Some(7), Some(3), true));
+    let stamped: bool =
+        sqlx::query_scalar("SELECT last_observed_at IS NOT NULL FROM invoices WHERE id = $1")
+            .bind(invoice_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert!(stamped);
     database.cleanup().await;
 }
