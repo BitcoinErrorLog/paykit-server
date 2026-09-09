@@ -36,10 +36,7 @@ use paykit_lib::PaykitReceiverPath;
 use paykit_sdk::PaykitSdkConfig;
 use paykit_server::{
     application::create_invoice::derive_bip84_p2wpkh_address,
-    chain_history::{
-        CLAIM_SCAN_MAX_WINDOWS, CLAIM_SCAN_WINDOW, ChainHistoryPort, ClaimScanError,
-        scan_claim_start_index,
-    },
+    chain_history::{CLAIM_SCAN_WINDOW, ChainHistoryPort, ClaimScanError, scan_claim_start_index},
     config::BitcoinNetwork,
     crypto::Crypto,
     http::accounts::{AccountsState, accounts_router},
@@ -160,8 +157,11 @@ async fn manual_claim_scan_fails_unavailable_when_electrum_is_down() {
 #[tokio::test]
 async fn manual_claim_scan_beyond_a_thousand_addresses_refuses_after_exactly_fifty_batches() {
     let xpub = regtest_account_tpub();
-    // Usage in EVERY window: all 1,000 bounded addresses carry history.
-    let used: Vec<ScriptBuf> = (0..CLAIM_SCAN_MAX_WINDOWS * CLAIM_SCAN_WINDOW)
+    // Literal protocol constants, asserted independently of
+    // CLAIM_SCAN_MAX_WINDOWS / CLAIM_SCAN_WINDOW so a mutation of the cap
+    // cannot shift this test's expectation: usage in EVERY one of the
+    // 1,000 bounded addresses (50 windows x 20).
+    let used: Vec<ScriptBuf> = (0..1_000)
         .map(|index| derived_script(&xpub, index))
         .collect();
     let server = HistoryServer::start(used).await;
@@ -179,7 +179,9 @@ async fn manual_claim_scan_beyond_a_thousand_addresses_refuses_after_exactly_fif
     let result = scan_claim_start_index(&adapter, &xpub, 0, &BitcoinNetwork::Regtest).await;
 
     assert_eq!(result, Err(ClaimScanError::HistoryTooDeep));
-    server.assert_rpc_counts((CLAIM_SCAN_MAX_WINDOWS * CLAIM_SCAN_WINDOW) as usize, 0, 0);
+    // Literal: exactly 50 batched requests of 20 scripthashes = 1,000
+    // get_history queries, no unspent, no transaction fetches.
+    server.assert_rpc_counts(1_000, 0, 0);
 }
 
 #[tokio::test]
@@ -358,8 +360,9 @@ async fn manual_claim_history_too_deep_refuses_the_claim_with_account_history_to
     );
     assert_eq!(
         *history.calls.lock().unwrap(),
-        CLAIM_SCAN_MAX_WINDOWS as usize,
-        "exactly 50 batched requests before the too-deep refusal"
+        50,
+        "exactly 50 batched requests before the too-deep refusal (literal \
+         protocol constant, independent of CLAIM_SCAN_MAX_WINDOWS)"
     );
 }
 
