@@ -61,15 +61,19 @@ or unbounded response memory. Mitigations:
   electrum-client's `From<S: Read + Write>` `RawClient` constructor, so
   the cap applies BEFORE the client's `BufReader::read_line` buffers the
   line and before any JSON decode: **no single Electrum response line
-  larger than `electrum.max_response_bytes` (default 1 MiB, floor
-  64 KiB) is ever held in memory; the connection is torn down.** An
-  over-cap read fails with the literal `electrum response exceeds
-  max_response_bytes` error and poisons the stream, so a half-read line
-  can never be resumed — the next lookup reconnects on a fresh capped
-  connection (connecting sends no Electrum RPC: the TLS handshake is
-  transport I/O, not an Electrum request, and the client performs no
-  `server.version` negotiation, so a reconnect is never a budgeted
-  send).
+  larger than `electrum.max_response_bytes` (default 1 MiB, accepted
+  range 64 KiB–16 MiB) is ever held in memory; the connection is torn
+  down.** The guarantee includes an exact consumption bound: each read
+  requests at most the current line's remaining budget plus one byte
+  from the socket, so **an over-cap line of any length consumes exactly
+  `max_response_bytes + 1` bytes from the source before the read fails
+  — never more**. The over-cap read fails with the literal `electrum
+  response exceeds max_response_bytes` error and poisons the stream, so
+  a half-read line can never be resumed — the next lookup reconnects on
+  a fresh capped connection (connecting sends no Electrum RPC: the TLS
+  handshake is transport I/O, not an Electrum request, and the client
+  performs no `server.version` negotiation, so a reconnect is never a
+  budgeted send).
 - **Item-count cap.** A response listing more than
   `electrum.max_utxos_per_address` UTXOs (default 200) is rejected before
   any per-UTXO record is materialised — no record vector is built for it.
@@ -82,6 +86,21 @@ or unbounded response memory. Mitigations:
 - **Per-address isolation.** Over-cap, over-deadline, and errored lookups
   fail that address only; the tick's other addresses are observed
   normally.
+
+**Transport authentication invariant.** Plaintext Electrum carries every
+tracked invoice address and UTXO set unauthenticated and in the clear,
+and a spoofed plaintext endpoint can feed the observer fabricated
+payment confirmations. The guarantee is enforced at configuration load:
+**when `bitcoin.network == mainnet`, startup refuses any
+`electrum.endpoint` whose scheme is not `ssl://`, with a literal
+diagnostic naming the network and the scheme** (`bitcoin.network
+mainnet requires an ssl:// electrum.endpoint; the <scheme>:// scheme is
+plaintext and refused`). TLS endpoints are built with the webpki root
+store and certificate validation ON — there is no `validate_domain`
+switch and no custom verifier in this tree. `tcp://` remains accepted on
+regtest/signet/testnet for local fulcrum-style endpoints that have no
+TLS. (There is no `--check-config` flag in this tree; the refusal is a
+config error at load, i.e. at process startup.)
 
 ## Budgeting rule
 

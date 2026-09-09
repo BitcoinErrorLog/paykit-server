@@ -87,16 +87,27 @@ panels and alerts that reference them:
 The `[electrum]` keys the observer honours (see
 `config/paykit-server.example.toml` for the full comments):
 
-| Key | Default | Floor | Effect |
+| Key | Default | Accepted range | Effect |
 | --- | --- | --- | --- |
-| `poll_interval` | `10s` | `1s` | Base tick cadence (±20% jitter). |
+| `poll_interval` | `10s` | ≥ `1s` | Base tick cadence (±20% jitter). |
 | `request_timeout` | `10s` | > 0 | Connect, read, and write timeout per connection. |
 | `max_requests_per_tick` | `1000` | > 2 effective | Token-bucket capacity (probe reservation included). |
 | `max_requests_per_second` | `5` | > 0 | Token-bucket refill rate. |
 | `max_utxos_per_address` | `200` | > 0 | Decoded list_unspent item cap per address. |
 | `address_deadline` | `5s` | > 0 | Per-address wall-clock deadline. |
-| `max_response_bytes` | `1048576` (1 MiB) | `65536` (64 KiB) | Transport cap on one response line; over-cap reads fail with `electrum response exceeds max_response_bytes` before decode and the connection is torn down. |
+| `max_response_bytes` | `1048576` (1 MiB) | `65536`–`16777216` (64 KiB–16 MiB) | Transport cap on one response line; an over-cap line of any length consumes exactly cap + 1 bytes from the source before the read fails with `electrum response exceeds max_response_bytes` (before any decode), and the connection is torn down. |
 | `max_tip_age` | `4h` | > 0 | Stale-tip readiness bound. |
+
+**Mainnet transport invariant:** when `bitcoin.network` is `mainnet`,
+startup refuses any `electrum.endpoint` whose scheme is not `ssl://`
+(plaintext Electrum would expose every tracked invoice address and UTXO
+set unauthenticated and in the clear, and could serve fabricated
+confirmations). The refusal is a config error at load with the literal
+diagnostic `bitcoin.network mainnet requires an ssl://
+electrum.endpoint; the <scheme>:// scheme is plaintext and refused`.
+`tcp://` stays accepted on regtest/signet/testnet for local
+fulcrum-style endpoints. Do not "fix" a mainnet refusal by switching
+the endpoint to `tcp://`; point the config at a TLS endpoint instead.
 
 ## Shared request limiter
 
