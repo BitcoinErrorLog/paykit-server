@@ -105,7 +105,10 @@ fn bitcoin_observation_debug_redacts_addresses_and_outpoints() {
 mod tick {
     use std::{
         collections::HashSet,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -173,6 +176,7 @@ mod tick {
         /// matches no invoice row.
         ghost_observed: Vec<String>,
         calls: Mutex<Vec<Vec<String>>>,
+        probes: AtomicUsize,
     }
 
     impl FakeElectrum {
@@ -185,6 +189,7 @@ mod tick {
                 failing_addresses: HashSet::new(),
                 ghost_observed: Vec::new(),
                 calls: Mutex::new(Vec::new()),
+                probes: AtomicUsize::new(0),
             }
         }
 
@@ -206,7 +211,12 @@ mod tick {
                 failing_addresses: HashSet::new(),
                 ghost_observed: Vec::new(),
                 calls: Mutex::new(Vec::new()),
+                probes: AtomicUsize::new(0),
             }
+        }
+
+        fn probe_count(&self) -> usize {
+            self.probes.load(Ordering::Relaxed)
         }
     }
 
@@ -239,6 +249,7 @@ mod tick {
         }
 
         async fn probe(&self) -> Result<TipProbe, ObserverError> {
+            self.probes.fetch_add(1, Ordering::Relaxed);
             self.probe
         }
     }
@@ -1010,6 +1021,115 @@ mod tick {
     }
 
     #[tokio::test]
+    async fn an_exhausted_shared_bucket_defers_the_whole_tick_without_electrum_io() {
+        // A creation caller drained the shared bucket to zero: the tick
+        // cannot reserve the probe, so it sends no Electrum requests at
+        // all — no probe, no lookups — and defers the whole tick. That is
+        // not an availability change and not a zero-success tick
+        // (processed == 0 because nothing was attempted): both signals
+        // stay untouched and the deferral is counted under its own
+        // budget_exhausted reason.
+        let port = FakeElectrum::healthy();
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![
+                FakeEntry::new("oldest", 600),
+                FakeEntry::new("second", 300),
+            ]),
+            applied: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+        runtime.set_electrum_available(true);
+        let electrum_before = runtime.readiness().await.electrum;
+        let limiter = RequestLimiter::new(6, 0);
+        let mut state = ObserverTickState::with_limiter(limiter.clone());
+        let drained = limiter
+            .try_reserve(6)
+            .expect("the creation caller drains the bucket");
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state,
+        )
+        .await;
+        assert_eq!(outcome, ObserverTickOutcome::Deferred);
+        assert_eq!(
+            port.probe_count(),
+            0,
+            "an uncharged probe must never be sent"
+        );
+        assert!(
+            port.calls.lock().unwrap().is_empty(),
+            "the deferred tick issues no lookups"
+        );
+        assert_eq!(
+            runtime.readiness().await.electrum,
+            electrum_before,
+            "a budget-deferred tick is not an availability change"
+        );
+        let encoded = runtime.metrics().encode().unwrap();
+        assert!(
+            encoded.contains("paykit_electrum_available 1"),
+            "the availability gauge is untouched: {encoded}"
+        );
+        assert!(
+            encoded.contains("paykit_electrum_budget_exhausted_ticks_total 1"),
+            "the deferred tick is counted under its own reason: {encoded}"
+        );
+        assert!(
+            encoded.contains("paykit_electrum_zero_success_ticks_total 0"),
+            "processed == 0, so the zero-success counter is untouched: {encoded}"
+        );
+        let entries = backend.entries.lock().unwrap();
+        assert_eq!(entries[0].staleness_secs, 600, "targets stay stale");
+        drop(drained);
+    }
+
+    #[tokio::test]
+    async fn a_bucket_holding_exactly_the_probe_reservation_probes_and_admits_no_lookups() {
+        // Exactly PROBE_REQUESTS_PER_TICK tokens in the bucket: the probe
+        // reservation succeeds and the probe runs, but nothing remains
+        // for lookups, so the whole plan defers to the next tick.
+        let port = FakeElectrum::healthy();
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![
+                FakeEntry::new("oldest", 600),
+                FakeEntry::new("second", 300),
+            ]),
+            applied: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+        let limiter = RequestLimiter::new(2, 0);
+        let mut state = ObserverTickState::with_limiter(limiter);
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 0,
+                deferred: 2,
+                failed: 0,
+            }
+        );
+        assert_eq!(port.probe_count(), 1, "the reserved probe ran");
+        assert!(
+            port.calls.lock().unwrap().is_empty(),
+            "zero lookups are admitted"
+        );
+    }
+
+    #[tokio::test]
     async fn a_zero_success_tick_is_counted_but_keeps_electrum_available() {
         // Every attempted lookup fails in isolation: the tick is visible
         // through the zero-success counter, but availability stays up and
@@ -1187,12 +1307,13 @@ mod tick {
         .await;
         assert_eq!(
             outcome,
-            ObserverTickOutcome::Observed {
-                processed: 0,
-                deferred: 3,
-                failed: 0,
-            },
-            "no wall time elapsed, so the bucket admits nothing"
+            ObserverTickOutcome::Deferred,
+            "no wall time elapsed, so the bucket cannot even cover the probe reservation"
+        );
+        assert_eq!(
+            port.probe_count(),
+            1,
+            "the starved tick defers without sending an uncharged probe"
         );
         // After one poll interval the bucket has refilled 1/s x 10s = 10
         // tokens, capped at its capacity of 3: the probe reserves 2 and

@@ -393,11 +393,11 @@ impl Drop for Permit {
 ///
 /// Expected callers:
 ///
-/// - **The observer tick** ([`observe_tick`]): it must compute its
-///   admission (probe reservation + lookup budget) from one consistent
-///   balance, so it reads [`Self::available`] and then charges the probe
-///   and the admitted lookups through [`Self::spend`] rather than
-///   round-tripping through permits.
+/// - **The observer tick** ([`observe_tick`]): reserves
+///   [`PROBE_REQUESTS_PER_TICK`] with [`Self::try_reserve`] BEFORE
+///   sending the probe, deferring the whole tick on exhaustion, then
+///   admits lookups with one atomic [`Self::reserve_up_to`] against the
+///   post-probe balance.
 /// - **Invoice-creation snapshot fetches, the first-bind candidate fetch,
 ///   and the claim-time history scan** (sibling slices): charge
 ///   [`Self::try_reserve`] before dispatch, or [`Self::reserve_or_wait`]
@@ -503,11 +503,25 @@ impl RequestLimiter {
         }
     }
 
-    /// Spends up to `requests` tokens without a permit (saturating at what
-    /// is available). Reserved for the observer tick's admission
-    /// accounting, which derives its lookup budget from one
-    /// [`Self::available`] read before charging; every other caller must
-    /// use [`Self::try_reserve`] or [`Self::reserve_or_wait`].
+    /// Atomically reserves as many of the currently available tokens as
+    /// `max` allows (possibly zero) and returns the permit for the
+    /// granted count. One lock covers the refill, the balance read, and
+    /// the charge, so the observer tick's lookup admission derives from
+    /// one consistent balance and a concurrent caller can never push the
+    /// joint total over budget. The surplus stays for other callers.
+    pub fn reserve_up_to(&self, max: u64) -> Permit {
+        let mut budget = self.lock();
+        let granted = budget.available(Instant::now()).min(max);
+        budget.spend(granted);
+        Permit { granted }
+    }
+
+    /// Spends up to `requests` tokens without a permit (saturating at
+    /// what is available). No production caller remains: the observer
+    /// tick reserves through [`Self::try_reserve`] and
+    /// [`Self::reserve_up_to`], so every request is charged before it is
+    /// sent. Retained for budget-accounting tests only.
+    #[cfg(test)]
     pub fn spend(&self, requests: u64) {
         self.lock().spend(requests);
     }
@@ -663,7 +677,8 @@ impl ObserverBackoff {
             }
             ObserverTickOutcome::ProbeFailed(_)
             | ObserverTickOutcome::ObservationFailed(_)
-            | ObserverTickOutcome::PlanUnavailable => {}
+            | ObserverTickOutcome::PlanUnavailable
+            | ObserverTickOutcome::Deferred => {}
         }
     }
 }
@@ -675,6 +690,11 @@ pub enum ObserverTickOutcome {
     ProbeFailed(ObserverError),
     /// The durable observation plan could not be loaded.
     PlanUnavailable,
+    /// The shared request budget could not cover the probe reservation,
+    /// so the tick sent no Electrum requests and deferred the whole tick
+    /// to the next poll interval. Not an availability change and not a
+    /// zero-success tick: nothing was attempted.
+    Deferred,
     /// Fetching, validating, applying, or recording observations failed.
     ObservationFailed(ObserverError),
     /// The tick probed and observed successfully; `failed` counts isolated
@@ -686,13 +706,15 @@ pub enum ObserverTickOutcome {
     },
 }
 
-/// Runs one bounded observer tick: active probe, plan, budgeted batch,
-/// persistence, and health publication. The empty-target case still probes
-/// and reports availability from the probe alone. `state` carries the
-/// cross-tick request budget and failure-log rate limiter. Per-address
-/// lookup failures are always isolated: they are counted and logged but
-/// never degrade endpoint availability; only a probe or connect failure
-/// does.
+/// Runs one bounded observer tick: budget-reserved active probe, plan,
+/// budgeted batch, persistence, and health publication. The empty-target
+/// case still probes and reports availability from the probe alone. If the
+/// shared budget cannot cover the probe reservation the tick sends no
+/// Electrum requests at all and returns [`ObserverTickOutcome::Deferred`].
+/// `state` carries the cross-tick request budget and failure-log rate
+/// limiter. Per-address lookup failures are always isolated: they are
+/// counted and logged but never degrade endpoint availability; only a
+/// probe or connect failure does.
 pub async fn observe_tick(
     port: &dyn ElectrumPort,
     backend: &dyn ObservationBackend,
@@ -700,6 +722,29 @@ pub async fn observe_tick(
     runtime: &Runtime,
     state: &mut ObserverTickState,
 ) -> ObserverTickOutcome {
+    // Reserve the probe's two requests BEFORE any Electrum I/O: every
+    // request the process sends is charged against the shared bucket
+    // first. `try_reserve`, not `reserve_or_wait`: the tick runs once per
+    // jittered poll interval, so when the bucket cannot cover the probe
+    // the correct action is to defer the whole tick to the next interval
+    // (pending targets keep their staleness) rather than hold the tick
+    // open waiting for refill. On exhaustion the tick sends nothing and
+    // touches neither availability nor the zero-success signal — no
+    // lookup was attempted — so it is counted under its own
+    // budget_exhausted reason instead.
+    let _probe_permit = match state.budget.try_reserve(PROBE_REQUESTS_PER_TICK) {
+        Ok(permit) => permit,
+        Err(exhausted) => {
+            runtime.metrics().electrum_budget_exhausted_tick();
+            tracing::info!(
+                reason = "budget_exhausted",
+                requested = exhausted.requested,
+                available = exhausted.available,
+                "shared electrum request budget cannot cover the probe; deferring the whole tick"
+            );
+            return ObserverTickOutcome::Deferred;
+        }
+    };
     let tip = match port.probe().await {
         Ok(tip) => {
             runtime.record_electrum_probe(ElectrumProbe::success(tip.height, tip.time_unix));
@@ -741,20 +786,19 @@ pub async fn observe_tick(
         );
     }
 
-    // The active probe already issued its requests; charge them against
-    // the shared sustained token bucket so the configured rate bounds the
-    // probe, the observation batch, and every non-tick caller jointly. The
-    // bucket refills from elapsed wall time, so the jittered loop cannot
-    // sustain a higher rate.
-    let available = state.budget.available();
-    state.budget.spend(PROBE_REQUESTS_PER_TICK);
-    let lookup_budget = available.saturating_sub(PROBE_REQUESTS_PER_TICK);
-    let selection = select_within_budget(plan, lookup_budget);
+    // The probe's requests were reserved before it ran; admit lookups
+    // from whatever the shared bucket holds now. One atomic
+    // reserve-up-to grants at most min(balance, plan length): the tick
+    // charges exactly what it will dispatch, the surplus stays for
+    // non-tick callers, and a concurrent caller can never push the joint
+    // total over budget. The bucket refills from elapsed wall time, so
+    // the jittered loop cannot sustain a higher rate.
+    let lookup_permit = state
+        .budget
+        .reserve_up_to(u64::try_from(plan.len()).unwrap_or(u64::MAX));
+    let selection = select_within_budget(plan, lookup_permit.granted());
     let processed = selection.batch.len();
     let deferred = selection.deferred.len();
-    state
-        .budget
-        .spend(u64::try_from(processed).unwrap_or(u64::MAX));
     if selection.batch.is_empty() {
         runtime.set_electrum_available(true);
         return ObserverTickOutcome::Observed {

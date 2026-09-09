@@ -38,6 +38,7 @@ pub struct Metrics {
     electrum_observation_stamp_misses: Counter,
     electrum_observation_address_failures: Family<AddressFailureLabels, Counter>,
     electrum_zero_success_ticks: Counter,
+    electrum_budget_exhausted_ticks: Counter,
     payment_states: Gauge,
     runtime_active: Gauge,
     session_validation_results: Counter,
@@ -57,6 +58,7 @@ impl Metrics {
         let electrum_observation_stamp_misses = Counter::default();
         let electrum_observation_address_failures = Family::default();
         let electrum_zero_success_ticks = Counter::default();
+        let electrum_budget_exhausted_ticks = Counter::default();
         let payment_states = Gauge::default();
         let runtime_active = Gauge::default();
         let session_validation_results = Counter::default();
@@ -117,6 +119,12 @@ impl Metrics {
             electrum_zero_success_ticks.clone(),
         );
         registry.register(
+            "paykit_electrum_budget_exhausted_ticks",
+            "Observer ticks deferred because the shared request budget could not \
+             cover the probe reservation; the tick sent no Electrum requests.",
+            electrum_budget_exhausted_ticks.clone(),
+        );
+        registry.register(
             "paykit_payment_states",
             "Aggregate persisted payment-state count.",
             payment_states.clone(),
@@ -144,6 +152,7 @@ impl Metrics {
             electrum_observation_stamp_misses,
             electrum_observation_address_failures,
             electrum_zero_success_ticks,
+            electrum_budget_exhausted_ticks,
             payment_states,
             runtime_active,
             session_validation_results,
@@ -182,6 +191,9 @@ impl Metrics {
     }
     pub fn electrum_zero_success_tick(&self) {
         self.electrum_zero_success_ticks.inc();
+    }
+    pub fn electrum_budget_exhausted_tick(&self) {
+        self.electrum_budget_exhausted_ticks.inc();
     }
     pub fn set_payment_states(&self, value: i64) {
         self.payment_states.set(value);
