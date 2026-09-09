@@ -121,6 +121,51 @@ regtest/signet/testnet for local fulcrum-style endpoints that have no
 TLS. (There is no `--check-config` flag in this tree; the refusal is a
 config error at load, i.e. at process startup.)
 
+## Claim-time scan
+
+The §B.5 claim-time address-index scan (`ChainHistoryPort`, same adapter;
+the observer tick never calls it) issues ONE batched
+`blockchain.scripthash.get_history` per 20-address window — presence only,
+never a transaction fetch — so the request *count* is bounded by the
+50-window scan cap. The response work is bounded three ways:
+
+- **Item-count cap.** A window whose batched response lists more than
+  `electrum.max_history_items_per_window` history items across its 20
+  scripthashes (default 2,000) is rejected before any per-history domain
+  value is materialised — presence is read off the raw response values,
+  and the over-cap window is treated as USED (it only advances the start
+  index; the 50-window bound still refuses with
+  `account_history_too_deep`), never attributed to individual addresses.
+  (electrum-client 0.25 does not expose its transport stream — it buffers
+  the whole response line and parses JSON internally — so the response
+  line itself is still read and JSON-decoded by the client; the cap plus
+  the deadline is the strongest bound the pinned client permits.)
+- **Per-window wall-clock deadline.** Connect + call + decode for one
+  window must finish within `electrum.claim_scan_window_deadline`
+  (default 5s). The blocking socket read cannot be cancelled, so on
+  expiry the wait is abandoned, the scan fails the window
+  `claim_scan_unavailable`, the stale connection is dropped and never
+  reused, and the abandoned read exits at latest when
+  `electrum.request_timeout` elapses on the wire.
+- **Concurrency bound.** At most `electrum.max_concurrent_claim_scans`
+  window fetches run at once process-wide (default 2, config-validated
+  non-zero, a semaphore owned by the claim adapter); over the bound a
+  claim fails `claim_scan_unavailable` immediately, before any blocking
+  task or Electrum call exists — there is no queueing.
+
+**Residual risk:** the request *count* is O(1) per window, but the
+*response size* grows with the scanned addresses' history depth, so a
+claimed account whose scanned address carries an arbitrarily large
+history can still produce a large or slow response. The per-window
+wall-clock deadline above (`electrum.claim_scan_window_deadline`) bounds
+how long the scan *waits*, but the blocking socket read behind it cannot
+be cancelled: an over-deadline response keeps one blocking-pool thread
+and its socket occupied until the read returns — bounded at latest by
+`electrum.request_timeout` on the wire, and bounded in count by the
+`electrum.max_concurrent_claim_scans` semaphore — so the residual is
+thread/socket occupancy by abandoned reads, never unbounded claim
+latency and never unbounded blocking-pool growth.
+
 ## Budgeting rule
 
 A sustained token bucket over a strict oldest-first queue: tokens refill

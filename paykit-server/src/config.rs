@@ -114,6 +114,9 @@ impl Config {
                 max_transaction_bytes: raw.electrum.max_transaction_bytes,
                 max_concurrent_creation_snapshots: raw.electrum.max_concurrent_creation_snapshots,
                 baseline_completion_timeout: raw.electrum.baseline_completion_timeout,
+                max_history_items_per_window: raw.electrum.max_history_items_per_window,
+                claim_scan_window_deadline: raw.electrum.claim_scan_window_deadline,
+                max_concurrent_claim_scans: raw.electrum.max_concurrent_claim_scans,
             },
             outbox: OutboxConfig::from(raw.outbox),
             limits: LimitsConfig::from(raw.limits),
@@ -164,6 +167,10 @@ impl Config {
             ("outbox.retry_max", self.outbox.retry_max),
             ("limits.lock_fetch_timeout", self.limits.lock_fetch_timeout),
             ("shutdown.drain_timeout", self.shutdown.drain_timeout),
+            (
+                "electrum.claim_scan_window_deadline",
+                self.electrum.claim_scan_window_deadline,
+            ),
         ] {
             if value.is_zero() {
                 return Err(ConfigError::ZeroDuration(name));
@@ -194,6 +201,14 @@ impl Config {
             (
                 "electrum.max_concurrent_creation_snapshots",
                 u64::from(self.electrum.max_concurrent_creation_snapshots),
+            ),
+            (
+                "electrum.max_history_items_per_window",
+                u64::from(self.electrum.max_history_items_per_window),
+            ),
+            (
+                "electrum.max_concurrent_claim_scans",
+                u64::from(self.electrum.max_concurrent_claim_scans),
             ),
             ("limits.request_body_bytes", self.limits.request_body_bytes),
             (
@@ -673,6 +688,24 @@ pub struct ElectrumConfig {
     pub max_concurrent_creation_snapshots: u32,
     /// Maximum age of an invoice left between creation commit and baseline completion.
     pub baseline_completion_timeout: Duration,
+    /// Claim-scan response bound: raw history items accepted across one
+    /// window's batched `get_history` (20 scripthashes), enforced on the
+    /// raw response values before any domain value is materialised. An
+    /// over-cap window is treated as used (design §B.5; conservative — it
+    /// only advances the start index, and the 50-window scan bound still
+    /// yields `account_history_too_deep`).
+    pub max_history_items_per_window: u32,
+    /// Claim-scan per-window wall-clock deadline over connect + call +
+    /// decode. The blocking socket read behind it cannot be cancelled, so
+    /// an over-deadline window keeps one blocking-pool thread occupied
+    /// until the read returns (bounded at latest by
+    /// `electrum.request_timeout` on the wire); see
+    /// docs/observer-threat-model.md, "claim-time scan".
+    pub claim_scan_window_deadline: Duration,
+    /// Process-wide bound on concurrent claim-scan window fetches; over
+    /// the bound a claim fails `claim_scan_unavailable` immediately (no
+    /// queueing, no Electrum call).
+    pub max_concurrent_claim_scans: u32,
 }
 
 #[derive(Debug)]
@@ -971,6 +1004,15 @@ struct RawElectrumConfig {
         with = "humantime_serde"
     )]
     baseline_completion_timeout: Duration,
+    #[serde(default = "default_electrum_max_history_items_per_window")]
+    max_history_items_per_window: u32,
+    #[serde(
+        default = "default_electrum_claim_scan_window_deadline",
+        with = "humantime_serde"
+    )]
+    claim_scan_window_deadline: Duration,
+    #[serde(default = "default_electrum_max_concurrent_claim_scans")]
+    max_concurrent_claim_scans: u32,
 }
 
 const fn default_electrum_max_requests_per_tick() -> u32 {
@@ -1007,6 +1049,18 @@ const fn default_electrum_baseline_completion_timeout() -> Duration {
 
 const fn default_electrum_max_response_bytes() -> u64 {
     crate::workers::electrum::DEFAULT_MAX_RESPONSE_BYTES
+}
+
+const fn default_electrum_max_history_items_per_window() -> u32 {
+    2_000
+}
+
+const fn default_electrum_claim_scan_window_deadline() -> Duration {
+    Duration::from_secs(5)
+}
+
+const fn default_electrum_max_concurrent_claim_scans() -> u32 {
+    2
 }
 
 const fn default_electrum_max_tip_age() -> Duration {

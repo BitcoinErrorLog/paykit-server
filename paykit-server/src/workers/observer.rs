@@ -25,9 +25,10 @@ use std::{
 use async_trait::async_trait;
 use bitcoin::{Address, Network, OutPoint, ScriptBuf, Txid, consensus::deserialize, hex::DisplayHex};
 use electrum_client::{
-    ElectrumApi, Error as ElectrumError, ListUnspentRes, Param, ToElectrumScriptHash,
+    Batch, ElectrumApi, Error as ElectrumError, ListUnspentRes, Param, ToElectrumScriptHash,
 };
 use rand::Rng;
+use tokio::sync::Semaphore;
 
 use crate::{
     bitcoin::{ObservationTarget, ObservedOutput, PlannedObservation},
@@ -1211,6 +1212,19 @@ pub async fn observation_loop(
     }
 }
 
+/// Default claim-scan response bound: raw history items accepted across one
+/// window's batched `get_history` before the window is treated as used
+/// (`electrum.max_history_items_per_window`).
+const DEFAULT_MAX_HISTORY_ITEMS_PER_WINDOW: usize = 2_000;
+
+/// Default claim-scan per-window wall-clock deadline over connect + call +
+/// decode (`electrum.claim_scan_window_deadline`).
+const DEFAULT_CLAIM_SCAN_WINDOW_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Default process-wide bound on concurrent claim-scan window fetches
+/// (`electrum.max_concurrent_claim_scans`).
+const DEFAULT_MAX_CONCURRENT_CLAIM_SCANS: usize = 2;
+
 /// Concrete synchronous Electrum client isolated behind the async observation port.
 #[derive(Clone)]
 pub struct ElectrumAdapter {
@@ -1235,6 +1249,17 @@ pub struct ElectrumAdapter {
     /// client's `BufReader` grows or any JSON decode runs, and the
     /// poisoned connection is torn down.
     max_response_bytes: u64,
+    /// Claim-scan response bound: raw history items accepted across one
+    /// window's batched `get_history`, enforced on the raw response values
+    /// before any domain value is materialised.
+    max_history_items_per_window: usize,
+    /// Claim-scan per-window wall-clock deadline over connect + call +
+    /// decode.
+    claim_scan_window_deadline: Duration,
+    /// Process-wide bound on concurrent claim-scan window fetches, shared
+    /// across clones, so concurrent claims cannot grow the blocking pool
+    /// unboundedly. Only the claim scan (`ChainHistoryPort`) draws permits.
+    claim_scan_permits: Arc<Semaphore>,
 }
 
 impl ElectrumAdapter {
@@ -1246,7 +1271,25 @@ impl ElectrumAdapter {
             max_utxos_per_address: self.max_utxos_per_address,
             address_deadline: self.address_deadline,
             max_response_bytes: self.max_response_bytes,
+            max_history_items_per_window: self.max_history_items_per_window,
+            claim_scan_window_deadline: self.claim_scan_window_deadline,
+            claim_scan_permits: self.claim_scan_permits.clone(),
         }
+    }
+
+    /// Overrides the claim-scan bounds (production wiring passes the
+    /// validated `electrum.*` config values; the constructors' defaults
+    /// match the config defaults).
+    pub fn with_claim_scan_bounds(
+        mut self,
+        max_history_items_per_window: usize,
+        claim_scan_window_deadline: Duration,
+        max_concurrent_claim_scans: usize,
+    ) -> Self {
+        self.max_history_items_per_window = max_history_items_per_window;
+        self.claim_scan_window_deadline = claim_scan_window_deadline;
+        self.claim_scan_permits = Arc::new(Semaphore::new(max_concurrent_claim_scans));
+        self
     }
 
     /// Constructs a production adapter without requiring the remote endpoint to be online.
@@ -1270,6 +1313,9 @@ impl ElectrumAdapter {
             max_utxos_per_address,
             address_deadline,
             max_response_bytes,
+            max_history_items_per_window: DEFAULT_MAX_HISTORY_ITEMS_PER_WINDOW,
+            claim_scan_window_deadline: DEFAULT_CLAIM_SCAN_WINDOW_DEADLINE,
+            claim_scan_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_CLAIM_SCANS)),
         })
     }
 
@@ -1542,36 +1588,103 @@ impl ElectrumPort for ElectrumAdapter {
 /// [`ElectrumPort::creation_snapshot`], and every failure maps to
 /// [`ClaimScanError::Unavailable`] so the claim is refused rather than
 /// defaulted to index 0.
+///
+/// The response work is bounded three ways:
+///
+/// - **Item cap before materialising domain values.** The window's ONE
+///   batched round-trip goes through [`ElectrumApi::batch_call`], which
+///   returns the raw `serde_json::Value` results; the total item count is
+///   capped at `max_history_items_per_window` across the batch BEFORE any
+///   `GetHistoryRes` is deserialised — none ever is, presence is read off
+///   the raw values. An over-cap window is treated as USED (presence =
+///   `true` for the whole window, never attributed to individual
+///   addresses): that only advances the start index, and the 50-window
+///   scan bound still yields `account_history_too_deep`, so a seller with
+///   a deep-history address is never derivable onto and never permanently
+///   refused by the cap. (electrum-client 0.25 does not expose the
+///   transport stream: `RawClient::_reader_thread` buffers the entire
+///   response line with an unbounded `BufRead::read_line` and parses it
+///   internally, and the public `raw_call`/`batch_call` return already
+///   materialised `serde_json::Value`s, so a raw-BYTE cap before JSON
+///   decode is not implementable through its public API. The item cap
+///   plus the per-window deadline is the strongest bound the pinned
+///   client permits; the residual is documented in
+///   docs/observer-threat-model.md under "claim-time scan".)
+/// - **Per-window wall-clock deadline.** Connect + call + decode must
+///   finish within `claim_scan_window_deadline`. The blocking socket read
+///   cannot be cancelled, so on expiry the join handle is abandoned: the
+///   window fails `Unavailable`, the connection is never reused, and the
+///   detached task exits when the socket read returns (bounded at latest
+///   by `electrum.request_timeout` on the wire).
+/// - **Concurrency bound.** At most `max_concurrent_claim_scans` window
+///   fetches run at once across the process; over the bound the window
+///   fails `Unavailable` immediately (no queueing, no Electrum call).
 #[async_trait]
 impl ChainHistoryPort for ElectrumAdapter {
     async fn history_presence_batch(
         &self,
         scripts: &[ScriptBuf],
     ) -> Result<Vec<bool>, ClaimScanError> {
+        // Concurrency bound first: over it the claim scan is unavailable
+        // immediately, before any blocking task or Electrum call exists.
+        let _permit = self
+            .claim_scan_permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ClaimScanError::Unavailable)?;
         let adapter = self.clone_for_fetch();
         let scripts = scripts.to_vec();
-        tokio::task::spawn_blocking(move || {
+        let max_items = self.max_history_items_per_window;
+        let fetch = tokio::task::spawn_blocking(move || {
             let client = adapter
                 .raw_client_blocking()
                 .map_err(|_| ClaimScanError::Unavailable)?;
-            let refs: Vec<&bitcoin::Script> = scripts.iter().map(ScriptBuf::as_script).collect();
             // ONE batched get_history round-trip for the window; presence
             // only, so transactions are never fetched.
-            let histories = client
-                .batch_script_get_history(refs)
+            let mut batch = Batch::default();
+            for script in &scripts {
+                batch.script_get_history(script.as_script());
+            }
+            let responses = client
+                .batch_call(&batch)
                 .map_err(|_| ClaimScanError::Unavailable)?;
-            if histories.len() != scripts.len() {
+            if responses.len() != scripts.len() {
                 // A malformed response is an Electrum failure, not an empty
                 // window.
                 return Err(ClaimScanError::Unavailable);
             }
-            Ok(histories
-                .iter()
-                .map(|history| !history.is_empty())
-                .collect())
-        })
-        .await
-        .map_err(|_| ClaimScanError::Unavailable)?
+            // Cap the decoded item count BEFORE any domain value is
+            // materialised; presence is computed on the raw values.
+            let mut items = 0_usize;
+            let mut presence = Vec::with_capacity(responses.len());
+            for response in &responses {
+                let entries = response.as_array().ok_or(ClaimScanError::Unavailable)?;
+                items = items.saturating_add(entries.len());
+                presence.push(!entries.is_empty());
+            }
+            if items > max_items {
+                // Over-cap: the whole window is treated as used (design
+                // §B.5 — conservative: it only advances the start index;
+                // the 50-window bound still yields account_history_too_deep).
+                tracing::debug!(
+                    items,
+                    max_items,
+                    "claim scan window over the history item cap; treating the window as used"
+                );
+                return Ok(vec![true; scripts.len()]);
+            }
+            Ok(presence)
+        });
+        // Per-window wall-clock deadline over connect + call + decode. The
+        // blocking socket read cannot be cancelled, so on expiry the join
+        // handle is abandoned: the scan fails the window Unavailable, the
+        // connection is never reused, and the detached task exits when the
+        // socket read returns (bounded at latest by
+        // `electrum.request_timeout` on the wire).
+        match tokio::time::timeout(self.claim_scan_window_deadline, fetch).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Err(ClaimScanError::Unavailable),
+        }
     }
 }
 

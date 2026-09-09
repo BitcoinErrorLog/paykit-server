@@ -101,6 +101,21 @@ address_deadline = "5s"
 # fails. Default 1 MiB; startup refuses values below 64 KiB or above
 # 16 MiB.
 max_response_bytes = 1048576
+# Claim-time address-index scan bounds (design B.5; see
+# docs/observer-threat-model.md, "claim-time scan"). Each claim scans the
+# account's external chain in windows of 20 scripthashes (one batched
+# get_history per window, presence only) for at most 50 windows.
+# max_history_items_per_window caps the raw history items accepted across
+# one window's batched response before any domain value is materialised;
+# an over-cap window is treated as used (it only advances the start
+# index; the 50-window bound still refuses with account_history_too_deep).
+# claim_scan_window_deadline is the per-window wall-clock deadline over
+# connect + call + decode. max_concurrent_claim_scans bounds concurrent
+# window fetches process-wide; over the bound a claim fails
+# claim_scan_unavailable immediately (no queueing).
+# max_history_items_per_window = 2000
+# claim_scan_window_deadline = "5s"
+# max_concurrent_claim_scans = 2
 # Readiness also requires a trustworthy chain tip: a probed tip older than
 # max_tip_age, a tip-height regression beyond the six-block reorg
 # tolerance, or a tip height that stops advancing within this window marks
