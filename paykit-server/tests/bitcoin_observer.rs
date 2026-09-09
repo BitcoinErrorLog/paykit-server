@@ -107,7 +107,10 @@ fn bitcoin_observation_debug_redacts_addresses_and_outpoints() {
 mod tick {
     use std::{
         collections::HashSet,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::Duration,
     };
 
@@ -183,6 +186,7 @@ mod tick {
         candidate_error: Option<ObserverError>,
         calls: Mutex<Vec<Vec<String>>>,
         candidate_calls: Mutex<Vec<Txid>>,
+        probes: AtomicUsize,
     }
 
     impl FakeElectrum {
@@ -197,6 +201,7 @@ mod tick {
                 candidate_error: None,
                 calls: Mutex::new(Vec::new()),
                 candidate_calls: Mutex::new(Vec::new()),
+                probes: AtomicUsize::new(0),
             }
         }
 
@@ -225,7 +230,12 @@ mod tick {
                 candidate_error: None,
                 calls: Mutex::new(Vec::new()),
                 candidate_calls: Mutex::new(Vec::new()),
+                probes: AtomicUsize::new(0),
             }
+        }
+
+        fn probe_count(&self) -> usize {
+            self.probes.load(Ordering::Relaxed)
         }
     }
 
@@ -273,6 +283,7 @@ mod tick {
         }
 
         async fn probe(&self) -> Result<TipProbe, ObserverError> {
+            self.probes.fetch_add(1, Ordering::Relaxed);
             self.probe
         }
     }
@@ -280,6 +291,11 @@ mod tick {
     struct FakeEntry {
         address: String,
         staleness_secs: u64,
+        /// Attempt-stamp sequence, mirroring `last_attempted_at`: `None`
+        /// until the first tick attempts the target, then the tick's
+        /// stamp order. Failed targets are stamped too, so they rotate
+        /// behind the plan exactly like successes.
+        last_attempt_seq: Option<u64>,
     }
 
     impl FakeEntry {
@@ -287,6 +303,7 @@ mod tick {
             Self {
                 address: address.into(),
                 staleness_secs,
+                last_attempt_seq: None,
             }
         }
     }
@@ -295,7 +312,12 @@ mod tick {
     struct FakeBackend {
         entries: Mutex<Vec<FakeEntry>>,
         applied: Mutex<Vec<Vec<String>>>,
+        /// Success-stamped addresses per tick (`last_observed_at` +
+        /// `last_attempted_at` in the store).
         stamped: Mutex<Vec<Vec<String>>>,
+        /// Failure-stamped addresses per tick (`last_attempted_at` only).
+        stamped_failed: Mutex<Vec<Vec<String>>>,
+        attempt_clock: Mutex<u64>,
         candidates: Mutex<Vec<PendingCandidate>>,
         recorded_failures: Mutex<Vec<CandidateFailureKind>>,
     }
@@ -305,10 +327,18 @@ mod tick {
         async fn observation_plan(&self) -> Result<Vec<PlannedObservation>, ObserverError> {
             let entries = self.entries.lock().unwrap();
             let mut ordered: Vec<&FakeEntry> = entries.iter().collect();
-            // Stable sort on a copy: ties (equally fresh targets) keep the
-            // plan's insertion order, mirroring the store's deterministic
-            // ORDER BY without reordering the stored entries.
-            ordered.sort_by(|left, right| right.staleness_secs.cmp(&left.staleness_secs));
+            // Mirrors the store's ORDER BY COALESCE(last_attempted_at,
+            // last_observed_at, created_at), invoices.id: never-attempted
+            // targets lead, stalest first with insertion order on ties
+            // (the id tiebreak); attempted targets follow in stamp order.
+            // Stable sort on a copy keeps the plan deterministic.
+            ordered.sort_by(|left, right| {
+                let key = |entry: &FakeEntry| match entry.last_attempt_seq {
+                    None => (0, std::cmp::Reverse(entry.staleness_secs), 0),
+                    Some(seq) => (1, std::cmp::Reverse(0), seq),
+                };
+                key(left).cmp(&key(right))
+            });
             Ok(ordered
                 .into_iter()
                 .map(|entry| {
@@ -337,14 +367,29 @@ mod tick {
 
         async fn record_observation_tick(
             &self,
-            addresses: &[String],
+            observed: &[String],
+            failed: &[String],
         ) -> Result<u64, ObserverError> {
-            self.stamped.lock().unwrap().push(addresses.to_vec());
+            self.stamped.lock().unwrap().push(observed.to_vec());
+            self.stamped_failed.lock().unwrap().push(failed.to_vec());
+            let mut clock = self.attempt_clock.lock().unwrap();
             let mut entries = self.entries.lock().unwrap();
             let mut misses = 0_u64;
-            for address in addresses {
+            for (address, succeeded) in observed
+                .iter()
+                .map(|address| (address, true))
+                .chain(failed.iter().map(|address| (address, false)))
+            {
                 match entries.iter_mut().find(|entry| entry.address == *address) {
-                    Some(entry) => entry.staleness_secs = 0,
+                    Some(entry) => {
+                        // Success and failure both carry the attempt
+                        // stamp; only a success clears the staleness.
+                        entry.last_attempt_seq = Some(*clock);
+                        *clock += 1;
+                        if succeeded {
+                            entry.staleness_secs = 0;
+                        }
+                    }
                     None => misses += 1,
                 }
             }
@@ -668,6 +713,8 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
             candidates: Mutex::new(Vec::new()),
             recorded_failures: Mutex::new(Vec::new()),
         };
@@ -762,6 +809,8 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
             candidates: Mutex::new(Vec::new()),
             recorded_failures: Mutex::new(Vec::new()),
         };
@@ -812,6 +861,8 @@ mod tick {
             ),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
             candidates: Mutex::new(Vec::new()),
             recorded_failures: Mutex::new(Vec::new()),
         };
@@ -851,8 +902,9 @@ mod tick {
     async fn a_per_address_failure_isolates_the_failed_target_and_keeps_the_endpoint_available() {
         // One address's lookup fails (for example a dusted address whose
         // response times out): the other targets in the same tick are still
-        // applied and stamped, the failed target keeps its staleness and
-        // leads the next plan, and Electrum stays available.
+        // applied and success-stamped, the failed target keeps its
+        // staleness but rotates behind them via the failure stamp, and
+        // Electrum stays available.
         let port = FakeElectrum::failing_addresses(["dusted"]);
         let backend = FakeBackend {
             entries: Mutex::new(vec![
@@ -862,6 +914,8 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
             candidates: Mutex::new(Vec::new()),
             recorded_failures: Mutex::new(Vec::new()),
         };
@@ -892,7 +946,12 @@ mod tick {
         assert_eq!(
             backend.stamped.lock().unwrap().as_slice(),
             &[vec!["cheap-a".to_owned(), "cheap-b".to_owned()]],
-            "only successfully observed targets are stamped"
+            "only successfully observed targets get the success stamp"
+        );
+        assert_eq!(
+            backend.stamped_failed.lock().unwrap().as_slice(),
+            &[vec!["dusted".to_owned()]],
+            "the failed target gets the failure stamp and rotates"
         );
         {
             let entries = backend.entries.lock().unwrap();
@@ -908,8 +967,9 @@ mod tick {
             "one per-address failure must not degrade the endpoint"
         );
 
-        // Next tick the failed target leads the plan and, succeeding now,
-        // is observed and stamped.
+        // Next tick the failure-stamped target has rotated behind the
+        // successes; with the port now healthy every target is observed
+        // and the dusted target is retried last within budget.
         let port = FakeElectrum::healthy();
         elapse_one_poll_interval(&mut state);
         let outcome = observe_tick(
@@ -929,7 +989,15 @@ mod tick {
             }
         );
         let calls = port.calls.lock().unwrap();
-        assert_eq!(calls[0][0], "dusted".to_owned());
+        assert_eq!(
+            calls[0],
+            vec![
+                "cheap-a".to_owned(),
+                "cheap-b".to_owned(),
+                "dusted".to_owned()
+            ],
+            "the failure stamp rotated the failed target to the tail"
+        );
     }
 
     #[tokio::test]
@@ -942,6 +1010,8 @@ mod tick {
             entries: Mutex::new(vec![FakeEntry::new("dusted", 600)]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
             candidates: Mutex::new(Vec::new()),
             recorded_failures: Mutex::new(Vec::new()),
         };
@@ -977,10 +1047,11 @@ mod tick {
     async fn three_failing_addresses_never_degrade_availability_or_other_sellers() {
         // Attacker scenario: three disclosed addresses (A, B, C) whose
         // lookups fail — with no intervening success — plus one healthy
-        // seller (D) in the same plan. D is observed and stamped, A/B/C
-        // keep their staleness and stay in the queue, Electrum stays
-        // available, and no backoff is recorded: per-address failures are
-        // never promoted to endpoint unavailability.
+        // seller (D) in the same plan. D is observed and success-stamped,
+        // A/B/C keep their staleness and stay in the queue (rotating via
+        // the failure stamp), Electrum stays available, and no backoff is
+        // recorded: per-address failures are never promoted to endpoint
+        // unavailability.
         let port = FakeElectrum::failing_addresses(["a", "b", "c"]);
         let backend = FakeBackend {
             entries: Mutex::new(vec![
@@ -991,6 +1062,8 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
             candidates: Mutex::new(Vec::new()),
             recorded_failures: Mutex::new(Vec::new()),
         };
@@ -1029,7 +1102,15 @@ mod tick {
         assert_eq!(
             backend.stamped.lock().unwrap().as_slice(),
             &[vec!["d".to_owned()], vec!["d".to_owned()]],
-            "only the healthy seller is ever stamped"
+            "only the healthy seller is ever success-stamped"
+        );
+        assert_eq!(
+            backend.stamped_failed.lock().unwrap().as_slice(),
+            &[
+                vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+                vec!["a".to_owned(), "b".to_owned(), "c".to_owned()],
+            ],
+            "the failing addresses are failure-stamped every tick"
         );
         let entries = backend.entries.lock().unwrap();
         assert_eq!(entries[0].staleness_secs, 600, "a keeps its staleness");
@@ -1042,12 +1123,15 @@ mod tick {
         // Two attacker addresses failing alternately across ticks (A, B,
         // then A again) with no successful lookup anywhere: availability
         // and backoff are unaffected, and the failed targets keep their
-        // queue position.
+        // staleness while rotating behind each other via the failure
+        // stamp.
         let port = FakeElectrum::failing_addresses(["a", "b"]);
         let backend = FakeBackend {
             entries: Mutex::new(vec![FakeEntry::new("a", 600), FakeEntry::new("b", 300)]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
             candidates: Mutex::new(Vec::new()),
             recorded_failures: Mutex::new(Vec::new()),
         };
@@ -1086,6 +1170,78 @@ mod tick {
     }
 
     #[tokio::test]
+    async fn permanently_failing_targets_rotate_behind_and_cannot_starve_the_plan() {
+        // Attacker scenario: 50 permanently-failing disclosed addresses
+        // (each dusted past max_utxos_per_address so its lookup fails
+        // fast) ahead of one honest seller in the oldest-first plan, at
+        // this test's configured budget of 48 lookups per tick (a
+        // 50-token bucket minus the two reserved probe requests).
+        // Because failed
+        // targets are failure-stamped, they rotate behind the rest of
+        // the plan exactly like successes: the honest target is attempted
+        // by the second tick and every attacker target within
+        // ceil(51/48) = 2 ticks — without the failure stamp the 48
+        // failures would hold the head forever and the honest target
+        // would NEVER be attempted.
+        const FAILING: usize = 50;
+        let port = FakeElectrum {
+            failing_addresses: (0..FAILING)
+                .map(|index| format!("attacker-{index}"))
+                .collect(),
+            ..FakeElectrum::healthy()
+        };
+        let mut entries: Vec<FakeEntry> = (0..FAILING)
+            .map(|index| FakeEntry::new(&format!("attacker-{index}"), (10_000 - index) as u64))
+            .collect();
+        entries.push(FakeEntry::new("honest", 1));
+        let backend = FakeBackend {
+            entries: Mutex::new(entries),
+            applied: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
+            candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+        // 50 tokens: the probe reserves 2, leaving this test's
+        // configured budget of 48 lookups per tick.
+        let mut state = state(&policy(50));
+
+        for _ in 0..5 {
+            elapse_one_poll_interval(&mut state);
+            let outcome = observe_tick(
+                &port,
+                &backend,
+                &BitcoinNetwork::Regtest,
+                &runtime,
+                &mut state,
+            )
+            .await;
+            assert!(
+                matches!(outcome, ObserverTickOutcome::Observed { .. }),
+                "failing targets never degrade the tick itself"
+            );
+        }
+        let calls = port.calls.lock().unwrap();
+        assert_eq!(calls[0].len(), 48, "tick 1 admits the budget exactly");
+        assert!(
+            !calls[0].iter().any(|address| address == "honest"),
+            "tick 1 is all attacker targets"
+        );
+        assert!(
+            calls[1].iter().any(|address| address == "honest"),
+            "the honest target is attempted by the second tick"
+        );
+        let attempted: HashSet<_> = calls[..2].iter().flatten().collect();
+        assert_eq!(
+            attempted.len(),
+            FAILING + 1,
+            "every target — attacker and honest — is attempted within ceil(51/48) = 2 ticks"
+        );
+    }
+
+    #[tokio::test]
     async fn a_stamp_miss_is_reported_without_blocking_the_other_records() {
         // The adapter reports an observed address whose lookup hash matches
         // no invoice row: the miss must surface as a named tick failure
@@ -1095,6 +1251,8 @@ mod tick {
             entries: Mutex::new(vec![FakeEntry::new("known", 300)]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
             candidates: Mutex::new(Vec::new()),
             recorded_failures: Mutex::new(Vec::new()),
         };
@@ -1130,6 +1288,8 @@ mod tick {
             entries: Mutex::new(vec![FakeEntry::new("known", 300)]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
             candidates: Mutex::new(Vec::new()),
             recorded_failures: Mutex::new(Vec::new()),
         };
@@ -1172,6 +1332,8 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
             candidates: Mutex::new(Vec::new()),
             recorded_failures: Mutex::new(Vec::new()),
         };
@@ -1203,6 +1365,8 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
             candidates: Mutex::new(Vec::new()),
             recorded_failures: Mutex::new(Vec::new()),
         };
@@ -1240,6 +1404,8 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
             candidates: Mutex::new(Vec::new()),
             recorded_failures: Mutex::new(Vec::new()),
         };
@@ -1295,6 +1461,123 @@ mod tick {
     }
 
     #[tokio::test]
+    async fn an_exhausted_shared_bucket_defers_the_whole_tick_without_electrum_io() {
+        // A creation caller drained the shared bucket to zero: the tick
+        // cannot reserve the probe, so it sends no Electrum requests at
+        // all — no probe, no lookups — and defers the whole tick. That is
+        // not an availability change and not a zero-success tick
+        // (processed == 0 because nothing was attempted): both signals
+        // stay untouched and the deferral is counted under its own
+        // budget_exhausted reason.
+        let port = FakeElectrum::healthy();
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![
+                FakeEntry::new("oldest", 600),
+                FakeEntry::new("second", 300),
+            ]),
+            applied: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
+            candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+        runtime.set_electrum_available(true);
+        let electrum_before = runtime.readiness().await.electrum;
+        let limiter = RequestLimiter::new(6, 0);
+        let mut state = ObserverTickState::with_limiter(limiter.clone());
+        let drained = limiter
+            .try_reserve(6)
+            .expect("the creation caller drains the bucket");
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state,
+        )
+        .await;
+        assert_eq!(outcome, ObserverTickOutcome::Deferred);
+        assert_eq!(
+            port.probe_count(),
+            0,
+            "an uncharged probe must never be sent"
+        );
+        assert!(
+            port.calls.lock().unwrap().is_empty(),
+            "the deferred tick issues no lookups"
+        );
+        assert_eq!(
+            runtime.readiness().await.electrum,
+            electrum_before,
+            "a budget-deferred tick is not an availability change"
+        );
+        let encoded = runtime.metrics().encode().unwrap();
+        assert!(
+            encoded.contains("paykit_electrum_available 1"),
+            "the availability gauge is untouched: {encoded}"
+        );
+        assert!(
+            encoded.contains("paykit_electrum_budget_exhausted_ticks_total 1"),
+            "the deferred tick is counted under its own reason: {encoded}"
+        );
+        assert!(
+            encoded.contains("paykit_electrum_zero_success_ticks_total 0"),
+            "processed == 0, so the zero-success counter is untouched: {encoded}"
+        );
+        let entries = backend.entries.lock().unwrap();
+        assert_eq!(entries[0].staleness_secs, 600, "targets stay stale");
+        drop(drained);
+    }
+
+    #[tokio::test]
+    async fn a_bucket_holding_exactly_the_probe_reservation_probes_and_admits_no_lookups() {
+        // Exactly PROBE_REQUESTS_PER_TICK tokens in the bucket: the probe
+        // reservation succeeds and the probe runs, but nothing remains
+        // for lookups, so the whole plan defers to the next tick.
+        let port = FakeElectrum::healthy();
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![
+                FakeEntry::new("oldest", 600),
+                FakeEntry::new("second", 300),
+            ]),
+            applied: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
+            candidates: Mutex::new(Vec::new()),
+            recorded_failures: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+        let limiter = RequestLimiter::new(2, 0);
+        let mut state = ObserverTickState::with_limiter(limiter);
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 0,
+                deferred: 2,
+                failed: 0,
+            }
+        );
+        assert_eq!(port.probe_count(), 1, "the reserved probe ran");
+        assert!(
+            port.calls.lock().unwrap().is_empty(),
+            "zero lookups are admitted"
+        );
+    }
+
+    #[tokio::test]
     async fn a_zero_success_tick_is_counted_but_keeps_electrum_available() {
         // Every attempted lookup fails in isolation: the tick is visible
         // through the zero-success counter, but availability stays up and
@@ -1307,6 +1590,8 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
             candidates: Mutex::new(Vec::new()),
             recorded_failures: Mutex::new(Vec::new()),
         };
@@ -1356,6 +1641,8 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
             candidates: Mutex::new(Vec::new()),
             recorded_failures: Mutex::new(Vec::new()),
         };
@@ -1440,6 +1727,8 @@ mod tick {
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
+            stamped_failed: Mutex::new(Vec::new()),
+            attempt_clock: Mutex::new(0),
             candidates: Mutex::new(Vec::new()),
             recorded_failures: Mutex::new(Vec::new()),
         };
@@ -1480,12 +1769,13 @@ mod tick {
         .await;
         assert_eq!(
             outcome,
-            ObserverTickOutcome::Observed {
-                processed: 0,
-                deferred: 3,
-                failed: 0,
-            },
-            "no wall time elapsed, so the bucket admits nothing"
+            ObserverTickOutcome::Deferred,
+            "no wall time elapsed, so the bucket cannot even cover the probe reservation"
+        );
+        assert_eq!(
+            port.probe_count(),
+            1,
+            "the starved tick defers without sending an uncharged probe"
         );
         // After one poll interval the bucket has refilled 1/s x 10s = 10
         // tokens, capped at its capacity of 3: the probe reserves 2 and

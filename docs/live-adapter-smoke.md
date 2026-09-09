@@ -13,8 +13,7 @@ Pinned/runtime versions:
 - `paykit-lib` and `paykit-sdk` `0.1.0-rc37`, Git revision `81fd0e5124aac1fd782811fd968109a5972cd323`
 - Paykit dependency `pubky` `0.8.0`
 - local Pubky Core static testnet `0.9.3`, Git revision `51db89744f97e33486a5e5aedf442b7e2f9b51c2`
-- `bdk_electrum` `0.24.0`
-- `electrum-client` `0.25.0`
+- `electrum-client` `0.25.0` (the adapter uses it directly; the earlier `bdk_electrum` `0.24.0` dependency was removed)
 - public Electrum server reported `Fulcrum 1.11.1`, protocol `1.4`
 
 The snapshot proves interoperability only for these versions and environments. It is not a compatibility claim for arbitrary homeservers, relays, Electrum implementations, or future dependency versions.

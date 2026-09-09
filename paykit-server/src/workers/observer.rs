@@ -7,10 +7,13 @@
 //! history RPCs or fetching a historical transaction: the request
 //! count is exactly one per observed address and cannot be expanded by an
 //! attacker dusting a disclosed invoice address. The response work is
-//! bounded too: the decoded item count is capped before any per-UTXO
-//! record is materialised and every address runs under a wall-clock
-//! deadline, and every per-address failure is isolated — it never
-//! degrades endpoint availability or the tick's other observations.
+//! bounded too: every connection's stream is byte-capped per response
+//! line (see [`crate::workers::electrum`]) before the client buffers or
+//! decodes anything, the decoded item count is capped before any
+//! per-UTXO record is materialised, and every address runs under a
+//! wall-clock deadline, and every per-address failure is isolated — it
+//! never degrades endpoint availability or the tick's other
+//! observations.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -22,8 +25,7 @@ use std::{
 use async_trait::async_trait;
 use bitcoin::{Address, Network, OutPoint, Txid, consensus::deserialize, hex::DisplayHex};
 use electrum_client::{
-    Client, ConfigBuilder, ElectrumApi, Error as ElectrumError, ListUnspentRes, Param,
-    ToElectrumScriptHash,
+    ElectrumApi, Error as ElectrumError, ListUnspentRes, Param, ToElectrumScriptHash,
 };
 use rand::Rng;
 
@@ -33,6 +35,7 @@ use crate::{
     domain::payment::BitcoinOutpoint,
     persistence::{BitcoinObservationInput, InvoiceStore, PendingCandidate, PersistenceError},
     runtime::{ElectrumProbe, Runtime},
+    workers::electrum::{self, CappedClient},
 };
 
 /// Oldest-observation age that triggers the backlog metric and WARN log.
@@ -86,8 +89,10 @@ pub struct TipProbe {
 /// (`paykit_electrum_observation_address_failures{reason=...}`).
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum AddressFailureReason {
-    /// The lookup errored: transport timeout, malformed response, or an
-    /// inconsistent height relative to the probed tip.
+    /// The lookup errored: transport timeout, malformed response, a
+    /// response line over `electrum.max_response_bytes` (the transport
+    /// cap fails the read before decode), or an inconsistent height
+    /// relative to the probed tip.
     Error,
     /// The response listed more UTXOs than `electrum.max_utxos_per_address`;
     /// it was rejected before any per-UTXO record was materialised.
@@ -129,17 +134,19 @@ pub struct CandidateTransaction {
 
 /// One tick's observation response with per-address outcomes. `outputs`
 /// holds the matched outputs of every successfully looked-up address;
-/// `observed` and `failed` partition the requested target addresses so the
-/// tick stamps only successful lookups and leaves failed targets stale for
-/// the next tick. One failed address never discards the others' results.
+/// `observed` and `failed` partition the requested target addresses. The
+/// tick stamps every attempted address — observed with the success
+/// stamp, failed with the failure stamp — so both rotate behind the
+/// plan, while failed targets keep their `last_observed_at` staleness.
+/// One failed address never discards the others' results.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ObservationReport {
     pub outputs: Vec<ObservedOutput>,
     /// Target addresses whose `list_unspent` lookup succeeded.
     pub observed: Vec<String>,
     /// Target addresses whose lookup timed out, exceeded the UTXO cap or
-    /// the per-address deadline, or errored; they keep their staleness and
-    /// lead the next tick's plan.
+    /// the per-address deadline, or errored; they keep their staleness
+    /// but rotate behind the rest of the plan like successes.
     pub failed: Vec<FailedObservation>,
 }
 
@@ -232,7 +239,7 @@ impl CandidateFailureKind {
 /// production implementation is [`InvoiceStore`]; tests inject fakes.
 #[async_trait]
 pub trait ObservationBackend: Send + Sync {
-    /// Loads the non-final observation plan, oldest successful observation first.
+    /// Loads the non-final observation plan, oldest attempt first.
     async fn observation_plan(&self) -> Result<Vec<PlannedObservation>, ObserverError>;
     /// Validates and persists one fetched batch for the requested targets.
     async fn apply_observations(
@@ -241,10 +248,18 @@ pub trait ObservationBackend: Send + Sync {
         targets: &[ObservationTarget],
         outputs: Vec<ObservedOutput>,
     ) -> Result<usize, ObserverError>;
-    /// Stamps the successfully observed target addresses. Returns the
-    /// number of records whose stamp matched no invoice row; misses are
-    /// logged and counted but never abort the other records.
-    async fn record_observation_tick(&self, addresses: &[String]) -> Result<u64, ObserverError>;
+    /// Stamps the tick's attempted target addresses: observed targets
+    /// with a success stamp (`last_observed_at` + `last_attempted_at`),
+    /// failed targets with a failure stamp (`last_attempted_at` only) so
+    /// they rotate behind the plan exactly like successes and cannot
+    /// starve it. Returns the number of records whose stamp matched no
+    /// invoice row; misses are logged and counted but never abort the
+    /// other records.
+    async fn record_observation_tick(
+        &self,
+        observed: &[String],
+        failed: &[String],
+    ) -> Result<u64, ObserverError>;
     async fn pending_candidates(&self) -> Result<Vec<PendingCandidate>, ObserverError> {
         Ok(Vec::new())
     }
@@ -290,8 +305,12 @@ impl ObservationBackend for InvoiceStore {
             .map_err(map_persistence)
     }
 
-    async fn record_observation_tick(&self, addresses: &[String]) -> Result<u64, ObserverError> {
-        InvoiceStore::record_observation_tick(self, addresses)
+    async fn record_observation_tick(
+        &self,
+        observed: &[String],
+        failed: &[String],
+    ) -> Result<u64, ObserverError> {
+        InvoiceStore::record_observation_tick(self, observed, failed)
             .await
             .map_err(map_persistence)
     }
@@ -395,13 +414,14 @@ pub struct BudgetSelection {
     pub deferred: Vec<PlannedObservation>,
 }
 
-/// Walks the oldest-first plan and admits exactly as many targets as the
-/// lookup budget allows; the remainder is deferred to the next tick and,
-/// keeping its staleness, is admitted first then. Every target costs
-/// exactly one lookup, so admission is a strict prefix of the plan: no
-/// bypass, no skipping, no slow lane. Observing a target stamps it, so an
-/// admitted target rotates behind the deferred tail and every target is
-/// observed within a bounded number of ticks.
+/// Walks the oldest-attempt-first plan and admits exactly as many targets
+/// as the lookup budget allows; the remainder is deferred to the next
+/// tick and, being the least recently attempted, is admitted first then.
+/// Every target costs exactly one lookup, so admission is a strict prefix
+/// of the plan: no bypass, no skipping, no slow lane. Attempting a target
+/// stamps it — success or failure — so an admitted target rotates behind
+/// the deferred tail and every target is attempted within a bounded
+/// number of ticks.
 pub fn select_within_budget(plan: Vec<PlannedObservation>, budget: u64) -> BudgetSelection {
     let admit = usize::try_from(budget).unwrap_or(usize::MAX);
     let mut plan = plan;
@@ -524,11 +544,11 @@ impl Drop for Permit {
 ///
 /// Expected callers:
 ///
-/// - **The observer tick** ([`observe_tick`]): it must compute its
-///   admission (probe reservation + lookup budget) from one consistent
-///   balance, so it reads [`Self::available`] and then charges the probe
-///   and the admitted lookups through [`Self::spend`] rather than
-///   round-tripping through permits.
+/// - **The observer tick** ([`observe_tick`]): reserves
+///   [`PROBE_REQUESTS_PER_TICK`] with [`Self::try_reserve`] BEFORE
+///   sending the probe, deferring the whole tick on exhaustion, then
+///   admits lookups with one atomic [`Self::reserve_up_to`] against the
+///   post-probe balance.
 /// - **Invoice-creation snapshot fetches, the first-bind candidate fetch,
 ///   and the claim-time history scan** (sibling slices): charge
 ///   [`Self::try_reserve`] before dispatch, or [`Self::reserve_or_wait`]
@@ -634,18 +654,22 @@ impl RequestLimiter {
         }
     }
 
-    /// Spends up to `requests` tokens without a permit (saturating at what
-    /// is available). Reserved for the observer tick's admission
-    /// accounting, which derives its lookup budget from one
-    /// [`Self::available`] read before charging; every other caller must
-    /// use [`Self::try_reserve`] or [`Self::reserve_or_wait`].
-    pub fn spend(&self, requests: u64) {
-        self.lock().spend(requests);
+    /// Atomically reserves as many of the currently available tokens as
+    /// `max` allows (possibly zero) and returns the permit for the
+    /// granted count. One lock covers the refill, the balance read, and
+    /// the charge, so the observer tick's lookup admission derives from
+    /// one consistent balance and a concurrent caller can never push the
+    /// joint total over budget. The surplus stays for other callers.
+    pub fn reserve_up_to(&self, max: u64) -> Permit {
+        let mut budget = self.lock();
+        let granted = budget.available(Instant::now()).min(max);
+        budget.spend(granted);
+        Permit { granted }
     }
 
     /// Rewinds the refill clock by `elapsed`, so deterministic tests can
     /// simulate wall time passing exactly as the production loop's real
-    /// sleep between ticks would. Not for production callers.
+    /// sleep between ticks would. Test-only; no production caller.
     pub fn rewind_refill_clock(&self, elapsed: Duration) {
         let mut budget = self.lock();
         if let Some(rewound) = budget.last_refill.checked_sub(elapsed) {
@@ -699,6 +723,7 @@ impl ObserverTickState {
     /// Tick state over a private limiter built from the policy's budget —
     /// for tests that drive ticks in isolation. Production uses
     /// [`Self::with_limiter`] with the app-owned shared limiter.
+    /// Test-only; no production caller.
     pub fn new(policy: &ObserverPolicy) -> Self {
         let mut state = Self::with_limiter_and_transaction_cap(
             RequestLimiter::from_policy(policy),
@@ -735,6 +760,7 @@ impl ObserverTickState {
 
     /// Whether the current zero-success streak has already emitted its one
     /// ERROR log (the log gate; exposed for tests and diagnostics).
+    /// Test-only; no production caller.
     pub fn zero_success_logged(&self) -> bool {
         self.zero_success_logged
     }
@@ -743,6 +769,7 @@ impl ObserverTickState {
     /// refills as if that much wall time had passed since the previous
     /// tick. The production loop gets the same refill from its real sleep
     /// between ticks; deterministic tests use this to space ticks.
+    /// Test-only; no production caller.
     pub fn rewind_budget_clock(&mut self, elapsed: Duration) {
         self.budget.rewind_refill_clock(elapsed);
     }
@@ -810,7 +837,8 @@ impl ObserverBackoff {
             }
             ObserverTickOutcome::ProbeFailed(_)
             | ObserverTickOutcome::ObservationFailed(_)
-            | ObserverTickOutcome::PlanUnavailable => {}
+            | ObserverTickOutcome::PlanUnavailable
+            | ObserverTickOutcome::Deferred => {}
         }
     }
 }
@@ -822,6 +850,11 @@ pub enum ObserverTickOutcome {
     ProbeFailed(ObserverError),
     /// The durable observation plan could not be loaded.
     PlanUnavailable,
+    /// The shared request budget could not cover the probe reservation,
+    /// so the tick sent no Electrum requests and deferred the whole tick
+    /// to the next poll interval. Not an availability change and not a
+    /// zero-success tick: nothing was attempted.
+    Deferred,
     /// Fetching, validating, applying, or recording observations failed.
     ObservationFailed(ObserverError),
     /// The tick probed and observed successfully; `failed` counts isolated
@@ -833,13 +866,15 @@ pub enum ObserverTickOutcome {
     },
 }
 
-/// Runs one bounded observer tick: active probe, plan, budgeted batch,
-/// persistence, and health publication. The empty-target case still probes
-/// and reports availability from the probe alone. `state` carries the
-/// cross-tick request budget and failure-log rate limiter. Per-address
-/// lookup failures are always isolated: they are counted and logged but
-/// never degrade endpoint availability; only a probe or connect failure
-/// does.
+/// Runs one bounded observer tick: budget-reserved active probe, plan,
+/// budgeted batch, persistence, and health publication. The empty-target
+/// case still probes and reports availability from the probe alone. If the
+/// shared budget cannot cover the probe reservation the tick sends no
+/// Electrum requests at all and returns [`ObserverTickOutcome::Deferred`].
+/// `state` carries the cross-tick request budget and failure-log rate
+/// limiter. Per-address lookup failures are always isolated: they are
+/// counted and logged but never degrade endpoint availability; only a
+/// probe or connect failure does.
 pub async fn observe_tick(
     port: &dyn ElectrumPort,
     backend: &dyn ObservationBackend,
@@ -847,6 +882,29 @@ pub async fn observe_tick(
     runtime: &Runtime,
     state: &mut ObserverTickState,
 ) -> ObserverTickOutcome {
+    // Reserve the probe's two requests BEFORE any Electrum I/O: every
+    // request the process sends is charged against the shared bucket
+    // first. `try_reserve`, not `reserve_or_wait`: the tick runs once per
+    // jittered poll interval, so when the bucket cannot cover the probe
+    // the correct action is to defer the whole tick to the next interval
+    // (pending targets keep their staleness) rather than hold the tick
+    // open waiting for refill. On exhaustion the tick sends nothing and
+    // touches neither availability nor the zero-success signal — no
+    // lookup was attempted — so it is counted under its own
+    // budget_exhausted reason instead.
+    let _probe_permit = match state.budget.try_reserve(PROBE_REQUESTS_PER_TICK) {
+        Ok(permit) => permit,
+        Err(exhausted) => {
+            runtime.metrics().electrum_budget_exhausted_tick();
+            tracing::info!(
+                reason = "budget_exhausted",
+                requested = exhausted.requested,
+                available = exhausted.available,
+                "shared electrum request budget cannot cover the probe; deferring the whole tick"
+            );
+            return ObserverTickOutcome::Deferred;
+        }
+    };
     if let Err(error) = backend
         .sweep_stale_creation_baselines(state.baseline_completion_timeout)
         .await
@@ -894,20 +952,19 @@ pub async fn observe_tick(
         );
     }
 
-    // The active probe already issued its requests; charge them against
-    // the shared sustained token bucket so the configured rate bounds the
-    // probe, the observation batch, and every non-tick caller jointly. The
-    // bucket refills from elapsed wall time, so the jittered loop cannot
-    // sustain a higher rate.
-    let available = state.budget.available();
-    state.budget.spend(PROBE_REQUESTS_PER_TICK);
-    let lookup_budget = available.saturating_sub(PROBE_REQUESTS_PER_TICK);
-    let selection = select_within_budget(plan, lookup_budget);
+    // The probe's requests were reserved before it ran; admit lookups
+    // from whatever the shared bucket holds now. One atomic
+    // reserve-up-to grants at most min(balance, plan length): the tick
+    // charges exactly what it will dispatch, the surplus stays for
+    // non-tick callers, and a concurrent caller can never push the joint
+    // total over budget. The bucket refills from elapsed wall time, so
+    // the jittered loop cannot sustain a higher rate.
+    let lookup_permit = state
+        .budget
+        .reserve_up_to(u64::try_from(plan.len()).unwrap_or(u64::MAX));
+    let selection = select_within_budget(plan, lookup_permit.granted());
     let processed = selection.batch.len();
     let deferred = selection.deferred.len();
-    state
-        .budget
-        .spend(u64::try_from(processed).unwrap_or(u64::MAX));
     if selection.batch.is_empty() {
         runtime.set_electrum_available(true);
         return ObserverTickOutcome::Observed {
@@ -997,7 +1054,11 @@ pub async fn observe_tick(
         runtime.set_electrum_available(false);
         return ObserverTickOutcome::ObservationFailed(error);
     }
-    if u64::try_from(processed).unwrap_or(u64::MAX) < lookup_budget
+    // The candidate fetch is admissible only when the observation batch
+    // did not exhaust the tick's budget: a non-empty `deferred` means the
+    // budget truncated the plan, so no headroom remains. `try_reserve(1)`
+    // is the authoritative charge — the fetch is never uncharged.
+    if deferred == 0
         && let Ok(candidates) = backend.pending_candidates().await
         && let Some(candidate) = candidates.first()
         && state.budget.try_reserve(1).is_ok()
@@ -1024,7 +1085,21 @@ pub async fn observe_tick(
             return ObserverTickOutcome::ObservationFailed(error);
         }
     }
-    let misses = match backend.record_observation_tick(&report.observed).await {
+    // Stamp every ATTEMPTED target: observed targets with the success
+    // stamp, failed targets with the failure stamp, so both rotate
+    // behind the rest of the oldest-first plan. Stamping only successes
+    // would let a run of permanently failing targets hold the plan's
+    // head forever and starve every honest seller of attempts; the
+    // failed targets keep their `last_observed_at` staleness either way.
+    let failed_addresses: Vec<String> = report
+        .failed
+        .iter()
+        .map(|failure| failure.address.clone())
+        .collect();
+    let misses = match backend
+        .record_observation_tick(&report.observed, &failed_addresses)
+        .await
+    {
         Ok(misses) => misses,
         Err(error) => {
             runtime.set_electrum_available(false);
@@ -1045,9 +1120,9 @@ pub async fn observe_tick(
         return ObserverTickOutcome::ObservationFailed(ObserverError::ObservationStampMiss);
     }
     // Isolated per-address failures degrade only the failed targets (they
-    // keep their staleness and lead the next plan); they never degrade
-    // endpoint availability. The endpoint degrades solely on a probe or
-    // connect failure, handled above.
+    // keep their staleness, though they rotate behind the plan like
+    // successes); they never degrade endpoint availability. The endpoint
+    // degrades solely on a probe or connect failure, handled above.
     runtime.set_electrum_available(true);
     ObserverTickOutcome::Observed {
         processed,
@@ -1146,8 +1221,19 @@ pub struct ElectrumAdapter {
     /// rejected before any per-UTXO record is materialised.
     max_utxos_per_address: usize,
     /// Per-address wall-clock deadline over connect + call + decode
-    /// (`electrum.address_deadline`).
+    /// (`electrum.address_deadline`). The tick's probe shares it: the
+    /// per-read socket timeout does not bound a drip-feeding endpoint,
+    /// so without a wall-clock bound on the probe a slow-drip
+    /// `headers.subscribe` reply would stall the tick forever — no
+    /// backoff, no availability change, no failover.
     address_deadline: Duration,
+    /// Transport-level cap on one Electrum response line
+    /// (`electrum.max_response_bytes`): every connection this adapter
+    /// opens is a [`CappedClient`], so no single response line larger
+    /// than this is ever held in memory — the read fails before the
+    /// client's `BufReader` grows or any JSON decode runs, and the
+    /// poisoned connection is torn down.
+    max_response_bytes: u64,
 }
 
 impl ElectrumAdapter {
@@ -1158,6 +1244,7 @@ impl ElectrumAdapter {
             timeout: self.timeout,
             max_utxos_per_address: self.max_utxos_per_address,
             address_deadline: self.address_deadline,
+            max_response_bytes: self.max_response_bytes,
         }
     }
 
@@ -1168,26 +1255,20 @@ impl ElectrumAdapter {
         timeout: Duration,
         max_utxos_per_address: usize,
         address_deadline: Duration,
+        max_response_bytes: u64,
     ) -> Result<Self, ObserverError> {
         let endpoint = endpoint.into();
-        let parsed = url::Url::parse(&endpoint).map_err(|_| ObserverError::Unavailable)?;
-        if !matches!(parsed.scheme(), "tcp" | "ssl")
-            || parsed.host_str().is_none()
-            || parsed.port().is_none()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || !matches!(parsed.path(), "" | "/")
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-        {
-            return Err(ObserverError::Unavailable);
-        }
+        // Refuse everything but tcp://host:port and ssl://host:port
+        // (including socks5://) at startup: the proxy transport is not
+        // routed through the capped wrapper.
+        electrum::ElectrumEndpoint::parse(&endpoint).map_err(|_| ObserverError::Unavailable)?;
         Ok(Self {
             endpoint: endpoint.into(),
             network,
             timeout,
             max_utxos_per_address,
             address_deadline,
+            max_response_bytes,
         })
     }
 
@@ -1197,6 +1278,7 @@ impl ElectrumAdapter {
         timeout: Duration,
         max_utxos_per_address: usize,
         address_deadline: Duration,
+        max_response_bytes: u64,
     ) -> Result<Self, ObserverError> {
         let adapter = Self::configured(
             endpoint,
@@ -1204,41 +1286,42 @@ impl ElectrumAdapter {
             timeout,
             max_utxos_per_address,
             address_deadline,
+            max_response_bytes,
         )?;
         adapter.raw_client().await?;
         Ok(adapter)
     }
 
-    /// electrum-client call retries stay at zero: each admitted target is
-    /// exactly one request, charged once against the sustained budget, and
-    /// the observer's own next tick is the retry.
-    fn client_config(&self) -> electrum_client::Config {
-        ConfigBuilder::new()
-            .timeout(Some(self.timeout))
-            .retry(0)
-            .build()
-    }
-
-    async fn raw_client(&self) -> Result<Client, ObserverError> {
-        let config = self.client_config();
+    /// Opens one fresh capped connection. There are no client-side call
+    /// retries: each admitted target is exactly one request, charged once
+    /// against the sustained budget, and the observer's own next tick is
+    /// the retry. Connecting performs no Electrum RPC (the TLS handshake
+    /// is transport I/O, not an Electrum request, and the client does not
+    /// negotiate `server.version`), so a (re)connect is never a budgeted
+    /// send.
+    async fn raw_client(&self) -> Result<CappedClient, ObserverError> {
         let endpoint = self.endpoint.clone();
-        tokio::task::spawn_blocking(move || Client::from_config(&endpoint, config))
-            .await
-            .map_err(|_| ObserverError::Unavailable)?
-            .map_err(|_| ObserverError::Unavailable)
+        let timeout = self.timeout;
+        let max_response_bytes = self.max_response_bytes;
+        tokio::task::spawn_blocking(move || {
+            electrum::connect(&endpoint, timeout, max_response_bytes)
+        })
+        .await
+        .map_err(|_| ObserverError::Unavailable)?
+        .map_err(|_| ObserverError::Unavailable)
     }
 
-    fn raw_client_blocking(&self) -> Result<Client, ElectrumError> {
-        Client::from_config(&self.endpoint, self.client_config())
+    fn raw_client_blocking(&self) -> Result<CappedClient, std::io::Error> {
+        electrum::connect(&self.endpoint, self.timeout, self.max_response_bytes)
     }
 }
 
 /// Outcome of one address's connect + call + decode inside the blocking
 /// pool. A successful lookup hands the connection back for reuse; a failed
-/// one drops it (its response stream may be desynchronized) so the next
-/// address reconnects.
+/// one drops it (its response stream may be desynchronized — a poisoned
+/// capped stream can never be resumed) so the next address reconnects.
 enum AddressAttempt {
-    Observed(Box<Client>, Vec<ObservedOutput>),
+    Observed(Box<CappedClient>, Vec<ObservedOutput>),
     Failed(AddressFailureReason),
     ConnectFailed,
 }
@@ -1266,7 +1349,9 @@ impl ElectrumPort for ElectrumAdapter {
             // `electrum.request_timeout` on the wire), so the semaphore
             // bounds live blocking reads, not just awaited snapshots.
             let _snapshot_slot = snapshot_slot;
-            let client = adapter.raw_client_blocking().map_err(map_electrum)?;
+            let client = adapter
+                .raw_client_blocking()
+                .map_err(|_| ObserverError::Unavailable)?;
             let address = parse_address(&address, adapter.network.as_bitcoin_network())?;
             let history = client
                 .script_get_history(address.script_pubkey().as_script())
@@ -1324,7 +1409,9 @@ impl ElectrumPort for ElectrumAdapter {
     ) -> Result<CandidateTransaction, ObserverError> {
         let adapter = self.clone_for_fetch();
         tokio::task::spawn_blocking(move || {
-            let client = adapter.raw_client_blocking().map_err(map_electrum)?;
+            let client = adapter
+                .raw_client_blocking()
+                .map_err(|_| ObserverError::Unavailable)?;
             let transaction = fetch_transaction_blocking(&client, txid, max_transaction_bytes)?;
             Ok(CandidateTransaction {
                 txid,
@@ -1345,7 +1432,7 @@ impl ElectrumPort for ElectrumAdapter {
         targets: &[ObservationTarget],
     ) -> Result<ObservationReport, ObserverError> {
         let mut report = ObservationReport::default();
-        let mut client: Option<Client> = None;
+        let mut client: Option<CappedClient> = None;
         for (index, target) in targets.iter().enumerate() {
             let adapter = self.clone();
             let target = target.clone();
@@ -1415,7 +1502,7 @@ impl ElectrumPort for ElectrumAdapter {
     async fn probe(&self) -> Result<TipProbe, ObserverError> {
         let client = self.raw_client().await?;
         let network = self.network.clone();
-        tokio::task::spawn_blocking(move || {
+        let probe = tokio::task::spawn_blocking(move || {
             let notification = client.block_headers_subscribe().map_err(map_electrum)?;
             let genesis = client.block_header(0).map_err(map_electrum)?;
             if genesis.block_hash().to_string() != expected_genesis_hash(&network) {
@@ -1426,9 +1513,23 @@ impl ElectrumPort for ElectrumAdapter {
                     .map_err(|_| ObserverError::InvalidObservation)?,
                 time_unix: notification.header.time,
             })
-        })
-        .await
-        .map_err(|_| ObserverError::Unavailable)?
+        });
+        // Wall-clock deadline over the whole probe, reusing the
+        // per-address `electrum.address_deadline` knob: the per-read
+        // socket timeout (`electrum.request_timeout`) does not bound a
+        // drip-feeding endpoint that answers one byte per interval, so
+        // without this a slow-drip `headers.subscribe` reply would stall
+        // the tick forever — no backoff, no `set_electrum_available`,
+        // no metrics, leadership never released. Expiry fails the probe
+        // as `Unavailable`, the same endpoint-level condition as a
+        // connect outage, so the existing backoff/metrics/availability
+        // path applies unchanged. As with the per-address path, the
+        // blocking socket read cannot be cancelled: the abandoned
+        // blocking task and its socket exit only when the read returns.
+        match tokio::time::timeout(self.address_deadline, probe).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Err(ObserverError::Unavailable),
+        }
     }
 }
 
@@ -1436,20 +1537,19 @@ impl ElectrumPort for ElectrumAdapter {
 /// raw call. The decoded item count is capped at `max_utxos` BEFORE any
 /// per-UTXO record is materialised: an over-limit response fails this
 /// address with [`AddressFailureReason::ResponseTooLarge`] and no record
-/// vector is built for it. (electrum-client 0.25 does not expose the
-/// transport stream: `RawClient::_reader_thread` buffers the entire
-/// response line with an unbounded `BufRead::read_line` and parses it
-/// internally, and the public `ElectrumApi::raw_call` returns an already
-/// materialised `serde_json::Value`, so a raw-byte cap before JSON decode
-/// is not implementable through its public API. The decoded-item cap plus
-/// the per-address deadline in [`ElectrumAdapter::observations`] is the
-/// strongest bound the pinned client permits.) Every returned item becomes
-/// a present output; a previously tracked outpoint missing from the
-/// unspent set becomes the same absence record the settlement layer
-/// already consumes. Any error fails this address only; the caller
-/// isolates it from the rest of the tick.
+/// vector is built for it. Below the item cap sits the transport cap: the
+/// client's stream is a [`crate::workers::electrum::CappedStream`], so a
+/// response line larger than `electrum.max_response_bytes` fails the read
+/// (with the literal `electrum response exceeds max_response_bytes`
+/// error) before the client's `BufReader` buffers it or any JSON decode
+/// runs; the poisoned connection is torn down by the caller and the next
+/// address reconnects. Every returned item becomes a present output; a
+/// previously tracked outpoint missing from the unspent set becomes the
+/// same absence record the settlement layer already consumes. Any error
+/// fails this address only; the caller isolates it from the rest of the
+/// tick.
 fn observe_address_blocking(
-    client: &Client,
+    client: &CappedClient,
     network: &BitcoinNetwork,
     tip_height: u32,
     target: &ObservationTarget,
@@ -1542,7 +1642,7 @@ fn map_electrum(_: ElectrumError) -> ObserverError {
 /// a resolution input. Over-cap responses are reported separately because
 /// they are deterministically unresolvable under the configured byte cap.
 fn fetch_transaction_blocking(
-    client: &Client,
+    client: &CappedClient,
     txid: Txid,
     max_transaction_bytes: usize,
 ) -> Result<bitcoin::Transaction, ObserverError> {
@@ -1779,36 +1879,47 @@ mod tests {
 
     #[test]
     fn concurrent_callers_cannot_jointly_exceed_the_shared_capacity() {
-        // One bucket shared by the tick-style caller and a creation-style
-        // caller: joint admissions over a window stay bounded by one
-        // capacity plus rate x window, no matter the interleaving.
-        let limiter = RequestLimiter::new(10, 2);
-        // The tick charges probe + lookups exactly as observe_tick does.
-        let available = limiter.available();
-        limiter.spend(PROBE_REQUESTS_PER_TICK);
-        limiter.spend(available - PROBE_REQUESTS_PER_TICK);
-        let mut admitted = available;
-        // A concurrent creation caller finds the shared bucket drained by
-        // the tick; there is no separate pool to draw from.
+        // Real contention: 16 threads race try_reserve(1) against one
+        // non-refilling bucket of capacity 5. Exactly 5 permits are
+        // granted and 11 callers see BudgetExhausted, no matter the
+        // interleaving; the bucket ends empty. Deterministic: every
+        // thread is joined and the assertions are over counts, never
+        // over timing.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const CALLERS: usize = 16;
+        const CAPACITY: u64 = 5;
+        let limiter = RequestLimiter::new(CAPACITY, 0);
+        let granted = Arc::new(AtomicUsize::new(0));
+        let exhausted = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::with_capacity(CALLERS);
+        for _ in 0..CALLERS {
+            let limiter = limiter.clone();
+            let granted = granted.clone();
+            let exhausted = exhausted.clone();
+            handles.push(std::thread::spawn(move || match limiter.try_reserve(1) {
+                Ok(_permit) => {
+                    granted.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(BudgetExhausted { .. }) => {
+                    exhausted.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("caller thread panicked");
+        }
         assert_eq!(
-            limiter.try_reserve(1).unwrap_err(),
-            BudgetExhausted {
-                requested: 1,
-                available: 0
-            }
+            granted.load(Ordering::Relaxed),
+            usize::try_from(CAPACITY).unwrap(),
+            "exactly the bucket capacity is granted under contention"
         );
-        // One second of wall time refills exactly two tokens; racing
-        // callers jointly admit no more than that.
-        limiter.rewind_refill_clock(Duration::from_secs(1));
-        let permit = limiter.try_reserve(2).expect("two tokens refilled");
-        assert_eq!(permit.granted(), 2);
-        admitted += 2;
-        assert!(limiter.try_reserve(1).is_err());
+        assert_eq!(
+            exhausted.load(Ordering::Relaxed),
+            CALLERS - usize::try_from(CAPACITY).unwrap(),
+            "every other caller fails without charging"
+        );
         assert_eq!(limiter.available(), 0);
-        assert!(
-            admitted <= 10 + 2,
-            "capacity + rate x window bounds joint admissions: {admitted}"
-        );
     }
 
     #[test]

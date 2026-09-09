@@ -2126,7 +2126,10 @@ async fn record_observation_tick_reports_stamp_misses_without_aborting_known_rec
     // A record whose address lookup hash matches no invoice row, followed
     // by a valid record: the miss is reported and the valid record stamps.
     let misses = store
-        .record_observation_tick(&["address-never-bound".to_owned(), REGTEST_ADDRESS.to_owned()])
+        .record_observation_tick(
+            &["address-never-bound".to_owned(), REGTEST_ADDRESS.to_owned()],
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(misses, 1);
@@ -2163,7 +2166,7 @@ async fn observation_plan_orders_oldest_observed_first_and_stamp_rotates_the_pla
     assert_eq!(plan[1].target().address(), "plan-address-b");
 
     store
-        .record_observation_tick(&[REGTEST_ADDRESS.to_owned()])
+        .record_observation_tick(&[REGTEST_ADDRESS.to_owned()], &[])
         .await
         .unwrap();
 
@@ -2178,5 +2181,61 @@ async fn observation_plan_orders_oldest_observed_first_and_stamp_rotates_the_pla
             .await
             .unwrap();
     assert!(stamped);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_failed_observation_attempt_rotates_the_plan_without_marking_the_target_observed() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+    store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator(),
+            reader: &reader(),
+            bundle_binding: b"plan-bundle-c",
+            payment_request_binding: b"plan-request-c",
+            new_reader_payloads: &FixedPayloads("plan-address-c"),
+            payment_request_intent: common::payment_intent(&reader()),
+            required_sats: 100,
+        })
+        .await
+        .unwrap();
+
+    let plan = store.observation_plan().await.unwrap();
+    assert_eq!(plan.len(), 2);
+    assert_eq!(plan[0].target().address(), REGTEST_ADDRESS);
+    assert_eq!(plan[1].target().address(), "plan-address-c");
+
+    // A FAILED attempt stamps last_attempted_at only: the target rotates
+    // behind the rest of the plan exactly like a success (so a
+    // permanently failing target cannot hold the head and starve other
+    // sellers), but last_observed_at stays NULL — staleness and backlog
+    // alerting keep tracking the last SUCCESSFUL observation.
+    store
+        .record_observation_tick(&[], &[REGTEST_ADDRESS.to_owned()])
+        .await
+        .unwrap();
+
+    let plan = store.observation_plan().await.unwrap();
+    assert_eq!(plan.len(), 2);
+    assert_eq!(plan[0].target().address(), "plan-address-c");
+    assert_eq!(plan[1].target().address(), REGTEST_ADDRESS);
+    let observed: bool =
+        sqlx::query_scalar("SELECT last_observed_at IS NOT NULL FROM invoices WHERE id = $1")
+            .bind(invoice_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert!(
+        !observed,
+        "a failed attempt must not mark the target observed"
+    );
+    let attempted: bool =
+        sqlx::query_scalar("SELECT last_attempted_at IS NOT NULL FROM invoices WHERE id = $1")
+            .bind(invoice_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert!(attempted, "a failed attempt carries the attempt stamp");
     database.cleanup().await;
 }

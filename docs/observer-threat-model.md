@@ -45,30 +45,81 @@ therefore costs **exactly one request per tracked address** and never calls
 
 **Residual risk:** the request *count* is O(1) per address, but the
 *response size* grows with the address's UTXO count, so a heavily dusted
-address can still produce a large or slow response. The per-address
-wall-clock deadline below (`electrum.address_deadline`) bounds how long
-the tick *waits*, but the blocking socket read behind it cannot be
-cancelled: an over-deadline response keeps one blocking-pool thread and
-its socket occupied until the read returns — bounded at latest by
-`electrum.request_timeout` on the wire — so the residual is thread/socket
-occupancy by abandoned reads, never unbounded tick latency. Mitigations:
+address can still produce a large or slow response. The transport byte
+cap below bounds the memory a large response can occupy, and the
+per-address wall-clock deadline (`electrum.address_deadline`) bounds how
+long the tick *waits*, but the blocking socket read behind the deadline
+cannot be cancelled. The socket timeout (`electrum.request_timeout`) is
+PER READ, so it does not bound the abandoned task in time: a
+drip-feeding endpoint answering one byte per `request_timeout − ε`
+keeps the abandoned blocking task and its socket alive for up to
+(`max_response_bytes` + 1) × drip interval. The residual is therefore an
+abandoned blocking-pool thread + socket PER ABANDONED ATTEMPT, bounded
+in count by the attempts spawned (the tick abandons at most one probe
+plus one read per batch address, and the tokio blocking pool caps at
+512 threads) — never unbounded tick latency or unbounded response
+memory. The aggregate tick-wall bound is the probe's deadline plus one
+deadline per batch address: worst case batch × `address_deadline` (up to
+capacity × deadline ≈ 1000 × 5 s at defaults), versus the per-address
+bound of one `address_deadline`. Mitigations:
 
+- **Transport byte cap.** Every Electrum connection wraps its TCP/TLS
+  stream in a byte-capped reader (`CappedStream`,
+  `paykit-server/src/workers/electrum.rs`) constructed through
+  electrum-client's `From<S: Read + Write>` `RawClient` constructor, so
+  the cap applies BEFORE the client's `BufReader::read_line` buffers the
+  line and before any JSON decode: **no single Electrum response line
+  larger than `electrum.max_response_bytes` (default 1 MiB, accepted
+  range 64 KiB–16 MiB) is ever held in memory; the connection is torn
+  down.** The guarantee includes an exact consumption bound: each read
+  requests at most the current line's remaining budget plus one byte
+  from the socket, so **an over-cap line of any length consumes exactly
+  `max_response_bytes + 1` bytes from the source before the read fails
+  — never more**. The over-cap read fails with the literal `electrum
+  response exceeds max_response_bytes` error and poisons the stream, so
+  a half-read line can never be resumed — the next lookup reconnects on
+  a fresh capped connection (connecting sends no Electrum RPC: the TLS
+  handshake is transport I/O, not an Electrum request, and the client
+  performs no `server.version` negotiation, so a reconnect is never a
+  budgeted send).
 - **Item-count cap.** A response listing more than
   `electrum.max_utxos_per_address` UTXOs (default 200) is rejected before
   any per-UTXO record is materialised — no record vector is built for it.
-  (electrum-client 0.25 does not expose its transport stream — it buffers
-  the whole response line and parses JSON internally — so the response
-  line itself is still read and JSON-decoded by the client; the cap plus
-  the deadline is the strongest bound the pinned client permits.)
+  The two caps are coupled at startup: configuration load refuses an
+  `electrum.max_utxos_per_address` whose maximum reply (items × the
+  176-byte per-item wire bound, plus the JSON-RPC envelope) would exceed
+  `electrum.max_response_bytes`, so the item cap can never demand a
+  response the transport byte cap refuses.
 - **Per-address wall-clock deadline.** Connect + call + decode for one
-  address must finish within `electrum.address_deadline` (default 5s). The
+  address must finish within `electrum.address_deadline` (default 5s),
+  and the tick's probe shares the same deadline so a drip-feeding
+  endpoint cannot stall the tick before any address is attempted. The
   blocking socket read cannot be cancelled, so on expiry the wait is
-  abandoned, the tick moves on, the stale connection is dropped and never
-  reused (the next address reconnects), and the abandoned read exits at
-  latest when `electrum.request_timeout` elapses on the wire.
+  abandoned, the tick moves on, and the stale connection is dropped and
+  never reused (the next address reconnects). The abandoned blocking
+  task is NOT bounded in time by `electrum.request_timeout` (that
+  timeout is per read): a drip-feeding server keeps it and its socket
+  alive for up to (`max_response_bytes` + 1) × drip interval; the
+  residual is bounded in count — one thread + socket per abandoned
+  attempt, under the tokio blocking-pool cap of 512.
 - **Per-address isolation.** Over-cap, over-deadline, and errored lookups
   fail that address only; the tick's other addresses are observed
   normally.
+
+**Transport authentication invariant.** Plaintext Electrum carries every
+tracked invoice address and UTXO set unauthenticated and in the clear,
+and a spoofed plaintext endpoint can feed the observer fabricated
+payment confirmations. The guarantee is enforced at configuration load:
+**when `bitcoin.network == mainnet`, startup refuses any
+`electrum.endpoint` whose scheme is not `ssl://`, with a literal
+diagnostic naming the network and the scheme** (`bitcoin.network
+mainnet requires an ssl:// electrum.endpoint; the <scheme>:// scheme is
+plaintext and refused`). TLS endpoints are built with the webpki root
+store and certificate validation ON — there is no `validate_domain`
+switch and no custom verifier in this tree. `tcp://` remains accepted on
+regtest/signet/testnet for local fulcrum-style endpoints that have no
+TLS. (There is no `--check-config` flag in this tree; the refusal is a
+config error at load, i.e. at process startup.)
 
 ## Budgeting rule
 
@@ -77,35 +128,103 @@ from elapsed wall time at `electrum.max_requests_per_second` up to
 `electrum.max_requests_per_tick`, so no loop cadence — including the
 shortest ±20% jitter interval — can sustain a higher request rate (a
 window's admissions are bounded by one bucket capacity plus rate × window,
-and by rate × window once the bucket is drained). Each tick charges its
-two probe requests (`headers.subscribe` + `block_header(0)`) against the
-bucket and admits exactly as many address lookups as the remainder allows.
-Client-side call retries are pinned at zero: each admitted target is
-exactly one request, charged once; the observer's own next tick is the
-only retry. No bypass, no slow lane, no unmetered admission. Startup
-rejects any configuration whose effective per-tick budget —
+and by rate × window once the bucket is drained). Each tick reserves its
+two probe requests (`headers.subscribe` + `block_header(0)`) from the
+bucket BEFORE sending them and admits exactly as many address lookups as
+the remainder allows. Client-side call retries are pinned at zero: each
+admitted target is exactly one request, charged once; the observer's own
+next tick is the only retry. No bypass, no slow lane, no unmetered
+admission. Startup rejects any configuration whose effective per-tick
+budget —
 `min(max_requests_per_tick, max_requests_per_second × poll_interval
 seconds)` — does not exceed the two-request probe reservation, so no
 accepted configuration can probe successfully while admitting zero address
 lookups forever.
 
 The bucket is process-wide and shared (`RequestLimiter`, owned by the
-runtime and installed once at startup): the observer tick charges its
-probe and lookups against it, and non-tick Electrum callers —
-invoice-creation snapshot fetches, the first-bind candidate fetch, and
-the claim-time history scan — reserve from the same bucket before
-dispatch. The configured rate therefore bounds the joint load, and a busy
-non-tick caller shrinks the next tick's admission instead of drawing from
-a separate pool.
+runtime and installed once at startup), and the guarantee is strict:
+**every Electrum request the process sends is reserved from this bucket
+before it is sent.** In THIS tree the callers are exactly:
 
-Unadmitted and failed targets keep their staleness and lead the next
-tick's plan, and only successfully observed targets are stamped/rotated.
-**Fairness:** every target is *attempted* at least once per
-⌈N ÷ per-tick budget⌉ ticks (N = pending targets). **Residual:** a failed
-target keeps its queue position and consumes one admission slot per tick
-until it succeeds or its invoice expires, so a permanently failing oldest
-target reduces every other seller's effective per-tick capacity by exactly
-one slot — it can never take more.
+- **the observer tick's active probe** — two requests
+  (`headers.subscribe` + `block_header(0)`) reserved with `try_reserve`
+  BEFORE the probe runs; if the bucket cannot cover them the tick sends
+  no Electrum requests at all and defers the whole tick (counted under
+  the `budget_exhausted` metric/log reason, no availability change, and
+  not a zero-success tick since no lookup was attempted), retrying on
+  the next poll interval;
+- **the observer tick's per-address `list_unspent` lookups** — one
+  atomic reserve-up-to against the post-probe balance admits the
+  oldest-first prefix and charges exactly what is dispatched.
+
+The **invoice-creation snapshot fetch and the first-bind candidate
+fetch** (W1.1, this tree) run on the same capped connection constructor
+(`workers/electrum.rs` is the only connection constructor, so their
+`get_history` scan is byte-capped identically) and charge `try_reserve`
+(or `reserve_or_wait` with a bounded deadline) before dispatch. The
+claim-time history scan (W1.2) inherits the same when it rebases onto
+this HEAD.
+
+The configured rate therefore bounds the joint load, and a busy non-tick
+caller shrinks — or, when it drains the bucket, wholly defers — the next
+tick instead of drawing from a separate pool. There is no uncharged send
+anywhere: a request that was not reserved is a request that is not sent.
+
+Unadmitted targets keep their position and lead the next tick's plan.
+Every ATTEMPTED target is stamped: a success stamps `last_observed_at`
+(last successful observation; drives staleness and backlog alerting) AND
+`last_attempted_at`, a failure stamps `last_attempted_at` only, and the
+plan orders oldest attempt first (`COALESCE(last_attempted_at,
+last_observed_at, created_at)`). Failed targets therefore rotate behind
+the rest of the plan exactly like successes — a permanently failing
+target cannot hold the head. **Fairness:** with F permanently failing
+targets and N other pending targets, every target — honest or failing —
+is *attempted* at least once per ⌈(N + F) ÷ B⌉ ticks, where B is the
+per-tick address budget: the tokens the shared bucket holds for address
+lookups after the tick's two probe requests are reserved. B is not a
+configured constant: the production limiter starts with a full
+1000-token burst, then refills from elapsed wall time at
+`max_requests_per_second` (default 5/s) — 40 tokens over the shortest
+jittered 8 s poll, so after the 2-token probe reservation the
+steady-state default is B = 38 addresses per tick (≈ 4.75
+addresses/s) — and concurrent Electrum callers (invoice-creation
+snapshots, claim scans, first-bind fetches) draw from the same bucket,
+so the initial burst and contention change B tick to tick. The bound
+is over a fixed population: continuous invoice creation adds to N, but
+a never-attempted row (NULL `last_attempted_at`) falls through the
+`COALESCE(last_attempted_at, last_observed_at, created_at)` plan key to
+its own `created_at`/`last_observed_at`, so it sorts only among the
+never-attempted rows and enters behind every row attempted before it —
+new invoices cannot starve already-attempted rows. The attacker's F
+addresses cost exactly F slots per rotation, never more. (Before
+failure stamping, F ≥ B permanently failing targets — each dusted with
+`max_utxos_per_address` + 1 UTXOs, on invoices that never expire out of
+the plan — held the head forever and honest sellers were attempted
+never.) **Residual:** the attacker still slows every seller's attempt
+interval by the F extra targets in the rotation: worst-case
+honest-seller delay is ⌈(N + F) ÷ B⌉ ticks including the F attacker
+targets, versus ⌈N ÷ B⌉ without them — bounded, not starvation.
+
+**W1.1 creation traffic shrinks B tick to tick.** The creation-time
+baseline snapshot and the first-bind candidate fetch draw from the same
+shared limiter as the tick, so every creation request directly reduces
+the tokens available for address lookups at the next tick. One invoice
+creation reserves 3 tokens for the snapshot sequence (history +
+listunspent + headers.subscribe) plus `PROBE_REQUESTS_PER_TICK` = 2 for
+its post-create probe — 5 tokens per creation — plus 1 token per
+unconfirmed baseline transaction whose inputs it fetches (bounded by
+`electrum.max_creation_history_entries`, default 50), so a single
+maximal creation charges at most 55 tokens. At the defaults (1000-token
+cap, 5 tokens/s refill, 10 s ±20 % poll) one 8 s tick window refills 40
+tokens, so once the initial 1000-token burst is spent a single maximal
+creation in a window (55 > 40) out-consumes the refill, and a sustained
+rate of one maximal creation per 11 s consumes it exactly — driving B
+to 0, at which point the tick's `try_reserve(PROBE_REQUESTS_PER_TICK)`
+fails, the whole tick defers as `budget_exhausted`, and no Electrum
+request is sent at all. Creation load therefore slows — and at the
+extreme pauses — observation, but the joint Electrum send rate never
+exceeds the configured limiter, which is exactly the invariant the
+limiter exists to keep.
 
 ## Bounded transaction fetches
 
@@ -123,8 +242,8 @@ Until W1.1c activation-time classification ships, R1 includes any pre-invoice tr
 errored) lookup for address A:
 
 - never discards successful observations for addresses B..N in the same
-  tick (A's target is simply not stamped and stays stale for the next
-  tick);
+  tick (A's target keeps its staleness for the next tick and rotates
+  behind the plan via the failure stamp);
 - never marks Electrum unavailable and never triggers global backoff —
   no number or pattern of per-address failures (one address, three
   distinct addresses, or an A,B,A alternation) is promoted to an
@@ -155,21 +274,31 @@ genuine endpoint-level conditions:
   work. Each such tick also logs ERROR once per streak (the streak resets
   on the first tick with a successful lookup). No availability change, no
   backoff.
+- `paykit_electrum_budget_exhausted_ticks` — counter of ticks deferred
+  because the shared budget could not cover the two-request probe
+  reservation (INFO log with reason `budget_exhausted`); the deferred
+  tick sent no Electrum requests, changed no availability, and is not a
+  zero-success tick. A sustained rise means non-tick callers are
+  starving observation: raise the budget or shed creation/claim load.
 - Rate-limited WARN log per failing address (at most once per five minutes
   per address) naming the address and the failure reason, plus a per-tick
   summary WARN with the tick's failure count.
 
 ## Seller-visible effect
 
-A dusted seller's own invoice may be observed more slowly (its target
-keeps failing, stays at the head of the plan, and is retried once per tick
-within budget, consuming one slot per tick until it succeeds or the
-invoice expires). Every other seller's targets are still attempted at
-least once per ⌈N ÷ per-tick budget⌉ ticks, the shared endpoint's request
-rate stays inside the configured sustained budget, and
-`bitcoin_offer_available` never degrades because of per-address failures.
-Payment semantics (outpoint/value/presence, `observed_sats >= required`,
-six-confirmation finality) are unchanged.
+A dusted seller's own invoice may be observed more slowly: its target
+keeps failing, rotates behind the plan via the failure stamp, and is
+retried once per rotation, consuming one slot per rotation. Every other
+seller's targets are still attempted at least once per
+⌈(N + F) ÷ B⌉ ticks (N other pending targets, F of them the
+attacker's failing targets, and B the per-tick address budget after the
+probe reservation — moved tick to tick by the initial 1000-token burst
+and by concurrent Electrum callers — so the F targets stretch the
+rotation but can never starve it), the
+shared endpoint's request rate stays inside the configured sustained
+budget, and `bitcoin_offer_available` never degrades because of
+per-address failures. Payment semantics (outpoint/value/presence,
+`observed_sats >= required`, six-confirmation finality) are unchanged.
 
 ## Cluster-single observer
 

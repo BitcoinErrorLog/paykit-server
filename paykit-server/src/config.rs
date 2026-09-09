@@ -9,7 +9,18 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
-use crate::workers::observer::{ObserverPolicy, PROBE_REQUESTS_PER_TICK};
+use crate::workers::{
+    electrum::{
+        ENDPOINT_SCHEME_ERROR_MESSAGE, ElectrumEndpoint, LISTUNSPENT_ITEM_BYTES_UPPER_BOUND,
+        MAX_MAX_RESPONSE_BYTES, MIN_MAX_RESPONSE_BYTES,
+    },
+    observer::{ObserverPolicy, PROBE_REQUESTS_PER_TICK},
+};
+
+/// Allowance for the JSON-RPC envelope around a `listunspent` reply
+/// (`{"jsonrpc":"2.0","id":<u64>,"result":[…]}` plus separators): well
+/// under 1 KiB. Used only by the item-cap/byte-cap coupling rule.
+pub const LISTUNSPENT_RESPONSE_ENVELOPE_BYTES: u64 = 1024;
 
 #[derive(Debug)]
 pub struct Config {
@@ -97,6 +108,7 @@ impl Config {
                 max_requests_per_second: raw.electrum.max_requests_per_second,
                 max_utxos_per_address: raw.electrum.max_utxos_per_address,
                 address_deadline: raw.electrum.address_deadline,
+                max_response_bytes: raw.electrum.max_response_bytes,
                 max_tip_age: raw.electrum.max_tip_age,
                 max_creation_history_entries: raw.electrum.max_creation_history_entries,
                 max_transaction_bytes: raw.electrum.max_transaction_bytes,
@@ -254,6 +266,55 @@ impl Config {
             && self.deployment_invariants.bitcoin_network != BitcoinNetwork::Mainnet
         {
             return Err(ConfigError::ProductionRequiresMainnet);
+        }
+        if self.electrum.max_response_bytes < MIN_MAX_RESPONSE_BYTES {
+            return Err(ConfigError::ElectrumResponseCapBelowFloor);
+        }
+        if self.electrum.max_response_bytes > MAX_MAX_RESPONSE_BYTES {
+            return Err(ConfigError::ElectrumResponseCapAboveCeiling);
+        }
+        // Coupling rule: the item cap must never demand a reply the
+        // transport byte cap refuses. A maximal listunspent reply is
+        // max_utxos_per_address items of at most
+        // LISTUNSPENT_ITEM_BYTES_UPPER_BOUND bytes each plus the
+        // JSON-RPC envelope; if that exceeds max_response_bytes, the
+        // byte cap would poison the server's own largest legitimate
+        // response, so startup refuses the configuration. u32 ×
+        // LISTUNSPENT_ITEM_BYTES_UPPER_BOUND (176) cannot overflow u64.
+        let largest_legitimate_response = u64::from(self.electrum.max_utxos_per_address)
+            * LISTUNSPENT_ITEM_BYTES_UPPER_BOUND
+            + LISTUNSPENT_RESPONSE_ENVELOPE_BYTES;
+        if largest_legitimate_response > self.electrum.max_response_bytes {
+            return Err(ConfigError::ElectrumUtxoCapExceedsResponseCap(
+                self.electrum.max_utxos_per_address,
+                self.electrum.max_response_bytes,
+            ));
+        }
+        // Plaintext Electrum carries the merchant's invoice addresses and
+        // UTXO sets unauthenticated and in the clear; on mainnet the only
+        // acceptable transport is TLS (`tcp://` stays allowed on
+        // regtest/signet/testnet for local fulcrum-style endpoints).
+        if self.deployment_invariants.bitcoin_network == BitcoinNetwork::Mainnet {
+            // Delegate endpoint-shape validation to the same parser the
+            // adapter construction uses, so a malformed endpoint (for
+            // example `ssl://host:port/tcp://`) is refused at config load
+            // with the parser's own literal instead of later at adapter
+            // construction.
+            let endpoint = ElectrumEndpoint::parse(&self.electrum.endpoint)
+                .map_err(|_| ConfigError::InvalidElectrumEndpoint(ENDPOINT_SCHEME_ERROR_MESSAGE))?;
+            // Fail closed on scheme case as well: `SSL://` is refused
+            // even though the URL parser would normalize it to `ssl`.
+            let scheme = self
+                .electrum
+                .endpoint
+                .split("://")
+                .next()
+                .unwrap_or_default();
+            if scheme != "ssl" || !endpoint.use_tls() {
+                return Err(ConfigError::PlaintextElectrumEndpointOnMainnet(
+                    scheme.to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -556,6 +617,12 @@ pub struct BitcoinConfig {
 
 #[derive(Debug)]
 pub struct ElectrumConfig {
+    /// `tcp://host:port` or `ssl://host:port`. When
+    /// `bitcoin.network == mainnet`, startup refuses anything but
+    /// `ssl://`: plaintext Electrum on mainnet would expose every
+    /// tracked invoice address and UTXO set unauthenticated and in the
+    /// clear. `tcp://` stays allowed on regtest/signet/testnet for
+    /// local fulcrum-style endpoints.
     pub endpoint: String,
     pub poll_interval: Duration,
     pub request_timeout: Duration,
@@ -577,6 +644,13 @@ pub struct ElectrumConfig {
     /// lookup exceeding it fails only that address; the connection is
     /// dropped and never reused.
     pub address_deadline: Duration,
+    /// Transport-level cap on one Electrum response line, in bytes. Every
+    /// connection wraps its stream in a capped reader, so no single
+    /// response line larger than this is ever held in memory: the read
+    /// fails before the client buffers or decodes it, and the poisoned
+    /// connection is torn down. Floor: 64 KiB; ceiling: 16 MiB (startup
+    /// refuses values outside the range).
+    pub max_response_bytes: u64,
     /// Maximum accepted chain-tip age for readiness. On networks with a
     /// live block cadence, /health/ready answers 503 (not_ready) when the
     /// probed tip is older than this, when the tip height regresses by
@@ -720,6 +794,20 @@ pub enum ConfigError {
          must be greater than {PROBE_REQUESTS_PER_TICK}"
     )]
     InsufficientElectrumBudget,
+    #[error("electrum.max_response_bytes must be at least 65536 bytes (64 KiB)")]
+    ElectrumResponseCapBelowFloor,
+    #[error("electrum.max_response_bytes must be at most 16777216 bytes (16 MiB)")]
+    ElectrumResponseCapAboveCeiling,
+    #[error(
+        "electrum.max_utxos_per_address {0} × {LISTUNSPENT_ITEM_BYTES_UPPER_BOUND} B exceeds electrum.max_response_bytes {1}"
+    )]
+    ElectrumUtxoCapExceedsResponseCap(u32, u64),
+    #[error(
+        "bitcoin.network mainnet requires an ssl:// electrum.endpoint; the {0}:// scheme is plaintext and refused"
+    )]
+    PlaintextElectrumEndpointOnMainnet(String),
+    #[error("{0}")]
+    InvalidElectrumEndpoint(&'static str),
 }
 
 fn decode_base64url_no_pad(value: &str, error: ConfigError) -> Result<Vec<u8>, ConfigError> {
@@ -868,6 +956,8 @@ struct RawElectrumConfig {
         with = "humantime_serde"
     )]
     address_deadline: Duration,
+    #[serde(default = "default_electrum_max_response_bytes")]
+    max_response_bytes: u64,
     #[serde(default = "default_electrum_max_tip_age", with = "humantime_serde")]
     max_tip_age: Duration,
     #[serde(default = "default_electrum_max_creation_history_entries")]
@@ -913,6 +1003,10 @@ const fn default_electrum_max_concurrent_creation_snapshots() -> u32 {
 
 const fn default_electrum_baseline_completion_timeout() -> Duration {
     Duration::from_secs(60)
+}
+
+const fn default_electrum_max_response_bytes() -> u64 {
+    crate::workers::electrum::DEFAULT_MAX_RESPONSE_BYTES
 }
 
 const fn default_electrum_max_tip_age() -> Duration {

@@ -24,9 +24,12 @@ use electrum_client::{ScriptHash, ToElectrumScriptHash};
 use paykit_server::{
     bitcoin::{ObservationTarget, TrackedOutput},
     config::BitcoinNetwork,
-    workers::observer::{
-        AddressFailureReason, ElectrumAdapter, ElectrumPort, FailedObservation, ObserverError,
-        RequestLimiter,
+    workers::{
+        electrum::DEFAULT_MAX_RESPONSE_BYTES,
+        observer::{
+            AddressFailureReason, ElectrumAdapter, ElectrumPort, FailedObservation, ObserverError,
+            RequestLimiter,
+        },
     },
 };
 
@@ -74,15 +77,23 @@ fn failed(address: &Address, reason: AddressFailureReason) -> FailedObservation 
 }
 
 /// Test adapter matching the production defaults: the configured UTXO cap
-/// (200) and a generous 5s per-address deadline.
+/// (200), a generous 5s per-address deadline, and the default 1 MiB
+/// response-line cap.
 async fn connect(server: &ProtocolServer) -> ElectrumAdapter {
-    connect_bounded(server, 200, Duration::from_secs(5)).await
+    connect_bounded(
+        server,
+        200,
+        Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .await
 }
 
 async fn connect_bounded(
     server: &ProtocolServer,
     max_utxos_per_address: usize,
     address_deadline: Duration,
+    max_response_bytes: u64,
 ) -> ElectrumAdapter {
     ElectrumAdapter::connect(
         server.endpoint(),
@@ -90,6 +101,7 @@ async fn connect_bounded(
         Duration::from_secs(1),
         max_utxos_per_address,
         address_deadline,
+        max_response_bytes,
     )
     .await
     .unwrap()
@@ -481,6 +493,71 @@ async fn an_oversized_listunspent_response_fails_only_that_address_before_materi
 }
 
 #[tokio::test]
+async fn an_over_cap_response_line_fails_the_read_before_decode_and_the_next_address_reconnects() {
+    let capped = fixture_address();
+    let healthy = Address::p2wpkh(
+        &CompressedPublicKey::from_str(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap(),
+        Network::Regtest,
+    );
+    // Literal fixtures: the capped address's listunspent response is a
+    // single JSON line far above a 4 KiB transport cap (100 items at
+    // ~100 bytes each); the healthy address answers a small line. The
+    // item-count cap (200) would NOT fire for the capped address: the
+    // failure must come from the transport cap, surfacing as an isolated
+    // per-address `error` — the read fails before the client buffers or
+    // JSON-decodes the line.
+    let server = ProtocolServer::start_multi(
+        Network::Regtest,
+        vec![
+            (
+                capped.script_pubkey(),
+                serde_json::Value::Array(
+                    (1..=100)
+                        .map(|label| unspent_entry(label, 546, TIP_HEIGHT))
+                        .collect(),
+                ),
+            ),
+            (
+                healthy.script_pubkey(),
+                serde_json::json!([unspent_entry(7, 30_000, TIP_HEIGHT)]),
+            ),
+        ],
+    )
+    .await;
+    let adapter = connect_bounded(&server, 200, Duration::from_secs(5), 4 * 1024).await;
+
+    let report = adapter
+        .observations(
+            TIP_HEIGHT as u32,
+            &[
+                ObservationTarget::new(capped.to_string(), None),
+                ObservationTarget::new(healthy.to_string(), None),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.failed,
+        vec![failed(&capped, AddressFailureReason::Error)],
+        "the over-cap line fails the read (transport cap), isolated to \
+         that address"
+    );
+    assert_eq!(
+        report.observed,
+        vec![healthy.to_string()],
+        "the poisoned connection is torn down and the next seller is \
+         observed over a fresh capped connection"
+    );
+    assert_eq!(report.outputs.len(), 1);
+    // One lookup per target; the capped lookup is NOT reissued.
+    server.assert_rpc_counts(2, 0, 0);
+}
+
+#[tokio::test]
 async fn a_trickling_response_exceeding_the_address_deadline_fails_only_that_address() {
     let trickled = fixture_address();
     let healthy = Address::p2wpkh(
@@ -504,7 +581,13 @@ async fn a_trickling_response_exceeding_the_address_deadline_fails_only_that_add
         )],
     )
     .await;
-    let adapter = connect_bounded(&server, 200, Duration::from_millis(300)).await;
+    let adapter = connect_bounded(
+        &server,
+        200,
+        Duration::from_millis(300),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .await;
 
     let started = std::time::Instant::now();
     let report = adapter
@@ -576,10 +659,57 @@ async fn classifies_endpoint_outage_as_retryable_unavailable() {
         Duration::from_millis(50),
         200,
         Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
     )
     .await;
 
     assert_eq!(result.err(), Some(ObserverError::Unavailable));
+}
+
+#[tokio::test]
+async fn a_trickling_probe_response_exceeding_the_deadline_fails_the_probe_as_unavailable() {
+    // The fake server answers blockchain.headers.subscribe one byte
+    // every 20ms: every socket read returns well inside the 1s per-read
+    // socket timeout, so only the wall-clock deadline can bound the
+    // probe. The full subscribe reply is over 200 bytes — about five
+    // seconds of drip — and without the deadline the tick would wedge
+    // here: no backoff, no availability change, no failover.
+    let server =
+        ProtocolServer::start_probe_drip(Network::Regtest, Duration::from_millis(20)).await;
+    let adapter = connect_bounded(
+        &server,
+        200,
+        Duration::from_millis(300),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    // Test-level outer bound: without the probe's wall-clock deadline
+    // this await would hang for the whole ~5s drip; the deadline must
+    // cut it to ~300ms with the endpoint-level Unavailable outcome, so
+    // the existing backoff/metrics/availability path applies.
+    let result = tokio::time::timeout(Duration::from_secs(2), adapter.probe())
+        .await
+        .expect("the probe deadline must return well before the drip completes");
+    assert_eq!(result, Err(ObserverError::Unavailable));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the 300ms deadline bounds the probe; the 5s drip never completes"
+    );
+
+    // The tick is not wedged: a subsequent probe against a healthy
+    // endpoint succeeds immediately.
+    let healthy =
+        ProtocolServer::start(
+            Network::Regtest,
+            ScriptBuf::new(),
+            |_| serde_json::json!([]),
+        )
+        .await;
+    let adapter = connect(&healthy).await;
+    let tip = adapter.probe().await.unwrap();
+    assert_eq!(tip.height, TIP_HEIGHT as u32);
 }
 
 #[tokio::test]
@@ -618,6 +748,7 @@ async fn probe_classifies_endpoint_outage_as_retryable_unavailable() {
         Duration::from_millis(50),
         200,
         Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
     )
     .unwrap();
 
@@ -635,6 +766,7 @@ async fn creation_snapshot_reads_tip_after_history_and_unspent() {
         Duration::from_secs(1),
         200,
         Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
     )
     .unwrap();
 
@@ -685,6 +817,7 @@ async fn creation_snapshot_rejects_history_over_the_entry_cap_before_transaction
         51,
         true,
         None,
+        None,
         false,
         None,
         None,
@@ -697,6 +830,7 @@ async fn creation_snapshot_rejects_history_over_the_entry_cap_before_transaction
         Duration::from_secs(1),
         200,
         Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
     )
     .unwrap();
 
@@ -728,6 +862,7 @@ async fn creation_snapshot_permit_outlives_an_abandoned_await() {
         0,
         true,
         None,
+        None,
         false,
         None,
         Some(gate.clone()),
@@ -742,6 +877,7 @@ async fn creation_snapshot_permit_outlives_an_abandoned_await() {
         Duration::from_secs(30),
         200,
         Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
     )
     .unwrap();
     let slots = Arc::new(tokio::sync::Semaphore::new(1));
@@ -814,6 +950,7 @@ async fn a_transaction_answered_under_the_wrong_txid_fails_both_fetch_paths() {
         0,
         false,
         None,
+        None,
         false,
         Some(encode::serialize_hex(&transaction_a)),
         None,
@@ -873,6 +1010,11 @@ struct ProtocolFixture {
     serve_history: bool,
     /// Script whose list_unspent response is delayed, and the delay.
     stall: Option<(ScriptBuf, Duration)>,
+    /// Per-byte write delay for the `blockchain.headers.subscribe`
+    /// response (probe drip-feed): every socket read stays well inside
+    /// the per-read socket timeout, so only a wall-clock deadline can
+    /// bound the probe.
+    probe_drip: Option<Duration>,
     /// Close each connection after its first list_unspent response.
     disconnect_after_unspent: bool,
     transaction_raw: Option<String>,
@@ -898,7 +1040,10 @@ impl ProtocolServer {
     }
 
     async fn start_multi(network: Network, unspent: Vec<(ScriptBuf, serde_json::Value)>) -> Self {
-        Self::start_with_fixture(network, unspent, 0, false, None, false, None, None, None).await
+        Self::start_with_fixture(
+            network, unspent, 0, false, None, None, false, None, None, None,
+        )
+        .await
     }
 
     /// Starts a server that would answer get_history with `history_len`
@@ -911,6 +1056,7 @@ impl ProtocolServer {
             vec![(script, unspent)],
             history_len,
             false,
+            None,
             None,
             false,
             None,
@@ -932,6 +1078,7 @@ impl ProtocolServer {
             0,
             false,
             Some((stalled_script, stall)),
+            None,
             false,
             None,
             None,
@@ -948,7 +1095,27 @@ impl ProtocolServer {
             0,
             false,
             None,
+            None,
             true,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Starts a server that answers `blockchain.headers.subscribe` one
+    /// byte per `per_byte` interval — a drip-feeding endpoint whose every
+    /// socket read completes inside the per-read socket timeout.
+    async fn start_probe_drip(network: Network, per_byte: Duration) -> Self {
+        Self::start_with_fixture(
+            network,
+            vec![],
+            0,
+            false,
+            None,
+            Some(per_byte),
+            false,
             None,
             None,
             None,
@@ -962,6 +1129,7 @@ impl ProtocolServer {
             Vec::new(),
             0,
             false,
+            None,
             None,
             false,
             Some(transaction_raw),
@@ -978,6 +1146,7 @@ impl ProtocolServer {
             0,
             true,
             None,
+            None,
             false,
             None,
             None,
@@ -993,6 +1162,7 @@ impl ProtocolServer {
         history_len: usize,
         serve_history: bool,
         stall: Option<(ScriptBuf, Duration)>,
+        probe_drip: Option<Duration>,
         disconnect_after_unspent: bool,
         transaction_raw: Option<String>,
         gate: Option<Arc<(Mutex<bool>, Condvar)>>,
@@ -1010,6 +1180,7 @@ impl ProtocolServer {
             history_len,
             serve_history,
             stall,
+            probe_drip,
             disconnect_after_unspent,
             transaction_raw,
             gate,
@@ -1145,6 +1316,20 @@ fn serve_connection(mut stream: TcpStream, fixture: Arc<ProtocolFixture>) {
             method => panic!("unexpected Electrum method: {method}"),
         };
         let response = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
+        // Probe drip-feed: write the subscribe reply one byte at a time
+        // so every socket read completes inside the per-read socket
+        // timeout and only a wall-clock deadline can bound the probe.
+        if method == "blockchain.headers.subscribe"
+            && let Some(per_byte) = fixture.probe_drip
+        {
+            for byte in format!("{response}\n").into_bytes() {
+                if stream.write_all(&[byte]).is_err() || stream.flush().is_err() {
+                    return;
+                }
+                thread::sleep(per_byte);
+            }
+            continue;
+        }
         if writeln!(stream, "{response}").is_err() {
             break;
         }

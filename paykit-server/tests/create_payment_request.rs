@@ -1004,7 +1004,8 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
 
         async fn record_observation_tick(
             &self,
-            _addresses: &[String],
+            _observed: &[String],
+            _failed: &[String],
         ) -> Result<u64, ObserverError> {
             Ok(0)
         }

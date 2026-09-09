@@ -64,7 +64,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
     let retired_observation_budget_columns: Vec<String> = sqlx::query_scalar(
         "SELECT table_name || '.' || column_name
@@ -186,13 +186,19 @@ async fn legacy_invoice_is_never_defaulted_into_observation() {
     .await
     .unwrap();
     sqlx::raw_sql(include_str!(
-        "../../paykit-server/migrations/0007_invoice_creation_baseline.sql"
+        "../../paykit-server/migrations/0007_invoice_observation_attempts.sql"
     ))
     .execute(pool)
     .await
     .unwrap();
     sqlx::raw_sql(include_str!(
-        "../../paykit-server/migrations/0008_observation_failure_isolation.sql"
+        "../../paykit-server/migrations/0008_invoice_creation_baseline.sql"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../paykit-server/migrations/0009_observation_failure_isolation.sql"
     ))
     .execute(pool)
     .await

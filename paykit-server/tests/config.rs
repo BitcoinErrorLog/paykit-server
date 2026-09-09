@@ -1,6 +1,11 @@
 use std::time::Duration;
 
-use paykit_server::config::{Config, ConfigEnvironment, PaykitNetwork};
+use paykit_server::config::{
+    Config, ConfigEnvironment, LISTUNSPENT_RESPONSE_ENVELOPE_BYTES, PaykitNetwork,
+};
+use paykit_server::workers::electrum::{
+    LISTUNSPENT_ITEM_BYTES_UPPER_BOUND, MAX_MAX_RESPONSE_BYTES, MIN_MAX_RESPONSE_BYTES,
+};
 
 const KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
@@ -321,6 +326,7 @@ fn parses_accepted_durations_and_uses_ledger_defaults() {
     assert_eq!(config.electrum.max_requests_per_second, 5);
     assert_eq!(config.electrum.max_utxos_per_address, 200);
     assert_eq!(config.electrum.address_deadline, Duration::from_secs(5));
+    assert_eq!(config.electrum.max_response_bytes, 1024 * 1024);
     assert_eq!(config.outbox.poll_interval, Duration::from_secs(5));
     assert_eq!(config.outbox.batch_size, 16);
     assert_eq!(config.outbox.lease_duration, Duration::from_secs(30));
@@ -444,6 +450,217 @@ fn rejects_electrum_budgets_with_zero_post_probe_capacity() {
             "{name}: {error}"
         );
     }
+}
+
+#[test]
+fn rejects_a_response_cap_below_the_64kib_floor_with_the_literal_message() {
+    let error = Config::from_toml_and_environment(
+        &electrum_toml("max_response_bytes = 65535"),
+        environment(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "electrum.max_response_bytes must be at least 65536 bytes (64 KiB)"
+    );
+}
+
+#[test]
+fn accepts_a_response_cap_at_the_64kib_floor() {
+    assert!(
+        Config::from_toml_and_environment(
+            &electrum_toml("max_response_bytes = 65536"),
+            environment()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn accepts_a_response_cap_at_the_16mib_ceiling() {
+    assert!(
+        Config::from_toml_and_environment(
+            &electrum_toml("max_response_bytes = 16777216"),
+            environment()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn rejects_a_response_cap_above_the_16mib_ceiling_with_the_literal_message() {
+    let error = Config::from_toml_and_environment(
+        &electrum_toml("max_response_bytes = 16777217"),
+        environment(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "electrum.max_response_bytes must be at most 16777216 bytes (16 MiB)"
+    );
+    // u64::MAX is refused too — the TOML layer rejects it before
+    // validation because the `toml` crate's integer type is i64, so the
+    // diagnostic is the TOML parse error rather than the range message.
+    assert!(
+        Config::from_toml_and_environment(
+            &electrum_toml("max_response_bytes = 18446744073709551615"),
+            environment()
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn the_utxo_item_cap_must_fit_inside_the_response_byte_cap() {
+    // Default configuration: 200 items × the per-item wire bound +
+    // envelope ≪ 1 MiB.
+    assert!(Config::from_toml_and_environment(&valid_toml(), environment()).is_ok());
+    // The largest item cap the 16 MiB byte-cap ceiling admits is
+    // floor((ceiling − envelope) / per-item bound); one item more and
+    // the byte cap would poison the item cap's own maximum reply, so
+    // startup refuses the coupling with a literal diagnostic naming
+    // both fields and the arithmetic.
+    let max_items = (MAX_MAX_RESPONSE_BYTES - LISTUNSPENT_RESPONSE_ENVELOPE_BYTES)
+        / LISTUNSPENT_ITEM_BYTES_UPPER_BOUND;
+    let error = Config::from_toml_and_environment(
+        &electrum_toml(&format!(
+            "max_utxos_per_address = {}\nmax_response_bytes = {}",
+            max_items + 1,
+            MAX_MAX_RESPONSE_BYTES
+        )),
+        environment(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "electrum.max_utxos_per_address {} × {} B exceeds electrum.max_response_bytes {}",
+            max_items + 1,
+            LISTUNSPENT_ITEM_BYTES_UPPER_BOUND,
+            MAX_MAX_RESPONSE_BYTES
+        )
+    );
+    // Exactly max_items fits inside the ceiling: accepted.
+    assert!(
+        Config::from_toml_and_environment(
+            &electrum_toml(&format!(
+                "max_utxos_per_address = {}\nmax_response_bytes = {}",
+                max_items, MAX_MAX_RESPONSE_BYTES
+            )),
+            environment(),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn the_utxo_item_cap_at_the_response_byte_floor_refuses_a_self_poisoning_config() {
+    // At the response byte cap's 64 KiB floor the largest admitted item
+    // cap is floor((floor − envelope) / per-item bound); one item more
+    // would self-poison its own largest legitimate reply, so startup
+    // refuses it.
+    let max_items = (MIN_MAX_RESPONSE_BYTES - LISTUNSPENT_RESPONSE_ENVELOPE_BYTES)
+        / LISTUNSPENT_ITEM_BYTES_UPPER_BOUND;
+    let error = Config::from_toml_and_environment(
+        &electrum_toml(&format!(
+            "max_utxos_per_address = {}\nmax_response_bytes = {}",
+            max_items + 1,
+            MIN_MAX_RESPONSE_BYTES
+        )),
+        environment(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "electrum.max_utxos_per_address {} × {} B exceeds electrum.max_response_bytes {}",
+            max_items + 1,
+            LISTUNSPENT_ITEM_BYTES_UPPER_BOUND,
+            MIN_MAX_RESPONSE_BYTES
+        )
+    );
+    // The default (200 items, 1 MiB) stays accepted.
+    assert!(Config::from_toml_and_environment(&valid_toml(), environment()).is_ok());
+}
+
+fn mainnet_toml(endpoint: &str) -> String {
+    valid_toml()
+        .replace(
+            "network = \"testnet\"\n[deployment]",
+            "network = \"mainnet\"\n[deployment]",
+        )
+        .replace(
+            "endpoint = \"ssl://electrum.example:50002\"",
+            &format!("endpoint = \"{endpoint}\""),
+        )
+}
+
+#[test]
+fn refuses_a_plaintext_electrum_endpoint_on_mainnet_with_a_literal_diagnostic() {
+    let error = Config::from_toml_and_environment(
+        &mainnet_toml("tcp://electrum.example:50001"),
+        environment(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "bitcoin.network mainnet requires an ssl:// electrum.endpoint; \
+         the tcp:// scheme is plaintext and refused"
+    );
+}
+
+#[test]
+fn accepts_an_ssl_electrum_endpoint_on_mainnet() {
+    assert!(
+        Config::from_toml_and_environment(
+            &mainnet_toml("ssl://electrum.example:50002"),
+            environment()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn refuses_a_malformed_ssl_electrum_endpoint_on_mainnet_at_config_load() {
+    // `ssl://host:port/tcp://` carries a path the endpoint parser
+    // refuses; delegating the pre-check to the parser refuses it at
+    // config load with the same literal adapter construction would use,
+    // instead of later at startup.
+    let error = Config::from_toml_and_environment(
+        &mainnet_toml("ssl://electrum.example:50002/tcp://"),
+        environment(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "electrum endpoint scheme must be tcp:// or ssl://"
+    );
+}
+
+#[test]
+fn refuses_an_uppercase_ssl_scheme_on_mainnet() {
+    // Fail closed on scheme case: `SSL://` is refused even though the
+    // URL parser would normalize it to `ssl`.
+    let error = Config::from_toml_and_environment(
+        &mainnet_toml("SSL://electrum.example:50002"),
+        environment(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "bitcoin.network mainnet requires an ssl:// electrum.endpoint; \
+         the SSL:// scheme is plaintext and refused"
+    );
+}
+
+#[test]
+fn accepts_a_plaintext_electrum_endpoint_on_regtest() {
+    // Local fulcrum-style endpoints have no TLS: the plaintext refusal
+    // is a mainnet-only invariant.
+    let regtest = local_compose_toml();
+    let config = Config::from_toml_and_environment(&regtest, environment())
+        .expect("regtest keeps accepting tcp:// endpoints");
+    assert_eq!(config.electrum.endpoint, "tcp://fulcrum:50001");
 }
 
 #[test]
