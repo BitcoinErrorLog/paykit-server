@@ -150,6 +150,7 @@ async fn invoice_store(database: &TestDatabase) -> InvoiceStore {
                 0,
             ),
             &StorageState::default(),
+            &key_tail(24),
         )
         .await
         .unwrap();
@@ -171,6 +172,12 @@ fn input<'a>(
         payment_request_intent: payment_intent(),
         required_sats: 100,
     }
+}
+
+/// Distinct canonical key tails so the fingerprint-to-seller binding written
+/// by every create/reauthenticate never collides within a test database.
+fn key_tail(seed: u8) -> [u8; 65] {
+    [seed; 65]
 }
 
 #[tokio::test]
@@ -709,6 +716,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
                 0,
             ),
             &StorageState::default(),
+            &key_tail(25),
         )
         .await
         .unwrap();
@@ -722,6 +730,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
                 0,
             ),
             &StorageState::default(),
+            &key_tail(26),
         )
         .await
         .unwrap();

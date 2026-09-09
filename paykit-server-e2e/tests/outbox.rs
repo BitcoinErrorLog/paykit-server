@@ -175,6 +175,12 @@ async fn assert_reconciliation_status(
         .unwrap();
 }
 
+/// Distinct canonical key tails so the fingerprint-to-seller binding written
+/// by every create/reauthenticate never collides within a test database.
+fn key_tail(seed: u8) -> [u8; 65] {
+    [seed; 65]
+}
+
 #[tokio::test]
 async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_dependency_order() {
     let database = TestDatabase::create().await;
@@ -192,6 +198,7 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
                 0,
             ),
             &StorageState::default(),
+            &key_tail(20),
         )
         .await
         .unwrap();
@@ -579,6 +586,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
                 0,
             ),
             &StorageState::default(),
+            &key_tail(21),
         )
         .await
         .unwrap();
@@ -857,6 +865,7 @@ async fn postgres_sdk_transactions_are_durable_and_creator_isolated() {
                 0,
             ),
             &StorageState::default(),
+            &key_tail(22),
         )
         .await
         .unwrap();
@@ -870,6 +879,7 @@ async fn postgres_sdk_transactions_are_durable_and_creator_isolated() {
                 0,
             ),
             &StorageState::default(),
+            &key_tail(23),
         )
         .await
         .unwrap();

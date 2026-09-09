@@ -288,6 +288,7 @@ async fn create_creator(
                 account_index,
             ),
             &state,
+            &key_tail(counter_seed),
         )
         .await
         .unwrap();
@@ -846,7 +847,8 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     let database = TestDatabase::create().await;
     let signing_key = SigningKey::from_bytes(&[7; 32]);
     let first_config = config(database.database_url(), &signing_key, "1h");
-    let first_pool = initialize_database(&first_config).await.unwrap();
+    let first_initialized = initialize_database(&first_config).await.unwrap();
+    let first_pool = first_initialized.pool.clone();
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
     let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone());
@@ -907,6 +909,7 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     let first_server = Server::build_with_transports(
         first_config,
         first_pool.clone(),
+        first_initialized.stack_identity.clone(),
         pubky.clone(),
         observer.clone(),
     )
@@ -985,11 +988,17 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     assert_eq!(queued_after, queued_before);
 
     let second_config = config(database.database_url(), &signing_key, "25ms");
-    let second_pool = initialize_database(&second_config).await.unwrap();
-    let second_server =
-        Server::build_with_transports(second_config, second_pool.clone(), pubky, observer)
-            .await
-            .unwrap();
+    let second_initialized = initialize_database(&second_config).await.unwrap();
+    let second_pool = second_initialized.pool.clone();
+    let second_server = Server::build_with_transports(
+        second_config,
+        second_pool.clone(),
+        second_initialized.stack_identity.clone(),
+        pubky,
+        observer,
+    )
+    .await
+    .unwrap();
     let second_runtime = second_server.runtime();
     let second_router = second_server.router();
     let second_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1124,4 +1133,11 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     first_pool.close().await;
     second_pool.close().await;
     database.cleanup().await;
+}
+/// Distinct canonical key tails so the fingerprint-to-seller binding written
+/// by every create/reauthenticate never collides within a test database.
+fn key_tail(seed: u64) -> [u8; 65] {
+    let mut tail = [0u8; 65];
+    tail[..8].copy_from_slice(&seed.to_be_bytes());
+    tail
 }

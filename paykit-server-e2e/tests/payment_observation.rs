@@ -81,6 +81,7 @@ async fn store(database: &TestDatabase) -> InvoiceStore {
                 0,
             ),
             &StorageState::default(),
+            &key_tail(18),
         )
         .await
         .unwrap();
@@ -132,6 +133,7 @@ async fn create_other_creator(database: &TestDatabase) {
                 0,
             ),
             &StorageState::default(),
+            &key_tail(19),
         )
         .await
         .unwrap();
@@ -205,6 +207,12 @@ async fn awaiting_invoice(
         .await
         .unwrap()
         .invoice_id()
+}
+
+/// Distinct canonical key tails so the fingerprint-to-seller binding written
+/// by every create/reauthenticate never collides within a test database.
+fn key_tail(seed: u8) -> [u8; 65] {
+    [seed; 65]
 }
 
 #[tokio::test]

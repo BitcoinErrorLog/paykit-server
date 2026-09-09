@@ -5,7 +5,7 @@ use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
 use uuid::Uuid;
 
-const REQUIRED_TABLES: [&str; 9] = [
+const REQUIRED_TABLES: [&str; 11] = [
     "deployment_metadata",
     "creators",
     "sdk_states",
@@ -15,6 +15,8 @@ const REQUIRED_TABLES: [&str; 9] = [
     "bitcoin_observations",
     "invoice_baseline_outpoints",
     "bitcoin_observation_candidates",
+    "stack_identity",
+    "claimed_key_fingerprints",
 ];
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
@@ -57,7 +59,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
 
     let retired_observation_budget_columns: Vec<String> = sqlx::query_scalar(
         "SELECT table_name || '.' || column_name
