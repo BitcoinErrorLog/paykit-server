@@ -17,17 +17,25 @@ use bitcoin::{
     bip32::{ChildNumber, Xpriv, Xpub},
     secp256k1::Secp256k1,
 };
-use paykit_lib::PaykitReceiverPath;
+use paykit_lib::{
+    PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount,
+    PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
+    PublicKey,
+};
 use paykit_sdk::PaykitSdkConfig;
 use paykit_server::{
+    application::semantic_intent::DeliveryIntentV1,
     chain_history::{ChainHistoryPort, ClaimScanError},
     config::{BitcoinNetwork, StackRole},
     crypto::Crypto,
-    domain::locks::{CreatorPubky, parse_creator},
+    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
     manual_claim::{
         ManualClaimError, ManualClaimRequest, ManualClaimService, RelayLoopbackSessionMinter,
     },
-    persistence::{CreatorStore, DeploymentStore, run_migrations},
+    persistence::{
+        AtomicInvoiceInput, CreatorStore, DeploymentStore, InvoiceStore, NewReaderPayloadFactory,
+        NewReaderPayloads, PersistenceError, run_migrations,
+    },
     real_setup::DirectMarkerPublisher,
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -110,6 +118,70 @@ fn claim_token(keypair: &Keypair, capabilities: &str) -> String {
 
 fn creator_of(keypair: &Keypair) -> CreatorPubky {
     parse_creator(&format!("pubky{}", keypair.public_key().z32())).unwrap()
+}
+
+fn reader_of(keypair: &Keypair) -> ReaderPubky {
+    parse_reader(&format!("pubky{}", keypair.public_key().z32())).unwrap()
+}
+
+/// The marker the invoice intents reference; only its serialized shape
+/// matters to the persistence path, so the noise key is a fixed valid one.
+fn marker() -> PaykitReceiverMarker {
+    PaykitReceiverMarker::new(
+        PaykitReceiverPath::new("bitkit/wallet").unwrap(),
+        PaykitReceiverCapabilities {
+            private_payments: true,
+            payment_requests: true,
+            receipts: false,
+            outgoing_payments: false,
+        },
+        PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy").unwrap(),
+    )
+}
+
+/// Real `NewReaderPayloadFactory`: the invoice store calls it with the
+/// allocated child index inside the allocation transaction.
+struct InvoicePayloads {
+    reader: ReaderPubky,
+}
+
+impl NewReaderPayloadFactory for InvoicePayloads {
+    fn for_child_index(&self, child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
+        let address = format!("test-address-{child_index}");
+        let endpoint_intent = DeliveryIntentV1::endpoint(
+            self.reader.to_string(),
+            &marker(),
+            PaykitReceiverPath::new("paykit/server").unwrap(),
+            vec![(
+                PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+                PaymentEndpointPayload::new(address.clone()),
+            )],
+        )
+        .unwrap();
+        Ok(NewReaderPayloads {
+            endpoint_intent,
+            bitcoin_address: address,
+        })
+    }
+}
+
+fn payment_request_intent(reader: &ReaderPubky) -> DeliveryIntentV1 {
+    DeliveryIntentV1::payment_request(
+        reader.to_string(),
+        &marker(),
+        PaykitReceiverPath::new("paykit/server").unwrap(),
+        &PaymentRequestTerms {
+            amount: PaymentAmount::new("0.00000100", "BTC").unwrap(),
+            payment_reference: PaymentReference::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+            proposal_expires_at: None,
+            recurrence: None,
+            accepted_payment_endpoint_identifiers: vec![
+                PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+            ],
+            metadata: Default::default(),
+        },
+    )
+    .unwrap()
 }
 
 struct Fixture {
@@ -277,6 +349,10 @@ async fn paste_is_shared_manual_bitkit_corroborated_is_exclusive_and_status_is_o
     assert_eq!(body["status"], "claimed");
     assert_eq!(body["account_index"], 1);
     assert_eq!(body["next_child_index"], 0);
+    assert_eq!(
+        body["first_child_index"], 0,
+        "the claim-time index is the cursor the scan left behind"
+    );
     assert!(body["key_fingerprint"].is_string());
     assert!(body["first_derived_address"].is_string());
     assert_eq!(body["stack_id"], fixture.stack_id);
@@ -351,6 +427,13 @@ async fn paste_is_shared_manual_bitkit_corroborated_is_exclusive_and_status_is_o
     // without both): exactly the claim response's values for this creator.
     assert_eq!(body["key_fingerprint"], claim_fingerprint_b);
     assert_eq!(body["first_derived_address"], claim_address_b);
+    // The derivation coordinates (W1.13 r3): the client re-derives
+    // `first_derived_address` from its own xpub at
+    // (`account_index`, `first_child_index`); `next_child_index` is
+    // informational.
+    assert_eq!(body["account_index"], 2);
+    assert_eq!(body["first_child_index"], 0);
+    assert_eq!(body["next_child_index"], 0);
     assert_eq!(body["evidence"], serde_json::json!([]));
     // No key material beyond the claim response's fields is present.
     let object = body.as_object().unwrap();
@@ -364,6 +447,9 @@ async fn paste_is_shared_manual_bitkit_corroborated_is_exclusive_and_status_is_o
                     | "downgrade_reason"
                     | "key_fingerprint"
                     | "first_derived_address"
+                    | "account_index"
+                    | "first_child_index"
+                    | "next_child_index"
                     | "evidence"
             ),
             "unexpected status field: {key}"
@@ -498,6 +584,22 @@ async fn each_failed_corroborating_check_downgrades_with_its_named_reason() {
     assert_eq!(body["allocation_mode"], "shared_manual");
     assert_eq!(body["downgrade_reason"], "account_has_history");
     assert_eq!(body["next_child_index"], 3 + 1 + 20);
+    assert_eq!(
+        body["first_child_index"],
+        3 + 1 + 20,
+        "the claim-time index is the scanned start index, not necessarily 0"
+    );
+    assert_eq!(
+        body["first_derived_address"],
+        paykit_server::application::create_invoice::derive_bip84_p2wpkh_address(
+            &account_xpub(113, 4),
+            4,
+            &BitcoinNetwork::Testnet,
+            3 + 1 + 20
+        )
+        .unwrap(),
+        "the claim response's address derives at the claim-time index"
+    );
     assert_eq!(
         history.calls(),
         2,
@@ -753,5 +855,97 @@ async fn pasted_auto_refusal_precedes_token_verification_and_persistence() {
         })
         .await;
     assert_eq!(result, Err(ManualClaimError::AllocationModeNotEnabled));
+    fixture.database.cleanup().await;
+}
+
+/// W1.13 r3 P1: the status's `first_derived_address` is the claim-time
+/// address forever. Invoice allocation advances `next_child_index`; the
+/// claim-time `first_child_index` — and the address derived at it — never
+/// move, and both equal the claim response's values.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_first_address_is_stable_across_invoice_allocation() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let fixture = fixture().await;
+    let seller = fixture.seller().await;
+    let router = fixture.router(fixture.service(StackRole::Proof, ScriptedHistory::clean()));
+    let xpub = account_xpub(161, 1);
+    let (status, claim) = post_claim(
+        &router,
+        &seller,
+        &fixture.required_capabilities,
+        &xpub,
+        1,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "claim: {claim}");
+    let claim_address = claim["first_derived_address"].clone();
+    let claim_first_child_index = claim["first_child_index"].clone();
+    assert_eq!(claim["first_child_index"], 0);
+    assert_eq!(
+        claim["first_child_index"], claim["next_child_index"],
+        "on a first claim the claim-time index IS the cursor"
+    );
+
+    // Issue an invoice through the real invoice-allocation path: it
+    // allocates child index 0 and advances the derivation cursor to 1.
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let invoices = InvoiceStore::new(fixture.database.pool(), crypto);
+    let creator = creator_of(&seller);
+    let reader = reader_of(&Keypair::random());
+    invoices
+        .create_awaiting_baseline(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"status-stability-bundle",
+            payment_request_binding: b"status-stability-request",
+            new_reader_payloads: &InvoicePayloads {
+                reader: reader.clone(),
+            },
+            payment_request_intent: payment_request_intent(&reader),
+            required_sats: 100,
+            nonce_sats: 1,
+        })
+        .await
+        .unwrap();
+    let cursor: i64 = sqlx::query_scalar("SELECT next_child_index FROM creators")
+        .fetch_one(fixture.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(cursor, 1, "invoice allocation advanced the cursor");
+
+    // The status still serves the claim response's address and claim-time
+    // index; only the informational cursor moved.
+    let (status, body) = get_status(
+        &router,
+        &creator,
+        Some(&claim_token(&seller, &fixture.required_capabilities)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "status: {body}");
+    assert_eq!(
+        body["first_derived_address"], claim_address,
+        "the status address is the claim-time address forever"
+    );
+    assert_eq!(body["first_child_index"], claim_first_child_index);
+    assert_eq!(body["account_index"], 1);
+    assert_eq!(body["next_child_index"], 1);
+    assert!(
+        body["next_child_index"].as_u64().unwrap() > body["first_child_index"].as_u64().unwrap(),
+        "the cursor moved past the stable claim-time index"
+    );
+    // The client's own re-derivation at (account_index, first_child_index)
+    // reproduces `first_derived_address`.
+    assert_eq!(
+        body["first_derived_address"],
+        paykit_server::application::create_invoice::derive_bip84_p2wpkh_address(
+            &xpub,
+            1,
+            &BitcoinNetwork::Testnet,
+            0
+        )
+        .unwrap()
+    );
+
     fixture.database.cleanup().await;
 }

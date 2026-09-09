@@ -22,8 +22,11 @@ no claimed account; 200 for the owner. The 200 body carries the persisted
 nullable `downgrade_reason`, the client's required evidence fields
 `key_fingerprint` (a hash, not key material) and `first_derived_address`
 (what invoices reveal anyway) — the same values the claim response emits —
-and `evidence`, which is always `[]` until §B.8.7 sentinel detection records
-any. Shape:
+the derivation coordinates below, and `evidence`, which is always `[]` until
+§B.8.7 sentinel detection records any. `claim_channel` and
+`downgrade_reason` are always present in the JSON body — serialized as an
+explicit `null` when unset (serde `Option`), never omitted — so clients may
+treat them as `.nullish()`. Shape:
 
 ```json
 {
@@ -33,9 +36,29 @@ any. Shape:
   "downgrade_reason": "claim_channel_not_bitkit",
   "key_fingerprint": "0011223344556677",
   "first_derived_address": "bc1q…",
+  "account_index": 1,
+  "first_child_index": 0,
+  "next_child_index": 3,
   "evidence": []
 }
 ```
+
+The four derivation fields, and what a client verifies with each:
+
+- `key_fingerprint` — the client recomputes the fingerprint from its own
+  account xpub and fails closed on mismatch before enabling the Bitcoin
+  rail.
+- `account_index` — the persisted BIP84 account index; with the client's own
+  xpub it anchors every re-derivation below.
+- `first_child_index` — the immutable claim-time child index the claim
+  response emitted; the client verifies
+  `first_derived_address == derive(xpub, account_index, first_child_index)`.
+- `first_derived_address` — the address at (`account_index`,
+  `first_child_index`), stable forever: it is the exact value the claim
+  response emitted and never moves, even as invoices are allocated.
+- `next_child_index` — the mutable derivation cursor the next invoice
+  address derives from. Informational only: it moves as invoice allocation
+  advances it, and no client equality check should be anchored to it.
 
 ## Allocation modes and downgrade reasons
 

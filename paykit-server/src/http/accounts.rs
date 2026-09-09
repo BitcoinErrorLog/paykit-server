@@ -185,6 +185,7 @@ async fn claim(State(state): State<AccountsState>, body: Json<ClaimBody>) -> Res
                 "creator": outcome.creator,
                 "account_index": outcome.account_index,
                 "next_child_index": outcome.next_child_index,
+                "first_child_index": outcome.first_child_index,
                 "key_fingerprint": outcome.key_fingerprint,
                 "first_derived_address": outcome.first_derived_address,
                 "stack_id": outcome.stack_id,
@@ -341,11 +342,21 @@ async fn allocation_status(
                 "claim_channel": status.claim_channel,
                 "downgrade_reason": status.downgrade_reason,
                 // The Ring-verification client's required evidence: the same
-                // canonical-78-byte-hash fingerprint and cursor address the
-                // claim response emits. Not key material — the fingerprint
-                // is a hash and the first address is what invoices reveal.
+                // canonical-78-byte-hash fingerprint and claim-time address
+                // the claim response emits. Not key material — the
+                // fingerprint is a hash and the first address is what
+                // invoices reveal.
                 "key_fingerprint": status.key_fingerprint,
                 "first_derived_address": status.first_derived_address,
+                // The derivation coordinates (W1.13 r3): with its own xpub
+                // the client re-derives `first_derived_address` at
+                // (`account_index`, `first_child_index`) — the immutable
+                // claim-time index, equal to the claim response's value
+                // forever. `next_child_index` is informational: invoice
+                // allocation moves it.
+                "account_index": status.account_index,
+                "first_child_index": status.first_child_index,
+                "next_child_index": status.next_child_index,
                 // §B.8.7 detection evidence metadata: no evidence rows exist
                 // until W1.14's sentinel detection records them.
                 "evidence": [],
