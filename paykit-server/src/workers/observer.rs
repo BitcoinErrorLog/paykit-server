@@ -172,10 +172,27 @@ pub struct BudgetSelection {
     pub deferred: Vec<PlannedObservation>,
     /// Estimated requests for the whole plan before trimming.
     pub estimated_requests: u64,
+    /// Estimated cost of the oldest target when it alone exceeded the budget
+    /// and was admitted by the head-of-line bypass; `None` when the head fit
+    /// within the budget or the plan was empty.
+    pub bypassed_head_cost: Option<u64>,
 }
 
-/// Walks the oldest-first plan and admits targets until the next one would
-/// exceed `budget`; the remainder is deferred to the next tick.
+/// Walks the oldest-first plan and admits targets until the budget is
+/// exhausted; the remainder is deferred to the next tick. Two liveness rules
+/// keep one expensive target from starving observation:
+///
+/// * The single oldest target is always admitted, even when its estimated
+///   cost alone exceeds `budget` (head-of-line bypass). A bypassed head does
+///   not consume the budget, so cheaper targets are still admitted this
+///   tick; its cost is reported via `bypassed_head_cost` so the caller can
+///   log the overrun against the hard per-tick cap.
+/// * A later over-budget entry is skipped without blocking: entries behind
+///   it that still fit are admitted.
+///
+/// Observing the head stamps it, so a permanently over-budget target rotates
+/// behind the deferred tail and every target is observed within a bounded
+/// number of ticks.
 pub fn select_within_budget(plan: Vec<PlannedObservation>, budget: u64) -> BudgetSelection {
     let estimated_requests = plan
         .iter()
@@ -184,10 +201,14 @@ pub fn select_within_budget(plan: Vec<PlannedObservation>, budget: u64) -> Budge
     let mut used = 0_u64;
     let mut batch = Vec::new();
     let mut deferred = Vec::new();
-    for entry in plan {
+    let mut bypassed_head_cost = None;
+    for (position, entry) in plan.into_iter().enumerate() {
         let cost = entry.estimated_requests();
-        if deferred.is_empty() && used.saturating_add(cost) <= budget {
+        if used.saturating_add(cost) <= budget {
             used += cost;
+            batch.push(entry);
+        } else if position == 0 {
+            bypassed_head_cost = Some(cost);
             batch.push(entry);
         } else {
             deferred.push(entry);
@@ -197,6 +218,7 @@ pub fn select_within_budget(plan: Vec<PlannedObservation>, budget: u64) -> Budge
         batch,
         deferred,
         estimated_requests,
+        bypassed_head_cost,
     }
 }
 
@@ -304,6 +326,15 @@ pub async fn observe_tick(
     }
 
     let selection = select_within_budget(plan, policy.per_tick_budget());
+    if let Some(cost) = selection.bypassed_head_cost {
+        tracing::warn!(
+            estimated_requests = cost,
+            budget = policy.per_tick_budget(),
+            hard_cap = policy.max_requests_per_tick,
+            "oldest observation target exceeds the per-tick request budget; \
+             observing it alone to preserve liveness"
+        );
+    }
     let processed = selection.batch.len();
     let deferred = selection.deferred.len();
     if selection.batch.is_empty() {
@@ -760,10 +791,74 @@ mod tests {
         assert_eq!(labels(&selection.batch), vec!["addr-stale", "addr-middle"]);
         assert_eq!(labels(&selection.deferred), vec!["addr-fresh"]);
         assert_eq!(selection.estimated_requests, 7);
+        assert_eq!(selection.bypassed_head_cost, None);
 
-        let empty = select_within_budget(vec![planned("big", Some(10))], 2);
-        assert!(empty.batch.is_empty());
-        assert_eq!(empty.deferred.len(), 1);
+        // An over-budget oldest target is admitted by the liveness bypass
+        // rather than starving the whole tick.
+        let bypass = select_within_budget(vec![planned("big", Some(10))], 2);
+        assert_eq!(labels(&bypass.batch), vec!["addr-big"]);
+        assert!(bypass.deferred.is_empty());
+        assert_eq!(bypass.bypassed_head_cost, Some(11));
+    }
+
+    #[test]
+    fn over_budget_entries_are_skipped_without_blocking_cheaper_targets() {
+        let plan = vec![
+            planned("oldest", Some(0)),
+            planned("expensive", Some(10)),
+            planned("cheap", Some(1)),
+        ];
+        // Costs 1, 11, 2 with budget 3: the expensive middle entry is
+        // deferred while the cheap tail is still admitted.
+        let selection = select_within_budget(plan, 3);
+        assert_eq!(labels(&selection.batch), vec!["addr-oldest", "addr-cheap"]);
+        assert_eq!(labels(&selection.deferred), vec!["addr-expensive"]);
+        assert_eq!(selection.bypassed_head_cost, None);
+    }
+
+    #[test]
+    fn every_target_is_observed_within_n_ticks_of_a_sustained_over_budget_set() {
+        use std::collections::{HashSet, VecDeque};
+
+        const TARGETS: usize = 5;
+        // Every target alone costs more than the whole per-tick budget, so
+        // only the head-of-line bypass can ever admit one.
+        let mut oldest_first: VecDeque<String> = (0..TARGETS)
+            .map(|index| format!("target-{index}"))
+            .collect();
+        let mut observed: HashSet<String> = HashSet::new();
+        for _ in 0..TARGETS {
+            let plan = oldest_first
+                .iter()
+                .map(|address| {
+                    PlannedObservation::new(
+                        ObservationTarget::new(address.clone(), None),
+                        Some(9),
+                        Duration::ZERO,
+                    )
+                })
+                .collect();
+            let selection = select_within_budget(plan, 3);
+            assert_eq!(
+                selection.batch.len(),
+                1,
+                "the bypass admits exactly the oldest target"
+            );
+            assert_eq!(selection.bypassed_head_cost, Some(10));
+            for entry in selection.batch {
+                let address = entry.target().address().to_owned();
+                observed.insert(address.clone());
+                // A successful observation stamps the head, rotating it
+                // behind the deferred tail.
+                oldest_first.retain(|pending| *pending != address);
+                oldest_first.push_back(address);
+            }
+        }
+        assert_eq!(
+            observed.len(),
+            TARGETS,
+            "every target must be observed within {TARGETS} ticks"
+        );
     }
 
     #[test]

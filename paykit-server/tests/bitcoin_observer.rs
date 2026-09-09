@@ -142,16 +142,25 @@ mod tick {
 
     struct FakeElectrum {
         probe: Result<TipProbe, ObserverError>,
+        history_tx_counts: std::collections::HashMap<String, u32>,
         calls: Mutex<Vec<Vec<String>>>,
     }
 
     impl FakeElectrum {
         fn healthy() -> Self {
+            Self::healthy_with_history([])
+        }
+
+        fn healthy_with_history<const N: usize>(history_tx_counts: [(&str, u32); N]) -> Self {
             Self {
                 probe: Ok(TipProbe {
                     height: 100,
                     time_unix: 1_700_000_000,
                 }),
+                history_tx_counts: history_tx_counts
+                    .into_iter()
+                    .map(|(address, tx_count)| (address.to_owned(), tx_count))
+                    .collect(),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -159,6 +168,7 @@ mod tick {
         fn failing(error: ObserverError) -> Self {
             Self {
                 probe: Err(error),
+                history_tx_counts: std::collections::HashMap::new(),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -182,7 +192,11 @@ mod tick {
                     .iter()
                     .map(|target| TargetHistory {
                         address: target.address().to_owned(),
-                        tx_count: 0,
+                        tx_count: self
+                            .history_tx_counts
+                            .get(target.address())
+                            .copied()
+                            .unwrap_or(0),
                     })
                     .collect(),
             })
@@ -402,5 +416,117 @@ mod tick {
         let calls = port.calls.lock().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1][..2], ["third".to_owned(), "freshest".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn sustained_over_budget_plan_observes_every_target_within_n_ticks() {
+        const TARGETS: usize = 5;
+        // Every target alone costs more than the whole per-tick budget
+        // (1 history fetch + 9 known transactions = 10 > 5), so only the
+        // head-of-line bypass can admit one target per tick.
+        let port = FakeElectrum::healthy_with_history([
+            ("target-0", 9),
+            ("target-1", 9),
+            ("target-2", 9),
+            ("target-3", 9),
+            ("target-4", 9),
+        ]);
+        let backend = FakeBackend {
+            entries: Mutex::new(
+                (0..TARGETS)
+                    .map(|index| FakeEntry {
+                        address: format!("target-{index}"),
+                        history_tx_count: Some(9),
+                        staleness_secs: (1_000 - 100 * index) as u64,
+                    })
+                    .collect(),
+            ),
+            applied: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+
+        for _ in 0..TARGETS {
+            let outcome = observe_tick(
+                &port,
+                &backend,
+                &BitcoinNetwork::Regtest,
+                &policy(5),
+                &runtime,
+            )
+            .await;
+            assert_eq!(
+                outcome,
+                ObserverTickOutcome::Observed {
+                    processed: 1,
+                    deferred: TARGETS - 1
+                },
+                "each tick observes exactly the oldest target"
+            );
+        }
+        let calls = port.calls.lock().unwrap();
+        let observed: std::collections::HashSet<_> = calls.iter().flatten().collect();
+        assert_eq!(
+            observed.len(),
+            TARGETS,
+            "every target must be observed within {TARGETS} ticks"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_dusted_target_never_starves_cheap_targets_and_is_itself_observed() {
+        // An attacker dusts one published invoice address with ten times the
+        // per-tick budget in cheap transactions (cost 1 + 50 = 51 > 5).
+        let port = FakeElectrum::healthy_with_history([("dusted", 50)]);
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![
+                FakeEntry {
+                    address: "dusted".into(),
+                    history_tx_count: Some(50),
+                    staleness_secs: 600,
+                },
+                FakeEntry {
+                    address: "cheap-a".into(),
+                    history_tx_count: Some(0),
+                    staleness_secs: 300,
+                },
+                FakeEntry {
+                    address: "cheap-b".into(),
+                    history_tx_count: Some(0),
+                    staleness_secs: 120,
+                },
+            ]),
+            applied: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+
+        const TICKS: usize = 6;
+        for _ in 0..TICKS {
+            let outcome = observe_tick(
+                &port,
+                &backend,
+                &BitcoinNetwork::Regtest,
+                &policy(5),
+                &runtime,
+            )
+            .await;
+            assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
+            let calls = port.calls.lock().unwrap();
+            let batch = calls.last().expect("a tick observes a batch");
+            for cheap in ["cheap-a", "cheap-b"] {
+                assert!(
+                    batch.contains(&cheap.to_owned()),
+                    "cheap targets must be observed every tick"
+                );
+            }
+        }
+        let calls = port.calls.lock().unwrap();
+        let dusted_ticks = calls
+            .iter()
+            .filter(|batch| batch.contains(&"dusted".to_owned()))
+            .count();
+        assert!(
+            dusted_ticks >= TICKS / 3,
+            "the dusted target must be observed at least once per three ticks, got {dusted_ticks} of {TICKS}"
+        );
     }
 }
