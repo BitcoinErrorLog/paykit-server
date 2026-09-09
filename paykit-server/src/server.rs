@@ -227,7 +227,9 @@ impl Server {
         // The claim-time history scan (design §B.5) reuses the observer's
         // Electrum adapter type, timeout, and retry configuration; each scan
         // batch opens its own bounded connection, so no second client type is
-        // introduced.
+        // introduced. The response-item cap, per-window deadline, and
+        // process-wide concurrency bound come from the validated electrum
+        // config.
         let claim_history = Arc::new(
             ElectrumAdapter::configured(
                 config.electrum.endpoint.clone(),
@@ -235,7 +237,14 @@ impl Server {
                 config.electrum.request_timeout,
                 config.electrum.connect_retries,
             )
-            .map_err(map_electrum_error)?,
+            .map_err(map_electrum_error)?
+            .with_claim_scan_bounds(
+                usize::try_from(config.electrum.max_history_items_per_window)
+                    .expect("validated history item cap fits usize"),
+                config.electrum.claim_scan_window_deadline,
+                usize::try_from(config.electrum.max_concurrent_claim_scans)
+                    .expect("validated claim scan concurrency bound fits usize"),
+            ),
         );
         let manual_claims = Arc::new(ManualClaimService::new(
             pubky.clone(),

@@ -15,11 +15,11 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     str::FromStr,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -174,6 +174,33 @@ async fn manual_claim_scan_beyond_a_thousand_addresses_refuses_after_exactly_fif
 
     assert_eq!(result, Err(ClaimScanError::HistoryTooDeep));
     server.assert_rpc_counts((CLAIM_SCAN_MAX_WINDOWS * CLAIM_SCAN_WINDOW) as usize, 0, 0);
+}
+
+#[tokio::test]
+async fn manual_claim_scan_treats_an_over_cap_history_window_as_used() {
+    let xpub = regtest_account_tpub();
+    // Index 3 carries 2,001 history entries: one over the default 2,000
+    // raw-item cap across the window's batched response. The cap is
+    // enforced on the raw response values before any domain value is
+    // materialised.
+    let server =
+        HistoryServer::start_with_heavy(vec![], vec![(derived_script(&xpub, 3), 2_001)]).await;
+
+    let start = scan(&server, &xpub).await.unwrap();
+
+    // The over-cap window is treated as used for the WHOLE window — never
+    // attributed to individual addresses — so last_used is the window's
+    // last index (19) and the scan stops at the next, empty window. This
+    // only advances the start index; nothing is derived onto the
+    // deep-history address.
+    assert_eq!(
+        start,
+        19 + 1 + 20,
+        "over-cap window treated as used: start is the window's last index + 1 + 20"
+    );
+    // Literal request-log evidence: exactly two batched windows (40
+    // get_history queries), no unspent, no transaction fetches.
+    server.assert_rpc_counts(40, 0, 0);
 }
 
 #[tokio::test]
@@ -366,16 +393,49 @@ struct HistoryServer {
 struct HistoryFixture {
     /// Scripts that answer get_history with one literal history entry.
     used: Vec<ScriptBuf>,
+    /// Scripts that answer get_history with a precomputed oversized
+    /// history, for the response-item-cap test.
+    heavy: Vec<(ScriptBuf, serde_json::Value)>,
     request_log: Mutex<Vec<String>>,
 }
 
 impl HistoryServer {
     async fn start(used: Vec<ScriptBuf>) -> Self {
+        Self::start_with_fixture(used, vec![]).await
+    }
+
+    /// `heavy` maps a script to the number of history entries its
+    /// get_history answer carries, precomputed once so serving stays cheap.
+    async fn start_with_heavy(used: Vec<ScriptBuf>, heavy: Vec<(ScriptBuf, usize)>) -> Self {
+        let heavy = heavy
+            .into_iter()
+            .map(|(script, entries)| {
+                let history = serde_json::Value::Array(
+                    (0..entries)
+                        .map(|_| {
+                            serde_json::json!({
+                                "height": USED_HISTORY_HEIGHT,
+                                "tx_hash": format!("{:064x}", 42),
+                            })
+                        })
+                        .collect(),
+                );
+                (script, history)
+            })
+            .collect();
+        Self::start_with_fixture(used, heavy).await
+    }
+
+    async fn start_with_fixture(
+        used: Vec<ScriptBuf>,
+        heavy: Vec<(ScriptBuf, serde_json::Value)>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let wake_address = listener.local_addr().unwrap();
         let endpoint = format!("tcp://{wake_address}");
         let fixture = Arc::new(HistoryFixture {
             used,
+            heavy,
             request_log: Mutex::new(Vec::new()),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -432,6 +492,223 @@ impl Drop for HistoryServer {
     }
 }
 
+// Multi-threaded: two scans must make progress concurrently while the
+// test task polls the in-flight count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_claim_scan_refuses_scans_beyond_the_concurrency_bound_without_an_electrum_call() {
+    let xpub = regtest_account_tpub();
+    let server = GatedHistoryServer::start().await;
+    // Concurrency bound 2 (the default); item cap and deadline explicit.
+    let adapter = Arc::new(
+        ElectrumAdapter::connect(
+            server.endpoint(),
+            BitcoinNetwork::Regtest,
+            Duration::from_secs(5),
+            1,
+        )
+        .await
+        .unwrap()
+        .with_claim_scan_bounds(2_000, Duration::from_secs(5), 2),
+    );
+    let spawn_scan = |adapter: &Arc<ElectrumAdapter>| {
+        let adapter = adapter.clone();
+        let xpub = xpub.clone();
+        tokio::spawn(async move {
+            scan_claim_start_index(adapter.as_ref(), &xpub, 0, &BitcoinNetwork::Regtest).await
+        })
+    };
+    // Two concurrent claims take both scan permits and block mid-window
+    // behind the server's closed gate.
+    let scan_a = spawn_scan(&adapter);
+    let scan_b = spawn_scan(&adapter);
+    server.wait_in_flight(2);
+
+    // The third concurrent claim exceeds the bound: it is refused
+    // Unavailable — `claim_scan_unavailable` at the handler — IMMEDIATELY,
+    // before any Electrum call exists.
+    let result = scan_claim_start_index(adapter.as_ref(), &xpub, 0, &BitcoinNetwork::Regtest).await;
+
+    assert_eq!(result, Err(ClaimScanError::Unavailable));
+    // The refused scan never reached Electrum: still exactly the two
+    // admitted windows in flight (a third connection's first get_history
+    // would have joined them behind the gate), and only their two first
+    // batched lines logged so far.
+    assert_eq!(
+        server.in_flight(),
+        2,
+        "no third window fetch joined the two admitted scans"
+    );
+    assert_eq!(
+        server.rpc_count("blockchain.scripthash.get_history"),
+        2,
+        "only the two admitted windows reached Electrum"
+    );
+
+    // The two admitted claims proceed once the gate opens; the refused
+    // one never made an Electrum call, so the log ends at exactly two
+    // batched windows (2 x 20).
+    server.open_gate();
+    assert_eq!(scan_a.await.unwrap(), Ok(0));
+    assert_eq!(scan_b.await.unwrap(), Ok(0));
+    assert_eq!(
+        server.rpc_count("blockchain.scripthash.get_history"),
+        40,
+        "the refused scan never made an Electrum call"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Gated mock Electrum server: blocks each connection's first get_history
+// response behind a test-controlled gate, so concurrent scans can be held
+// mid-window deterministically. Serves empty histories once the gate opens.
+// ---------------------------------------------------------------------------
+
+struct GatedHistoryServer {
+    endpoint: String,
+    wake_address: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    request_log: Arc<Mutex<Vec<String>>>,
+    in_flight: Arc<AtomicUsize>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl GatedHistoryServer {
+    async fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let wake_address = listener.local_addr().unwrap();
+        let endpoint = format!("tcp://{wake_address}");
+        let request_log = Arc::new(Mutex::new(Vec::new()));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let thread_log = request_log.clone();
+        let thread_in_flight = in_flight.clone();
+        let thread_gate = gate.clone();
+        let handle = thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                if thread_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let log = thread_log.clone();
+                let in_flight = thread_in_flight.clone();
+                let gate = thread_gate.clone();
+                thread::spawn(move || serve_gated_connection(stream, log, in_flight, gate));
+            }
+        });
+        Self {
+            endpoint,
+            wake_address,
+            shutdown,
+            request_log,
+            in_flight,
+            gate,
+            handle: Some(handle),
+        }
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Waits until `expected` window fetches are blocked behind the gate
+    /// (their permits held), panicking after five seconds.
+    fn wait_in_flight(&self, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.in_flight.load(Ordering::SeqCst) < expected {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {expected} in-flight scan windows; request log: {:?}",
+                self.request_log.lock().unwrap()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+
+    fn open_gate(&self) {
+        let (lock, condvar) = &*self.gate;
+        *lock.lock().unwrap() = true;
+        condvar.notify_all();
+    }
+
+    fn rpc_count(&self, method: &str) -> usize {
+        self.request_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| *entry == method)
+            .count()
+    }
+}
+
+impl Drop for GatedHistoryServer {
+    fn drop(&mut self) {
+        // Release any blocked handler before shutting the listener down.
+        self.open_gate();
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.wake_address);
+        if let Some(handle) = self.handle.take() {
+            handle.join().unwrap();
+        }
+    }
+}
+
+fn serve_gated_connection(
+    mut stream: TcpStream,
+    request_log: Arc<Mutex<Vec<String>>>,
+    in_flight: Arc<AtomicUsize>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+) {
+    let reader = BufReader::new(stream.try_clone().unwrap());
+    let mut waited = false;
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let id = request["id"].clone();
+        let method = request["method"].as_str().unwrap();
+        request_log.lock().unwrap().push(method.to_owned());
+        let result = match method {
+            "server.version" => serde_json::json!(["paykit-test-electrum", "1.4"]),
+            "blockchain.scripthash.get_history" => {
+                // Block this connection's first get_history response until
+                // the test opens the gate.
+                if !waited {
+                    waited = true;
+                    in_flight.fetch_add(1, Ordering::SeqCst);
+                    let (lock, condvar) = &*gate;
+                    let mut open = lock.lock().unwrap();
+                    while !*open {
+                        open = condvar.wait(open).unwrap();
+                    }
+                    drop(open);
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                }
+                serde_json::json!([])
+            }
+            // The claim scan is presence-only; any other RPC fails loudly.
+            "blockchain.scripthash.listunspent" => {
+                panic!("claim scan called blockchain.scripthash.listunspent")
+            }
+            "blockchain.transaction.get" => {
+                panic!("claim scan called blockchain.transaction.get")
+            }
+            method => panic!("unexpected Electrum method: {method}"),
+        };
+        let response = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
+        if writeln!(stream, "{response}").is_err() {
+            break;
+        }
+        if stream.flush().is_err() {
+            break;
+        }
+    }
+}
+
 fn serve_connection(mut stream: TcpStream, fixture: Arc<HistoryFixture>) {
     use bdk_electrum::electrum_client::{ScriptHash, ToElectrumScriptHash};
     let reader = BufReader::new(stream.try_clone().unwrap());
@@ -446,11 +723,17 @@ fn serve_connection(mut stream: TcpStream, fixture: Arc<HistoryFixture>) {
             "blockchain.scripthash.get_history" => {
                 let requested_hash: ScriptHash =
                     serde_json::from_value(request["params"][0].clone()).unwrap();
-                let used = fixture
+                if let Some((_, history)) = fixture
+                    .heavy
+                    .iter()
+                    .find(|(script, _)| script.to_electrum_scripthash() == requested_hash)
+                {
+                    history.clone()
+                } else if fixture
                     .used
                     .iter()
-                    .any(|script| script.to_electrum_scripthash() == requested_hash);
-                if used {
+                    .any(|script| script.to_electrum_scripthash() == requested_hash)
+                {
                     serde_json::json!([{
                         "height": USED_HISTORY_HEIGHT,
                         "tx_hash": format!("{:064x}", 42),
