@@ -207,6 +207,7 @@ impl Server {
             config.paykit.receiver_path.clone(),
             Arc::new(creators.clone()),
             config.deployment_invariants().bitcoin_network.clone(),
+            config.bitcoin.creation_enabled,
             Arc::new(invoices.clone()),
             Arc::new(PaykitIntentBuilder::for_network(
                 &config.deployment_invariants().bitcoin_network,
@@ -245,6 +246,7 @@ impl Server {
             64,
         ));
         runtime.set_electrum_probe_interval(config.electrum.poll_interval);
+        runtime.set_bitcoin_creation_enabled(config.bitcoin.creation_enabled);
         let router = operational_router(business_routes, runtime.clone());
         let workers = WorkerComponents {
             pool,

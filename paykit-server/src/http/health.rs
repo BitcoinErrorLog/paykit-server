@@ -20,6 +20,7 @@ struct ReadyResponse {
     status: &'static str,
     postgres: &'static str,
     electrum: ElectrumResponse,
+    bitcoin_creation_enabled: bool,
     paykit_delivery: &'static str,
     outbox: &'static str,
 }
@@ -63,6 +64,7 @@ async fn ready(State(runtime): State<Arc<Runtime>>) -> impl IntoResponse {
             last_probe_at: report.electrum_probe.last_probe_at,
             genesis_ok: report.electrum_probe.genesis_ok,
         },
+        bitcoin_creation_enabled: report.bitcoin_creation_enabled,
         paykit_delivery: report.paykit_delivery.as_str(),
         outbox: report.outbox.as_str(),
     });

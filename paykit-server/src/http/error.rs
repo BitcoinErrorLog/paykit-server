@@ -18,6 +18,7 @@ pub enum ApiError {
     InvoiceNotFound,
     InternalError,
     LockNotFound,
+    BitcoinCreationDisabled,
 }
 
 #[derive(Serialize)]
@@ -88,6 +89,11 @@ impl ApiError {
                 StatusCode::NOT_FOUND,
                 "lock_not_found",
                 "lock resource was not found",
+            ),
+            Self::BitcoinCreationDisabled => (
+                StatusCode::FORBIDDEN,
+                "bitcoin_creation_disabled",
+                "bitcoin payment request creation is disabled",
             ),
         }
     }

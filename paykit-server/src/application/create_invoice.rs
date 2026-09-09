@@ -65,6 +65,8 @@ pub enum CreateInvoiceError {
     Conflict,
     DeadlineExceeded,
     Unavailable,
+    /// New Bitcoin binds are administratively disabled on this stack.
+    BitcoinCreationDisabled,
 }
 
 #[async_trait]

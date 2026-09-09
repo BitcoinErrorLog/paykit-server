@@ -36,6 +36,10 @@ network = "testnet"
 [bitcoin]
 # Must match the supplied Creator xpubs, derived addresses, and Electrum chain.
 network = "testnet"
+# Kill switch: when false, new Bitcoin payment-request binds are refused with
+# the stable code bitcoin_creation_disabled while existing invoices keep
+# being observed. Defaults to true.
+# creation_enabled = true
 
 [deployment]
 # Required, no default. "production" serves real-money traffic; "proof" marks

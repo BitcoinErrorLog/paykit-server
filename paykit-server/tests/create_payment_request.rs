@@ -210,6 +210,15 @@ fn service(
     store: Arc<CapturingStore>,
     network: BitcoinNetwork,
 ) -> MarketplacePaymentRequestService {
+    service_with_creation(session, store, network, true)
+}
+
+fn service_with_creation(
+    session: Arc<FakeSession>,
+    store: Arc<CapturingStore>,
+    network: BitcoinNetwork,
+    bitcoin_creation_enabled: bool,
+) -> MarketplacePaymentRequestService {
     MarketplacePaymentRequestService::new(
         session,
         Arc::new(FakeMarkers {
@@ -220,6 +229,7 @@ fn service(
         paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
         Arc::new(FakeCredentials),
         network.clone(),
+        bitcoin_creation_enabled,
         store,
         Arc::new(PaykitIntentBuilder::for_network(&network)),
     )
@@ -316,6 +326,7 @@ async fn regtest_deployments_advertise_the_regtest_endpoint_identifier() {
         paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
         Arc::new(RegtestCredentials),
         BitcoinNetwork::Regtest,
+        true,
         store.clone(),
         Arc::new(PaykitIntentBuilder::for_network(&BitcoinNetwork::Regtest)),
     );
@@ -415,6 +426,7 @@ async fn a_reader_without_a_capable_marker_is_unavailable() {
         paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
+        true,
         store.clone(),
         Arc::new(PaykitIntentBuilder::default()),
     );
@@ -640,4 +652,160 @@ async fn malformed_identifiers_are_invalid_requests() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn disabled_creation_refuses_new_binds_but_replays_exact_requests() {
+    let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    let service =
+        service_with_creation(ok_session(), store.clone(), BitcoinNetwork::Mainnet, false);
+    assert_eq!(
+        service.create(request(50_000)).await,
+        Err(CreateInvoiceError::BitcoinCreationDisabled)
+    );
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+
+    // An exact replay binds nothing new and is still served.
+    let replay_store = Arc::new(CapturingStore::with_preflight(
+        InvoicePreflight::ExactReplay,
+    ));
+    let replayed =
+        service_with_creation(ok_session(), replay_store, BitcoinNetwork::Mainnet, false)
+            .create(request(50_000))
+            .await
+            .unwrap();
+    assert!(replayed.replayed());
+}
+
+#[tokio::test]
+async fn disabled_creation_maps_to_the_stable_http_code() {
+    let locks_key = SigningKey::from_bytes(&[3; 32]);
+    let config = auth_config(&locks_key, None);
+    let auth = Arc::new(SignedLocksAuth::from_config(&config));
+    let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    let router = payment_requests_router(Arc::new(service_with_creation(
+        ok_session(),
+        store,
+        BitcoinNetwork::Mainnet,
+        false,
+    )))
+    .layer(Extension(auth));
+
+    let response = router
+        .oneshot(signed_request(&locks_key, canonical_body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["error"]["code"], "bitcoin_creation_disabled");
+}
+
+#[tokio::test]
+async fn disabled_creation_keeps_observing_existing_invoices() {
+    use paykit_server::{
+        bitcoin::{ObservationTarget, PlannedObservation, TargetTickRecord},
+        runtime::{DependencyCheck, Runtime},
+        workers::observer::{
+            ElectrumPort, ObservationBackend, ObservationReport, ObserverError, ObserverPolicy,
+            ObserverTickOutcome, TargetHistory, TipProbe, observe_tick,
+        },
+    };
+
+    struct ReadyPostgres;
+    #[async_trait]
+    impl DependencyCheck for ReadyPostgres {
+        async fn postgres_ready(&self) -> bool {
+            true
+        }
+    }
+
+    struct HealthyPort;
+    #[async_trait]
+    impl ElectrumPort for HealthyPort {
+        async fn observations(
+            &self,
+            targets: &[ObservationTarget],
+        ) -> Result<ObservationReport, ObserverError> {
+            Ok(ObservationReport {
+                outputs: Vec::new(),
+                history: targets
+                    .iter()
+                    .map(|target| TargetHistory {
+                        address: target.address().to_owned(),
+                        tx_count: 0,
+                    })
+                    .collect(),
+            })
+        }
+
+        async fn probe(&self) -> Result<TipProbe, ObserverError> {
+            Ok(TipProbe {
+                height: 1,
+                time_unix: 1,
+            })
+        }
+    }
+
+    struct ExistingInvoice;
+    #[async_trait]
+    impl ObservationBackend for ExistingInvoice {
+        async fn observation_plan(&self) -> Result<Vec<PlannedObservation>, ObserverError> {
+            Ok(vec![PlannedObservation::new(
+                ObservationTarget::new("bc1qexisting-invoice", None),
+                None,
+                std::time::Duration::from_secs(30),
+            )])
+        }
+
+        async fn apply_observations(
+            &self,
+            _network: &BitcoinNetwork,
+            _targets: &[ObservationTarget],
+            _outputs: Vec<paykit_server::bitcoin::ObservedOutput>,
+        ) -> Result<usize, ObserverError> {
+            Ok(0)
+        }
+
+        async fn record_observation_tick(
+            &self,
+            _records: &[TargetTickRecord],
+        ) -> Result<(), ObserverError> {
+            Ok(())
+        }
+    }
+
+    // Creation is disabled on this service, yet the observer tick still
+    // processes the pre-existing invoice target unchanged.
+    let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    let disabled = service_with_creation(ok_session(), store, BitcoinNetwork::Mainnet, false);
+    assert_eq!(
+        disabled.create(request(50_000)).await,
+        Err(CreateInvoiceError::BitcoinCreationDisabled)
+    );
+
+    let runtime = Runtime::new(Arc::new(ReadyPostgres), 1);
+    runtime.set_bitcoin_creation_enabled(false);
+    let outcome = observe_tick(
+        &HealthyPort,
+        &ExistingInvoice,
+        &BitcoinNetwork::Mainnet,
+        &ObserverPolicy {
+            poll_interval: std::time::Duration::from_secs(10),
+            max_requests_per_tick: 100,
+            max_requests_per_second: 5,
+        },
+        &runtime,
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        ObserverTickOutcome::Observed {
+            processed: 1,
+            deferred: 0
+        }
+    );
+    assert!(!runtime.readiness().await.bitcoin_creation_enabled);
 }

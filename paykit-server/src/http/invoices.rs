@@ -63,5 +63,8 @@ fn invoice_error(error: CreateInvoiceError) -> Response {
         CreateInvoiceError::LockNotFound => ApiError::LockNotFound.into_response(),
         CreateInvoiceError::Conflict => ApiError::InvoiceConflict.into_response(),
         CreateInvoiceError::DeadlineExceeded => ApiError::DependencyTimeout.into_response(),
+        CreateInvoiceError::BitcoinCreationDisabled => {
+            ApiError::BitcoinCreationDisabled.into_response()
+        }
     }
 }

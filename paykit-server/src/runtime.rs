@@ -168,6 +168,7 @@ pub struct Readiness {
     pub postgres: ComponentState,
     pub electrum: ComponentState,
     pub electrum_probe: ElectrumProbeReport,
+    pub bitcoin_creation_enabled: bool,
     pub paykit_delivery: ComponentState,
     pub outbox: ComponentState,
 }
@@ -202,6 +203,7 @@ pub struct Runtime {
     idle: Notify,
     capacity: Arc<tokio::sync::Semaphore>,
     electrum: AtomicU8,
+    bitcoin_creation_enabled: AtomicBool,
     electrum_probe: Mutex<Option<ElectrumProbe>>,
     electrum_probe_freshness: Mutex<Duration>,
     paykit_enqueue: AtomicU8,
@@ -227,6 +229,7 @@ impl Runtime {
             idle: Notify::new(),
             capacity: Arc::new(tokio::sync::Semaphore::new(max_concurrent_requests)),
             electrum: AtomicU8::new(NOT_READY),
+            bitcoin_creation_enabled: AtomicBool::new(true),
             electrum_probe: Mutex::new(None),
             electrum_probe_freshness: Mutex::new(DEFAULT_ELECTRUM_PROBE_FRESHNESS),
             paykit_enqueue: AtomicU8::new(NOT_READY),
@@ -249,6 +252,11 @@ impl Runtime {
         self.electrum
             .store(if available { READY } else { DEGRADED }, Ordering::Release);
         self.metrics.set_electrum_available(available);
+    }
+    /// Publishes whether this stack accepts new Bitcoin payment-request binds.
+    pub fn set_bitcoin_creation_enabled(&self, enabled: bool) {
+        self.bitcoin_creation_enabled
+            .store(enabled, Ordering::Release);
     }
     /// Records the most recent Electrum tip probe result.
     pub fn record_electrum_probe(&self, probe: ElectrumProbe) {
@@ -360,6 +368,7 @@ impl Runtime {
             postgres,
             electrum,
             electrum_probe,
+            bitcoin_creation_enabled: self.bitcoin_creation_enabled.load(Ordering::Acquire),
             paykit_delivery,
             outbox,
         }

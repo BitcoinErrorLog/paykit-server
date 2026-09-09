@@ -20,6 +20,7 @@ pub struct Config {
     pub marketplace: Option<MarketplaceConfig>,
     pub setup: SetupConfig,
     pub paykit: PaykitConfig,
+    pub bitcoin: BitcoinConfig,
     pub electrum: ElectrumConfig,
     pub outbox: OutboxConfig,
     pub limits: LimitsConfig,
@@ -82,6 +83,9 @@ impl Config {
                 receiver_path_priority,
                 network: PaykitNetwork::parse(&raw.paykit.network)?,
                 auth_relay,
+            },
+            bitcoin: BitcoinConfig {
+                creation_enabled: raw.bitcoin.creation_enabled,
             },
             electrum: ElectrumConfig {
                 endpoint: raw.electrum.endpoint,
@@ -488,6 +492,14 @@ impl ReceiverPathPriority {
     }
 }
 
+/// Operational switches for the Bitcoin settlement path.
+#[derive(Debug)]
+pub struct BitcoinConfig {
+    /// When false, new Bitcoin payment-request binds are refused while every
+    /// existing invoice keeps being observed.
+    pub creation_enabled: bool,
+}
+
 #[derive(Debug)]
 pub struct ElectrumConfig {
     pub endpoint: String,
@@ -726,6 +738,12 @@ fn default_receiver_path_priority() -> Vec<String> {
 #[serde(deny_unknown_fields)]
 struct RawBitcoinConfig {
     network: String,
+    #[serde(default = "default_bitcoin_creation_enabled")]
+    creation_enabled: bool,
+}
+
+const fn default_bitcoin_creation_enabled() -> bool {
+    true
 }
 
 #[derive(Deserialize)]
