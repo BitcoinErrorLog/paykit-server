@@ -49,11 +49,19 @@ address can still produce a large or slow response. The transport byte
 cap below bounds the memory a large response can occupy, and the
 per-address wall-clock deadline (`electrum.address_deadline`) bounds how
 long the tick *waits*, but the blocking socket read behind the deadline
-cannot be cancelled: an over-deadline response keeps one blocking-pool
-thread and its socket occupied until the read returns — bounded at
-latest by `electrum.request_timeout` on the wire — so the residual is
-thread/socket occupancy by abandoned reads, never unbounded tick latency
-or unbounded response memory. Mitigations:
+cannot be cancelled. The socket timeout (`electrum.request_timeout`) is
+PER READ, so it does not bound the abandoned task in time: a
+drip-feeding endpoint answering one byte per `request_timeout − ε`
+keeps the abandoned blocking task and its socket alive for up to
+(`max_response_bytes` + 1) × drip interval. The residual is therefore an
+abandoned blocking-pool thread + socket PER ABANDONED ATTEMPT, bounded
+in count by the attempts spawned (the tick abandons at most one probe
+plus one read per batch address, and the tokio blocking pool caps at
+512 threads) — never unbounded tick latency or unbounded response
+memory. The aggregate tick-wall bound is the probe's deadline plus one
+deadline per batch address: worst case batch × `address_deadline` (up to
+capacity × deadline ≈ 1000 × 5 s at defaults), versus the per-address
+bound of one `address_deadline`. Mitigations:
 
 - **Transport byte cap.** Every Electrum connection wraps its TCP/TLS
   stream in a byte-capped reader (`CappedStream`,
@@ -79,15 +87,21 @@ or unbounded response memory. Mitigations:
   any per-UTXO record is materialised — no record vector is built for it.
   The two caps are coupled at startup: configuration load refuses an
   `electrum.max_utxos_per_address` whose maximum reply (items × the
-  110-byte per-item wire bound, plus the JSON-RPC envelope) would exceed
+  160-byte per-item wire bound, plus the JSON-RPC envelope) would exceed
   `electrum.max_response_bytes`, so the item cap can never demand a
   response the transport byte cap refuses.
 - **Per-address wall-clock deadline.** Connect + call + decode for one
-  address must finish within `electrum.address_deadline` (default 5s). The
+  address must finish within `electrum.address_deadline` (default 5s),
+  and the tick's probe shares the same deadline so a drip-feeding
+  endpoint cannot stall the tick before any address is attempted. The
   blocking socket read cannot be cancelled, so on expiry the wait is
-  abandoned, the tick moves on, the stale connection is dropped and never
-  reused (the next address reconnects), and the abandoned read exits at
-  latest when `electrum.request_timeout` elapses on the wire.
+  abandoned, the tick moves on, and the stale connection is dropped and
+  never reused (the next address reconnects). The abandoned blocking
+  task is NOT bounded in time by `electrum.request_timeout` (that
+  timeout is per read): a drip-feeding server keeps it and its socket
+  alive for up to (`max_response_bytes` + 1) × drip interval; the
+  residual is bounded in count — one thread + socket per abandoned
+  attempt, under the tokio blocking-pool cap of 512.
 - **Per-address isolation.** Over-cap, over-deadline, and errored lookups
   fail that address only; the tick's other addresses are observed
   normally.
@@ -156,14 +170,25 @@ caller shrinks — or, when it drains the bucket, wholly defers — the next
 tick instead of drawing from a separate pool. There is no uncharged send
 anywhere: a request that was not reserved is a request that is not sent.
 
-Unadmitted and failed targets keep their staleness and lead the next
-tick's plan, and only successfully observed targets are stamped/rotated.
-**Fairness:** every target is *attempted* at least once per
-⌈N ÷ per-tick budget⌉ ticks (N = pending targets). **Residual:** a failed
-target keeps its queue position and consumes one admission slot per tick
-until it succeeds or its invoice expires, so a permanently failing oldest
-target reduces every other seller's effective per-tick capacity by exactly
-one slot — it can never take more.
+Unadmitted targets keep their position and lead the next tick's plan.
+Every ATTEMPTED target is stamped: a success stamps `last_observed_at`
+(last successful observation; drives staleness and backlog alerting) AND
+`last_attempted_at`, a failure stamps `last_attempted_at` only, and the
+plan orders oldest attempt first (`COALESCE(last_attempted_at,
+last_observed_at, created_at)`). Failed targets therefore rotate behind
+the rest of the plan exactly like successes — a permanently failing
+target cannot hold the head. **Fairness:** with F permanently failing
+targets among N pending targets and a per-tick lookup budget B, every
+target — honest or failing — is *attempted* at least once per
+⌈N ÷ B⌉ ticks, and the attacker's F addresses cost exactly F slots per
+rotation, never more. (Before failure stamping, F ≥ B permanently
+failing targets — each dusted with `max_utxos_per_address` + 1 UTXOs, ≈
+48 × 201 dust outputs at defaults, on invoices that never expire out of
+the plan — held the head forever and honest sellers were attempted
+never.) **Residual:** the attacker still slows every seller's attempt
+interval by the F extra targets in the rotation: worst-case
+honest-seller delay is ⌈(N) ÷ B⌉ ticks including the F attacker
+targets, versus ⌈(N − F) ÷ B⌉ without them — bounded, not starvation.
 
 ## Acceptable degradation
 
@@ -171,8 +196,8 @@ one slot — it can never take more.
 errored) lookup for address A:
 
 - never discards successful observations for addresses B..N in the same
-  tick (A's target is simply not stamped and stays stale for the next
-  tick);
+  tick (A's target keeps its staleness for the next tick and rotates
+  behind the plan via the failure stamp);
 - never marks Electrum unavailable and never triggers global backoff —
   no number or pattern of per-address failures (one address, three
   distinct addresses, or an A,B,A alternation) is promoted to an
@@ -215,15 +240,16 @@ genuine endpoint-level conditions:
 
 ## Seller-visible effect
 
-A dusted seller's own invoice may be observed more slowly (its target
-keeps failing, stays at the head of the plan, and is retried once per tick
-within budget, consuming one slot per tick until it succeeds or the
-invoice expires). Every other seller's targets are still attempted at
-least once per ⌈N ÷ per-tick budget⌉ ticks, the shared endpoint's request
-rate stays inside the configured sustained budget, and
-`bitcoin_offer_available` never degrades because of per-address failures.
-Payment semantics (outpoint/value/presence, `observed_sats >= required`,
-six-confirmation finality) are unchanged.
+A dusted seller's own invoice may be observed more slowly: its target
+keeps failing, rotates behind the plan via the failure stamp, and is
+retried once per rotation, consuming one slot per rotation. Every other
+seller's targets are still attempted at least once per
+⌈N ÷ per-tick budget⌉ ticks (N now includes the attacker's failing
+targets, so F of them stretch the rotation but can never starve it), the
+shared endpoint's request rate stays inside the configured sustained
+budget, and `bitcoin_offer_available` never degrades because of
+per-address failures. Payment semantics (outpoint/value/presence,
+`observed_sats >= required`, six-confirmation finality) are unchanged.
 
 ## Cluster-single observer
 

@@ -6,7 +6,7 @@
 
 **Architecture:** Keep one explicit server composition root, PostgreSQL as the only production state authority, one BIP84 account xpub/account index and one SDK state per Creator, fenced at-least-once outbox work, and direct invoice-specific Bitcoin observation. Prefer narrow corrections and deletion over generalized frameworks. Unsupported edge cases are acceptable only when documented and fail safely.
 
-**Tech stack:** Rust 2024/MSRV 1.91.1, Tokio, Axum, SQLx/PostgreSQL, XChaCha20-Poly1305, HKDF-SHA256, Ed25519, pinned `paykit-sdk`/`paykit-lib`, Bitcoin 0.32, and pinned `bdk_electrum` 0.24.
+**Tech stack:** Rust 2024/MSRV 1.91.1, Tokio, Axum, SQLx/PostgreSQL, XChaCha20-Poly1305, HKDF-SHA256, Ed25519, pinned `paykit-sdk`/`paykit-lib`, Bitcoin 0.32, and pinned `electrum-client` 0.25.
 
 ---
 
@@ -539,10 +539,11 @@ inspectable production client without implementing a private Electrum protocol.
 2. Record the selected crate/version and exact symbols in this plan before
    writing the adapter. Reject a candidate that requires custom wire calls for
    the supported path.
-   - **Selected and re-verified 2026-07-22:** `bdk_electrum = 0.24.0`, pinned
-     exactly with `default-features = false` and `features = ["use-rustls-ring"]`.
-     Its re-exported `electrum-client = 0.25.0` transport and `bitcoin = "0.32"`
-     types unify with this workspace's exact `bitcoin = "=0.32.101"` pin.
+   - **Selected and re-verified 2026-07-22, superseded:** the adapter now
+     uses `electrum-client = 0.25.0` directly (the `bdk_electrum = 0.24.0`
+     wrapper this bullet originally selected was removed); its
+     `bitcoin = "0.32"` types unify with this workspace's exact
+     `bitcoin = "=0.32.101"` pin.
    - **Construction/config symbols:** `BdkElectrumClient::new`, the re-exported
      `Client::from_config`, and `ConfigBuilder::{new, timeout, retry, build}`.
    - **Observation symbols:** `bdk_core::spk_client::SyncRequest`,
@@ -673,7 +674,8 @@ without weakening validation, persistence atomicity, or payment semantics.
 - Preserve the public `ElectrumPort`, `ObservationTarget`, `ObservedOutput`,
   `TrackedOutput`, and persisted-state contracts unless a separate reviewed
   breaking change is approved.
-- Keep `bdk_electrum` as the maintained Electrum abstraction. Do not reintroduce
+- Keep `electrum-client` 0.25 as the maintained Electrum transport (the
+  `bdk_electrum` abstraction was removed). Do not reintroduce
   direct Electrum history/transaction scanning, custom wire calls, or a
   descriptor wallet/spending-key dependency.
 - Do not blindly merge adapter parsing with `validate_batch`: provider output
@@ -765,7 +767,7 @@ Stop for manual review before Task 8 composition work.
 **Implementation:**
 - Replace the empty `Server` placeholder with a small explicit owner of config, pool, crypto, stores, services, router, runtime state, adapters, and worker task set.
 - Replace unsupported `paykit.relay_url` / `paykit.homeserver_url` keys with closed `paykit.network = "mainnet" | "testnet"` selection and construct the corresponding pinned Pubky client; do not bypass SDK-owned AUTH to force a custom relay.
-- Add closed `electrum.request_timeout` and `electrum.connect_retries` settings with accepted defaults `"10s"` and `1`; production construction must not use the dependency's unbounded socket-timeout default.
+- Add a closed `electrum.request_timeout` setting with accepted default `"10s"`; production construction must not use the dependency's unbounded socket-timeout default. (The originally proposed `electrum.connect_retries` was dropped: client-side call retries are pinned at zero and the observer's own next tick is the retry.)
 - Add closed `outbox.batch_size` with accepted default `16` and use it for enqueue and reconciliation claims.
 - Keep `main.rs` to load configuration, connect/migrate, build, and run.
 - Bind encrypted Bitcoin observations to their parent invoice in AEAD associated
@@ -961,7 +963,7 @@ git status --short
   and discovered markers through the separate localhost relay/homeserver process,
   established an Encrypted Link, and sent/received one Payment Request.
 - Against Fulcrum `1.11.1` protocol `1.4` over Bitcoin mainnet, the production
-  `bdk_electrum 0.24.0` adapter observed the exact known outpoint, `900000` sats,
+  `electrum-client 0.25.0` adapter observed the exact known outpoint, `900000` sats,
   presence, and two confirmations among the address's complete history.
 - The supplied Fulcrum TLS port presented a self-signed certificate without a SAN
   and was correctly rejected; the successful plaintext port is bounded protocol
@@ -1069,7 +1071,7 @@ git diff --check
 | 3 | Implemented | Trusted signed policy is charged only after verified closed-schema input; runtime capacity bounds pre-auth work; setup uses transport-IP policy plus cancellation-safe global reservations; sub-second persistence lease/retry durations are rejected. |
 | 4 | Implemented and PostgreSQL-verified | Invoice success atomically persists complete Creator-bound endpoint and Payment Request intents with selected marker binding, dependency, current-format validation, and exact replay preservation. |
 | 5 | Implemented and PostgreSQL-verified | Creator-scoped public-SDK handoff durably persists SDK-generated IDs, fences exact outbound reconciliation through durable `Sent`, retains terminal failures, and documents the accepted at-least-once pre-association duplicate window. |
-| 6–7B | Implemented, PostgreSQL-verified, and live-smoke verified | Bitcoin records are encrypted/keyed-hashed; the concrete adapter uses pinned `bdk_electrum`; complete batches are validated before one atomic persistence call; one exact mainnet output passed against Fulcrum. |
+| 6–7B | Implemented, PostgreSQL-verified, and live-smoke verified | Bitcoin records are encrypted/keyed-hashed; the concrete adapter uses pinned `electrum-client` 0.25; complete batches are validated before one atomic persistence call; one exact mainnet output passed against Fulcrum. |
 | 7C | Implemented and PostgreSQL-verified | Three evidence-driven reviews simplified network/address parsing, BDK metadata indexing, outpoint validation, and idle persistence while preserving the independent provider boundary; stale BDK protocol and canonical migration fixtures were corrected. |
 | 8–9 | Implemented and PostgreSQL-verified | Production composition owns all business routes and workers; evidence-driven readiness and one bounded lifecycle supervisor cover startup, retry degradation, admission/claim stop, graceful drain, and forced deadline abort. |
 | 10 | Complete | Composed two-Creator PostgreSQL workflow passes through production routes/workers across restart with persistence privacy assertions. |
