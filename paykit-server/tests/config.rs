@@ -471,6 +471,40 @@ fn accepts_a_response_cap_at_the_64kib_floor() {
     );
 }
 
+#[test]
+fn accepts_a_response_cap_at_the_16mib_ceiling() {
+    assert!(
+        Config::from_toml_and_environment(
+            &electrum_toml("max_response_bytes = 16777216"),
+            environment()
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn rejects_a_response_cap_above_the_16mib_ceiling_with_the_literal_message() {
+    let error = Config::from_toml_and_environment(
+        &electrum_toml("max_response_bytes = 16777217"),
+        environment(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "electrum.max_response_bytes must be at most 16777216 bytes (16 MiB)"
+    );
+    // u64::MAX is refused too — the TOML layer rejects it before
+    // validation because the `toml` crate's integer type is i64, so the
+    // diagnostic is the TOML parse error rather than the range message.
+    assert!(
+        Config::from_toml_and_environment(
+            &electrum_toml("max_response_bytes = 18446744073709551615"),
+            environment()
+        )
+        .is_err()
+    );
+}
+
 fn mainnet_toml(endpoint: &str) -> String {
     valid_toml()
         .replace(

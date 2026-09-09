@@ -88,8 +88,10 @@ address_deadline = "5s"
 # single response line larger than this is ever held in memory: the read
 # fails with "electrum response exceeds max_response_bytes" before the
 # client buffers or JSON-decodes the line, and the poisoned connection is
-# torn down (the next lookup reconnects). Default 1 MiB; startup refuses
-# values below 64 KiB.
+# torn down (the next lookup reconnects). A poisoned line of any length
+# costs the source exactly cap + 1 bytes of consumption before the read
+# fails. Default 1 MiB; startup refuses values below 64 KiB or above
+# 16 MiB.
 max_response_bytes = 1048576
 # Readiness also requires a trustworthy chain tip: a probed tip older than
 # max_tip_age, a tip-height regression beyond the six-block reorg

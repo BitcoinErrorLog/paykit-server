@@ -10,7 +10,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::workers::{
-    electrum::MIN_MAX_RESPONSE_BYTES,
+    electrum::{MAX_MAX_RESPONSE_BYTES, MIN_MAX_RESPONSE_BYTES},
     observer::{ObserverPolicy, PROBE_REQUESTS_PER_TICK},
 };
 
@@ -233,6 +233,9 @@ impl Config {
         }
         if self.electrum.max_response_bytes < MIN_MAX_RESPONSE_BYTES {
             return Err(ConfigError::ElectrumResponseCapBelowFloor);
+        }
+        if self.electrum.max_response_bytes > MAX_MAX_RESPONSE_BYTES {
+            return Err(ConfigError::ElectrumResponseCapAboveCeiling);
         }
         // Plaintext Electrum carries the merchant's invoice addresses and
         // UTXO sets unauthenticated and in the clear; on mainnet the only
@@ -583,7 +586,8 @@ pub struct ElectrumConfig {
     /// connection wraps its stream in a capped reader, so no single
     /// response line larger than this is ever held in memory: the read
     /// fails before the client buffers or decodes it, and the poisoned
-    /// connection is torn down. Floor: 64 KiB (startup refuses less).
+    /// connection is torn down. Floor: 64 KiB; ceiling: 16 MiB (startup
+    /// refuses values outside the range).
     pub max_response_bytes: u64,
     /// Maximum accepted chain-tip age for readiness. On networks with a
     /// live block cadence, /health/ready answers 503 (not_ready) when the
@@ -720,6 +724,8 @@ pub enum ConfigError {
     InsufficientElectrumBudget,
     #[error("electrum.max_response_bytes must be at least 65536 bytes (64 KiB)")]
     ElectrumResponseCapBelowFloor,
+    #[error("electrum.max_response_bytes must be at most 16777216 bytes (16 MiB)")]
+    ElectrumResponseCapAboveCeiling,
     #[error(
         "bitcoin.network mainnet requires an ssl:// electrum.endpoint; the {0}:// scheme is plaintext and refused"
     )]

@@ -55,6 +55,21 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 /// smaller value.
 pub const MIN_MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
+/// Ceiling for `electrum.max_response_bytes`: 16 MiB. Startup refuses a
+/// larger value. Justification from the design's own caps: the largest
+/// legitimate response this process ever reads is one
+/// `blockchain.scripthash.listunspent` reply of at most
+/// `electrum.max_utxos_per_address` items (default 200), and one item is
+/// `{"tx_hash":"<64 hex>","tx_pos":<u32>,"height":<u32>,"value":<u64>}`
+/// — under 110 bytes on the wire including JSON punctuation, so the
+/// default configuration's largest response is ~200 × 110 B ≈ 21 KiB and
+/// even a 100 000-item configuration stays under ~11 MiB. The only other
+/// responses are the tick's probe replies (`headers.subscribe` and
+/// `block_header(0)`: an 80-byte header hex-encoded plus envelope, well
+/// under 1 KiB). 16 MiB therefore bounds every legitimate response with
+/// headroom while keeping the per-line memory bound tight.
+pub const MAX_MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
 fn response_cap_error() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, RESPONSE_CAP_ERROR_MESSAGE)
 }
