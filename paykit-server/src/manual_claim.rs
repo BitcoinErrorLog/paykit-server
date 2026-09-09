@@ -31,11 +31,11 @@ use url::Url;
 
 use crate::{
     bitkit_claim::{ClaimError, WatchOnlyAccountClaim, required_capabilities},
+    chain_history::{ChainHistoryPort, ClaimScanError, scan_claim_start_index},
     config::BitcoinNetwork,
     domain::locks::{CreatorPubky, parse_creator},
     persistence::CreatorStore,
     real_setup::{CreatorSetupCommit, MarkerPublisher, validate_xpub},
-    setup_orchestration::VerifiedSetupCommit,
 };
 
 /// How long the claim waits for the relay round-trip and homeserver session
@@ -64,6 +64,10 @@ pub struct ManualClaimOutcome {
     /// Canonical pubky-prefixed creator identity that now owns the account.
     pub creator: String,
     pub account_index: u32,
+    /// The creator's derivation cursor after the claim-time history scan
+    /// (design §B.5/§B.6): the child index the next invoice address derives
+    /// from.
+    pub next_child_index: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +83,13 @@ pub enum ManualClaimError {
     InvalidXpub,
     /// A different account is already persisted for this creator.
     AccountMismatch,
+    /// The claim-time history scan could not reach Electrum (connect,
+    /// timeout, or malformed response). The claim is refused — never
+    /// defaulted to index 0 (design §B.5) — and is retryable.
+    ClaimScanUnavailable,
+    /// The claim-time history scan found usage in every window up to the
+    /// 1,000-address bound; the seller must claim a fresh, dedicated account.
+    AccountHistoryTooDeep,
     /// The relay or the creator's homeserver could not complete the session
     /// exchange; the claim is retryable.
     SessionUnavailable,
@@ -162,6 +173,7 @@ pub struct ManualClaimService {
     minter: Arc<dyn SessionMinter>,
     creators: CreatorStore,
     marker_publisher: Arc<dyn MarkerPublisher>,
+    history: Arc<dyn ChainHistoryPort>,
     bitcoin_network: BitcoinNetwork,
     receiver_path: PaykitReceiverPath,
     required_capabilities: String,
@@ -173,6 +185,7 @@ impl ManualClaimService {
         minter: Arc<dyn SessionMinter>,
         creators: CreatorStore,
         marker_publisher: Arc<dyn MarkerPublisher>,
+        history: Arc<dyn ChainHistoryPort>,
         bitcoin_network: BitcoinNetwork,
         receiver_path: PaykitReceiverPath,
     ) -> Self {
@@ -182,6 +195,7 @@ impl ManualClaimService {
             minter,
             creators,
             marker_publisher,
+            history,
             bitcoin_network,
             receiver_path,
             required_capabilities,
@@ -212,6 +226,26 @@ impl ManualClaimService {
             request.account_index,
             &self.bitcoin_network,
         )?;
+
+        // Claim-time address-index scan (design §B.5): derive the account's
+        // external chain in windows of 20 until a fully empty window, bounded
+        // at 1,000 addresses. The scan runs before the relay round-trip and
+        // any persistence, and any Electrum failure refuses the claim — an
+        // unscanned claim is exactly the P1-A condition the design forbids.
+        let canonical_xpub = Xpub::decode(&claim.serialized_xpub)
+            .map_err(|_| ManualClaimError::InvalidXpub)?
+            .to_string();
+        let start_index = scan_claim_start_index(
+            self.history.as_ref(),
+            &canonical_xpub,
+            request.account_index,
+            &self.bitcoin_network,
+        )
+        .await
+        .map_err(|error| match error {
+            ClaimScanError::Unavailable => ManualClaimError::ClaimScanUnavailable,
+            ClaimScanError::HistoryTooDeep => ManualClaimError::AccountHistoryTooDeep,
+        })?;
 
         let capabilities = Capabilities::try_from(self.required_capabilities.as_str())
             .map_err(|_| ManualClaimError::InvalidCapabilities)?;
@@ -252,17 +286,20 @@ impl ManualClaimService {
             bitcoin_network: self.bitcoin_network.clone(),
             receiver_path: self.receiver_path.clone(),
             marker_capabilities: CreatorSetupCommit::marker_capabilities(),
+            next_child_index_floor: Some(i64::from(start_index)),
         };
-        commit
-            .publish_readback_and_commit(claim)
+        let next_child_index = commit
+            .publish_readback_and_commit_reporting(claim)
             .await
             .map_err(|error| match error {
                 ClaimError::AccountMismatch => ManualClaimError::AccountMismatch,
                 _ => ManualClaimError::Unavailable,
-            })?;
+            })?
+            .unwrap_or(i64::from(start_index));
         Ok(ManualClaimOutcome {
             creator: creator.to_string(),
             account_index: request.account_index,
+            next_child_index,
         })
     }
 

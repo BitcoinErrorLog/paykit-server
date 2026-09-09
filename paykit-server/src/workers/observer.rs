@@ -23,7 +23,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bitcoin::{Address, Network, OutPoint, Txid, consensus::deserialize, hex::DisplayHex};
+use bitcoin::{Address, Network, OutPoint, ScriptBuf, Txid, consensus::deserialize, hex::DisplayHex};
 use electrum_client::{
     ElectrumApi, Error as ElectrumError, ListUnspentRes, Param, ToElectrumScriptHash,
 };
@@ -31,6 +31,7 @@ use rand::Rng;
 
 use crate::{
     bitcoin::{ObservationTarget, ObservedOutput, PlannedObservation},
+    chain_history::{ChainHistoryPort, ClaimScanError},
     config::BitcoinNetwork,
     domain::payment::BitcoinOutpoint,
     persistence::{BitcoinObservationInput, InvoiceStore, PendingCandidate, PersistenceError},
@@ -1530,6 +1531,47 @@ impl ElectrumPort for ElectrumAdapter {
             Ok(Ok(result)) => result,
             Ok(Err(_)) | Err(_) => Err(ObserverError::Unavailable),
         }
+    }
+}
+
+/// Claim-time history scan on the same adapter the observer uses (design
+/// §B.5). The observer tick never calls this port — the scan runs only in the
+/// claim handler — so this adds no Electrum calls to observation. Each batch
+/// runs bounded and blocking on its own dedicated connection with the
+/// configured timeout, exactly like
+/// [`ElectrumPort::creation_snapshot`], and every failure maps to
+/// [`ClaimScanError::Unavailable`] so the claim is refused rather than
+/// defaulted to index 0.
+#[async_trait]
+impl ChainHistoryPort for ElectrumAdapter {
+    async fn history_presence_batch(
+        &self,
+        scripts: &[ScriptBuf],
+    ) -> Result<Vec<bool>, ClaimScanError> {
+        let adapter = self.clone_for_fetch();
+        let scripts = scripts.to_vec();
+        tokio::task::spawn_blocking(move || {
+            let client = adapter
+                .raw_client_blocking()
+                .map_err(|_| ClaimScanError::Unavailable)?;
+            let refs: Vec<&bitcoin::Script> = scripts.iter().map(ScriptBuf::as_script).collect();
+            // ONE batched get_history round-trip for the window; presence
+            // only, so transactions are never fetched.
+            let histories = client
+                .batch_script_get_history(refs)
+                .map_err(|_| ClaimScanError::Unavailable)?;
+            if histories.len() != scripts.len() {
+                // A malformed response is an Electrum failure, not an empty
+                // window.
+                return Err(ClaimScanError::Unavailable);
+            }
+            Ok(histories
+                .iter()
+                .map(|history| !history.is_empty())
+                .collect())
+        })
+        .await
+        .map_err(|_| ClaimScanError::Unavailable)?
     }
 }
 

@@ -243,6 +243,21 @@ impl Server {
             )
             .with_electrum_controls(electrum_request_limiter.clone(), creation_snapshot_slots),
         );
+        // The claim-time history scan (design §B.5) reuses the observer's
+        // Electrum adapter type and timeout configuration; each scan batch
+        // opens its own bounded connection, so no second client type is
+        // introduced.
+        let claim_history = Arc::new(
+            ElectrumAdapter::configured(
+                config.electrum.endpoint.clone(),
+                config.deployment_invariants().bitcoin_network.clone(),
+                config.electrum.request_timeout,
+                usize::try_from(config.electrum.max_utxos_per_address).unwrap_or(usize::MAX),
+                config.electrum.address_deadline,
+                config.electrum.max_response_bytes,
+            )
+            .map_err(map_electrum_error)?,
+        );
         let manual_claims = Arc::new(ManualClaimService::new(
             pubky.clone(),
             Arc::new(RelayLoopbackSessionMinter::new(
@@ -251,6 +266,7 @@ impl Server {
             )),
             creators.clone(),
             Arc::new(crate::real_setup::DirectMarkerPublisher),
+            claim_history,
             config.deployment_invariants().bitcoin_network.clone(),
             config.paykit.receiver_path.clone(),
         ));

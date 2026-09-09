@@ -8,6 +8,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use paykit_lib::PaykitReceiverPath;
 use paykit_sdk::PaykitSdkConfig;
 use paykit_server::{
+    chain_history::{ChainHistoryPort, ClaimScanError},
     config::BitcoinNetwork,
     crypto::Crypto,
     http::accounts::{AccountsState, accounts_router},
@@ -34,6 +35,20 @@ impl SessionMinter for RefusingMinter {
     }
 }
 
+/// Every scripted window answers empty: the scan passes so these tests keep
+/// exercising the boundary they target (validation, minting, rate limits).
+struct UnusedHistory;
+
+#[async_trait::async_trait]
+impl ChainHistoryPort for UnusedHistory {
+    async fn history_presence_batch(
+        &self,
+        scripts: &[bitcoin::ScriptBuf],
+    ) -> Result<Vec<bool>, ClaimScanError> {
+        Ok(vec![false; scripts.len()])
+    }
+}
+
 fn receiver_path() -> PaykitReceiverPath {
     PaykitReceiverPath::new("paykit/server").unwrap()
 }
@@ -52,6 +67,7 @@ fn service() -> Arc<ManualClaimService> {
         Arc::new(RefusingMinter),
         CreatorStore::new(&pool, crypto),
         Arc::new(DirectMarkerPublisher),
+        Arc::new(UnusedHistory),
         BitcoinNetwork::Regtest,
         receiver_path(),
     ))
