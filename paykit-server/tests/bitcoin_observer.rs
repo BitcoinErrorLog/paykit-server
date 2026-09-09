@@ -104,18 +104,19 @@ fn bitcoin_observation_debug_redacts_addresses_and_outpoints() {
 
 mod tick {
     use std::{
+        collections::HashSet,
         sync::{Arc, Mutex},
         time::Duration,
     };
 
     use async_trait::async_trait;
     use paykit_server::{
-        bitcoin::{ObservationTarget, PlannedObservation, TargetTickRecord},
+        bitcoin::{ObservationTarget, PlannedObservation},
         config::BitcoinNetwork,
         runtime::{DependencyCheck, Runtime},
         workers::observer::{
-            ElectrumPort, ObservationBackend, ObservationReport, ObserverBackoff, ObserverError,
-            ObserverPolicy, ObserverTickOutcome, OverrunLane, TargetHistory, TipProbe,
+            AddressFailureGate, ElectrumPort, ObservationBackend, ObservationReport,
+            ObserverBackoff, ObserverError, ObserverPolicy, ObserverTickOutcome, TipProbe,
             observe_tick,
         },
     };
@@ -148,67 +149,55 @@ mod tick {
             poll_interval: Duration::from_secs(10),
             max_requests_per_tick: budget,
             max_requests_per_second: 100,
-            max_target_requests: 500,
-            overrun_lane_interval_ticks: 10,
         }
     }
 
-    /// A lane that never opens, for ticks that do not exercise the slow lane.
-    fn closed_lane() -> OverrunLane {
-        OverrunLane::new(u32::MAX)
+    fn failure_gate() -> AddressFailureGate {
+        AddressFailureGate::new()
     }
 
     struct FakeElectrum {
         probe: Result<TipProbe, ObserverError>,
-        history_tx_counts: std::collections::HashMap<String, u32>,
-        request_count: u64,
-        extra_history: Vec<TargetHistory>,
+        /// Addresses whose per-address lookup fails; every other requested
+        /// address is observed successfully.
+        failing_addresses: HashSet<String>,
+        /// Extra addresses reported as observed even though they were not
+        /// requested, modelling an observation stamp whose lookup hash
+        /// matches no invoice row.
+        ghost_observed: Vec<String>,
         calls: Mutex<Vec<Vec<String>>>,
     }
 
     impl FakeElectrum {
         fn healthy() -> Self {
-            Self::healthy_with_history([])
-        }
-
-        fn healthy_with_history<const N: usize>(history_tx_counts: [(&str, u32); N]) -> Self {
             Self {
                 probe: Ok(TipProbe {
                     height: 100,
                     time_unix: fresh_tip_time(),
                 }),
-                history_tx_counts: history_tx_counts
-                    .into_iter()
-                    .map(|(address, tx_count)| (address.to_owned(), tx_count))
-                    .collect(),
-                request_count: 0,
-                extra_history: Vec::new(),
+                failing_addresses: HashSet::new(),
+                ghost_observed: Vec::new(),
                 calls: Mutex::new(Vec::new()),
             }
         }
 
-        fn with_request_count(mut self, request_count: u64) -> Self {
-            self.request_count = request_count;
-            self
+        fn failing_addresses<const N: usize>(addresses: [&str; N]) -> Self {
+            Self {
+                failing_addresses: addresses.into_iter().map(str::to_owned).collect(),
+                ..Self::healthy()
+            }
         }
 
-        /// Appends a history entry for an address that is not part of the
-        /// requested batch, modelling an observation stamp whose lookup
-        /// hash matches no invoice row.
-        fn with_ghost_history(mut self, address: &str) -> Self {
-            self.extra_history.push(TargetHistory {
-                address: address.into(),
-                tx_count: 0,
-            });
+        fn with_ghost_observed(mut self, address: &str) -> Self {
+            self.ghost_observed.push(address.to_owned());
             self
         }
 
         fn failing(error: ObserverError) -> Self {
             Self {
                 probe: Err(error),
-                history_tx_counts: std::collections::HashMap::new(),
-                request_count: 0,
-                extra_history: Vec::new(),
+                failing_addresses: HashSet::new(),
+                ghost_observed: Vec::new(),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -218,6 +207,7 @@ mod tick {
     impl ElectrumPort for FakeElectrum {
         async fn observations(
             &self,
+            _tip_height: u32,
             targets: &[ObservationTarget],
         ) -> Result<ObservationReport, ObserverError> {
             self.calls.lock().unwrap().push(
@@ -226,23 +216,16 @@ mod tick {
                     .map(|target| target.address().to_owned())
                     .collect(),
             );
-            let mut history: Vec<TargetHistory> = targets
-                .iter()
-                .map(|target| TargetHistory {
-                    address: target.address().to_owned(),
-                    tx_count: self
-                        .history_tx_counts
-                        .get(target.address())
-                        .copied()
-                        .unwrap_or(0),
-                })
-                .collect();
-            history.extend(self.extra_history.iter().cloned());
-            Ok(ObservationReport {
-                outputs: Vec::new(),
-                history,
-                request_count: self.request_count,
-            })
+            let mut report = ObservationReport::default();
+            for target in targets {
+                if self.failing_addresses.contains(target.address()) {
+                    report.failed.push(target.address().to_owned());
+                } else {
+                    report.observed.push(target.address().to_owned());
+                }
+            }
+            report.observed.extend(self.ghost_observed.iter().cloned());
+            Ok(report)
         }
 
         async fn probe(&self) -> Result<TipProbe, ObserverError> {
@@ -252,20 +235,14 @@ mod tick {
 
     struct FakeEntry {
         address: String,
-        history_tx_count: Option<u32>,
-        last_request_count: Option<u32>,
         staleness_secs: u64,
-        observation_overrun: bool,
     }
 
     impl FakeEntry {
-        fn new(address: &str, history_tx_count: Option<u32>, staleness_secs: u64) -> Self {
+        fn new(address: &str, staleness_secs: u64) -> Self {
             Self {
                 address: address.into(),
-                history_tx_count,
-                last_request_count: None,
                 staleness_secs,
-                observation_overrun: false,
             }
         }
     }
@@ -274,24 +251,25 @@ mod tick {
     struct FakeBackend {
         entries: Mutex<Vec<FakeEntry>>,
         applied: Mutex<Vec<Vec<String>>>,
-        marked_overrun: Mutex<Vec<String>>,
+        stamped: Mutex<Vec<Vec<String>>>,
     }
 
     #[async_trait]
     impl ObservationBackend for FakeBackend {
         async fn observation_plan(&self) -> Result<Vec<PlannedObservation>, ObserverError> {
-            let mut entries = self.entries.lock().unwrap();
-            entries.sort_by(|left, right| right.staleness_secs.cmp(&left.staleness_secs));
-            Ok(entries
-                .iter()
+            let entries = self.entries.lock().unwrap();
+            let mut ordered: Vec<&FakeEntry> = entries.iter().collect();
+            // Stable sort on a copy: ties (equally fresh targets) keep the
+            // plan's insertion order, mirroring the store's deterministic
+            // ORDER BY without reordering the stored entries.
+            ordered.sort_by(|left, right| right.staleness_secs.cmp(&left.staleness_secs));
+            Ok(ordered
+                .into_iter()
                 .map(|entry| {
                     PlannedObservation::new(
                         ObservationTarget::new(entry.address.clone(), None),
-                        entry.history_tx_count,
-                        entry.last_request_count,
                         Duration::from_secs(entry.staleness_secs),
                     )
-                    .with_observation_overrun(entry.observation_overrun)
                 })
                 .collect())
         }
@@ -311,47 +289,16 @@ mod tick {
             Ok(0)
         }
 
-        async fn mark_observation_overrun(
-            &self,
-            addresses: &[String],
-        ) -> Result<Vec<uuid::Uuid>, ObserverError> {
-            let mut marked = self.marked_overrun.lock().unwrap();
-            let mut entries = self.entries.lock().unwrap();
-            let mut invoice_ids = Vec::new();
-            for address in addresses {
-                marked.push(address.clone());
-                if let Some(entry) = entries.iter_mut().find(|entry| entry.address == *address)
-                    && !entry.observation_overrun
-                {
-                    entry.observation_overrun = true;
-                    invoice_ids.push(uuid::Uuid::new_v4());
-                }
-            }
-            Ok(invoice_ids)
-        }
-
         async fn record_observation_tick(
             &self,
-            records: &[TargetTickRecord],
-            overrun_clear_bound: u32,
+            addresses: &[String],
         ) -> Result<u64, ObserverError> {
+            self.stamped.lock().unwrap().push(addresses.to_vec());
             let mut entries = self.entries.lock().unwrap();
             let mut misses = 0_u64;
-            for record in records {
-                match entries
-                    .iter_mut()
-                    .find(|entry| entry.address == record.address())
-                {
-                    Some(entry) => {
-                        entry.staleness_secs = 0;
-                        entry.history_tx_count = Some(record.history_tx_count());
-                        entry.last_request_count = Some(record.request_count());
-                        // Mirrors the store's UPDATE: a stamped structural
-                        // estimate at or below the bound clears the flag.
-                        if u64::from(record.history_tx_count()) < u64::from(overrun_clear_bound) {
-                            entry.observation_overrun = false;
-                        }
-                    }
+            for address in addresses {
+                match entries.iter_mut().find(|entry| entry.address == *address) {
+                    Some(entry) => entry.staleness_secs = 0,
                     None => misses += 1,
                 }
             }
@@ -371,7 +318,7 @@ mod tick {
             &BitcoinNetwork::Regtest,
             &policy(100),
             &runtime,
-            &mut closed_lane(),
+            &mut failure_gate(),
         )
         .await;
 
@@ -404,7 +351,7 @@ mod tick {
                 &BitcoinNetwork::Regtest,
                 &policy(100),
                 &runtime,
-                &mut closed_lane(),
+                &mut failure_gate(),
             )
             .await;
             assert_eq!(
@@ -423,14 +370,15 @@ mod tick {
             &BitcoinNetwork::Regtest,
             &policy(100),
             &runtime,
-            &mut closed_lane(),
+            &mut failure_gate(),
         )
         .await;
         assert_eq!(
             outcome,
             ObserverTickOutcome::Observed {
                 processed: 0,
-                deferred: 0
+                deferred: 0,
+                failed: 0,
             }
         );
         backoff.reset();
@@ -445,33 +393,35 @@ mod tick {
         let port = FakeElectrum::healthy();
         let backend = FakeBackend {
             entries: Mutex::new(vec![
-                FakeEntry::new("oldest", None, 600),
-                FakeEntry::new("second", Some(2), 300),
-                FakeEntry::new("third", Some(0), 120),
-                FakeEntry::new("freshest", Some(0), 60),
+                FakeEntry::new("oldest", 600),
+                FakeEntry::new("second", 300),
+                FakeEntry::new("third", 120),
+                FakeEntry::new("freshest", 60),
             ]),
             applied: Mutex::new(Vec::new()),
-            marked_overrun: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
-        // Costs: 2 + 3 + 1 + 1 = 7 estimated. Policy budget 7 reserves the
-        // tick's two probe requests (headers.subscribe + block_header(0)),
-        // leaving 5, which admits the first two targets only. Without the
-        // reservation all four would fit and nothing would be deferred.
+        // Every target costs exactly one lookup. Policy budget 4 reserves
+        // the tick's two probe requests (headers.subscribe +
+        // block_header(0)), leaving 2 lookups, which admits the first two
+        // targets only. Without the reservation all four would fit and
+        // nothing would be deferred.
         let outcome = observe_tick(
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(7),
+            &policy(4),
             &runtime,
-            &mut closed_lane(),
+            &mut failure_gate(),
         )
         .await;
         assert_eq!(
             outcome,
             ObserverTickOutcome::Observed {
                 processed: 2,
-                deferred: 2
+                deferred: 2,
+                failed: 0,
             }
         );
         assert_eq!(
@@ -479,56 +429,118 @@ mod tick {
             &[vec!["oldest".to_owned(), "second".to_owned()]]
         );
 
-        // Next tick: the deferred targets are now the stalest and are observed
-        // first; the just-observed pair fits the remaining budget behind them.
+        // Next tick: the deferred targets are now the stalest and are
+        // observed first; the just-observed pair defers behind them.
         let outcome = observe_tick(
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(7),
+            &policy(4),
             &runtime,
-            &mut closed_lane(),
+            &mut failure_gate(),
         )
         .await;
         assert_eq!(
             outcome,
             ObserverTickOutcome::Observed {
-                processed: 4,
-                deferred: 0
+                processed: 2,
+                deferred: 2,
+                failed: 0,
+            }
+        );
+        {
+            let calls = port.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[1], vec!["third".to_owned(), "freshest".to_owned()]);
+        }
+
+        // One more tick observes the rotated remainder: every stamped
+        // target reports staleness 0, so the plan's stable order admits the
+        // pair deferred behind last tick's head.
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(4),
+            &runtime,
+            &mut failure_gate(),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 2,
+                deferred: 2,
+                failed: 0,
             }
         );
         let calls = port.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1][..2], ["third".to_owned(), "freshest".to_owned()]);
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[2], vec!["oldest".to_owned(), "second".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn the_token_gate_rejects_exactly_one_extra_lookup() {
+        // A plan exactly one target larger than the lookup budget: the gate
+        // admits the budget exactly and the one extra target is deferred,
+        // so the adapter never issues the extra list_unspent call.
+        let port = FakeElectrum::healthy();
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![
+                FakeEntry::new("first", 600),
+                FakeEntry::new("extra", 300),
+            ]),
+            applied: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+        // Budget 3 minus the two reserved probe requests admits one lookup.
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(3),
+            &runtime,
+            &mut failure_gate(),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 1,
+                deferred: 1,
+                failed: 0,
+            }
+        );
+        let calls = port.calls.lock().unwrap();
+        assert_eq!(
+            calls.as_slice(),
+            &[vec!["first".to_owned()]],
+            "exactly one lookup is admitted; the extra target is never fetched"
+        );
+        let entries = backend.entries.lock().unwrap();
+        assert_eq!(
+            entries[1].staleness_secs, 300,
+            "the extra target stays stale"
+        );
     }
 
     #[tokio::test]
     async fn sustained_over_budget_plan_observes_every_target_within_n_ticks() {
         const TARGETS: usize = 5;
-        // Every target alone costs more than the whole per-tick budget
-        // (1 history fetch + 9 known transactions = 10 > 5), so only the
-        // head-of-line bypass can admit one target per tick.
-        let port = FakeElectrum::healthy_with_history([
-            ("target-0", 9),
-            ("target-1", 9),
-            ("target-2", 9),
-            ("target-3", 9),
-            ("target-4", 9),
-        ]);
+        // The lookup budget admits one target per tick, so the plan rotates
+        // through every target in TARGETS ticks.
+        let port = FakeElectrum::healthy();
         let backend = FakeBackend {
             entries: Mutex::new(
                 (0..TARGETS)
                     .map(|index| {
-                        FakeEntry::new(
-                            &format!("target-{index}"),
-                            Some(9),
-                            (1_000 - 100 * index) as u64,
-                        )
+                        FakeEntry::new(&format!("target-{index}"), (1_000 - 100 * index) as u64)
                     })
                     .collect(),
             ),
             applied: Mutex::new(Vec::new()),
-            marked_overrun: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
 
@@ -537,22 +549,23 @@ mod tick {
                 &port,
                 &backend,
                 &BitcoinNetwork::Regtest,
-                &policy(5),
+                &policy(3),
                 &runtime,
-                &mut closed_lane(),
+                &mut failure_gate(),
             )
             .await;
             assert_eq!(
                 outcome,
                 ObserverTickOutcome::Observed {
                     processed: 1,
-                    deferred: TARGETS - 1
+                    deferred: TARGETS - 1,
+                    failed: 0,
                 },
                 "each tick observes exactly the oldest target"
             );
         }
         let calls = port.calls.lock().unwrap();
-        let observed: std::collections::HashSet<_> = calls.iter().flatten().collect();
+        let observed: HashSet<_> = calls.iter().flatten().collect();
         assert_eq!(
             observed.len(),
             TARGETS,
@@ -561,219 +574,204 @@ mod tick {
     }
 
     #[tokio::test]
-    async fn one_dusted_target_never_starves_cheap_targets_and_is_itself_observed() {
-        // An attacker dusts one published invoice address with ten times the
-        // per-tick budget in cheap transactions (cost 1 + 50 = 51 > 5).
-        let port = FakeElectrum::healthy_with_history([("dusted", 50)]);
+    async fn a_per_address_failure_isolates_the_failed_target_and_keeps_the_endpoint_available() {
+        // One address's lookup fails (for example a dusted address whose
+        // response times out): the other targets in the same tick are still
+        // applied and stamped, the failed target keeps its staleness and
+        // leads the next plan, and Electrum stays available.
+        let port = FakeElectrum::failing_addresses(["dusted"]);
         let backend = FakeBackend {
             entries: Mutex::new(vec![
-                FakeEntry::new("dusted", Some(50), 600),
-                FakeEntry::new("cheap-a", Some(0), 300),
-                FakeEntry::new("cheap-b", Some(0), 120),
+                FakeEntry::new("dusted", 600),
+                FakeEntry::new("cheap-a", 300),
+                FakeEntry::new("cheap-b", 120),
             ]),
             applied: Mutex::new(Vec::new()),
-            marked_overrun: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
+        let mut gate = failure_gate();
 
-        const TICKS: usize = 6;
-        for _ in 0..TICKS {
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(100),
+            &runtime,
+            &mut gate,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 3,
+                deferred: 0,
+                failed: 1,
+            }
+        );
+        assert_eq!(
+            backend.applied.lock().unwrap().as_slice(),
+            &[vec!["cheap-a".to_owned(), "cheap-b".to_owned()]],
+            "only successfully observed targets are applied"
+        );
+        assert_eq!(
+            backend.stamped.lock().unwrap().as_slice(),
+            &[vec!["cheap-a".to_owned(), "cheap-b".to_owned()]],
+            "only successfully observed targets are stamped"
+        );
+        {
+            let entries = backend.entries.lock().unwrap();
+            assert_eq!(
+                entries[0].staleness_secs, 600,
+                "the failed target keeps its staleness"
+            );
+        }
+        let report = runtime.readiness().await;
+        assert_eq!(
+            report.electrum,
+            paykit_server::runtime::ComponentState::Ready,
+            "one per-address failure must not degrade the endpoint"
+        );
+
+        // Next tick the failed target leads the plan and, succeeding now,
+        // is observed and stamped.
+        let port = FakeElectrum::healthy();
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(100),
+            &runtime,
+            &mut gate,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 3,
+                deferred: 0,
+                failed: 0,
+            }
+        );
+        let calls = port.calls.lock().unwrap();
+        assert_eq!(calls[0][0], "dusted".to_owned());
+    }
+
+    #[tokio::test]
+    async fn repeated_failure_of_one_address_never_degrades_the_endpoint() {
+        // The same single address failing on every retry — with no
+        // successful lookup anywhere — is an address condition, not an
+        // endpoint condition: the gate never trips.
+        let port = FakeElectrum::failing_addresses(["dusted"]);
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![FakeEntry::new("dusted", 600)]),
+            applied: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+        let mut gate = failure_gate();
+
+        for _ in 0..10 {
             let outcome = observe_tick(
                 &port,
                 &backend,
                 &BitcoinNetwork::Regtest,
-                &policy(5),
+                &policy(100),
                 &runtime,
-                &mut closed_lane(),
+                &mut gate,
             )
             .await;
-            assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
-            let calls = port.calls.lock().unwrap();
-            let batch = calls.last().expect("a tick observes a batch");
-            for cheap in ["cheap-a", "cheap-b"] {
-                assert!(
-                    batch.contains(&cheap.to_owned()),
-                    "cheap targets must be observed every tick"
-                );
-            }
-        }
-        let calls = port.calls.lock().unwrap();
-        let dusted_ticks = calls
-            .iter()
-            .filter(|batch| batch.contains(&"dusted".to_owned()))
-            .count();
-        assert!(
-            dusted_ticks >= TICKS / 3,
-            "the dusted target must be observed at least once per three ticks, got {dusted_ticks} of {TICKS}"
-        );
-    }
-
-    #[tokio::test]
-    async fn measured_batch_cost_is_attributed_to_the_dusted_target_not_the_batch() {
-        const CHEAP: usize = 20;
-        // One target dusted to 200 history transactions batched with twenty
-        // cheap targets; the measured batch cost (242 requests) must be
-        // attributed to the targets' own structural estimates, not split
-        // evenly (even split would stamp every cheap target with
-        // ceil(242/21) = 12 and collapse the next tick's throughput).
-        let port = FakeElectrum::healthy_with_history([("dusted", 200)]).with_request_count(242);
-        let mut entries = vec![FakeEntry::new("dusted", Some(200), 600)];
-        entries.extend(
-            (0..CHEAP).map(|index| FakeEntry::new(&format!("cheap-{index}"), Some(0), 300)),
-        );
-        let backend = FakeBackend {
-            entries: Mutex::new(entries),
-            applied: Mutex::new(Vec::new()),
-            marked_overrun: Mutex::new(Vec::new()),
-        };
-        let runtime = runtime();
-
-        let outcome = observe_tick(
-            &port,
-            &backend,
-            &BitcoinNetwork::Regtest,
-            &policy(100),
-            &runtime,
-            &mut closed_lane(),
-        )
-        .await;
-        assert!(
-            matches!(outcome, ObserverTickOutcome::Observed { .. }),
-            "the mixed batch must be observed: {outcome:?}"
-        );
-        {
-            let entries = backend.entries.lock().unwrap();
-            let dusted = entries
-                .iter()
-                .find(|entry| entry.address == "dusted")
-                .expect("dusted target recorded");
-            assert!(
-                dusted.last_request_count.unwrap_or(0) >= 200,
-                "the dusted target must absorb its own measured cost, got {:?}",
-                dusted.last_request_count
+            assert_eq!(
+                outcome,
+                ObserverTickOutcome::Observed {
+                    processed: 1,
+                    deferred: 0,
+                    failed: 1,
+                }
             );
-            for entry in entries.iter().filter(|entry| entry.address != "dusted") {
-                assert!(
-                    entry.last_request_count.unwrap_or(u32::MAX) <= 2,
-                    "cheap target {} must keep a small persisted request count, got {:?}",
-                    entry.address,
-                    entry.last_request_count
-                );
-            }
-        }
-
-        // Next tick: every cheap target's persisted request count is small,
-        // so the whole cheap set fits the budget behind the bypassed dusted
-        // head and is admitted.
-        let outcome = observe_tick(
-            &port,
-            &backend,
-            &BitcoinNetwork::Regtest,
-            &policy(100),
-            &runtime,
-            &mut closed_lane(),
-        )
-        .await;
-        assert!(
-            matches!(outcome, ObserverTickOutcome::Observed { .. }),
-            "the next tick must observe: {outcome:?}"
-        );
-        let calls = port.calls.lock().unwrap();
-        let batch = calls.last().expect("a tick observes a batch");
-        for index in 0..CHEAP {
-            assert!(
-                batch.contains(&format!("cheap-{index}")),
-                "cheap target {index} must be admitted on the next tick"
+            assert_eq!(
+                runtime.readiness().await.electrum,
+                paykit_server::runtime::ComponentState::Ready
             );
         }
     }
 
     #[tokio::test]
-    async fn a_head_beyond_the_target_bound_is_flagged_and_loses_the_bypass() {
-        // The head's estimate (1 + 600 history transactions) exceeds
-        // max_target_requests (500): it is still observed this tick for
-        // liveness, but flagged observation_overrun so it can no longer
-        // monopolise the endpoint from the next tick on.
-        let port = FakeElectrum::healthy_with_history([("huge", 600)]);
+    async fn distinct_consecutive_address_failures_degrade_the_endpoint() {
+        // Three consecutive per-address failures across distinct addresses
+        // with no intervening success are the documented endpoint-level
+        // condition: the tick reports Unavailable and the loop backs off.
         let backend = FakeBackend {
             entries: Mutex::new(vec![
-                FakeEntry::new("huge", Some(600), 600),
-                FakeEntry::new("cheap", Some(0), 300),
+                FakeEntry::new("a", 600),
+                FakeEntry::new("b", 300),
+                FakeEntry::new("c", 120),
             ]),
             applied: Mutex::new(Vec::new()),
-            marked_overrun: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
+        let mut gate = failure_gate();
+        let mut backoff = ObserverBackoff::new();
 
+        // Tick 1: a mixed tick — one success keeps the endpoint healthy and
+        // resets the streak even though two lookups failed.
+        let port = FakeElectrum::failing_addresses(["a", "b"]);
         let outcome = observe_tick(
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
             &policy(100),
             &runtime,
-            &mut closed_lane(),
+            &mut gate,
         )
         .await;
         assert_eq!(
             outcome,
             ObserverTickOutcome::Observed {
-                processed: 2,
-                deferred: 0
-            },
-            "the over-bound head is still observed once, for liveness"
+                processed: 3,
+                deferred: 0,
+                failed: 2,
+            }
         );
-        assert_eq!(
-            backend.marked_overrun.lock().unwrap().as_slice(),
-            &["huge".to_owned()],
-            "the over-bound head must be flagged observation_overrun"
-        );
-        {
-            let entries = backend.entries.lock().unwrap();
-            let huge = entries
-                .iter()
-                .find(|entry| entry.address == "huge")
-                .expect("huge target recorded");
-            assert!(huge.observation_overrun);
-        }
+        backoff.record_outcome(&outcome);
+        assert!(!backoff.is_backing_off());
 
-        // Next tick: the flagged head no longer bypasses the budget, so it
-        // is deferred and only the cheap target is observed; the overrun
-        // count is published for the health surface and metrics.
+        // Tick 2: every admitted lookup fails — three consecutive failures
+        // across distinct addresses with no intervening success trip the
+        // gate and the endpoint degrades.
+        let port = FakeElectrum::failing_addresses(["a", "b", "c"]);
         let outcome = observe_tick(
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
             &policy(100),
             &runtime,
-            &mut closed_lane(),
+            &mut gate,
         )
         .await;
         assert_eq!(
             outcome,
-            ObserverTickOutcome::Observed {
-                processed: 1,
-                deferred: 1
-            },
-            "the flagged head is deferred instead of bypassing again"
+            ObserverTickOutcome::ObservationFailed(ObserverError::Unavailable)
         );
-        {
-            let calls = port.calls.lock().unwrap();
-            assert_eq!(calls.len(), 2);
-            assert_eq!(calls[1], vec!["cheap".to_owned()]);
-        }
-        assert_eq!(runtime.readiness().await.electrum_overrun_targets, 1);
+        backoff.record_outcome(&outcome);
+        assert!(backoff.is_backing_off());
+        assert_ne!(
+            runtime.readiness().await.electrum,
+            paykit_server::runtime::ComponentState::Ready
+        );
     }
 
     #[tokio::test]
     async fn a_stamp_miss_is_reported_without_blocking_the_other_records() {
-        // The adapter reports history for an address whose lookup hash
-        // matches no invoice row: the miss must surface as a named tick
-        // failure while the known target is still stamped.
-        let port = FakeElectrum::healthy().with_ghost_history("ghost");
+        // The adapter reports an observed address whose lookup hash matches
+        // no invoice row: the miss must surface as a named tick failure
+        // while the known target is still stamped.
+        let port = FakeElectrum::healthy().with_ghost_observed("ghost");
         let backend = FakeBackend {
-            entries: Mutex::new(vec![FakeEntry::new("known", Some(0), 300)]),
+            entries: Mutex::new(vec![FakeEntry::new("known", 300)]),
             applied: Mutex::new(Vec::new()),
-            marked_overrun: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
 
@@ -783,7 +781,7 @@ mod tick {
             &BitcoinNetwork::Regtest,
             &policy(100),
             &runtime,
-            &mut closed_lane(),
+            &mut failure_gate(),
         )
         .await;
         assert_eq!(
@@ -796,7 +794,6 @@ mod tick {
             entries[0].staleness_secs, 0,
             "the known record must still be stamped"
         );
-        assert_eq!(entries[0].history_tx_count, Some(0));
     }
 
     #[tokio::test]
@@ -804,11 +801,11 @@ mod tick {
         // Backoff accumulated from an outage must not persist through a
         // stamp miss: the tick reached Electrum and committed the other
         // records, so availability recovers and the backoff resets.
-        let port = FakeElectrum::healthy().with_ghost_history("ghost");
+        let port = FakeElectrum::healthy().with_ghost_observed("ghost");
         let backend = FakeBackend {
-            entries: Mutex::new(vec![FakeEntry::new("known", Some(0), 300)]),
+            entries: Mutex::new(vec![FakeEntry::new("known", 300)]),
             applied: Mutex::new(Vec::new()),
-            marked_overrun: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         let mut backoff = ObserverBackoff::new();
@@ -822,7 +819,7 @@ mod tick {
             &BitcoinNetwork::Regtest,
             &policy(100),
             &runtime,
-            &mut closed_lane(),
+            &mut failure_gate(),
         )
         .await;
         assert_eq!(
@@ -841,19 +838,15 @@ mod tick {
     }
 
     #[tokio::test]
-    async fn a_flagged_head_does_not_block_the_next_over_budget_target() {
-        // Tick 1 flags the over-bound head. On tick 2 the bypass passes over
-        // the flagged head and admits the second over-budget target instead
-        // of letting the flag starve every expensive target behind it.
-        let port = FakeElectrum::healthy_with_history([("huge", 600), ("second", 100)]);
+    async fn the_backlog_gauge_tracks_the_oldest_pending_target() {
+        let port = FakeElectrum::healthy();
         let backend = FakeBackend {
             entries: Mutex::new(vec![
-                FakeEntry::new("huge", Some(600), 600),
-                FakeEntry::new("second", Some(100), 300),
-                FakeEntry::new("cheap", Some(0), 120),
+                FakeEntry::new("stale", 600),
+                FakeEntry::new("fresh", 120),
             ]),
             applied: Mutex::new(Vec::new()),
-            marked_overrun: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
 
@@ -863,152 +856,44 @@ mod tick {
             &BitcoinNetwork::Regtest,
             &policy(100),
             &runtime,
-            &mut closed_lane(),
-        )
-        .await;
-        assert!(
-            matches!(outcome, ObserverTickOutcome::Observed { .. }),
-            "tick 1 must observe: {outcome:?}"
-        );
-        assert!(
-            backend.entries.lock().unwrap()[0].observation_overrun,
-            "tick 1 must flag the over-bound head"
-        );
-
-        let outcome = observe_tick(
-            &port,
-            &backend,
-            &BitcoinNetwork::Regtest,
-            &policy(100),
-            &runtime,
-            &mut closed_lane(),
-        )
-        .await;
-        assert_eq!(
-            outcome,
-            ObserverTickOutcome::Observed {
-                processed: 2,
-                deferred: 1
-            },
-            "the second over-budget target must be observed on the next tick"
-        );
-        let calls = port.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1], vec!["second".to_owned(), "cheap".to_owned()]);
-    }
-
-    #[tokio::test]
-    async fn the_overrun_slow_lane_admits_one_flagged_target_every_interval_ticks() {
-        let port = FakeElectrum::healthy_with_history([("flagged", 600)]);
-        let mut flagged = FakeEntry::new("flagged", Some(600), 600);
-        flagged.observation_overrun = true;
-        let backend = FakeBackend {
-            entries: Mutex::new(vec![flagged]),
-            applied: Mutex::new(Vec::new()),
-            marked_overrun: Mutex::new(Vec::new()),
-        };
-        let runtime = runtime();
-        let mut lane = OverrunLane::new(2);
-
-        for tick in 1..=6 {
-            let outcome = observe_tick(
-                &port,
-                &backend,
-                &BitcoinNetwork::Regtest,
-                &policy(100),
-                &runtime,
-                &mut lane,
-            )
-            .await;
-            let admitted = matches!(
-                outcome,
-                ObserverTickOutcome::Observed {
-                    processed: 1,
-                    deferred: 0
-                }
-            );
-            assert_eq!(
-                admitted,
-                tick % 3 == 0,
-                "tick {tick} admission must follow the slow-lane cadence: {outcome:?}"
-            );
-        }
-        let calls = port.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], vec!["flagged".to_owned()]);
-        assert_eq!(calls[1], vec!["flagged".to_owned()]);
-        let encoded = runtime.metrics().encode().unwrap();
-        assert!(
-            encoded.contains("paykit_electrum_overrun_lane_admissions_total 2"),
-            "each slow-lane admission must be counted: {encoded}"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_overrun_flag_clears_when_the_stamped_estimate_drops_below_the_bound() {
-        // The flagged target's fresh history is small again: the same stamp
-        // that records it clears the flag, so the target rejoins the regular
-        // budgeted plan without operator action.
-        let port = FakeElectrum::healthy_with_history([("flagged", 3)]);
-        let mut flagged = FakeEntry::new("flagged", Some(600), 600);
-        flagged.observation_overrun = true;
-        let backend = FakeBackend {
-            entries: Mutex::new(vec![flagged]),
-            applied: Mutex::new(Vec::new()),
-            marked_overrun: Mutex::new(Vec::new()),
-        };
-        let runtime = runtime();
-        let mut lane = OverrunLane::new(1);
-
-        for _ in 0..2 {
-            let outcome = observe_tick(
-                &port,
-                &backend,
-                &BitcoinNetwork::Regtest,
-                &policy(100),
-                &runtime,
-                &mut lane,
-            )
-            .await;
-            assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
-        }
-        let entries = backend.entries.lock().unwrap();
-        assert_eq!(entries[0].history_tx_count, Some(3));
-        assert!(
-            !entries[0].observation_overrun,
-            "a stamped estimate within the bound must clear the flag"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_backlog_gauge_ignores_overrun_flagged_targets() {
-        // The flagged target is the stalest, but it is only admitted on the
-        // slow lane: its age must not pin the backlog gauge and mask the
-        // regularly observed backlog behind it.
-        let port = FakeElectrum::healthy();
-        let mut flagged = FakeEntry::new("flagged", Some(600), 600);
-        flagged.observation_overrun = true;
-        let backend = FakeBackend {
-            entries: Mutex::new(vec![flagged, FakeEntry::new("fresh", Some(0), 120)]),
-            applied: Mutex::new(Vec::new()),
-            marked_overrun: Mutex::new(Vec::new()),
-        };
-        let runtime = runtime();
-
-        let outcome = observe_tick(
-            &port,
-            &backend,
-            &BitcoinNetwork::Regtest,
-            &policy(100),
-            &runtime,
-            &mut closed_lane(),
+            &mut failure_gate(),
         )
         .await;
         assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
         let encoded = runtime.metrics().encode().unwrap();
         assert!(
-            encoded.contains("paykit_electrum_backlog_oldest_age_seconds 120"),
-            "the gauge must track the oldest non-overrun target: {encoded}"
+            encoded.contains("paykit_electrum_backlog_oldest_age_seconds 600"),
+            "the gauge must track the oldest pending target: {encoded}"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_address_failures_are_counted_for_operators() {
+        let port = FakeElectrum::failing_addresses(["dusted"]);
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![
+                FakeEntry::new("dusted", 600),
+                FakeEntry::new("cheap", 300),
+            ]),
+            applied: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(100),
+            &runtime,
+            &mut failure_gate(),
+        )
+        .await;
+        assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
+        let encoded = runtime.metrics().encode().unwrap();
+        assert!(
+            encoded.contains("paykit_electrum_observation_address_failures_total 1"),
+            "the isolated failure must be counted: {encoded}"
         );
     }
 }

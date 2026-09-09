@@ -36,7 +36,6 @@ struct ElectrumResponse {
     tip_age_secs: Option<u64>,
     last_probe_at: Option<u64>,
     genesis_ok: bool,
-    overrun_targets: u64,
 }
 
 pub fn router(runtime: Arc<Runtime>) -> Router {
@@ -67,7 +66,6 @@ async fn ready(State(runtime): State<Arc<Runtime>>) -> impl IntoResponse {
             tip_age_secs: report.electrum_probe.tip_age_secs,
             last_probe_at: report.electrum_probe.last_probe_at,
             genesis_ok: report.electrum_probe.genesis_ok,
-            overrun_targets: report.electrum_overrun_targets,
         },
         bitcoin_creation_enabled: report.bitcoin_creation_enabled,
         bitcoin_offer_available: report.bitcoin_offer_available,

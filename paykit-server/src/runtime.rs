@@ -3,7 +3,7 @@
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -286,9 +286,6 @@ pub struct Readiness {
     /// resolved Electrum component being ready, and postgres being ready
     /// (paykit cannot bind or observe without it).
     pub bitcoin_offer_available: bool,
-    /// Observation targets currently flagged `observation_overrun` and
-    /// excluded from the head-of-line budget bypass.
-    pub electrum_overrun_targets: u64,
     pub bitcoin_creation_enabled: bool,
     pub paykit_delivery: ComponentState,
     pub outbox: ComponentState,
@@ -335,7 +332,6 @@ pub struct Runtime {
     idle: Notify,
     capacity: Arc<tokio::sync::Semaphore>,
     electrum: AtomicU8,
-    electrum_overrun_targets: AtomicU64,
     bitcoin_creation_enabled: AtomicBool,
     electrum_probe: Mutex<ElectrumProbeState>,
     electrum_probe_freshness: Mutex<Duration>,
@@ -363,7 +359,6 @@ impl Runtime {
             idle: Notify::new(),
             capacity: Arc::new(tokio::sync::Semaphore::new(max_concurrent_requests)),
             electrum: AtomicU8::new(NOT_READY),
-            electrum_overrun_targets: AtomicU64::new(0),
             bitcoin_creation_enabled: AtomicBool::new(true),
             electrum_probe: Mutex::new(ElectrumProbeState::default()),
             electrum_probe_freshness: Mutex::new(DEFAULT_ELECTRUM_PROBE_FRESHNESS),
@@ -388,14 +383,6 @@ impl Runtime {
         self.electrum
             .store(if available { READY } else { DEGRADED }, Ordering::Release);
         self.metrics.set_electrum_available(available);
-    }
-    /// Publishes the number of observation targets currently flagged
-    /// `observation_overrun` for the health surface and metrics.
-    pub fn set_electrum_overrun_targets(&self, count: u64) {
-        self.electrum_overrun_targets
-            .store(count, Ordering::Release);
-        self.metrics
-            .set_electrum_observation_overrun_targets(i64::try_from(count).unwrap_or(i64::MAX));
     }
     /// Publishes whether this stack accepts new Bitcoin payment-request binds.
     pub fn set_bitcoin_creation_enabled(&self, enabled: bool) {
@@ -579,7 +566,6 @@ impl Runtime {
             postgres,
             electrum,
             electrum_probe,
-            electrum_overrun_targets: self.electrum_overrun_targets.load(Ordering::Acquire),
             bitcoin_creation_enabled: self.bitcoin_creation_enabled.load(Ordering::Acquire),
             bitcoin_offer_available: self.bitcoin_creation_enabled.load(Ordering::Acquire)
                 && offer_available

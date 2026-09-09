@@ -248,6 +248,22 @@ fn rejects_invalid_network_origin_key_zero_values_and_inconsistent_retries() {
     );
     assert!(Config::from_toml_and_environment(&inconsistent_retries, environment()).is_err());
 
+    // Retired observation-scheduler keys fail loudly instead of being
+    // silently ignored (the electrum section denies unknown fields).
+    for retired_key in [
+        "max_target_requests = 500",
+        "overrun_lane_interval_ticks = 10",
+    ] {
+        let input = valid_toml().replace(
+            "endpoint = \"ssl://electrum.example:50002\"",
+            &format!("endpoint = \"ssl://electrum.example:50002\"\n{retired_key}"),
+        );
+        assert!(
+            Config::from_toml_and_environment(&input, environment()).is_err(),
+            "retired key {retired_key} should be rejected"
+        );
+    }
+
     for invalid_receiver_path in ["/paykit/receiver", "paykit/receiver", "paykit/server/extra"] {
         let input = valid_toml().replace(
             "receiver_path = \"paykit/server\"",

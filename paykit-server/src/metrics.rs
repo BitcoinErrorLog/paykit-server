@@ -24,11 +24,8 @@ pub struct Metrics {
     electrum_available: Gauge,
     electrum_last_success_age_seconds: Gauge,
     electrum_backlog_oldest_age_seconds: Gauge,
-    electrum_bypassed_head_requests: Gauge,
-    electrum_bypassed_head_budget_violations: Counter,
-    electrum_observation_overrun_targets: Gauge,
     electrum_observation_stamp_misses: Counter,
-    electrum_overrun_lane_admissions: Counter,
+    electrum_observation_address_failures: Counter,
     payment_states: Gauge,
     runtime_active: Gauge,
     session_validation_results: Counter,
@@ -45,11 +42,8 @@ impl Metrics {
         let electrum_available = Gauge::default();
         let electrum_last_success_age_seconds = Gauge::default();
         let electrum_backlog_oldest_age_seconds = Gauge::default();
-        let electrum_bypassed_head_requests = Gauge::default();
-        let electrum_bypassed_head_budget_violations = Counter::default();
-        let electrum_observation_overrun_targets = Gauge::default();
         let electrum_observation_stamp_misses = Counter::default();
-        let electrum_overrun_lane_admissions = Counter::default();
+        let electrum_observation_address_failures = Counter::default();
         let payment_states = Gauge::default();
         let runtime_active = Gauge::default();
         let session_validation_results = Counter::default();
@@ -94,29 +88,14 @@ impl Metrics {
             electrum_backlog_oldest_age_seconds.clone(),
         );
         registry.register(
-            "paykit_electrum_bypassed_head_requests",
-            "Estimated request cost of the last budget-bypassed head observation target.",
-            electrum_bypassed_head_requests.clone(),
-        );
-        registry.register(
-            "paykit_electrum_bypassed_head_budget_violations",
-            "Ticks whose bypassed head cost exceeded twice the per-tick budget.",
-            electrum_bypassed_head_budget_violations.clone(),
-        );
-        registry.register(
-            "paykit_electrum_observation_overrun_targets",
-            "Observation targets excluded from the head-of-line bypass for exceeding the per-target request bound.",
-            electrum_observation_overrun_targets.clone(),
-        );
-        registry.register(
             "paykit_electrum_observation_stamp_misses",
             "Observation tick stamps that matched no invoice row.",
             electrum_observation_stamp_misses.clone(),
         );
         registry.register(
-            "paykit_electrum_overrun_lane_admissions",
-            "Overrun-flagged observation targets admitted through the slow lane.",
-            electrum_overrun_lane_admissions.clone(),
+            "paykit_electrum_observation_address_failures",
+            "Isolated per-address Electrum lookup failures (timeout, oversize, or error).",
+            electrum_observation_address_failures.clone(),
         );
         registry.register(
             "paykit_payment_states",
@@ -143,11 +122,8 @@ impl Metrics {
             electrum_available,
             electrum_last_success_age_seconds,
             electrum_backlog_oldest_age_seconds,
-            electrum_bypassed_head_requests,
-            electrum_bypassed_head_budget_violations,
-            electrum_observation_overrun_targets,
             electrum_observation_stamp_misses,
-            electrum_overrun_lane_admissions,
+            electrum_observation_address_failures,
             payment_states,
             runtime_active,
             session_validation_results,
@@ -176,20 +152,11 @@ impl Metrics {
     pub fn set_electrum_backlog_oldest_age_seconds(&self, seconds: i64) {
         self.electrum_backlog_oldest_age_seconds.set(seconds.max(0));
     }
-    pub fn set_electrum_bypassed_head_requests(&self, requests: i64) {
-        self.electrum_bypassed_head_requests.set(requests.max(0));
-    }
-    pub fn electrum_bypassed_head_budget_violation(&self) {
-        self.electrum_bypassed_head_budget_violations.inc();
-    }
-    pub fn set_electrum_observation_overrun_targets(&self, count: i64) {
-        self.electrum_observation_overrun_targets.set(count.max(0));
-    }
     pub fn electrum_observation_stamp_misses(&self, misses: u64) {
         self.electrum_observation_stamp_misses.inc_by(misses);
     }
-    pub fn electrum_overrun_lane_admission(&self) {
-        self.electrum_overrun_lane_admissions.inc();
+    pub fn electrum_observation_address_failures(&self, failures: u64) {
+        self.electrum_observation_address_failures.inc_by(failures);
     }
     pub fn set_payment_states(&self, value: i64) {
         self.payment_states.set(value);

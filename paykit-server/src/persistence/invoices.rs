@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -15,8 +15,7 @@ use crate::{
     application::payment_status::PersistedPaymentStatus,
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     bitcoin::{
-        DirectBinding, ObservationAction, ObservationTarget, PlannedObservation, TargetTickRecord,
-        TrackedOutput,
+        DirectBinding, ObservationAction, ObservationTarget, PlannedObservation, TrackedOutput,
     },
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
     domain::locks::{CreatorPubky, ReaderPubky},
@@ -152,6 +151,82 @@ impl AtomicInvoiceResult {
     }
 }
 
+/// PostgreSQL advisory-lock key for cluster-single observer leadership.
+/// Fixed and documented: every replica of one deployment tries the same key,
+/// so exactly one observer is active cluster-wide. (Advisory locks are
+/// server-wide in PostgreSQL; stacks that share one PostgreSQL cluster must
+/// not co-locate two paykit observer deployments without overriding nothing
+/// — the second stack's observer simply idles, which is the designed
+/// fail-closed behaviour.)
+pub const OBSERVER_LEADERSHIP_LOCK_KEY: i64 = 7_216_043_388_155_778_021;
+
+/// Cluster-single observer leadership backed by a session-scoped
+/// PostgreSQL advisory lock. The lock is held on a dedicated detached
+/// connection for as long as this replica leads; the connection is never
+/// held across per-row database locks, and no row lock is ever held across
+/// network I/O. `is_leader` re-asserts the lock on every call, so takeover
+/// is fail-closed: while another replica's session holds the lock this
+/// replica idles, and when the leader's session dies PostgreSQL releases
+/// the lock and the next call here acquires it.
+pub struct PgObserverLeadership {
+    pool: PgPool,
+    connection: tokio::sync::Mutex<Option<PgConnection>>,
+}
+
+impl PgObserverLeadership {
+    pub fn new(pool: &PgPool) -> Self {
+        Self {
+            pool: pool.clone(),
+            connection: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// Re-asserts the leadership advisory lock on this replica's dedicated
+    /// session. Returns `true` while this replica leads, `false` while a
+    /// live peer leads, and `Err` when the check itself cannot complete
+    /// (the caller treats that as "not leader" and idles fail-closed). A
+    /// dead session is replaced once before giving up.
+    pub async fn is_leader(&self) -> Result<bool, PersistenceError> {
+        let mut guard = self.connection.lock().await;
+        for attempt in 0..2 {
+            if guard.is_none() {
+                let connection = self
+                    .pool
+                    .acquire()
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)?
+                    .detach();
+                *guard = Some(connection);
+            }
+            let connection = guard.as_mut().expect("leadership connection present");
+            match sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+                .bind(OBSERVER_LEADERSHIP_LOCK_KEY)
+                .fetch_one(&mut *connection)
+                .await
+            {
+                // Re-entrant on the holding session, so a leader stays
+                // leader; a non-leader holds no lock and drops its session.
+                Ok(acquired) => {
+                    if !acquired {
+                        guard.take();
+                    }
+                    return Ok(acquired);
+                }
+                Err(_) => {
+                    // The session is dead: PostgreSQL has already released
+                    // any lock it held, so dropping it and retrying once on
+                    // a fresh session is safe and never double-leads.
+                    guard.take();
+                    if attempt == 1 {
+                        return Err(PersistenceError::Unavailable);
+                    }
+                }
+            }
+        }
+        Err(PersistenceError::Unavailable)
+    }
+}
+
 /// Encrypted invoice persistence with creator-row serialization.
 #[derive(Clone, Debug)]
 pub struct InvoiceStore {
@@ -248,9 +323,6 @@ impl InvoiceStore {
                     invoices.payment_record_envelope, invoices.bitcoin_address_lookup_hash, \
                     invoices.derivation_index_lookup_hash, observations.id AS observation_id, \
                     observations.observation_envelope, observations.outpoint_lookup_hash, \
-                    invoices.observation_history_tx_count, \
-                    invoices.observation_request_count, \
-                    invoices.observation_overrun, \
                     GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (NOW() - \
                         COALESCE(invoices.last_observed_at, invoices.created_at)))))::BIGINT \
                         AS staleness_secs \
@@ -269,111 +341,45 @@ impl InvoiceStore {
             .map(|row| {
                 let staleness_secs = u64::try_from(row.staleness_secs)
                     .map_err(|_| PersistenceError::CorruptOrMissing)?;
-                let history_tx_count = row
-                    .observation_history_tx_count
-                    .map(u32::try_from)
-                    .transpose()
-                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
-                let last_request_count = row
-                    .observation_request_count
-                    .map(u32::try_from)
-                    .transpose()
-                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
                 let target = self.decrypt_target(row.target)?;
                 Ok(PlannedObservation::new(
                     target,
-                    history_tx_count,
-                    last_request_count,
                     std::time::Duration::from_secs(staleness_secs),
-                )
-                .with_observation_overrun(row.observation_overrun))
+                ))
             })
             .collect()
     }
 
-    /// Flags the invoices behind the given target addresses as
-    /// `observation_overrun`, excluding them from the head-of-line budget
-    /// bypass on later ticks. Returns the ids of the invoices newly flagged
-    /// by this call so the caller can report them at ERROR level.
-    pub async fn mark_observation_overrun(
-        &self,
-        addresses: &[String],
-    ) -> Result<Vec<Uuid>, PersistenceError> {
-        if addresses.is_empty() {
-            return Ok(Vec::new());
-        }
-        let lookup_hashes: Vec<Vec<u8>> = addresses
-            .iter()
-            .map(|address| {
-                self.crypto
-                    .bitcoin_address_lookup_hash(address.as_bytes())
-                    .as_bytes()
-                    .to_vec()
-            })
-            .collect();
-        sqlx::query_scalar(
-            "UPDATE invoices SET observation_overrun = TRUE, updated_at = NOW() \
-             WHERE bitcoin_address_lookup_hash = ANY($1) AND NOT observation_overrun \
-             RETURNING id",
-        )
-        .bind(&lookup_hashes)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|_| PersistenceError::Unavailable)
-    }
-
-    /// Records the previous tick's per-target history sizes and measured
-    /// request costs, and stamps every recorded target as successfully
-    /// observed just now.
+    /// Stamps every recorded target address as successfully observed just
+    /// now, rotating it behind the rest of the oldest-first plan.
     ///
     /// Every record's UPDATE must match exactly one invoice row: a zero-row
     /// stamp means the lookup hash derived from the observer's canonical
     /// address string no longer matches any stored hash, so the invoice
-    /// would never rotate behind the plan and the head-of-line bypass would
-    /// re-sync it forever. Misses are reported at WARN (with the truncated
+    /// would never rotate behind the plan and would be re-observed at the
+    /// head of every tick. Misses are reported at WARN (with the truncated
     /// lookup hash; no invoice id exists for an unmatched hash) and counted
     /// in the return value, but never abort the remaining records.
-    ///
-    /// `overrun_clear_bound` is the configured per-target request bound: a
-    /// stamped structural estimate (`1 + history_tx_count`) at or below it
-    /// clears the invoice's `observation_overrun` flag in the same UPDATE,
-    /// so a target whose history is fetchable again rejoins the regular
-    /// budgeted plan without operator action.
     pub async fn record_observation_tick(
         &self,
-        records: &[TargetTickRecord],
-        overrun_clear_bound: u32,
+        addresses: &[String],
     ) -> Result<u64, PersistenceError> {
-        if records.is_empty() {
+        if addresses.is_empty() {
             return Ok(0);
         }
-        let overrun_clear_bound = i64::from(overrun_clear_bound);
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         let mut misses = 0_u64;
-        for record in records {
-            let address_lookup_hash = self
-                .crypto
-                .bitcoin_address_lookup_hash(record.address().as_bytes());
-            let history_tx_count = i32::try_from(record.history_tx_count())
-                .map_err(|_| PersistenceError::CorruptOrMissing)?;
-            let request_count = i32::try_from(record.request_count())
-                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        for address in addresses {
+            let address_lookup_hash = self.crypto.bitcoin_address_lookup_hash(address.as_bytes());
             let stamped = sqlx::query(
-                "UPDATE invoices SET observation_history_tx_count = $1, \
-                 observation_request_count = $2, \
-                 last_observed_at = NOW(), updated_at = NOW(), \
-                 observation_overrun = observation_overrun \
-                     AND ($1::BIGINT + 1 > $4) \
-                 WHERE bitcoin_address_lookup_hash = $3",
+                "UPDATE invoices SET last_observed_at = NOW(), updated_at = NOW() \
+                 WHERE bitcoin_address_lookup_hash = $1",
             )
-            .bind(history_tx_count)
-            .bind(request_count)
             .bind(address_lookup_hash.as_bytes().as_slice())
-            .bind(overrun_clear_bound)
             .execute(&mut *tx)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
@@ -1263,9 +1269,6 @@ struct ObservationTargetRow {
 struct ObservationPlanRow {
     #[sqlx(flatten)]
     target: ObservationTargetRow,
-    observation_history_tx_count: Option<i32>,
-    observation_request_count: Option<i32>,
-    observation_overrun: bool,
     staleness_secs: i64,
 }
 

@@ -706,11 +706,11 @@ async fn disabled_creation_maps_to_the_stable_http_code() {
 #[tokio::test]
 async fn disabled_creation_keeps_observing_existing_invoices() {
     use paykit_server::{
-        bitcoin::{ObservationTarget, PlannedObservation, TargetTickRecord},
+        bitcoin::{ObservationTarget, PlannedObservation},
         runtime::{DependencyCheck, Runtime},
         workers::observer::{
-            ElectrumPort, ObservationBackend, ObservationReport, ObserverError, ObserverPolicy,
-            ObserverTickOutcome, TargetHistory, TipProbe, observe_tick,
+            AddressFailureGate, ElectrumPort, ObservationBackend, ObservationReport, ObserverError,
+            ObserverPolicy, ObserverTickOutcome, TipProbe, observe_tick,
         },
     };
 
@@ -727,18 +727,16 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
     impl ElectrumPort for HealthyPort {
         async fn observations(
             &self,
+            _tip_height: u32,
             targets: &[ObservationTarget],
         ) -> Result<ObservationReport, ObserverError> {
             Ok(ObservationReport {
                 outputs: Vec::new(),
-                history: targets
+                observed: targets
                     .iter()
-                    .map(|target| TargetHistory {
-                        address: target.address().to_owned(),
-                        tx_count: 0,
-                    })
+                    .map(|target| target.address().to_owned())
                     .collect(),
-                request_count: 0,
+                failed: Vec::new(),
             })
         }
 
@@ -756,8 +754,6 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
         async fn observation_plan(&self) -> Result<Vec<PlannedObservation>, ObserverError> {
             Ok(vec![PlannedObservation::new(
                 ObservationTarget::new("bc1qexisting-invoice", None),
-                None,
-                None,
                 std::time::Duration::from_secs(30),
             )])
         }
@@ -771,17 +767,9 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
             Ok(0)
         }
 
-        async fn mark_observation_overrun(
-            &self,
-            _addresses: &[String],
-        ) -> Result<Vec<uuid::Uuid>, ObserverError> {
-            Ok(Vec::new())
-        }
-
         async fn record_observation_tick(
             &self,
-            _records: &[TargetTickRecord],
-            _overrun_clear_bound: u32,
+            _addresses: &[String],
         ) -> Result<u64, ObserverError> {
             Ok(0)
         }
@@ -806,18 +794,17 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
             poll_interval: std::time::Duration::from_secs(10),
             max_requests_per_tick: 100,
             max_requests_per_second: 5,
-            max_target_requests: 500,
-            overrun_lane_interval_ticks: 10,
         },
         &runtime,
-        &mut paykit_server::workers::observer::OverrunLane::new(10),
+        &mut AddressFailureGate::new(),
     )
     .await;
     assert_eq!(
         outcome,
         ObserverTickOutcome::Observed {
             processed: 1,
-            deferred: 0
+            deferred: 0,
+            failed: 0,
         }
     );
     assert!(!runtime.readiness().await.bitcoin_creation_enabled);

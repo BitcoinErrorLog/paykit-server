@@ -202,76 +202,29 @@ pub enum ObservationAction {
     Ignore,
 }
 
-/// One scheduled observation target together with its request-budget
-/// metadata. `history_tx_count` is the transaction count returned by the
-/// previous tick's history fetch (`None` = unknown, budgeted as 1),
-/// `last_request_count` is the per-target share of the actual Electrum
-/// request count measured for the batch that last observed it (`None` =
-/// never measured), and `staleness` is the age of the last successful
-/// observation (or of the invoice itself when it has never been observed).
+/// One scheduled observation target. Observing a target costs exactly one
+/// Electrum `script_list_unspent` lookup regardless of the address's
+/// history or UTXO count, so the plan carries no request-cost bookkeeping:
+/// `staleness` (the age of the last successful observation, or of the
+/// invoice itself when it has never been observed) is the only scheduling
+/// input, and the oldest target is always first.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PlannedObservation {
     target: ObservationTarget,
-    history_tx_count: Option<u32>,
-    last_request_count: Option<u32>,
     staleness: Duration,
-    observation_overrun: bool,
 }
 
 impl PlannedObservation {
-    pub fn new(
-        target: ObservationTarget,
-        history_tx_count: Option<u32>,
-        last_request_count: Option<u32>,
-        staleness: Duration,
-    ) -> Self {
-        Self {
-            target,
-            history_tx_count,
-            last_request_count,
-            staleness,
-            observation_overrun: false,
-        }
-    }
-
-    /// Marks the target as flagged `observation_overrun`: its estimated
-    /// cost exceeded the configured per-target bound under the head-of-line
-    /// bypass, so later ticks no longer bypass the budget for it.
-    pub fn with_observation_overrun(mut self, overrun: bool) -> Self {
-        self.observation_overrun = overrun;
-        self
-    }
-
-    /// Whether the target was flagged for exceeding the per-target request
-    /// bound and is excluded from the head-of-line budget bypass.
-    pub fn is_observation_overrun(&self) -> bool {
-        self.observation_overrun
+    pub fn new(target: ObservationTarget, staleness: Duration) -> Self {
+        Self { target, staleness }
     }
 
     pub fn target(&self) -> &ObservationTarget {
         &self.target
     }
 
-    pub fn history_tx_count(&self) -> Option<u32> {
-        self.history_tx_count
-    }
-
-    pub fn last_request_count(&self) -> Option<u32> {
-        self.last_request_count
-    }
-
     pub fn staleness(&self) -> Duration {
         self.staleness
-    }
-
-    /// Estimated Electrum requests for observing this target once: the
-    /// larger of the structural estimate (one history fetch plus one
-    /// request per known history transaction) and the actual per-target
-    /// request cost measured for the batch that last observed it.
-    pub fn estimated_requests(&self) -> u64 {
-        let structural = 1 + u64::from(self.history_tx_count.unwrap_or(1));
-        let observed = u64::from(self.last_request_count.unwrap_or(0));
-        structural.max(observed)
     }
 }
 
@@ -280,43 +233,7 @@ impl fmt::Debug for PlannedObservation {
         formatter
             .debug_struct("PlannedObservation")
             .field("target", &self.target)
-            .field("history_tx_count", &self.history_tx_count)
             .field("staleness", &self.staleness)
-            .field("observation_overrun", &self.observation_overrun)
             .finish()
-    }
-}
-
-/// Persisted budget facts for one successfully observed target: the number
-/// of transactions the previous history fetch returned for its address, and
-/// its share of the actual Electrum request count measured for that batch
-/// (attributed proportionally to each target's structural estimate, with
-/// the shares summing to the measured batch total).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TargetTickRecord {
-    address: String,
-    history_tx_count: u32,
-    request_count: u32,
-}
-
-impl TargetTickRecord {
-    pub fn new(address: impl Into<String>, history_tx_count: u32, request_count: u32) -> Self {
-        Self {
-            address: address.into(),
-            history_tx_count,
-            request_count,
-        }
-    }
-
-    pub fn address(&self) -> &str {
-        &self.address
-    }
-
-    pub fn history_tx_count(&self) -> u32 {
-        self.history_tx_count
-    }
-
-    pub fn request_count(&self) -> u32 {
-        self.request_count
     }
 }

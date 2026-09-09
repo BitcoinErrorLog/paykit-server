@@ -1,9 +1,15 @@
+//! Protocol-fixture tests for the raw `script_list_unspent` observation
+//! adapter. Every fixture pins the literal Electrum JSON response; the mock
+//! server panics on `blockchain.scripthash.get_history` and
+//! `blockchain.transaction.get`, so any history fanout in the adapter fails
+//! loudly, and every request is logged for exact RPC-count assertions.
+
 use std::{
     io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     str::FromStr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -12,238 +18,335 @@ use std::{
 
 use bdk_electrum::electrum_client::{ScriptHash, ToElectrumScriptHash};
 use bitcoin::{
-    Address, Amount, CompressedPublicKey, Network, OutPoint, ScriptBuf, Transaction, TxMerkleNode,
-    TxOut, absolute, consensus::encode::serialize_hex, hashes::Hash, transaction,
+    Address, CompressedPublicKey, Network, OutPoint, ScriptBuf, Txid, consensus::encode,
 };
 use paykit_server::{
     bitcoin::{ObservationTarget, TrackedOutput},
     config::BitcoinNetwork,
-    workers::observer::{ElectrumAdapter, ElectrumPort},
+    workers::observer::{ElectrumAdapter, ElectrumPort, ObserverError},
 };
 
-#[tokio::test]
-async fn emits_typed_output_identity_amount_and_confirmations_from_electrum() {
+const TIP_HEIGHT: usize = 120;
+
+fn fixture_address() -> Address {
     let public_key = CompressedPublicKey::from_str(
         "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
     )
     .unwrap();
-    let address = Address::p2wpkh(&public_key, Network::Regtest);
-    let transaction = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: Vec::new(),
-        output: vec![TxOut {
-            value: Amount::from_sat(125_000),
-            script_pubkey: address.script_pubkey(),
-        }],
-    };
-    let txid = transaction.compute_txid();
-    let server = ProtocolServer::start(
-        Network::Regtest,
-        120,
-        address.script_pubkey(),
-        transaction,
-        118,
+    Address::p2wpkh(&public_key, Network::Regtest)
+}
+
+/// One literal `blockchain.scripthash.listunspent` result item.
+fn unspent_entry(label: u64, value_sats: u64, height: usize) -> serde_json::Value {
+    serde_json::json!({
+        "tx_hash": format!("{label:064x}"),
+        "tx_pos": 0,
+        "value": value_sats,
+        "height": height,
+    })
+}
+
+fn outpoint(label: u64) -> OutPoint {
+    OutPoint::new(Txid::from_str(&format!("{label:064x}")).unwrap(), 0)
+}
+
+async fn connect(server: &ProtocolServer) -> ElectrumAdapter {
+    ElectrumAdapter::connect(
+        server.endpoint(),
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(1),
+        1,
     )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn an_empty_address_observes_no_outputs_with_one_lookup() {
+    let address = fixture_address();
+    // Literal fixture: the address has never been used.
+    let server = ProtocolServer::start(Network::Regtest, address.script_pubkey(), |_| {
+        serde_json::json!([])
+    })
     .await;
-    let adapter = ElectrumAdapter::connect(
-        server.endpoint(),
-        BitcoinNetwork::Regtest,
-        Duration::from_secs(1),
-        1,
-    )
-    .await
-    .unwrap();
+    let adapter = connect(&server).await;
 
-    let observations = adapter
-        .observations(&[ObservationTarget::new(address.to_string(), None)])
+    let report = adapter
+        .observations(
+            TIP_HEIGHT as u32,
+            &[ObservationTarget::new(address.to_string(), None)],
+        )
         .await
-        .unwrap()
-        .outputs;
+        .unwrap();
 
-    assert_eq!(observations.len(), 1);
-    assert_eq!(observations[0].outpoint, OutPoint::new(txid, 0));
-    assert_eq!(observations[0].sats, 125_000);
-    assert_eq!(observations[0].confirmations, 3);
-    assert!(observations[0].present);
+    assert!(report.outputs.is_empty());
+    assert_eq!(report.observed, vec![address.to_string()]);
+    assert!(report.failed.is_empty());
+    server.assert_rpc_counts(1, 0, 0);
 }
 
 #[tokio::test]
-async fn emits_absence_when_a_tracked_prefinal_outpoint_disappears_from_history() {
-    let public_key = CompressedPublicKey::from_str(
-        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-    )
-    .unwrap();
-    let address = Address::p2wpkh(&public_key, Network::Regtest);
-    let outpoint = OutPoint::new(bitcoin::Txid::all_zeros(), 7);
-    let server = ProtocolServer::start_empty(Network::Regtest, 120, address.script_pubkey()).await;
-    let adapter = ElectrumAdapter::connect(
-        server.endpoint(),
-        BitcoinNetwork::Regtest,
-        Duration::from_secs(1),
-        1,
-    )
-    .await
-    .unwrap();
+async fn a_mempool_utxo_observes_present_with_zero_confirmations() {
+    let address = fixture_address();
+    // Literal fixture: one mempool UTXO (height 0) of 125_000 sats.
+    let server = ProtocolServer::start(Network::Regtest, address.script_pubkey(), |_| {
+        serde_json::json!([unspent_entry(1, 125_000, 0)])
+    })
+    .await;
+    let adapter = connect(&server).await;
 
-    let observations = adapter
-        .observations(&[ObservationTarget::new(
-            address.to_string(),
-            Some(TrackedOutput::new(outpoint, 90_000)),
-        )])
+    let report = adapter
+        .observations(
+            TIP_HEIGHT as u32,
+            &[ObservationTarget::new(address.to_string(), None)],
+        )
         .await
-        .unwrap()
-        .outputs;
+        .unwrap();
 
-    assert_eq!(observations.len(), 1);
-    assert_eq!(observations[0].outpoint, outpoint);
-    assert_eq!(observations[0].sats, 90_000);
-    assert_eq!(observations[0].confirmations, 0);
-    assert!(!observations[0].present);
+    assert_eq!(report.outputs.len(), 1);
+    assert_eq!(report.outputs[0].outpoint, outpoint(1));
+    assert_eq!(report.outputs[0].sats, 125_000);
+    assert_eq!(report.outputs[0].confirmations, 0);
+    assert!(report.outputs[0].present);
+    server.assert_rpc_counts(1, 0, 0);
 }
 
 #[tokio::test]
-async fn rejects_remote_genesis_for_another_network_before_observing_targets() {
-    let server = ProtocolServer::start_empty(Network::Signet, 120, ScriptBuf::new()).await;
-    let adapter = ElectrumAdapter::connect(
-        server.endpoint(),
-        BitcoinNetwork::Regtest,
-        Duration::from_secs(1),
-        1,
-    )
-    .await
-    .unwrap();
+async fn a_confirmed_utxo_derives_confirmations_from_the_probe_tip() {
+    let address = fixture_address();
+    // Literal fixture: one UTXO confirmed at height 118; tip 120.
+    let server = ProtocolServer::start(Network::Regtest, address.script_pubkey(), |_| {
+        serde_json::json!([unspent_entry(2, 125_000, 118)])
+    })
+    .await;
+    let adapter = connect(&server).await;
 
-    assert_eq!(
-        adapter.observations(&[]).await,
-        Err(paykit_server::workers::observer::ObserverError::WrongNetwork)
+    let report = adapter
+        .observations(
+            TIP_HEIGHT as u32,
+            &[ObservationTarget::new(address.to_string(), None)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.outputs.len(), 1);
+    assert_eq!(report.outputs[0].confirmations, 3);
+    assert!(report.outputs[0].present);
+    server.assert_rpc_counts(1, 0, 0);
+}
+
+#[tokio::test]
+async fn a_many_utxo_address_completes_with_one_lookup_and_zero_transaction_fetches() {
+    let address = fixture_address();
+    // Literal fixture: the address was dusted with 200 minimal UTXOs.
+    const DUST: u64 = 200;
+    let server = ProtocolServer::start(Network::Regtest, address.script_pubkey(), |_| {
+        serde_json::Value::Array(
+            (1..=DUST)
+                .map(|label| unspent_entry(label, 546, TIP_HEIGHT))
+                .collect(),
+        )
+    })
+    .await;
+    let adapter = connect(&server).await;
+
+    let report = adapter
+        .observations(
+            TIP_HEIGHT as u32,
+            &[ObservationTarget::new(address.to_string(), None)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.outputs.len(), DUST as usize);
+    assert!(report.outputs.iter().all(|output| output.present));
+    assert_eq!(report.observed, vec![address.to_string()]);
+    // ONE list_unspent call, ZERO history calls, ZERO transaction fetches.
+    server.assert_rpc_counts(1, 0, 0);
+}
+
+#[tokio::test]
+async fn a_many_history_address_causes_no_transaction_fetch_fanout() {
+    let address = fixture_address();
+    // The endpoint would answer get_history with 600 entries for this
+    // script and panics on any transaction.get: the adapter must never
+    // ask. Its single list_unspent lookup returns the current UTXO set.
+    let server =
+        ProtocolServer::start_with_history(Network::Regtest, address.script_pubkey(), 600).await;
+    let adapter = connect(&server).await;
+
+    let report = adapter
+        .observations(
+            TIP_HEIGHT as u32,
+            &[ObservationTarget::new(address.to_string(), None)],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.outputs.len(), 1);
+    assert_eq!(report.observed, vec![address.to_string()]);
+    // RPC-count evidence: one lookup, no history call, no fanout.
+    server.assert_rpc_counts(1, 0, 0);
+}
+
+#[tokio::test]
+async fn a_spent_tracked_outpoint_observes_absence() {
+    let address = fixture_address();
+    let tracked = outpoint(77);
+    // Literal fixture: the unspent set no longer contains the tracked
+    // outpoint (it was spent or replaced).
+    let server = ProtocolServer::start(Network::Regtest, address.script_pubkey(), |_| {
+        serde_json::json!([])
+    })
+    .await;
+    let adapter = connect(&server).await;
+
+    let report = adapter
+        .observations(
+            TIP_HEIGHT as u32,
+            &[ObservationTarget::new(
+                address.to_string(),
+                Some(TrackedOutput::new(tracked, 90_000)),
+            )],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.outputs.len(), 1);
+    assert_eq!(report.outputs[0].outpoint, tracked);
+    assert_eq!(report.outputs[0].sats, 90_000);
+    assert_eq!(report.outputs[0].confirmations, 0);
+    assert!(!report.outputs[0].present);
+    server.assert_rpc_counts(1, 0, 0);
+}
+
+#[tokio::test]
+async fn a_utxo_height_above_the_tip_fails_only_that_address() {
+    let address = fixture_address();
+    let other = Address::p2wpkh(
+        &CompressedPublicKey::from_str(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap(),
+        Network::Regtest,
     );
-}
-
-#[tokio::test]
-async fn rejects_a_positive_history_height_above_the_reported_tip() {
-    let public_key = CompressedPublicKey::from_str(
-        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-    )
-    .unwrap();
-    let address = Address::p2wpkh(&public_key, Network::Regtest);
-    let transaction = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: Vec::new(),
-        output: vec![TxOut {
-            value: Amount::from_sat(125_000),
-            script_pubkey: address.script_pubkey(),
-        }],
-    };
-    let server = ProtocolServer::start(
+    // Literal fixtures: the first address reports a UTXO above the probed
+    // tip (an inconsistent endpoint view); the second is healthy.
+    let server = ProtocolServer::start_multi(
         Network::Regtest,
-        120,
-        address.script_pubkey(),
-        transaction,
-        121,
+        vec![
+            (
+                address.script_pubkey(),
+                serde_json::json!([unspent_entry(3, 125_000, TIP_HEIGHT + 1)]),
+            ),
+            (
+                other.script_pubkey(),
+                serde_json::json!([unspent_entry(4, 50_000, TIP_HEIGHT)]),
+            ),
+        ],
     )
     .await;
-    let adapter = ElectrumAdapter::connect(
-        server.endpoint(),
-        BitcoinNetwork::Regtest,
-        Duration::from_secs(1),
-        1,
-    )
-    .await
-    .unwrap();
+    let adapter = connect(&server).await;
 
-    assert_eq!(
-        adapter
-            .observations(&[ObservationTarget::new(address.to_string(), None)])
-            .await,
-        Err(paykit_server::workers::observer::ObserverError::Unavailable)
-    );
-}
-
-#[tokio::test]
-async fn treats_nonpositive_history_heights_as_unconfirmed_through_bdk() {
-    let public_key = CompressedPublicKey::from_str(
-        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-    )
-    .unwrap();
-    let address = Address::p2wpkh(&public_key, Network::Regtest);
-    let transaction = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: Vec::new(),
-        output: vec![TxOut {
-            value: Amount::from_sat(125_000),
-            script_pubkey: address.script_pubkey(),
-        }],
-    };
-    let server = ProtocolServer::start(
-        Network::Regtest,
-        120,
-        address.script_pubkey(),
-        transaction,
-        -2,
-    )
-    .await;
-    let adapter = ElectrumAdapter::connect(
-        server.endpoint(),
-        BitcoinNetwork::Regtest,
-        Duration::from_secs(1),
-        1,
-    )
-    .await
-    .unwrap();
-
-    let observations = adapter
-        .observations(&[ObservationTarget::new(address.to_string(), None)])
+    let report = adapter
+        .observations(
+            TIP_HEIGHT as u32,
+            &[
+                ObservationTarget::new(address.to_string(), None),
+                ObservationTarget::new(other.to_string(), None),
+            ],
+        )
         .await
-        .unwrap()
-        .outputs;
-    assert_eq!(observations.len(), 1);
-    assert_eq!(observations[0].confirmations, 0);
-    assert!(observations[0].present);
+        .unwrap();
+
+    assert_eq!(report.failed, vec![address.to_string()]);
+    assert_eq!(report.observed, vec![other.to_string()]);
+    assert_eq!(report.outputs.len(), 1);
+    assert_eq!(report.outputs[0].sats, 50_000);
+}
+
+#[tokio::test]
+async fn a_per_address_timeout_isolates_the_failed_address_and_the_rest_are_observed() {
+    let stalled = fixture_address();
+    let healthy_a = Address::p2wpkh(
+        &CompressedPublicKey::from_str(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap(),
+        Network::Regtest,
+    );
+    let healthy_b = Address::p2wpkh(
+        &CompressedPublicKey::from_str(
+            "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9",
+        )
+        .unwrap(),
+        Network::Regtest,
+    );
+    // The stalled address's list_unspent response takes ten times the
+    // client timeout; the healthy addresses answer immediately.
+    let server = ProtocolServer::start_multi_with_stall(
+        Network::Regtest,
+        stalled.script_pubkey(),
+        Duration::from_secs(10),
+        vec![
+            (
+                healthy_a.script_pubkey(),
+                serde_json::json!([unspent_entry(5, 10_000, TIP_HEIGHT)]),
+            ),
+            (
+                healthy_b.script_pubkey(),
+                serde_json::json!([unspent_entry(6, 20_000, TIP_HEIGHT)]),
+            ),
+        ],
+    )
+    .await;
+    let adapter = connect(&server).await;
+
+    let report = adapter
+        .observations(
+            TIP_HEIGHT as u32,
+            &[
+                ObservationTarget::new(stalled.to_string(), None),
+                ObservationTarget::new(healthy_a.to_string(), None),
+                ObservationTarget::new(healthy_b.to_string(), None),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.failed, vec![stalled.to_string()]);
+    assert_eq!(
+        report.observed,
+        vec![healthy_a.to_string(), healthy_b.to_string()],
+        "the timed-out address must not discard the other addresses' observations"
+    );
+    assert_eq!(report.outputs.len(), 2);
 }
 
 #[tokio::test]
 async fn reconnects_and_reuses_the_same_adapter_after_transport_disconnect() {
-    let public_key = CompressedPublicKey::from_str(
-        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-    )
-    .unwrap();
-    let address = Address::p2wpkh(&public_key, Network::Regtest);
-    let transaction = Transaction {
-        version: transaction::Version::TWO,
-        lock_time: absolute::LockTime::ZERO,
-        input: Vec::new(),
-        output: vec![TxOut {
-            value: Amount::from_sat(125_000),
-            script_pubkey: address.script_pubkey(),
-        }],
-    };
-    let server = ProtocolServer::start_disconnect_after_transaction(
-        Network::Regtest,
-        120,
-        address.script_pubkey(),
-        transaction,
-        118,
-    )
-    .await;
-    let adapter = ElectrumAdapter::connect(
-        server.endpoint(),
-        BitcoinNetwork::Regtest,
-        Duration::from_secs(1),
-        1,
-    )
-    .await
-    .unwrap();
+    let address = fixture_address();
+    let server =
+        ProtocolServer::start_disconnecting(Network::Regtest, address.script_pubkey()).await;
+    let adapter = connect(&server).await;
     let targets = [ObservationTarget::new(address.to_string(), None)];
 
     assert_eq!(
-        adapter.observations(&targets).await.unwrap().outputs.len(),
+        adapter
+            .observations(TIP_HEIGHT as u32, &targets)
+            .await
+            .unwrap()
+            .outputs
+            .len(),
         1
     );
     assert_eq!(
-        adapter.observations(&targets).await.unwrap().outputs.len(),
+        adapter
+            .observations(TIP_HEIGHT as u32, &targets)
+            .await
+            .unwrap()
+            .outputs
+            .len(),
         1
     );
 }
@@ -262,241 +365,32 @@ async fn classifies_endpoint_outage_as_retryable_unavailable() {
     )
     .await;
 
-    assert_eq!(
-        result.err(),
-        Some(paykit_server::workers::observer::ObserverError::Unavailable)
-    );
-}
-
-struct ProtocolServer {
-    endpoint: String,
-    wake_address: SocketAddr,
-    shutdown: Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
-impl ProtocolServer {
-    async fn start(
-        network: Network,
-        tip_height: usize,
-        script: ScriptBuf,
-        transaction: Transaction,
-        transaction_height: i32,
-    ) -> Self {
-        Self::start_with_history(
-            network,
-            tip_height,
-            script,
-            Some((transaction, transaction_height)),
-            false,
-        )
-        .await
-    }
-
-    async fn start_empty(network: Network, tip_height: usize, script: ScriptBuf) -> Self {
-        Self::start_with_history(network, tip_height, script, None, false).await
-    }
-
-    async fn start_disconnect_after_transaction(
-        network: Network,
-        tip_height: usize,
-        script: ScriptBuf,
-        transaction: Transaction,
-        transaction_height: i32,
-    ) -> Self {
-        Self::start_with_history(
-            network,
-            tip_height,
-            script,
-            Some((transaction, transaction_height)),
-            true,
-        )
-        .await
-    }
-
-    async fn start_with_history(
-        network: Network,
-        tip_height: usize,
-        script: ScriptBuf,
-        transaction: Option<(Transaction, i32)>,
-        disconnect_after_transaction: bool,
-    ) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let wake_address = listener.local_addr().unwrap();
-        let endpoint = format!("tcp://{wake_address}");
-        let transaction_hex = transaction
-            .as_ref()
-            .map(|(transaction, _)| serialize_hex(transaction));
-        let transaction_id = transaction
-            .as_ref()
-            .map(|(transaction, _)| transaction.compute_txid().to_string());
-        let transaction_height = transaction.as_ref().map(|(_, height)| *height);
-        let genesis_header = bitcoin::constants::genesis_block(network).header;
-        let mut tip_header = genesis_header;
-        if let Some((transaction, _)) = &transaction {
-            tip_header.merkle_root =
-                TxMerkleNode::from_byte_array(transaction.compute_txid().to_byte_array());
-        }
-        let fixture = Arc::new(ProtocolFixture {
-            genesis_header: serialize_hex(&genesis_header),
-            tip_header: serialize_hex(&tip_header),
-            tip_height,
-            script,
-            transaction_hex,
-            transaction_id,
-            transaction_height,
-            disconnect_after_transaction: AtomicBool::new(disconnect_after_transaction),
-        });
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let thread_shutdown = shutdown.clone();
-        let handle = thread::spawn(move || {
-            while let Ok((stream, _)) = listener.accept() {
-                if thread_shutdown.load(Ordering::SeqCst) {
-                    break;
-                }
-                serve_connection(stream, fixture.clone());
-            }
-        });
-        Self {
-            endpoint,
-            wake_address,
-            shutdown,
-            handle: Some(handle),
-        }
-    }
-
-    fn endpoint(&self) -> &str {
-        &self.endpoint
-    }
-}
-
-impl Drop for ProtocolServer {
-    fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(self.wake_address);
-        if let Some(handle) = self.handle.take() {
-            handle.join().unwrap();
-        }
-    }
-}
-
-struct ProtocolFixture {
-    genesis_header: String,
-    tip_header: String,
-    tip_height: usize,
-    script: ScriptBuf,
-    transaction_hex: Option<String>,
-    transaction_id: Option<String>,
-    transaction_height: Option<i32>,
-    disconnect_after_transaction: AtomicBool,
-}
-
-fn serve_connection(mut stream: TcpStream, fixture: Arc<ProtocolFixture>) {
-    let reader = BufReader::new(stream.try_clone().unwrap());
-    for line in reader.lines() {
-        let request: serde_json::Value = serde_json::from_str(&line.unwrap()).unwrap();
-        let id = request["id"].clone();
-        let method = request["method"].as_str().unwrap();
-        let result = match method {
-            "server.version" => serde_json::json!(["paykit-test-electrum", "1.4"]),
-            "blockchain.block.header" => {
-                if request["params"][0].as_u64() == Some(0) {
-                    serde_json::json!(fixture.genesis_header)
-                } else {
-                    serde_json::json!(fixture.tip_header)
-                }
-            }
-            "blockchain.headers.subscribe" => serde_json::json!({
-                "height": fixture.tip_height,
-                "hex": fixture.tip_header,
-            }),
-            "blockchain.block.headers" => {
-                let count = request["params"][1].as_u64().unwrap() as usize;
-                serde_json::json!({
-                    "count": count,
-                    "hex": fixture.tip_header.repeat(count),
-                    "max": 2016,
-                })
-            }
-            "blockchain.scripthash.get_history" => {
-                let requested_hash: ScriptHash =
-                    serde_json::from_value(request["params"][0].clone()).unwrap();
-                assert_eq!(requested_hash, fixture.script.to_electrum_scripthash());
-                match (&fixture.transaction_id, fixture.transaction_height) {
-                    (Some(transaction_id), Some(transaction_height)) => serde_json::json!([{
-                        "height": transaction_height,
-                        "tx_hash": transaction_id,
-                        "fee": null,
-                    }]),
-                    _ => serde_json::json!([]),
-                }
-            }
-            "blockchain.transaction.get" => {
-                serde_json::json!(fixture.transaction_hex.as_ref().unwrap())
-            }
-            "blockchain.transaction.get_merkle" => {
-                assert_eq!(
-                    request["params"][0].as_str(),
-                    fixture.transaction_id.as_deref()
-                );
-                assert_eq!(
-                    request["params"][1].as_i64(),
-                    fixture.transaction_height.map(i64::from)
-                );
-                serde_json::json!({
-                    "block_height": fixture.transaction_height.unwrap(),
-                    "merkle": [],
-                    "pos": 0,
-                })
-            }
-            method => panic!("unexpected Electrum method: {method}"),
-        };
-        let response = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
-        writeln!(stream, "{response}").unwrap();
-        stream.flush().unwrap();
-        if method == "blockchain.transaction.get"
-            && fixture
-                .disconnect_after_transaction
-                .swap(false, Ordering::SeqCst)
-        {
-            break;
-        }
-    }
+    assert_eq!(result.err(), Some(ObserverError::Unavailable));
 }
 
 #[tokio::test]
 async fn probe_reports_the_tip_and_verifies_the_endpoint_genesis() {
-    let server = ProtocolServer::start_empty(Network::Regtest, 120, ScriptBuf::new()).await;
-    let adapter = ElectrumAdapter::connect(
-        server.endpoint(),
-        BitcoinNetwork::Regtest,
-        Duration::from_secs(1),
-        1,
-    )
-    .await
-    .unwrap();
+    let server =
+        ProtocolServer::start(
+            Network::Regtest,
+            ScriptBuf::new(),
+            |_| serde_json::json!([]),
+        )
+        .await;
+    let adapter = connect(&server).await;
 
     let tip = adapter.probe().await.unwrap();
-    assert_eq!(tip.height, 120);
+    assert_eq!(tip.height, TIP_HEIGHT as u32);
     assert!(tip.time_unix > 0);
 }
 
 #[tokio::test]
 async fn probe_rejects_an_endpoint_serving_the_wrong_genesis() {
-    let server = ProtocolServer::start_empty(Network::Signet, 120, ScriptBuf::new()).await;
-    let adapter = ElectrumAdapter::connect(
-        server.endpoint(),
-        BitcoinNetwork::Regtest,
-        Duration::from_secs(1),
-        1,
-    )
-    .await
-    .unwrap();
+    let server =
+        ProtocolServer::start(Network::Signet, ScriptBuf::new(), |_| serde_json::json!([])).await;
+    let adapter = connect(&server).await;
 
-    assert_eq!(
-        adapter.probe().await,
-        Err(paykit_server::workers::observer::ObserverError::WrongNetwork)
-    );
+    assert_eq!(adapter.probe().await, Err(ObserverError::WrongNetwork));
 }
 
 #[tokio::test]
@@ -512,8 +406,203 @@ async fn probe_classifies_endpoint_outage_as_retryable_unavailable() {
     )
     .unwrap();
 
-    assert_eq!(
-        adapter.probe().await,
-        Err(paykit_server::workers::observer::ObserverError::Unavailable)
-    );
+    assert_eq!(adapter.probe().await, Err(ObserverError::Unavailable));
+}
+
+struct ProtocolServer {
+    endpoint: String,
+    wake_address: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    fixture: Arc<ProtocolFixture>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+struct ProtocolFixture {
+    genesis_header: String,
+    tip_header: String,
+    tip_height: usize,
+    /// Literal list_unspent result per script hash.
+    unspent_by_script: Vec<(ScriptBuf, serde_json::Value)>,
+    /// History length served if the adapter ever calls get_history.
+    history_len: usize,
+    /// Script whose list_unspent response is delayed, and the delay.
+    stall: Option<(ScriptBuf, Duration)>,
+    /// Close each connection after its first list_unspent response.
+    disconnect_after_unspent: bool,
+    request_log: Mutex<Vec<String>>,
+}
+
+impl ProtocolServer {
+    /// Starts a server whose single script answers list_unspent with the
+    /// given literal JSON fixture.
+    async fn start(
+        network: Network,
+        script: ScriptBuf,
+        unspent: impl FnOnce(&ScriptBuf) -> serde_json::Value,
+    ) -> Self {
+        let unspent = unspent(&script);
+        Self::start_multi(network, vec![(script, unspent)]).await
+    }
+
+    async fn start_multi(network: Network, unspent: Vec<(ScriptBuf, serde_json::Value)>) -> Self {
+        Self::start_with_fixture(network, unspent, 0, None, false).await
+    }
+
+    /// Starts a server that would answer get_history with `history_len`
+    /// entries for the script (and panics on transaction.get); the
+    /// list_unspent fixture is one current UTXO.
+    async fn start_with_history(network: Network, script: ScriptBuf, history_len: usize) -> Self {
+        let unspent = serde_json::json!([unspent_entry(9, 125_000, TIP_HEIGHT)]);
+        Self::start_with_fixture(network, vec![(script, unspent)], history_len, None, false).await
+    }
+
+    async fn start_multi_with_stall(
+        network: Network,
+        stalled_script: ScriptBuf,
+        stall: Duration,
+        healthy: Vec<(ScriptBuf, serde_json::Value)>,
+    ) -> Self {
+        Self::start_with_fixture(network, healthy, 0, Some((stalled_script, stall)), false).await
+    }
+
+    async fn start_disconnecting(network: Network, script: ScriptBuf) -> Self {
+        let unspent = serde_json::json!([unspent_entry(11, 125_000, TIP_HEIGHT)]);
+        Self::start_with_fixture(network, vec![(script, unspent)], 0, None, true).await
+    }
+
+    async fn start_with_fixture(
+        network: Network,
+        unspent_by_script: Vec<(ScriptBuf, serde_json::Value)>,
+        history_len: usize,
+        stall: Option<(ScriptBuf, Duration)>,
+        disconnect_after_unspent: bool,
+    ) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let wake_address = listener.local_addr().unwrap();
+        let endpoint = format!("tcp://{wake_address}");
+        let genesis_header = bitcoin::constants::genesis_block(network).header;
+        let fixture = Arc::new(ProtocolFixture {
+            genesis_header: encode::serialize_hex(&genesis_header),
+            tip_header: encode::serialize_hex(&genesis_header),
+            tip_height: TIP_HEIGHT,
+            unspent_by_script,
+            history_len,
+            stall,
+            disconnect_after_unspent,
+            request_log: Mutex::new(Vec::new()),
+        });
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let thread_fixture = fixture.clone();
+        let handle = thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                if thread_shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                // One thread per connection: a stalled response on one
+                // connection must not block the adapter's reconnect.
+                let fixture = thread_fixture.clone();
+                thread::spawn(move || serve_connection(stream, fixture));
+            }
+        });
+        Self {
+            endpoint,
+            wake_address,
+            shutdown,
+            fixture,
+            handle: Some(handle),
+        }
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// RPC-count evidence: exactly `unspent` list_unspent calls, `history`
+    /// get_history calls, and `transactions` transaction.get calls were
+    /// served across every connection this server accepted.
+    fn assert_rpc_counts(&self, unspent: usize, history: usize, transactions: usize) {
+        let log = self.fixture.request_log.lock().unwrap();
+        eprintln!("electrum request log: {log:?}");
+        let count = |method: &str| log.iter().filter(|entry| *entry == method).count();
+        assert_eq!(
+            (
+                count("blockchain.scripthash.listunspent"),
+                count("blockchain.scripthash.get_history"),
+                count("blockchain.transaction.get"),
+            ),
+            (unspent, history, transactions),
+            "unexpected Electrum request mix: {log:?}"
+        );
+    }
+}
+
+impl Drop for ProtocolServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.wake_address);
+        if let Some(handle) = self.handle.take() {
+            handle.join().unwrap();
+        }
+    }
+}
+
+fn serve_connection(mut stream: TcpStream, fixture: Arc<ProtocolFixture>) {
+    let reader = BufReader::new(stream.try_clone().unwrap());
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let id = request["id"].clone();
+        let method = request["method"].as_str().unwrap();
+        fixture.request_log.lock().unwrap().push(method.to_owned());
+        let result = match method {
+            "server.version" => serde_json::json!(["paykit-test-electrum", "1.4"]),
+            "blockchain.block.header" => {
+                if request["params"][0].as_u64() == Some(0) {
+                    serde_json::json!(fixture.genesis_header)
+                } else {
+                    serde_json::json!(fixture.tip_header)
+                }
+            }
+            "blockchain.headers.subscribe" => serde_json::json!({
+                "height": fixture.tip_height,
+                "hex": fixture.tip_header,
+            }),
+            "blockchain.scripthash.listunspent" => {
+                let requested_hash: ScriptHash =
+                    serde_json::from_value(request["params"][0].clone()).unwrap();
+                if let Some((stalled_script, delay)) = &fixture.stall
+                    && requested_hash == stalled_script.to_electrum_scripthash()
+                {
+                    thread::sleep(*delay);
+                }
+                fixture
+                    .unspent_by_script
+                    .iter()
+                    .find(|(script, _)| script.to_electrum_scripthash() == requested_hash)
+                    .map(|(_, result)| result.clone())
+                    .unwrap_or_else(|| serde_json::json!([]))
+            }
+            // The adapter must never call these; if it ever does, fail the
+            // test loudly instead of silently serving a fanout.
+            "blockchain.scripthash.get_history" => {
+                let _ = fixture.history_len;
+                panic!("adapter called blockchain.scripthash.get_history");
+            }
+            "blockchain.transaction.get" => {
+                panic!("adapter called blockchain.transaction.get");
+            }
+            method => panic!("unexpected Electrum method: {method}"),
+        };
+        let response = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
+        if writeln!(stream, "{response}").is_err() {
+            break;
+        }
+        if stream.flush().is_err() {
+            break;
+        }
+        if method == "blockchain.scripthash.listunspent" && fixture.disconnect_after_unspent {
+            break;
+        }
+    }
 }

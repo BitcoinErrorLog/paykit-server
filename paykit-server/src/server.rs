@@ -28,8 +28,8 @@ use crate::{
     setup_orchestration::PubkyCompanionRelay,
     workers::{
         observer::{
-            ElectrumAdapter, ElectrumPort, ObservationBackend, ObserverError, ObserverPolicy,
-            observation_loop,
+            ElectrumAdapter, ElectrumPort, ObservationBackend, ObserverError, ObserverLeadership,
+            ObserverPolicy, observation_loop,
         },
         outbox::{ProcessingHealth, process_claim_with_health, process_reconciliation_with_health},
     },
@@ -275,8 +275,6 @@ impl Server {
                 poll_interval: config.electrum.poll_interval,
                 max_requests_per_tick: config.electrum.max_requests_per_tick,
                 max_requests_per_second: config.electrum.max_requests_per_second,
-                max_target_requests: config.electrum.max_target_requests,
-                overrun_lane_interval_ticks: config.electrum.overrun_lane_interval_ticks,
             },
         };
 
@@ -597,6 +595,8 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
     observation_loop(
         workers.electrum.clone(),
         Arc::new(workers.invoices.clone()) as Arc<dyn ObservationBackend>,
+        Arc::new(crate::persistence::PgObserverLeadership::new(&workers.pool))
+            as Arc<dyn ObserverLeadership>,
         workers.bitcoin_network.clone(),
         workers.electrum_policy,
         runtime,

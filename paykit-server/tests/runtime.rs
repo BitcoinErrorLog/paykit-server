@@ -316,40 +316,6 @@ async fn a_far_future_tip_time_is_degraded_without_failing_closed() {
 }
 
 #[tokio::test]
-async fn health_reports_the_observation_overrun_target_count() {
-    let runtime = runtime(true, 1);
-    runtime.set_electrum_available(true);
-    runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
-    runtime.set_paykit_delivery_available(true);
-    runtime.set_outbox_available(true);
-    runtime.set_electrum_overrun_targets(2);
-    let app = operational_router(Router::new(), runtime);
-
-    let ready = app
-        .clone()
-        .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    assert_eq!(ready.status(), StatusCode::OK);
-    let body = to_bytes(ready.into_body(), 1024).await.unwrap();
-    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(parsed["electrum"]["overrun_targets"], 2);
-
-    let metrics = app
-        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
-        .await
-        .unwrap();
-    let text = String::from_utf8(
-        to_bytes(metrics.into_body(), 32 * 1024)
-            .await
-            .unwrap()
-            .to_vec(),
-    )
-    .unwrap();
-    assert!(text.contains("paykit_electrum_observation_overrun_targets 2"));
-}
-
-#[tokio::test]
 async fn task9_cancelled_request_releases_admission_for_shutdown_drain() {
     let runtime = runtime(true, 1);
     let entered = Arc::new(tokio::sync::Notify::new());
