@@ -77,26 +77,42 @@ from elapsed wall time at `electrum.max_requests_per_second` up to
 `electrum.max_requests_per_tick`, so no loop cadence — including the
 shortest ±20% jitter interval — can sustain a higher request rate (a
 window's admissions are bounded by one bucket capacity plus rate × window,
-and by rate × window once the bucket is drained). Each tick charges its
-two probe requests (`headers.subscribe` + `block_header(0)`) against the
-bucket and admits exactly as many address lookups as the remainder allows.
-Client-side call retries are pinned at zero: each admitted target is
-exactly one request, charged once; the observer's own next tick is the
-only retry. No bypass, no slow lane, no unmetered admission. Startup
-rejects any configuration whose effective per-tick budget —
+and by rate × window once the bucket is drained). Each tick reserves its
+two probe requests (`headers.subscribe` + `block_header(0)`) from the
+bucket BEFORE sending them and admits exactly as many address lookups as
+the remainder allows. Client-side call retries are pinned at zero: each
+admitted target is exactly one request, charged once; the observer's own
+next tick is the only retry. No bypass, no slow lane, no unmetered
+admission. Startup rejects any configuration whose effective per-tick
+budget —
 `min(max_requests_per_tick, max_requests_per_second × poll_interval
 seconds)` — does not exceed the two-request probe reservation, so no
 accepted configuration can probe successfully while admitting zero address
 lookups forever.
 
 The bucket is process-wide and shared (`RequestLimiter`, owned by the
-runtime and installed once at startup): the observer tick charges its
-probe and lookups against it, and non-tick Electrum callers —
-invoice-creation snapshot fetches, the first-bind candidate fetch, and
-the claim-time history scan — reserve from the same bucket before
-dispatch. The configured rate therefore bounds the joint load, and a busy
-non-tick caller shrinks the next tick's admission instead of drawing from
-a separate pool.
+runtime and installed once at startup), and the guarantee is strict:
+**every Electrum request the process sends is reserved from this bucket
+before it is sent.** The callers are exactly:
+
+- **the observer tick's active probe** — two requests
+  (`headers.subscribe` + `block_header(0)`) reserved with `try_reserve`
+  BEFORE the probe runs; if the bucket cannot cover them the tick sends
+  no Electrum requests at all and defers the whole tick (counted under
+  the `budget_exhausted` metric/log reason, no availability change, and
+  not a zero-success tick since no lookup was attempted), retrying on
+  the next poll interval;
+- **the observer tick's per-address `list_unspent` lookups** — one
+  atomic reserve-up-to against the post-probe balance admits the
+  oldest-first prefix and charges exactly what is dispatched;
+- **invoice-creation snapshot fetches, the first-bind candidate fetch,
+  and the claim-time history scan** — `try_reserve` (or
+  `reserve_or_wait` with a bounded deadline) before dispatch.
+
+The configured rate therefore bounds the joint load, and a busy non-tick
+caller shrinks — or, when it drains the bucket, wholly defers — the next
+tick instead of drawing from a separate pool. There is no uncharged send
+anywhere: a request that was not reserved is a request that is not sent.
 
 Unadmitted and failed targets keep their staleness and lead the next
 tick's plan, and only successfully observed targets are stamped/rotated.
@@ -145,6 +161,12 @@ genuine endpoint-level conditions:
   work. Each such tick also logs ERROR once per streak (the streak resets
   on the first tick with a successful lookup). No availability change, no
   backoff.
+- `paykit_electrum_budget_exhausted_ticks` — counter of ticks deferred
+  because the shared budget could not cover the two-request probe
+  reservation (INFO log with reason `budget_exhausted`); the deferred
+  tick sent no Electrum requests, changed no availability, and is not a
+  zero-success tick. A sustained rise means non-tick callers are
+  starving observation: raise the budget or shed creation/claim load.
 - Rate-limited WARN log per failing address (at most once per five minutes
   per address) naming the address and the failure reason, plus a per-tick
   summary WARN with the tick's failure count.

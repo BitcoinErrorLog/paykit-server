@@ -44,24 +44,32 @@ panels and alerts that reference them:
 - `paykit_electrum_observation_address_failures{reason="error" |
   "response_too_large" | "deadline"}` — counter family of isolated
   per-address lookup failures. Registered at
-  `paykit-server/src/metrics.rs:109`; incremented at
-  `paykit-server/src/workers/observer.rs:795`. A rising value localizes
+  `paykit-server/src/metrics.rs:111`; incremented at
+  `paykit-server/src/workers/observer.rs:829`. A rising value localizes
   trouble to specific targets with no endpoint impact.
 - `paykit_electrum_zero_success_ticks` — counter of observer ticks that
   attempted ≥1 lookup and succeeded at none. Registered at
-  `paykit-server/src/metrics.rs:115`; incremented at
-  `paykit-server/src/workers/observer.rs:811`. Each such tick also logs
+  `paykit-server/src/metrics.rs:117`; incremented at
+  `paykit-server/src/workers/observer.rs:845`. Each such tick also logs
   ERROR once per streak (the streak resets on the first tick with a
   successful lookup). Alert on a sustained increase: with per-address
   failures isolated from availability, this is the only signal that
   observation is doing no useful work while the endpoint reads healthy.
+- `paykit_electrum_budget_exhausted_ticks` — counter of observer ticks
+  deferred because the shared request budget could not cover the
+  two-request probe reservation; the deferred tick sent no Electrum
+  requests and changed no availability. Registered at
+  `paykit-server/src/metrics.rs:122`; incremented at
+  `paykit-server/src/workers/observer.rs:728` (INFO log with reason
+  `budget_exhausted`). A sustained rise means non-tick callers are
+  starving observation: raise the budget or shed creation/claim load.
 - Alert on `paykit_electrum_backlog_oldest_age_seconds > 300` — gauge of
   the oldest pending observation. Registered at
-  `paykit-server/src/metrics.rs:99`; set at
-  `paykit-server/src/workers/observer.rs:734`. 300 s matches the
+  `paykit-server/src/metrics.rs:101`; set at
+  `paykit-server/src/workers/observer.rs:769`. 300 s matches the
   code's own `BACKLOG_ALERT_THRESHOLD`
   (`paykit-server/src/workers/observer.rs:39`), past which the observer
-  also emits a WARN log (`paykit-server/src/workers/observer.rs:737`):
+  also emits a WARN log (`paykit-server/src/workers/observer.rs:772`):
   the budget is saturated or a target is failing repeatedly.
 
 ## Shared request limiter
@@ -73,4 +81,7 @@ The observer tick and all non-tick Electrum callers (invoice-creation
 snapshot fetches, the first-bind candidate fetch, the claim-time history
 scan) charge the same bucket, so raising creation/claim traffic directly
 shrinks observation admission — size the budget for the joint load, not
-just the tick.
+just the tick. Every Electrum request is reserved before it is sent: the
+tick reserves its two probe requests up front, so a bucket drained to
+zero defers the whole tick (counted under
+`paykit_electrum_budget_exhausted_ticks`) rather than probing uncharged.
