@@ -152,6 +152,7 @@ async fn invoice_store(database: &TestDatabase) -> InvoiceStore {
             &StorageState::default(),
             &key_tail(24),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -719,6 +720,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             &StorageState::default(),
             &key_tail(25),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -734,6 +736,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             &StorageState::default(),
             &key_tail(26),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();

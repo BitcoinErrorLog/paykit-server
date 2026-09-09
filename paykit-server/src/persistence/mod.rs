@@ -8,8 +8,8 @@ mod outbox;
 pub(crate) mod sdk_state;
 
 pub use creators::{
-    CreatorAllocationStatus, CreatorCredentials, CreatorSetupLock, CreatorStatusRecord,
-    CreatorStore, PersistedCreator,
+    ChildIndexCursor, CreatorAllocationStatus, CreatorCredentials, CreatorSetupLock,
+    CreatorStatusRecord, CreatorStore, PersistedCreator,
 };
 pub use deployment::{DeploymentStore, PersistenceError, StackIdentity};
 pub(crate) use invoices::BitcoinObservationInput;

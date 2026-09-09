@@ -17,6 +17,18 @@
 -- through the Bitkit companion flow, which carries no channel assertion and
 -- performs no claim-time scan. downgrade_reason is one of B.8.8's five
 -- fixed identifiers; NULL when no downgrade reason was ever assigned.
+--
+-- first_child_index is the creator's CLAIM-TIME child index (W1.13 r3): the
+-- derivation cursor value the claim response's first_derived_address was
+-- derived at -- the claim-time history scan's start index for a manual
+-- claim, 0 for a companion-flow setup, which performs no scan. It is
+-- written once at row creation and never updated, so the seller status
+-- surface can serve the exact address the claim emitted forever, while
+-- next_child_index keeps moving as invoice allocation advances it.
+-- Backfill rule for rows created before this column existed: none exist
+-- outside tests (this migration is the W1.13 branch's own and unreleased);
+-- the UPDATE below still derives the value as the row's next_child_index at
+-- migration time, the best available approximation of the claim-time index.
 
 ALTER TABLE creators
     ADD COLUMN allocation_mode TEXT NOT NULL DEFAULT 'shared_manual'
@@ -30,4 +42,10 @@ ALTER TABLE creators
             'account_index_mismatch',
             'account_has_history',
             'unassigned_sentinel_evidence'
-        ));
+        )),
+    ADD COLUMN first_child_index BIGINT;
+
+UPDATE creators SET first_child_index = next_child_index;
+
+ALTER TABLE creators
+    ALTER COLUMN first_child_index SET NOT NULL;

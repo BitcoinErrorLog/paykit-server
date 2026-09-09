@@ -124,7 +124,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
     assert!(nullable_current_columns.is_empty());
 
     let creator_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO creators (creator_lookup_hash, credential_envelope) VALUES ($1, $2) RETURNING id",
+        "INSERT INTO creators (creator_lookup_hash, credential_envelope, first_child_index) VALUES ($1, $2, 0) RETURNING id",
     )
     .bind(b"creator-lookup".as_slice())
     .bind(b"encrypted-creator".as_slice())
@@ -481,7 +481,7 @@ async fn enum_like_status_columns_allow_unexpected_text_for_read_time_validation
 
 async fn insert_creator(pool: &PgPool) -> Uuid {
     sqlx::query_scalar(
-        "INSERT INTO creators (creator_lookup_hash, credential_envelope) VALUES ($1, $2) RETURNING id",
+        "INSERT INTO creators (creator_lookup_hash, credential_envelope, first_child_index) VALUES ($1, $2, 0) RETURNING id",
     )
     .bind(b"creator-a".as_slice())
     .bind(b"encrypted-creator".as_slice())

@@ -166,6 +166,7 @@ async fn startup_authenticates_two_independent_creators_before_returning_ready_d
             &first_state,
             &key_tail(1),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -175,6 +176,7 @@ async fn startup_authenticates_two_independent_creators_before_returning_ready_d
             &second_state,
             &key_tail(2),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -207,6 +209,7 @@ async fn exact_creator_id_lookup_is_isolated_and_never_falls_back() {
             &StorageState::default(),
             &key_tail(3),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -216,6 +219,7 @@ async fn exact_creator_id_lookup_is_isolated_and_never_falls_back() {
             &StorageState::default(),
             &key_tail(4),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -248,6 +252,7 @@ async fn startup_rejects_a_correctly_shaped_wrong_master_key_without_exposing_st
             &StorageState::default(),
             &key_tail(5),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -269,6 +274,7 @@ async fn startup_rejects_corrupt_encrypted_payment_records_before_readiness() {
             &StorageState::default(),
             &key_tail(6),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -316,6 +322,7 @@ async fn startup_rejects_one_corrupt_creator_or_sdk_state_before_returning_ready
                 &StorageState::default(),
                 &key_tail(7),
                 &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+                0,
             )
             .await
             .unwrap();
@@ -325,6 +332,7 @@ async fn startup_rejects_one_corrupt_creator_or_sdk_state_before_returning_ready
                 &StorageState::default(),
                 &key_tail(8),
                 &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+                0,
             )
             .await
             .unwrap();
@@ -362,6 +370,7 @@ async fn startup_rejects_creator_envelopes_swapped_between_rows() {
             &StorageState::default(),
             &key_tail(9),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -371,6 +380,7 @@ async fn startup_rejects_creator_envelopes_swapped_between_rows() {
             &StorageState::default(),
             &key_tail(10),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -482,6 +492,7 @@ async fn setup_and_sdk_mutation_for_one_creator_leave_all_other_creator_state_un
             &first_state,
             &key_tail(11),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -491,6 +502,7 @@ async fn setup_and_sdk_mutation_for_one_creator_leave_all_other_creator_state_un
             &second_state,
             &key_tail(12),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -609,6 +621,7 @@ async fn creator_and_sdk_state_round_trip_only_through_ciphertext() {
             &initial,
             &key_tail(1),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -661,6 +674,7 @@ async fn creator_create_rolls_back_when_initial_sdk_state_insert_fails() {
                 &StorageState::default(),
                 &key_tail(13),
                 &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+                0,
             )
             .await
             .is_err()
@@ -685,6 +699,7 @@ async fn boot_scan_rejects_corrupt_creator_sdk_and_missing_state_without_histori
             &StorageState::default(),
             &key_tail(14),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -717,6 +732,7 @@ async fn boot_scan_rejects_corrupt_sdk_state_and_missing_sdk_state() {
             &StorageState::default(),
             &key_tail(15),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -746,6 +762,7 @@ async fn reauthentication_preserves_noise_index_and_assignments_and_rejects_acco
             &StorageState::default(),
             &key_tail(16),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -807,6 +824,7 @@ async fn concurrent_sdk_updates_serialize_and_retain_both_mutations() {
             &StorageState::default(),
             &key_tail(17),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();

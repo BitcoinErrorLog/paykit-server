@@ -226,12 +226,20 @@ impl CreatorStore {
     /// statement in the system that can persist the `exclusive` mode, and
     /// only when the claim-channel checks computed it — creation is the
     /// sole `— → exclusive` transition in the design's table.
+    ///
+    /// `first_child_index` is the claim-time child index (W1.13 r3): the
+    /// derivation cursor value the claim response's `first_derived_address`
+    /// was derived at. It is written here, at row creation, and no statement
+    /// ever updates it, so the seller status surface can re-derive that exact
+    /// address forever while `next_child_index` moves with invoice
+    /// allocation.
     pub async fn create(
         &self,
         credentials: &CreatorCredentials,
         state: &StorageState,
         key_tail: &[u8; 65],
         allocation: &ClaimAllocation,
+        first_child_index: i64,
     ) -> Result<PersistedCreator, PersistenceError> {
         let lookup_hash = self
             .crypto
@@ -253,11 +261,12 @@ impl CreatorStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         self.bind_key_tail(&mut tx, key_tail, &lookup_hash).await?;
-        sqlx::query("INSERT INTO creators (id, creator_lookup_hash, credential_envelope, allocation_mode, claim_channel, downgrade_reason) VALUES ($1, $2, $3, $4, $5, $6)")
+        sqlx::query("INSERT INTO creators (id, creator_lookup_hash, credential_envelope, allocation_mode, claim_channel, downgrade_reason, first_child_index) VALUES ($1, $2, $3, $4, $5, $6, $7)")
             .bind(id).bind(lookup_hash.as_bytes().as_slice()).bind(credential_envelope.as_bytes())
             .bind(allocation.mode.as_str())
             .bind(allocation.channel.as_deref())
             .bind(allocation.downgrade_reason.map(|reason| reason.as_str()))
+            .bind(first_child_index)
             .execute(&mut *tx).await.map_err(|_| PersistenceError::Unavailable)?;
         sqlx::query("INSERT INTO sdk_states (creator_id, state_envelope) VALUES ($1, $2)")
             .bind(id)
@@ -369,7 +378,7 @@ impl CreatorStore {
     ) -> Result<Option<CreatorStatusRecord>, PersistenceError> {
         let hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
         let row = sqlx::query_as::<_, CreatorStatusRow>(
-            "SELECT id, creator_lookup_hash, credential_envelope, next_child_index, allocation_mode, claim_channel, downgrade_reason FROM creators WHERE creator_lookup_hash = $1",
+            "SELECT id, creator_lookup_hash, credential_envelope, next_child_index, first_child_index, allocation_mode, claim_channel, downgrade_reason FROM creators WHERE creator_lookup_hash = $1",
         )
         .bind(hash.as_bytes().as_slice())
         .fetch_optional(&self.pool)
@@ -392,6 +401,7 @@ impl CreatorStore {
             xpub: credentials.xpub().to_owned(),
             account_index: credentials.account_index(),
             next_child_index: row.next_child_index,
+            first_child_index: row.first_child_index,
         }))
     }
 
@@ -516,19 +526,21 @@ impl CreatorStore {
     }
 
     /// Advances the creator's derivation cursor to at least `floor` and
-    /// returns the resulting value. The update is monotonic (`GREATEST`), so
-    /// a re-claim can never move the cursor backwards over an already
-    /// allocated child index. Callers hold the creator's setup lock, so this
-    /// runs inside the same critical section as the claim commit.
+    /// returns the resulting cursor pair. The update is monotonic
+    /// (`GREATEST`), so a re-claim can never move the cursor backwards over
+    /// an already allocated child index, and it never touches
+    /// `first_child_index` — the claim-time index is written once at row
+    /// creation. Callers hold the creator's setup lock, so this runs inside
+    /// the same critical section as the claim commit.
     pub async fn advance_next_child_index(
         &self,
         creator: &CreatorPubky,
         floor: i64,
-    ) -> Result<i64, PersistenceError> {
+    ) -> Result<ChildIndexCursor, PersistenceError> {
         let hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
-        sqlx::query_scalar(
+        sqlx::query_as::<_, ChildIndexCursor>(
             "UPDATE creators SET next_child_index = GREATEST(next_child_index, $2), updated_at = NOW() \
-             WHERE creator_lookup_hash = $1 RETURNING next_child_index",
+             WHERE creator_lookup_hash = $1 RETURNING next_child_index, first_child_index",
         )
         .bind(hash.as_bytes().as_slice())
         .bind(floor)
@@ -599,6 +611,16 @@ pub struct CreatorAllocationStatus {
     pub downgrade_reason: Option<String>,
 }
 
+/// The derivation cursor pair after a claim-floor advance: the mutable
+/// cursor the next invoice address derives from, and the immutable
+/// claim-time index (W1.13 r3) the status's stable `first_derived_address`
+/// derives at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, sqlx::FromRow)]
+pub struct ChildIndexCursor {
+    pub next_child_index: i64,
+    pub first_child_index: i64,
+}
+
 /// Everything the authenticated seller status surface serves (design §B.8.6):
 /// the allocation columns plus the persisted account key data the client's
 /// evidence fields (`key_fingerprint`, `first_derived_address`) derive from.
@@ -610,9 +632,13 @@ pub struct CreatorStatusRecord {
     /// The exact persisted account xpub (canonical base58 form).
     pub xpub: String,
     pub account_index: u32,
-    /// The creator's derivation cursor; the status's `first_derived_address`
-    /// derives at this index, exactly as the claim response did.
+    /// The creator's mutable derivation cursor; invoice allocation advances
+    /// it. Informational in the status body — never a derivation input.
     pub next_child_index: i64,
+    /// The immutable claim-time child index (W1.13 r3): the status's
+    /// `first_derived_address` derives at THIS index, exactly as the claim
+    /// response did — never at `next_child_index`, which moves.
+    pub first_child_index: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -621,6 +647,7 @@ struct CreatorStatusRow {
     creator_lookup_hash: Vec<u8>,
     credential_envelope: Vec<u8>,
     next_child_index: i64,
+    first_child_index: i64,
     allocation_mode: String,
     claim_channel: Option<String>,
     downgrade_reason: Option<String>,

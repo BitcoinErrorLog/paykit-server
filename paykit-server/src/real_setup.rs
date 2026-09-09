@@ -272,11 +272,15 @@ pub(crate) struct CreatorSetupCommit {
     pub(crate) allocation: crate::allocation::ClaimAllocation,
 }
 
-/// What a claim commit persisted: the derivation cursor (when a claim-scan
-/// floor applied) and the creator row's allocation status after the commit
-/// — the values the claim response reports.
+/// What a claim commit persisted: the derivation cursor pair (when a
+/// claim-scan floor applied) and the creator row's allocation status after
+/// the commit — the values the claim response reports.
 pub(crate) struct ClaimCommitReport {
     pub(crate) next_child_index: Option<i64>,
+    /// The creator's immutable claim-time child index (W1.13 r3), read back
+    /// from the row in the same critical section: written once at creation,
+    /// never moved by re-claims or invoice allocation.
+    pub(crate) first_child_index: Option<i64>,
     pub(crate) allocation_mode: String,
     pub(crate) downgrade_reason: Option<String>,
 }
@@ -357,6 +361,11 @@ impl CreatorSetupCommit {
                         &StorageState::default(),
                         &key_tail,
                         &self.allocation,
+                        // The claim-time child index (W1.13 r3): the scan's
+                        // start index for a manual claim, 0 for the
+                        // companion flow, which performs no scan and leaves
+                        // the cursor at its initial 0.
+                        self.next_child_index_floor.unwrap_or(0),
                     )
                     .await
                     .map(|_| {
@@ -402,14 +411,16 @@ impl CreatorSetupCommit {
                     .creators
                     .advance_next_child_index(&self.creator, floor)
                     .await
-                    .map(|next_child_index| ClaimCommitReport {
-                        next_child_index: Some(next_child_index),
+                    .map(|cursor| ClaimCommitReport {
+                        next_child_index: Some(cursor.next_child_index),
+                        first_child_index: Some(cursor.first_child_index),
                         allocation_mode,
                         downgrade_reason,
                     })
                     .map_err(|_| ClaimError::InvalidEnvelope),
                 None => Ok(ClaimCommitReport {
                     next_child_index: None,
+                    first_child_index: None,
                     allocation_mode,
                     downgrade_reason,
                 }),

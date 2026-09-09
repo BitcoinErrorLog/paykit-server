@@ -200,6 +200,7 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             &StorageState::default(),
             &key_tail(20),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -589,6 +590,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             &StorageState::default(),
             &key_tail(21),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -869,6 +871,7 @@ async fn postgres_sdk_transactions_are_durable_and_creator_isolated() {
             &StorageState::default(),
             &key_tail(22),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -884,6 +887,7 @@ async fn postgres_sdk_transactions_are_durable_and_creator_isolated() {
             &StorageState::default(),
             &key_tail(23),
             &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
