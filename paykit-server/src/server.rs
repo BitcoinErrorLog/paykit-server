@@ -189,6 +189,7 @@ impl Server {
             config.paykit.receiver_path.clone(),
             Arc::new(creators.clone()),
             config.deployment_invariants().bitcoin_network.clone(),
+            config.bitcoin.creation_enabled,
             Arc::new(invoices.clone()),
             Arc::new(PaykitIntentBuilder::for_network(
                 &config.deployment_invariants().bitcoin_network,

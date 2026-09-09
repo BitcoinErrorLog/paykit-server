@@ -290,6 +290,15 @@ fn service(
     locks: Arc<FakeLocks>,
     store: Arc<FakeStore>,
 ) -> CreateInvoiceService {
+    service_with_creation(session, locks, store, true)
+}
+
+fn service_with_creation(
+    session: Arc<FakeSession>,
+    locks: Arc<FakeLocks>,
+    store: Arc<FakeStore>,
+    bitcoin_creation_enabled: bool,
+) -> CreateInvoiceService {
     CreateInvoiceService::new(
         session,
         locks,
@@ -301,6 +310,7 @@ fn service(
         paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
+        bitcoin_creation_enabled,
         store,
         Arc::new(PaykitIntentBuilder::default()),
     )
@@ -418,6 +428,76 @@ async fn changed_binding_returns_conflict_without_validator_or_lock_fetch() {
 }
 
 #[tokio::test]
+async fn disabled_creation_refuses_new_locks_invoice_binds_but_replays_exact_requests() {
+    let session = Arc::new(FakeSession {
+        result: Ok(()),
+        calls: AtomicUsize::default(),
+        creators: Mutex::new(vec![]),
+    });
+    let locks = Arc::new(FakeLocks {
+        result: Ok(valid_lock()),
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+
+    assert_eq!(
+        service_with_creation(session.clone(), locks.clone(), store.clone(), false)
+            .create(request())
+            .await,
+        Err(CreateInvoiceError::BitcoinCreationDisabled)
+    );
+    assert_eq!(session.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(locks.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+
+    // An exact replay binds nothing new and is still served.
+    let replay_store = Arc::new(FakeStore::with_preflight(InvoicePreflight::ExactReplay));
+    let replayed = service_with_creation(session, locks, replay_store, false)
+        .create(request())
+        .await
+        .unwrap();
+    assert!(replayed.replayed());
+}
+
+#[tokio::test]
+async fn disabled_creation_maps_to_the_stable_http_code_on_the_locks_route() {
+    let key = SigningKey::from_bytes(&[14; 32]);
+    let session = Arc::new(FakeSession {
+        result: Ok(()),
+        calls: AtomicUsize::default(),
+        creators: Mutex::new(vec![]),
+    });
+    let locks = Arc::new(FakeLocks {
+        result: Ok(valid_lock()),
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let router = invoices_router(Arc::new(service_with_creation(
+        session, locks, store, false,
+    )))
+    .layer(Extension(signed_auth(&key)));
+    let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "bundle_id": BUNDLE,
+        "lock_resource": LOCK_RESOURCE,
+        "reader": reader()
+    }))
+    .unwrap();
+
+    let response = router
+        .oneshot(signed_invoice_request(&key, body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error":{"code":"bitcoin_creation_disabled","message":"bitcoin payment request creation is disabled"}})
+    );
+}
+
+#[tokio::test]
 async fn fifteen_second_deadline_is_safe_and_does_not_commit() {
     let session = Arc::new(FakeSession {
         result: Ok(()),
@@ -441,6 +521,7 @@ async fn fifteen_second_deadline_is_safe_and_does_not_commit() {
         paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
+        true,
         store.clone(),
         Arc::new(PaykitIntentBuilder::default()),
         Arc::new(FixedClock::new([start, start + Duration::from_secs(15)])),
@@ -479,6 +560,7 @@ async fn marker_discovery_cannot_start_after_the_whole_request_deadline() {
         paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
+        true,
         store.clone(),
         Arc::new(PaykitIntentBuilder::default()),
         Arc::new(FixedClock::new([
@@ -523,6 +605,7 @@ async fn signed_router_maps_deadline_exhaustion_to_dependency_timeout() {
         paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
+        true,
         store,
         Arc::new(PaykitIntentBuilder::default()),
         Arc::new(FixedClock::new([start, start + Duration::from_secs(15)])),
@@ -797,6 +880,7 @@ async fn new_invoice_discovers_marker_before_atomic_persistence_and_pins_it_in_b
         PaykitReceiverPath::new("paykit/server").unwrap(),
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
+        true,
         store.clone(),
         Arc::new(PaykitIntentBuilder::default()),
     );

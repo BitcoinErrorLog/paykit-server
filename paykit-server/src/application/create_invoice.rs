@@ -332,6 +332,7 @@ pub struct CreateInvoiceService {
     local_receiver_path: PaykitReceiverPath,
     credentials: Arc<dyn CreatorXpubProvider>,
     bitcoin_network: crate::config::BitcoinNetwork,
+    bitcoin_creation_enabled: bool,
     store: Arc<dyn InvoicePersistence>,
     intents: Arc<dyn IntentBuilder>,
     clock: Arc<dyn DeadlineClock>,
@@ -346,6 +347,7 @@ impl CreateInvoiceService {
         local_receiver_path: PaykitReceiverPath,
         credentials: Arc<dyn CreatorXpubProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
+        bitcoin_creation_enabled: bool,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
     ) -> Self {
@@ -357,6 +359,7 @@ impl CreateInvoiceService {
             local_receiver_path,
             credentials,
             bitcoin_network,
+            bitcoin_creation_enabled,
             store,
             intents,
             Arc::new(SystemDeadlineClock),
@@ -372,6 +375,7 @@ impl CreateInvoiceService {
         local_receiver_path: PaykitReceiverPath,
         credentials: Arc<dyn CreatorXpubProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
+        bitcoin_creation_enabled: bool,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
         clock: Arc<dyn DeadlineClock>,
@@ -384,6 +388,7 @@ impl CreateInvoiceService {
             local_receiver_path,
             credentials,
             bitcoin_network,
+            bitcoin_creation_enabled,
             store,
             intents,
             clock,
@@ -399,6 +404,7 @@ impl CreateInvoiceService {
         local_receiver_path: PaykitReceiverPath,
         credentials: Arc<dyn CreatorXpubProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
+        bitcoin_creation_enabled: bool,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
     ) -> Self {
@@ -410,6 +416,7 @@ impl CreateInvoiceService {
             local_receiver_path,
             credentials,
             bitcoin_network,
+            bitcoin_creation_enabled,
             store,
             intents,
         )
@@ -449,6 +456,11 @@ impl CreateInvoiceService {
                 .map_err(map_store);
             }
             InvoicePreflight::Conflict => return Err(CreateInvoiceError::Conflict),
+            // An exact replay above binds nothing new; only first-time binds
+            // are gated by the creation kill switch.
+            InvoicePreflight::New if !self.bitcoin_creation_enabled => {
+                return Err(CreateInvoiceError::BitcoinCreationDisabled);
+            }
             InvoicePreflight::New => {}
         }
         let session_remaining = remaining(started, self.clock.now())?;
