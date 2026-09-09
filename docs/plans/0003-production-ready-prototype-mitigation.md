@@ -546,6 +546,10 @@ inspectable production client without implementing a private Electrum protocol.
      `bitcoin = "=0.32.101"` pin.
    - **Construction/config symbols:** `BdkElectrumClient::new`, the re-exported
      `Client::from_config`, and `ConfigBuilder::{new, timeout, retry, build}`.
+     Superseded 2026-09-09: the adapter constructs `electrum-client 0.25`'s
+     `raw_client::RawClient` directly over the byte-capped transport (no
+     `bdk_electrum` wrapper, no `ConfigBuilder::retry` — call retries are
+     pinned at zero); see `paykit-server/src/workers/electrum.rs`.
    - **Observation symbols:** `bdk_core::spk_client::SyncRequest`,
      `BdkElectrumClient::sync`, `SyncResponse::{chain_update, tx_update}`,
      `TxUpdate::{txs, anchors, seen_ats, evicted_ats}`, and
