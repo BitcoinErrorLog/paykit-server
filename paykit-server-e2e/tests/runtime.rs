@@ -51,7 +51,6 @@ stack_role = "proof"
 endpoint = "{electrum_endpoint}"
 poll_interval = "1s"
 request_timeout = "1s"
-connect_retries = 0
 
 [outbox]
 poll_interval = "1s"

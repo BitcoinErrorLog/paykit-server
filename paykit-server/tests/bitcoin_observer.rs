@@ -115,9 +115,9 @@ mod tick {
         config::BitcoinNetwork,
         runtime::{DependencyCheck, Runtime},
         workers::observer::{
-            AddressFailureGate, ElectrumPort, ObservationBackend, ObservationReport,
-            ObserverBackoff, ObserverError, ObserverPolicy, ObserverTickOutcome, TipProbe,
-            observe_tick,
+            AddressFailureReason, ElectrumPort, FailedObservation, ObservationBackend,
+            ObservationReport, ObserverBackoff, ObserverError, ObserverPolicy, ObserverTickOutcome,
+            ObserverTickState, TipProbe, observe_tick,
         },
     };
 
@@ -152,8 +152,15 @@ mod tick {
         }
     }
 
-    fn failure_gate() -> AddressFailureGate {
-        AddressFailureGate::new()
+    fn state(policy: &ObserverPolicy) -> ObserverTickState {
+        ObserverTickState::new(policy)
+    }
+
+    /// Simulates one full poll interval of wall time between ticks so the
+    /// sustained budget refills exactly as the production loop's real sleep
+    /// would refill it.
+    fn elapse_one_poll_interval(state: &mut ObserverTickState) {
+        state.rewind_budget_clock(Duration::from_secs(10));
     }
 
     struct FakeElectrum {
@@ -219,7 +226,10 @@ mod tick {
             let mut report = ObservationReport::default();
             for target in targets {
                 if self.failing_addresses.contains(target.address()) {
-                    report.failed.push(target.address().to_owned());
+                    report.failed.push(FailedObservation {
+                        address: target.address().to_owned(),
+                        reason: AddressFailureReason::Error,
+                    });
                 } else {
                     report.observed.push(target.address().to_owned());
                 }
@@ -316,9 +326,8 @@ mod tick {
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(100),
             &runtime,
-            &mut failure_gate(),
+            &mut state(&policy(100)),
         )
         .await;
 
@@ -349,9 +358,8 @@ mod tick {
                 &port,
                 &backend,
                 &BitcoinNetwork::Regtest,
-                &policy(100),
                 &runtime,
-                &mut failure_gate(),
+                &mut state(&policy(100)),
             )
             .await;
             assert_eq!(
@@ -368,9 +376,8 @@ mod tick {
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(100),
             &runtime,
-            &mut failure_gate(),
+            &mut state(&policy(100)),
         )
         .await;
         assert_eq!(
@@ -402,6 +409,7 @@ mod tick {
             stamped: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
+        let mut state = state(&policy(4));
         // Every target costs exactly one lookup. Policy budget 4 reserves
         // the tick's two probe requests (headers.subscribe +
         // block_header(0)), leaving 2 lookups, which admits the first two
@@ -411,9 +419,8 @@ mod tick {
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(4),
             &runtime,
-            &mut failure_gate(),
+            &mut state,
         )
         .await;
         assert_eq!(
@@ -431,13 +438,13 @@ mod tick {
 
         // Next tick: the deferred targets are now the stalest and are
         // observed first; the just-observed pair defers behind them.
+        elapse_one_poll_interval(&mut state);
         let outcome = observe_tick(
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(4),
             &runtime,
-            &mut failure_gate(),
+            &mut state,
         )
         .await;
         assert_eq!(
@@ -457,13 +464,13 @@ mod tick {
         // One more tick observes the rotated remainder: every stamped
         // target reports staleness 0, so the plan's stable order admits the
         // pair deferred behind last tick's head.
+        elapse_one_poll_interval(&mut state);
         let outcome = observe_tick(
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(4),
             &runtime,
-            &mut failure_gate(),
+            &mut state,
         )
         .await;
         assert_eq!(
@@ -499,9 +506,8 @@ mod tick {
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(3),
             &runtime,
-            &mut failure_gate(),
+            &mut state(&policy(3)),
         )
         .await;
         assert_eq!(
@@ -543,15 +549,16 @@ mod tick {
             stamped: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
+        let mut state = state(&policy(3));
 
         for _ in 0..TARGETS {
+            elapse_one_poll_interval(&mut state);
             let outcome = observe_tick(
                 &port,
                 &backend,
                 &BitcoinNetwork::Regtest,
-                &policy(3),
                 &runtime,
-                &mut failure_gate(),
+                &mut state,
             )
             .await;
             assert_eq!(
@@ -590,15 +597,14 @@ mod tick {
             stamped: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
-        let mut gate = failure_gate();
+        let mut state = state(&policy(100));
 
         let outcome = observe_tick(
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(100),
             &runtime,
-            &mut gate,
+            &mut state,
         )
         .await;
         assert_eq!(
@@ -636,13 +642,13 @@ mod tick {
         // Next tick the failed target leads the plan and, succeeding now,
         // is observed and stamped.
         let port = FakeElectrum::healthy();
+        elapse_one_poll_interval(&mut state);
         let outcome = observe_tick(
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(100),
             &runtime,
-            &mut gate,
+            &mut state,
         )
         .await;
         assert_eq!(
@@ -661,7 +667,7 @@ mod tick {
     async fn repeated_failure_of_one_address_never_degrades_the_endpoint() {
         // The same single address failing on every retry — with no
         // successful lookup anywhere — is an address condition, not an
-        // endpoint condition: the gate never trips.
+        // endpoint condition: availability never degrades.
         let port = FakeElectrum::failing_addresses(["dusted"]);
         let backend = FakeBackend {
             entries: Mutex::new(vec![FakeEntry::new("dusted", 600)]),
@@ -669,16 +675,16 @@ mod tick {
             stamped: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
-        let mut gate = failure_gate();
+        let mut state = state(&policy(100));
 
         for _ in 0..10 {
+            elapse_one_poll_interval(&mut state);
             let outcome = observe_tick(
                 &port,
                 &backend,
                 &BitcoinNetwork::Regtest,
-                &policy(100),
                 &runtime,
-                &mut gate,
+                &mut state,
             )
             .await;
             assert_eq!(
@@ -697,69 +703,111 @@ mod tick {
     }
 
     #[tokio::test]
-    async fn distinct_consecutive_address_failures_degrade_the_endpoint() {
-        // Three consecutive per-address failures across distinct addresses
-        // with no intervening success are the documented endpoint-level
-        // condition: the tick reports Unavailable and the loop backs off.
+    async fn three_failing_addresses_never_degrade_availability_or_other_sellers() {
+        // Attacker scenario: three disclosed addresses (A, B, C) whose
+        // lookups fail — with no intervening success — plus one healthy
+        // seller (D) in the same plan. D is observed and stamped, A/B/C
+        // keep their staleness and stay in the queue, Electrum stays
+        // available, and no backoff is recorded: per-address failures are
+        // never promoted to endpoint unavailability.
+        let port = FakeElectrum::failing_addresses(["a", "b", "c"]);
         let backend = FakeBackend {
             entries: Mutex::new(vec![
                 FakeEntry::new("a", 600),
                 FakeEntry::new("b", 300),
                 FakeEntry::new("c", 120),
+                FakeEntry::new("d", 60),
             ]),
             applied: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
-        let mut gate = failure_gate();
+        let mut state = state(&policy(100));
         let mut backoff = ObserverBackoff::new();
 
-        // Tick 1: a mixed tick — one success keeps the endpoint healthy and
-        // resets the streak even though two lookups failed.
-        let port = FakeElectrum::failing_addresses(["a", "b"]);
-        let outcome = observe_tick(
-            &port,
-            &backend,
-            &BitcoinNetwork::Regtest,
-            &policy(100),
-            &runtime,
-            &mut gate,
-        )
-        .await;
+        for tick in 0..2 {
+            elapse_one_poll_interval(&mut state);
+            let outcome = observe_tick(
+                &port,
+                &backend,
+                &BitcoinNetwork::Regtest,
+                &runtime,
+                &mut state,
+            )
+            .await;
+            assert_eq!(
+                outcome,
+                ObserverTickOutcome::Observed {
+                    processed: 4,
+                    deferred: 0,
+                    failed: 3,
+                },
+                "tick {tick}: the failed addresses stay isolated, D is observed"
+            );
+            backoff.record_outcome(&outcome);
+            assert!(!backoff.is_backing_off(), "tick {tick}: no backoff");
+            let report = runtime.readiness().await;
+            assert_eq!(
+                report.electrum,
+                paykit_server::runtime::ComponentState::Ready,
+                "tick {tick}: /health/ready stays ready"
+            );
+        }
         assert_eq!(
-            outcome,
-            ObserverTickOutcome::Observed {
-                processed: 3,
-                deferred: 0,
-                failed: 2,
-            }
+            backend.stamped.lock().unwrap().as_slice(),
+            &[vec!["d".to_owned()], vec!["d".to_owned()]],
+            "only the healthy seller is ever stamped"
         );
-        backoff.record_outcome(&outcome);
-        assert!(!backoff.is_backing_off());
+        let entries = backend.entries.lock().unwrap();
+        assert_eq!(entries[0].staleness_secs, 600, "a keeps its staleness");
+        assert_eq!(entries[1].staleness_secs, 300, "b keeps its staleness");
+        assert_eq!(entries[2].staleness_secs, 120, "c keeps its staleness");
+    }
 
-        // Tick 2: every admitted lookup fails — three consecutive failures
-        // across distinct addresses with no intervening success trip the
-        // gate and the endpoint degrades.
-        let port = FakeElectrum::failing_addresses(["a", "b", "c"]);
-        let outcome = observe_tick(
-            &port,
-            &backend,
-            &BitcoinNetwork::Regtest,
-            &policy(100),
-            &runtime,
-            &mut gate,
-        )
-        .await;
-        assert_eq!(
-            outcome,
-            ObserverTickOutcome::ObservationFailed(ObserverError::Unavailable)
-        );
-        backoff.record_outcome(&outcome);
-        assert!(backoff.is_backing_off());
-        assert_ne!(
-            runtime.readiness().await.electrum,
-            paykit_server::runtime::ComponentState::Ready
-        );
+    #[tokio::test]
+    async fn an_a_b_a_failure_pattern_never_degrades_availability() {
+        // Two attacker addresses failing alternately across ticks (A, B,
+        // then A again) with no successful lookup anywhere: availability
+        // and backoff are unaffected, and the failed targets keep their
+        // queue position.
+        let port = FakeElectrum::failing_addresses(["a", "b"]);
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![FakeEntry::new("a", 600), FakeEntry::new("b", 300)]),
+            applied: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+        let mut state = state(&policy(100));
+        let mut backoff = ObserverBackoff::new();
+
+        for _ in 0..3 {
+            elapse_one_poll_interval(&mut state);
+            let outcome = observe_tick(
+                &port,
+                &backend,
+                &BitcoinNetwork::Regtest,
+                &runtime,
+                &mut state,
+            )
+            .await;
+            assert_eq!(
+                outcome,
+                ObserverTickOutcome::Observed {
+                    processed: 2,
+                    deferred: 0,
+                    failed: 2,
+                }
+            );
+            backoff.record_outcome(&outcome);
+            assert!(!backoff.is_backing_off());
+            assert_eq!(
+                runtime.readiness().await.electrum,
+                paykit_server::runtime::ComponentState::Ready
+            );
+        }
+        let entries = backend.entries.lock().unwrap();
+        assert_eq!(entries[0].staleness_secs, 600, "a stays stale and queued");
+        assert_eq!(entries[1].staleness_secs, 300, "b stays stale and queued");
     }
 
     #[tokio::test]
@@ -779,9 +827,8 @@ mod tick {
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(100),
             &runtime,
-            &mut failure_gate(),
+            &mut state(&policy(100)),
         )
         .await;
         assert_eq!(
@@ -817,9 +864,8 @@ mod tick {
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(100),
             &runtime,
-            &mut failure_gate(),
+            &mut state(&policy(100)),
         )
         .await;
         assert_eq!(
@@ -854,9 +900,8 @@ mod tick {
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(100),
             &runtime,
-            &mut failure_gate(),
+            &mut state(&policy(100)),
         )
         .await;
         assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
@@ -884,16 +929,99 @@ mod tick {
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(100),
             &runtime,
-            &mut failure_gate(),
+            &mut state(&policy(100)),
         )
         .await;
         assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
         let encoded = runtime.metrics().encode().unwrap();
         assert!(
-            encoded.contains("paykit_electrum_observation_address_failures_total 1"),
-            "the isolated failure must be counted: {encoded}"
+            encoded
+                .contains("paykit_electrum_observation_address_failures_total{reason=\"error\"} 1"),
+            "the isolated failure must be counted under the error label: {encoded}"
         );
+    }
+
+    #[tokio::test]
+    async fn the_sustained_budget_admits_nothing_without_elapsed_refill() {
+        // The token bucket refills from elapsed wall time, not from the
+        // tick count: two back-to-back ticks admit only the first tick's
+        // budget — the jittered loop can never sustain more than
+        // max_requests_per_second.
+        let port = FakeElectrum::healthy();
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![
+                FakeEntry::new("oldest", 600),
+                FakeEntry::new("second", 300),
+                FakeEntry::new("third", 120),
+            ]),
+            applied: Mutex::new(Vec::new()),
+            stamped: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+        // Capacity 3 (one post-probe lookup), rate 1/s: an immediate second
+        // tick has refilled nothing.
+        let mut state = state(&ObserverPolicy {
+            poll_interval: Duration::from_secs(10),
+            max_requests_per_tick: 3,
+            max_requests_per_second: 1,
+        });
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 1,
+                deferred: 2,
+                failed: 0,
+            }
+        );
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 0,
+                deferred: 3,
+                failed: 0,
+            },
+            "no wall time elapsed, so the bucket admits nothing"
+        );
+        // After one poll interval the bucket has refilled 1/s x 10s = 10
+        // tokens, capped at its capacity of 3: the probe reserves 2 and
+        // exactly one lookup is admitted.
+        elapse_one_poll_interval(&mut state);
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 1,
+                deferred: 2,
+                failed: 0,
+            },
+            "the bucket capacity, not rate x poll_interval, bounds the burst"
+        );
+        let calls = port.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "only two lookups were ever issued");
     }
 }

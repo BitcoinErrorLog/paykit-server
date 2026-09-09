@@ -3,17 +3,28 @@
 use std::sync::Mutex;
 
 use prometheus_client::{
-    encoding::text::encode,
+    encoding::{EncodeLabelSet, text::encode},
     metrics::{
         counter::Counter,
+        family::Family,
         gauge::Gauge,
         histogram::{Histogram, exponential_buckets},
     },
     registry::Registry,
 };
 
-/// Metrics intentionally have no labels: routes, identifiers, and caller input
-/// must never become metric cardinality or data-exposure boundaries.
+/// Label set for per-address observation lookup failures. The value set is
+/// a closed code-owned enum (`error`, `response_too_large`, `deadline`) —
+/// never caller input — so cardinality is bounded at three series.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AddressFailureLabels {
+    reason: &'static str,
+}
+
+/// Metrics intentionally carry no route, identifier, or caller-input
+/// labels: the only label anywhere is the closed failure-reason enum above,
+/// so caller input can never become metric cardinality or a data-exposure
+/// boundary.
 pub struct Metrics {
     registry: Mutex<Registry>,
     http_requests: Counter,
@@ -25,7 +36,7 @@ pub struct Metrics {
     electrum_last_success_age_seconds: Gauge,
     electrum_backlog_oldest_age_seconds: Gauge,
     electrum_observation_stamp_misses: Counter,
-    electrum_observation_address_failures: Counter,
+    electrum_observation_address_failures: Family<AddressFailureLabels, Counter>,
     payment_states: Gauge,
     runtime_active: Gauge,
     session_validation_results: Counter,
@@ -43,7 +54,7 @@ impl Metrics {
         let electrum_last_success_age_seconds = Gauge::default();
         let electrum_backlog_oldest_age_seconds = Gauge::default();
         let electrum_observation_stamp_misses = Counter::default();
-        let electrum_observation_address_failures = Counter::default();
+        let electrum_observation_address_failures = Family::default();
         let payment_states = Gauge::default();
         let runtime_active = Gauge::default();
         let session_validation_results = Counter::default();
@@ -94,7 +105,8 @@ impl Metrics {
         );
         registry.register(
             "paykit_electrum_observation_address_failures",
-            "Isolated per-address Electrum lookup failures (timeout, oversize, or error).",
+            "Isolated per-address Electrum lookup failures by closed reason label \
+             (error, response_too_large, or deadline).",
             electrum_observation_address_failures.clone(),
         );
         registry.register(
@@ -155,8 +167,10 @@ impl Metrics {
     pub fn electrum_observation_stamp_misses(&self, misses: u64) {
         self.electrum_observation_stamp_misses.inc_by(misses);
     }
-    pub fn electrum_observation_address_failures(&self, failures: u64) {
-        self.electrum_observation_address_failures.inc_by(failures);
+    pub fn electrum_observation_address_failures(&self, reason: &'static str, failures: u64) {
+        self.electrum_observation_address_failures
+            .get_or_create(&AddressFailureLabels { reason })
+            .inc_by(failures);
     }
     pub fn set_payment_states(&self, value: i64) {
         self.payment_states.set(value);

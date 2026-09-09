@@ -268,9 +268,15 @@ async fn live_electrum_observes_known_output_and_confirmations() {
         .parse::<u32>()
         .unwrap();
     let outpoint = OutPoint::new(txid, vout);
-    let adapter = ElectrumAdapter::connect(endpoint, network, Duration::from_secs(15), 1)
-        .await
-        .unwrap();
+    let adapter = ElectrumAdapter::connect(
+        endpoint,
+        network,
+        Duration::from_secs(15),
+        200,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     let tip = adapter.probe().await.unwrap();
     let observations = adapter
         .observations(

@@ -248,11 +248,15 @@ fn rejects_invalid_network_origin_key_zero_values_and_inconsistent_retries() {
     );
     assert!(Config::from_toml_and_environment(&inconsistent_retries, environment()).is_err());
 
-    // Retired observation-scheduler keys fail loudly instead of being
-    // silently ignored (the electrum section denies unknown fields).
+    // Retired observation-scheduler and client-retry keys fail loudly
+    // instead of being silently ignored (the electrum section denies
+    // unknown fields). connect_retries is retired: electrum-client call
+    // retries are pinned at zero so each admitted target is exactly one
+    // request charged against the sustained budget.
     for retired_key in [
         "max_target_requests = 500",
         "overrun_lane_interval_ticks = 10",
+        "connect_retries = 1",
     ] {
         let input = valid_toml().replace(
             "endpoint = \"ssl://electrum.example:50002\"",
@@ -313,7 +317,10 @@ fn parses_accepted_durations_and_uses_ledger_defaults() {
 
     assert_eq!(config.electrum.poll_interval, Duration::from_secs(10));
     assert_eq!(config.electrum.request_timeout, Duration::from_secs(10));
-    assert_eq!(config.electrum.connect_retries, 1);
+    assert_eq!(config.electrum.max_requests_per_tick, 1000);
+    assert_eq!(config.electrum.max_requests_per_second, 5);
+    assert_eq!(config.electrum.max_utxos_per_address, 200);
+    assert_eq!(config.electrum.address_deadline, Duration::from_secs(5));
     assert_eq!(config.outbox.poll_interval, Duration::from_secs(5));
     assert_eq!(config.outbox.batch_size, 16);
     assert_eq!(config.outbox.lease_duration, Duration::from_secs(30));
@@ -399,6 +406,70 @@ fn rejects_outbox_batch_size_above_the_supported_integer_range() {
         "poll_interval = \"5s\"\nbatch_size = 4294967296",
     );
     assert!(Config::from_toml_and_environment(&oversized, environment()).is_err());
+}
+
+fn electrum_toml(extra: &str) -> String {
+    valid_toml().replace(
+        "endpoint = \"ssl://electrum.example:50002\"",
+        &format!("endpoint = \"ssl://electrum.example:50002\"\n{extra}"),
+    )
+}
+
+#[test]
+fn rejects_electrum_budgets_with_zero_post_probe_capacity() {
+    // Every tick reserves two requests for the active probe, so the
+    // effective per-tick budget —
+    // min(max_requests_per_tick,
+    //     max_requests_per_second * poll_interval seconds)
+    // — must exceed 2, or every tick would probe successfully while
+    // admitting zero address lookups forever.
+    for (name, extra) in [
+        // Hard-cap floor: 2 leaves nothing after the probe reservation.
+        ("tick cap at floor", "max_requests_per_tick = 2"),
+        ("tick cap below floor", "max_requests_per_tick = 1"),
+        // Rate-derived floor: 2/s x 1s = 2 requests per tick.
+        (
+            "rate allowance at floor",
+            "poll_interval = \"1s\"\nmax_requests_per_second = 2",
+        ),
+        (
+            "rate allowance below floor",
+            "poll_interval = \"1s\"\nmax_requests_per_second = 1",
+        ),
+    ] {
+        let error =
+            Config::from_toml_and_environment(&electrum_toml(extra), environment()).unwrap_err();
+        assert!(
+            error.to_string().contains("reserved probe requests"),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn accepts_electrum_budgets_one_above_the_post_probe_floor() {
+    for (name, extra) in [
+        ("tick cap floor + 1", "max_requests_per_tick = 3"),
+        (
+            "rate allowance floor + 1",
+            "poll_interval = \"1s\"\nmax_requests_per_second = 3",
+        ),
+    ] {
+        assert!(
+            Config::from_toml_and_environment(&electrum_toml(extra), environment()).is_ok(),
+            "{name} should be accepted"
+        );
+    }
+}
+
+#[test]
+fn rejects_zero_electrum_max_utxos_per_address_and_address_deadline() {
+    for extra in ["max_utxos_per_address = 0", "address_deadline = \"0s\""] {
+        assert!(
+            Config::from_toml_and_environment(&electrum_toml(extra), environment()).is_err(),
+            "{extra} should be rejected"
+        );
+    }
 }
 
 fn marketplace_toml(section: &str) -> String {

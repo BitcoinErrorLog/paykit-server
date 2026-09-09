@@ -390,7 +390,6 @@ stack_role = "proof"
 endpoint = "tcp://127.0.0.1:1"
 poll_interval = "1s"
 request_timeout = "1s"
-connect_retries = 0
 [outbox]
 poll_interval = "{poll_interval}"
 batch_size = 16

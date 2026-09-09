@@ -6,18 +6,25 @@
 //! outpoint/value/presence model is preserved without ever calling
 //! history RPCs or fetching a historical transaction: the request
 //! count is exactly one per observed address and cannot be expanded by an
-//! attacker dusting a disclosed invoice address.
+//! attacker dusting a disclosed invoice address. The response work is
+//! bounded too: the decoded item count is capped before any per-UTXO
+//! record is materialised and every address runs under a wall-clock
+//! deadline, and every per-address failure is isolated — it never
+//! degrades endpoint availability or the tick's other observations.
 
 use std::{
     collections::{HashMap, HashSet},
     str::FromStr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
-use bdk_electrum::electrum_client::{Client, ConfigBuilder, ElectrumApi, Error as ElectrumError};
-use bitcoin::{Address, Network};
+use bdk_electrum::electrum_client::{
+    Client, ConfigBuilder, ElectrumApi, Error as ElectrumError, ListUnspentRes, Param,
+    ToElectrumScriptHash,
+};
+use bitcoin::{Address, Network, hex::DisplayHex};
 use rand::Rng;
 
 use crate::{
@@ -36,16 +43,10 @@ pub const BACKLOG_ALERT_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 /// the probe and the observation batch together.
 pub const PROBE_REQUESTS_PER_TICK: u64 = 2;
 
-/// Consecutive per-address lookup failures across distinct addresses that
-/// degrade endpoint availability. This is the explicit endpoint-failure
-/// rule: a single oversized, timed-out, or errored response for one address
-/// never marks Electrum unavailable and never discards the tick's other
-/// observations; only a streak of failures for three pairwise-distinct
-/// addresses with no intervening success is treated as an endpoint-level
-/// condition (alongside connect failure and tip-probe failure, which
-/// degrade immediately). A single address that fails every time it is
-/// retried cannot trip the gate on its own.
-pub const MAX_CONSECUTIVE_ADDRESS_FAILURES: u32 = 3;
+/// Minimum interval between WARN logs for the same failing address: a
+/// permanently failing target is visible without flooding the log, while
+/// the per-tick summary WARN still records every tick's failure count.
+const ADDRESS_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(30);
 const BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
@@ -78,6 +79,40 @@ pub struct TipProbe {
     pub time_unix: u32,
 }
 
+/// Why one address's `list_unspent` lookup failed. Every reason is an
+/// isolated per-address condition — never an endpoint condition — and is
+/// counted under a distinct metric label
+/// (`paykit_electrum_observation_address_failures{reason=...}`).
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum AddressFailureReason {
+    /// The lookup errored: transport timeout, malformed response, or an
+    /// inconsistent height relative to the probed tip.
+    Error,
+    /// The response listed more UTXOs than `electrum.max_utxos_per_address`;
+    /// it was rejected before any per-UTXO record was materialised.
+    ResponseTooLarge,
+    /// Connect + call + decode exceeded `electrum.address_deadline`.
+    Deadline,
+}
+
+impl AddressFailureReason {
+    /// Stable metric label value.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::ResponseTooLarge => "response_too_large",
+            Self::Deadline => "deadline",
+        }
+    }
+}
+
+/// One failed per-address lookup with its classified reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedObservation {
+    pub address: String,
+    pub reason: AddressFailureReason,
+}
+
 /// One tick's observation response with per-address outcomes. `outputs`
 /// holds the matched outputs of every successfully looked-up address;
 /// `observed` and `failed` partition the requested target addresses so the
@@ -88,9 +123,10 @@ pub struct ObservationReport {
     pub outputs: Vec<ObservedOutput>,
     /// Target addresses whose `list_unspent` lookup succeeded.
     pub observed: Vec<String>,
-    /// Target addresses whose lookup timed out or errored; they keep their
-    /// staleness and lead the next tick's plan.
-    pub failed: Vec<String>,
+    /// Target addresses whose lookup timed out, exceeded the UTXO cap or
+    /// the per-address deadline, or errored; they keep their staleness and
+    /// lead the next tick's plan.
+    pub failed: Vec<FailedObservation>,
 }
 
 /// Production Electrum adapters are injected here. This boundary deliberately
@@ -196,20 +232,25 @@ impl ObserverLeadership for crate::persistence::PgObserverLeadership {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObserverPolicy {
     pub poll_interval: Duration,
-    /// Hard cap on Electrum lookups admitted to one tick, including the
-    /// tick's two probe requests ([`PROBE_REQUESTS_PER_TICK`]), which are
-    /// reserved before observation targets are admitted. Each admitted
-    /// target costs exactly one `list_unspent` lookup; there is no bypass,
-    /// no slow lane, and no unmetered admission of any kind.
+    /// Token-bucket capacity: the maximum Electrum requests one tick may
+    /// hold, including the tick's two probe requests
+    /// ([`PROBE_REQUESTS_PER_TICK`]), which are charged before observation
+    /// targets are admitted. Each admitted target costs exactly one
+    /// `list_unspent` lookup; there is no bypass, no slow lane, and no
+    /// unmetered admission of any kind.
     pub max_requests_per_tick: u32,
-    /// Sustained rate budget; the per-tick allowance is this rate times the
-    /// poll interval, so lookups per second stay at or below it.
+    /// Token-bucket refill rate. Tokens refill from elapsed wall time at
+    /// this rate, so no loop cadence — including the shortest jitter
+    /// interval — can sustain more requests per second.
     pub max_requests_per_second: u32,
 }
 
 impl ObserverPolicy {
-    /// Effective per-tick lookup budget: the hard cap bounded further by the
-    /// sustained rate allowance for one poll interval.
+    /// Effective per-tick lookup budget in steady state: the bucket
+    /// capacity bounded further by one poll interval's refill. Startup
+    /// validation requires this to exceed [`PROBE_REQUESTS_PER_TICK`] so no
+    /// accepted configuration probes successfully while admitting zero
+    /// address lookups forever.
     pub fn per_tick_budget(&self) -> u64 {
         let rate_allowance = u64::from(self.max_requests_per_second) * self.poll_interval.as_secs();
         u64::from(self.max_requests_per_tick).min(rate_allowance)
@@ -240,39 +281,120 @@ pub fn select_within_budget(plan: Vec<PlannedObservation>, budget: u64) -> Budge
     }
 }
 
-/// Tracks consecutive per-address lookup failures to decide when they stop
-/// being isolated address conditions and become an endpoint condition.
-/// Rule (see [`MAX_CONSECUTIVE_ADDRESS_FAILURES`]): any successful lookup
-/// resets the streak; a failure for the same address as the previous
-/// failure does not extend it, so one repeatedly failing address (for
-/// example an address dusted until its response times out) degrades only
-/// its own observation cadence.
-#[derive(Clone, Debug, Default)]
-pub struct AddressFailureGate {
-    consecutive: u32,
-    last_failed: Option<String>,
+/// Sustained Electrum request token bucket. Tokens refill from elapsed
+/// wall time at `max_requests_per_second` up to `max_requests_per_tick`, so
+/// the jittered loop can never sustain a rate above the configured one: a
+/// window's admissions are bounded by one bucket capacity plus rate ×
+/// window, and once the bucket is drained (sustained over-budget load)
+/// every window admits at most rate × window. Refill accounting is
+/// integer-exact: sub-token remainders stay in `last_refill` and cannot
+/// drift over long runs.
+#[derive(Clone, Debug)]
+pub struct RequestBudget {
+    capacity: u64,
+    refill_per_second: u64,
+    tokens: u64,
+    last_refill: Instant,
 }
 
-impl AddressFailureGate {
+impl RequestBudget {
+    /// Starts with a full bucket: the first tick may burst up to the
+    /// configured per-tick capacity; sustained admission is then bounded by
+    /// the refill rate.
+    pub fn new(capacity: u64, refill_per_second: u64, now: Instant) -> Self {
+        Self {
+            capacity,
+            refill_per_second,
+            tokens: capacity,
+            last_refill: now,
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        if self.refill_per_second == 0 {
+            self.last_refill = now;
+            return;
+        }
+        let elapsed_millis = now.saturating_duration_since(self.last_refill).as_millis();
+        let whole = u64::try_from(elapsed_millis * u128::from(self.refill_per_second) / 1000)
+            .unwrap_or(u64::MAX);
+        if whole == 0 {
+            return;
+        }
+        self.tokens = self.tokens.saturating_add(whole).min(self.capacity);
+        // Advance only by the time the granted whole tokens represent, so
+        // the sub-token remainder keeps accruing instead of being dropped.
+        let consumed_millis = u128::from(whole) * 1000 / u128::from(self.refill_per_second);
+        self.last_refill +=
+            Duration::from_millis(u64::try_from(consumed_millis).unwrap_or(u64::MAX));
+    }
+
+    /// Tokens available after refilling from elapsed wall time.
+    pub fn available(&mut self, now: Instant) -> u64 {
+        self.refill(now);
+        self.tokens
+    }
+
+    /// Spends up to `count` tokens (saturating at what is available).
+    pub fn spend(&mut self, count: u64) {
+        self.tokens = self.tokens.saturating_sub(count);
+    }
+}
+
+/// Per-address WARN-log rate limiter: one failing address logs at most once
+/// per [`ADDRESS_FAILURE_LOG_INTERVAL`] no matter how many ticks it fails,
+/// so a permanently dusted address cannot flood the log.
+#[derive(Clone, Debug, Default)]
+pub struct AddressFailureLog {
+    last_logged: HashMap<String, Instant>,
+}
+
+impl AddressFailureLog {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Folds one tick's per-address outcomes into the streak and returns
-    /// whether the endpoint must now be treated as unavailable.
-    pub fn record_tick(&mut self, failed: &[String], any_success: bool) -> bool {
-        if any_success {
-            self.consecutive = 0;
-            self.last_failed = None;
+    /// Records a failure for `address` and returns whether it should be
+    /// logged now.
+    pub fn should_log(&mut self, address: &str, now: Instant) -> bool {
+        if let Some(last) = self.last_logged.get(address)
+            && now.duration_since(*last) < ADDRESS_FAILURE_LOG_INTERVAL
+        {
             return false;
         }
-        for address in failed {
-            if self.last_failed.as_deref() != Some(address.as_str()) {
-                self.consecutive = self.consecutive.saturating_add(1);
-                self.last_failed = Some(address.clone());
-            }
+        self.last_logged.insert(address.to_owned(), now);
+        true
+    }
+}
+
+/// Cross-tick observer state owned by the loop: the sustained request
+/// budget and the per-address failure-log rate limiter.
+#[derive(Clone, Debug)]
+pub struct ObserverTickState {
+    budget: RequestBudget,
+    failure_log: AddressFailureLog,
+}
+
+impl ObserverTickState {
+    pub fn new(policy: &ObserverPolicy) -> Self {
+        Self {
+            budget: RequestBudget::new(
+                u64::from(policy.max_requests_per_tick),
+                u64::from(policy.max_requests_per_second),
+                Instant::now(),
+            ),
+            failure_log: AddressFailureLog::new(),
         }
-        self.consecutive >= MAX_CONSECUTIVE_ADDRESS_FAILURES
+    }
+
+    /// Rewinds the budget's refill clock by `elapsed`, so the next tick
+    /// refills as if that much wall time had passed since the previous
+    /// tick. The production loop gets the same refill from its real sleep
+    /// between ticks; deterministic tests use this to space ticks.
+    pub fn rewind_budget_clock(&mut self, elapsed: Duration) {
+        if let Some(rewound) = self.budget.last_refill.checked_sub(elapsed) {
+            self.budget.last_refill = rewound;
+        }
     }
 }
 
@@ -363,17 +485,17 @@ pub enum ObserverTickOutcome {
 
 /// Runs one bounded observer tick: active probe, plan, budgeted batch,
 /// persistence, and health publication. The empty-target case still probes
-/// and reports availability from the probe alone. `failure_gate` carries
-/// the cross-tick per-address failure streak; the tick records its failed
-/// lookups into it, and only a tripped gate (or a probe/connect failure)
-/// degrades endpoint availability.
+/// and reports availability from the probe alone. `state` carries the
+/// cross-tick request budget and failure-log rate limiter. Per-address
+/// lookup failures are always isolated: they are counted and logged but
+/// never degrade endpoint availability; only a probe or connect failure
+/// does.
 pub async fn observe_tick(
     port: &dyn ElectrumPort,
     backend: &dyn ObservationBackend,
     network: &BitcoinNetwork,
-    policy: &ObserverPolicy,
     runtime: &Runtime,
-    failure_gate: &mut AddressFailureGate,
+    state: &mut ObserverTickState,
 ) -> ObserverTickOutcome {
     let tip = match port.probe().await {
         Ok(tip) => {
@@ -416,14 +538,19 @@ pub async fn observe_tick(
         );
     }
 
-    // The active probe issues requests of its own; reserve them so the
-    // configured rate bounds the probe and the observation batch together.
-    let lookup_budget = policy
-        .per_tick_budget()
-        .saturating_sub(PROBE_REQUESTS_PER_TICK);
+    // The active probe already issued its requests; charge them against
+    // the sustained token bucket so the configured rate bounds the probe
+    // and the observation batch together. The bucket refills from elapsed
+    // wall time, so the jittered loop cannot sustain a higher rate.
+    let available = state.budget.available(Instant::now());
+    state.budget.spend(PROBE_REQUESTS_PER_TICK);
+    let lookup_budget = available.saturating_sub(PROBE_REQUESTS_PER_TICK);
     let selection = select_within_budget(plan, lookup_budget);
     let processed = selection.batch.len();
     let deferred = selection.deferred.len();
+    state
+        .budget
+        .spend(u64::try_from(processed).unwrap_or(u64::MAX));
     if selection.batch.is_empty() {
         runtime.set_electrum_available(true);
         return ObserverTickOutcome::Observed {
@@ -446,9 +573,23 @@ pub async fn observe_tick(
     };
     let failed_count = report.failed.len();
     if failed_count > 0 {
-        runtime
-            .metrics()
-            .electrum_observation_address_failures(u64::try_from(failed_count).unwrap_or(u64::MAX));
+        let mut by_reason: HashMap<AddressFailureReason, u64> = HashMap::new();
+        let now = Instant::now();
+        for failure in &report.failed {
+            *by_reason.entry(failure.reason).or_default() += 1;
+            if state.failure_log.should_log(&failure.address, now) {
+                tracing::warn!(
+                    address = %failure.address,
+                    reason = failure.reason.as_label(),
+                    "isolated per-address electrum lookup failure; the target stays stale"
+                );
+            }
+        }
+        for (reason, count) in by_reason {
+            runtime
+                .metrics()
+                .electrum_observation_address_failures(reason.as_label(), count);
+        }
         tracing::warn!(
             failed = failed_count,
             succeeded = report.observed.len(),
@@ -500,18 +641,9 @@ pub async fn observe_tick(
         return ObserverTickOutcome::ObservationFailed(ObserverError::ObservationStampMiss);
     }
     // Isolated per-address failures degrade only the failed targets (they
-    // keep their staleness and lead the next plan). The endpoint degrades
-    // solely on the documented rule: a streak of failures across distinct
-    // addresses with no intervening success.
-    if failure_gate.record_tick(&report.failed, !report.observed.is_empty()) {
-        tracing::error!(
-            consecutive_failures = MAX_CONSECUTIVE_ADDRESS_FAILURES,
-            "consecutive per-address electrum lookup failures across distinct addresses; \
-             treating the endpoint as unavailable"
-        );
-        runtime.set_electrum_available(false);
-        return ObserverTickOutcome::ObservationFailed(ObserverError::Unavailable);
-    }
+    // keep their staleness and lead the next plan); they never degrade
+    // endpoint availability. The endpoint degrades solely on a probe or
+    // connect failure, handled above.
     runtime.set_electrum_available(true);
     ObserverTickOutcome::Observed {
         processed,
@@ -534,7 +666,7 @@ pub async fn observation_loop(
     runtime: Arc<Runtime>,
 ) {
     let mut backoff = ObserverBackoff::new();
-    let mut failure_gate = AddressFailureGate::new();
+    let mut state = ObserverTickState::new(&policy);
     let mut first_tick = true;
     let mut was_leader = true;
     loop {
@@ -583,9 +715,8 @@ pub async fn observation_loop(
             port.as_ref(),
             backend.as_ref(),
             &network,
-            &policy,
             &runtime,
-            &mut failure_gate,
+            &mut state,
         )
         .await;
         backoff.record_outcome(&outcome);
@@ -593,11 +724,18 @@ pub async fn observation_loop(
 }
 
 /// Concrete synchronous Electrum client isolated behind the async observation port.
+#[derive(Clone)]
 pub struct ElectrumAdapter {
     endpoint: Arc<str>,
     network: BitcoinNetwork,
     timeout: Duration,
-    retries: u8,
+    /// Hard cap on decoded `list_unspent` items per address
+    /// (`electrum.max_utxos_per_address`); over-limit responses are
+    /// rejected before any per-UTXO record is materialised.
+    max_utxos_per_address: usize,
+    /// Per-address wall-clock deadline over connect + call + decode
+    /// (`electrum.address_deadline`).
+    address_deadline: Duration,
 }
 
 impl ElectrumAdapter {
@@ -606,7 +744,8 @@ impl ElectrumAdapter {
         endpoint: impl Into<String>,
         network: BitcoinNetwork,
         timeout: Duration,
-        retries: u8,
+        max_utxos_per_address: usize,
+        address_deadline: Duration,
     ) -> Result<Self, ObserverError> {
         let endpoint = endpoint.into();
         let parsed = url::Url::parse(&endpoint).map_err(|_| ObserverError::Unavailable)?;
@@ -625,7 +764,8 @@ impl ElectrumAdapter {
             endpoint: endpoint.into(),
             network,
             timeout,
-            retries,
+            max_utxos_per_address,
+            address_deadline,
         })
     }
 
@@ -633,18 +773,32 @@ impl ElectrumAdapter {
         endpoint: impl Into<String>,
         network: BitcoinNetwork,
         timeout: Duration,
-        retries: u8,
+        max_utxos_per_address: usize,
+        address_deadline: Duration,
     ) -> Result<Self, ObserverError> {
-        let adapter = Self::configured(endpoint, network, timeout, retries)?;
+        let adapter = Self::configured(
+            endpoint,
+            network,
+            timeout,
+            max_utxos_per_address,
+            address_deadline,
+        )?;
         adapter.raw_client().await?;
         Ok(adapter)
     }
 
-    async fn raw_client(&self) -> Result<Client, ObserverError> {
-        let config = ConfigBuilder::new()
+    /// electrum-client call retries stay at zero: each admitted target is
+    /// exactly one request, charged once against the sustained budget, and
+    /// the observer's own next tick is the retry.
+    fn client_config(&self) -> bdk_electrum::electrum_client::Config {
+        ConfigBuilder::new()
             .timeout(Some(self.timeout))
-            .retry(self.retries)
-            .build();
+            .retry(0)
+            .build()
+    }
+
+    async fn raw_client(&self) -> Result<Client, ObserverError> {
+        let config = self.client_config();
         let endpoint = self.endpoint.clone();
         tokio::task::spawn_blocking(move || Client::from_config(&endpoint, config))
             .await
@@ -653,12 +807,18 @@ impl ElectrumAdapter {
     }
 
     fn raw_client_blocking(&self) -> Result<Client, ElectrumError> {
-        let config = ConfigBuilder::new()
-            .timeout(Some(self.timeout))
-            .retry(self.retries)
-            .build();
-        Client::from_config(&self.endpoint, config)
+        Client::from_config(&self.endpoint, self.client_config())
     }
+}
+
+/// Outcome of one address's connect + call + decode inside the blocking
+/// pool. A successful lookup hands the connection back for reuse; a failed
+/// one drops it (its response stream may be desynchronized) so the next
+/// address reconnects.
+enum AddressAttempt {
+    Observed(Box<Client>, Vec<ObservedOutput>),
+    Failed(AddressFailureReason),
+    ConnectFailed,
 }
 
 #[async_trait]
@@ -668,52 +828,72 @@ impl ElectrumPort for ElectrumAdapter {
         tip_height: u32,
         targets: &[ObservationTarget],
     ) -> Result<ObservationReport, ObserverError> {
-        let adapter = Self {
-            endpoint: self.endpoint.clone(),
-            network: self.network.clone(),
-            timeout: self.timeout,
-            retries: self.retries,
-        };
-        let targets = targets.to_vec();
-        tokio::task::spawn_blocking(move || {
-            // A connect failure before any lookup is an endpoint-level
-            // condition; per-address failures after it are isolated.
-            let mut client = adapter
-                .raw_client_blocking()
-                .map_err(|_| ObserverError::Unavailable)?;
-            let mut report = ObservationReport::default();
-            for (index, target) in targets.iter().enumerate() {
-                match observe_address_blocking(&client, &adapter.network, tip_height, target) {
-                    Ok(outputs) => {
-                        report.observed.push(target.address().to_owned());
-                        report.outputs.extend(outputs);
+        let mut report = ObservationReport::default();
+        let mut client: Option<Client> = None;
+        for (index, target) in targets.iter().enumerate() {
+            let adapter = self.clone();
+            let target = target.clone();
+            let address = target.address().to_owned();
+            let attempt = tokio::task::spawn_blocking(move || {
+                // A connect failure before any lookup is an endpoint-level
+                // condition; per-address failures after it are isolated.
+                let client = match client {
+                    Some(client) => client,
+                    None => match adapter.raw_client_blocking() {
+                        Ok(client) => client,
+                        Err(_) => return AddressAttempt::ConnectFailed,
+                    },
+                };
+                match observe_address_blocking(
+                    &client,
+                    &adapter.network,
+                    tip_height,
+                    &target,
+                    adapter.max_utxos_per_address,
+                ) {
+                    Ok(outputs) => AddressAttempt::Observed(Box::new(client), outputs),
+                    Err(reason) => AddressAttempt::Failed(reason),
+                }
+            });
+            // Per-address wall-clock deadline over connect + call + decode.
+            // The blocking socket read cannot be cancelled, so on expiry
+            // the join handle is abandoned: the tick moves on, the
+            // connection is never reused, and the detached task exits when
+            // the socket read returns (bounded by
+            // `electrum.request_timeout`).
+            let attempt = match tokio::time::timeout(self.address_deadline, attempt).await {
+                Ok(Ok(attempt)) => attempt,
+                Ok(Err(_)) => AddressAttempt::Failed(AddressFailureReason::Error),
+                Err(_) => AddressAttempt::Failed(AddressFailureReason::Deadline),
+            };
+            match attempt {
+                AddressAttempt::Observed(returned, outputs) => {
+                    report.observed.push(address);
+                    report.outputs.extend(outputs);
+                    client = Some(*returned);
+                }
+                AddressAttempt::Failed(reason) => {
+                    report.failed.push(FailedObservation { address, reason });
+                    client = None;
+                }
+                AddressAttempt::ConnectFailed => {
+                    if index == 0 {
+                        return Err(ObserverError::Unavailable);
                     }
-                    Err(_) => {
-                        report.failed.push(target.address().to_owned());
-                        // A failed (for example timed-out) response can leave
-                        // the connection's response stream desynchronized, so
-                        // the remaining addresses are fetched over a fresh
-                        // connection. A reconnect failure fails the remaining
-                        // addresses without discarding the observations
-                        // already collected.
-                        match adapter.raw_client_blocking() {
-                            Ok(fresh) => client = fresh,
-                            Err(_) => {
-                                report.failed.extend(
-                                    targets[index + 1..]
-                                        .iter()
-                                        .map(|target| target.address().to_owned()),
-                                );
-                                break;
-                            }
-                        }
-                    }
+                    // A reconnect failure fails the remaining addresses
+                    // without discarding the observations already
+                    // collected.
+                    report
+                        .failed
+                        .extend(targets[index..].iter().map(|target| FailedObservation {
+                            address: target.address().to_owned(),
+                            reason: AddressFailureReason::Error,
+                        }));
+                    break;
                 }
             }
-            Ok(report)
-        })
-        .await
-        .map_err(|_| ObserverError::Unavailable)?
+        }
+        Ok(report)
     }
 
     async fn probe(&self) -> Result<TipProbe, ObserverError> {
@@ -736,22 +916,56 @@ impl ElectrumPort for ElectrumAdapter {
     }
 }
 
-/// Observes one address with a single `script_list_unspent` call. Every
-/// returned item becomes a present output; a previously tracked outpoint
-/// missing from the unspent set becomes the same absence record the
-/// settlement layer already consumes. Any error fails this address only;
-/// the caller isolates it from the rest of the tick.
+/// Observes one address with a single `blockchain.scripthash.listunspent`
+/// raw call. The decoded item count is capped at `max_utxos` BEFORE any
+/// per-UTXO record is materialised: an over-limit response fails this
+/// address with [`AddressFailureReason::ResponseTooLarge`] and no record
+/// vector is built for it. (electrum-client 0.25 does not expose the
+/// transport stream: `RawClient::_reader_thread` buffers the entire
+/// response line with an unbounded `BufRead::read_line` and parses it
+/// internally, and the public `ElectrumApi::raw_call` returns an already
+/// materialised `serde_json::Value`, so a raw-byte cap before JSON decode
+/// is not implementable through its public API. The decoded-item cap plus
+/// the per-address deadline in [`ElectrumAdapter::observations`] is the
+/// strongest bound the pinned client permits.) Every returned item becomes
+/// a present output; a previously tracked outpoint missing from the
+/// unspent set becomes the same absence record the settlement layer
+/// already consumes. Any error fails this address only; the caller
+/// isolates it from the rest of the tick.
 fn observe_address_blocking(
     client: &Client,
     network: &BitcoinNetwork,
     tip_height: u32,
     target: &ObservationTarget,
-) -> Result<Vec<ObservedOutput>, ObserverError> {
+    max_utxos: usize,
+) -> Result<Vec<ObservedOutput>, AddressFailureReason> {
     let expected_network = network.as_bitcoin_network();
-    let address = parse_address(target.address(), expected_network)?;
-    let unspent = client
-        .script_list_unspent(address.script_pubkey().as_script())
-        .map_err(map_electrum)?;
+    let address = parse_address(target.address(), expected_network)
+        .map_err(|_| AddressFailureReason::Error)?;
+    let response = client
+        .raw_call(
+            "blockchain.scripthash.listunspent",
+            [Param::String(
+                address
+                    .script_pubkey()
+                    .as_script()
+                    .to_electrum_scripthash()
+                    .to_lower_hex_string(),
+            )],
+        )
+        .map_err(|_| AddressFailureReason::Error)?;
+    if response
+        .as_array()
+        .ok_or(AddressFailureReason::Error)?
+        .len()
+        > max_utxos
+    {
+        return Err(AddressFailureReason::ResponseTooLarge);
+    }
+    let mut unspent: Vec<ListUnspentRes> =
+        serde_json::from_value(response).map_err(|_| AddressFailureReason::Error)?;
+    // Mirror ElectrumApi::script_list_unspent's canonical ordering.
+    unspent.sort_unstable_by_key(|item| (item.height, item.tx_pos));
     let mut outputs = Vec::with_capacity(unspent.len() + 1);
     let mut seen_outpoints = HashSet::with_capacity(unspent.len());
     for item in unspent {
@@ -762,16 +976,15 @@ fn observe_address_blocking(
         let confirmations = if item.height == 0 {
             0
         } else {
-            let height =
-                u32::try_from(item.height).map_err(|_| ObserverError::InvalidObservation)?;
+            let height = u32::try_from(item.height).map_err(|_| AddressFailureReason::Error)?;
             tip_height
                 .checked_sub(height)
                 .and_then(|distance| distance.checked_add(1))
-                .ok_or(ObserverError::InvalidObservation)?
+                .ok_or(AddressFailureReason::Error)?
         };
         let outpoint = bitcoin::OutPoint::new(
             item.tx_hash,
-            u32::try_from(item.tx_pos).map_err(|_| ObserverError::InvalidObservation)?,
+            u32::try_from(item.tx_pos).map_err(|_| AddressFailureReason::Error)?,
         );
         seen_outpoints.insert(outpoint);
         outputs.push(ObservedOutput {
@@ -964,27 +1177,71 @@ mod tests {
     }
 
     #[test]
-    fn the_failure_gate_trips_only_on_distinct_consecutive_failures() {
-        let mut gate = AddressFailureGate::new();
-        // One address failing on every retry never trips the gate.
-        for _ in 0..10 {
-            assert!(!gate.record_tick(&["a".to_owned()], false));
-        }
-        // Failures for distinct addresses with no intervening success do.
-        assert!(!gate.record_tick(&["a".to_owned()], false));
-        assert!(!gate.record_tick(&["b".to_owned()], false));
-        assert!(gate.record_tick(&["c".to_owned()], false));
+    fn the_budget_refills_from_elapsed_wall_time_and_caps_at_capacity() {
+        let start = Instant::now();
+        let mut budget = RequestBudget::new(50, 5, start);
+        // A fresh bucket is full: the first tick may burst to capacity.
+        assert_eq!(budget.available(start), 50);
+        budget.spend(50);
+        assert_eq!(budget.available(start), 0);
+        // Refill is wall-clock driven: 5/s over 8s (the shortest jitter of
+        // a 10s poll interval) restores exactly 40 tokens, not the nominal
+        // 50 a per-tick allowance would grant.
+        assert_eq!(budget.available(start + Duration::from_secs(8)), 40);
+        budget.spend(40);
+        // Sub-token remainders keep accruing instead of being dropped: two
+        // 100ms waits at 5/s grant exactly one token.
+        assert_eq!(budget.available(start + Duration::from_millis(8100)), 0);
+        assert_eq!(budget.available(start + Duration::from_millis(8200)), 1);
+        // Accumulation never exceeds capacity, even across a long backoff.
+        assert_eq!(budget.available(start + Duration::from_secs(3600)), 50);
     }
 
     #[test]
-    fn the_failure_gate_resets_on_any_success() {
-        let mut gate = AddressFailureGate::new();
-        assert!(!gate.record_tick(&["a".to_owned()], false));
-        assert!(!gate.record_tick(&["b".to_owned()], false));
-        assert!(!gate.record_tick(&["c".to_owned()], true));
-        assert!(!gate.record_tick(&["a".to_owned()], false));
-        assert!(!gate.record_tick(&["b".to_owned()], false));
-        assert!(gate.record_tick(&["d".to_owned()], false));
+    fn sustained_ticks_at_the_shortest_jitter_interval_never_exceed_the_configured_rate() {
+        const TICKS: usize = 100;
+        let start = Instant::now();
+        let interval = Duration::from_secs(8); // 80% of a 10s poll interval
+        let mut budget = RequestBudget::new(50, 5, start);
+        let mut instants = Vec::with_capacity(TICKS + 1);
+        let mut consumed = Vec::with_capacity(TICKS);
+        instants.push(start);
+        for tick in 0..TICKS {
+            let now = start + interval * u32::try_from(tick).unwrap();
+            // Sustained over-budget load: demand always exceeds supply, so
+            // every tick drains the bucket.
+            let available = budget.available(now);
+            budget.spend(available);
+            consumed.push(available);
+            instants.push(now);
+        }
+        // After the initial burst, every window admits at most
+        // rate x window: the shortest possible loop cadence cannot beat
+        // the configured sustained rate.
+        let burst = consumed[0];
+        assert_eq!(burst, 50, "the first tick spends the full bucket");
+        for i in 1..TICKS {
+            for j in i + 1..=TICKS {
+                let window = instants[j] - instants[i - 1];
+                let admitted: u64 = consumed[i..j].iter().sum();
+                assert!(
+                    admitted <= 5 * window.as_secs(),
+                    "window {i}..{j} admitted {admitted} in {window:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_failure_log_rate_limits_per_address() {
+        let start = Instant::now();
+        let mut log = AddressFailureLog::new();
+        assert!(log.should_log("a", start));
+        assert!(!log.should_log("a", start + Duration::from_secs(60)));
+        // Other addresses are unaffected by a's suppression.
+        assert!(log.should_log("b", start + Duration::from_secs(60)));
+        // After the interval the failure is visible again.
+        assert!(log.should_log("a", start + ADDRESS_FAILURE_LOG_INTERVAL));
     }
 
     #[test]

@@ -121,7 +121,8 @@ impl Server {
             config.electrum.endpoint.clone(),
             config.deployment_invariants().bitcoin_network.clone(),
             config.electrum.request_timeout,
-            config.electrum.connect_retries,
+            usize::try_from(config.electrum.max_utxos_per_address).unwrap_or(usize::MAX),
+            config.electrum.address_deadline,
         )
         .map_err(map_electrum_error)?;
         Self::build_with_clients(config, pool, pubky, Arc::new(electrum)).await
@@ -786,7 +787,6 @@ stack_role = "proof"
 [electrum]
 endpoint = "tcp://127.0.0.1:1"
 request_timeout = "1s"
-connect_retries = 0
 [outbox]
 poll_interval = "1s"
 "#

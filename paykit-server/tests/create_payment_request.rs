@@ -709,8 +709,8 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
         bitcoin::{ObservationTarget, PlannedObservation},
         runtime::{DependencyCheck, Runtime},
         workers::observer::{
-            AddressFailureGate, ElectrumPort, ObservationBackend, ObservationReport, ObserverError,
-            ObserverPolicy, ObserverTickOutcome, TipProbe, observe_tick,
+            ElectrumPort, ObservationBackend, ObservationReport, ObserverError, ObserverPolicy,
+            ObserverTickOutcome, ObserverTickState, TipProbe, observe_tick,
         },
     };
 
@@ -790,13 +790,12 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
         &HealthyPort,
         &ExistingInvoice,
         &BitcoinNetwork::Mainnet,
-        &ObserverPolicy {
+        &runtime,
+        &mut ObserverTickState::new(&ObserverPolicy {
             poll_interval: std::time::Duration::from_secs(10),
             max_requests_per_tick: 100,
             max_requests_per_second: 5,
-        },
-        &runtime,
-        &mut AddressFailureGate::new(),
+        }),
     )
     .await;
     assert_eq!(

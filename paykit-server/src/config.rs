@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
+use crate::workers::observer::{ObserverPolicy, PROBE_REQUESTS_PER_TICK};
+
 #[derive(Debug)]
 pub struct Config {
     pub http: HttpConfig,
@@ -91,9 +93,10 @@ impl Config {
                 endpoint: raw.electrum.endpoint,
                 poll_interval: raw.electrum.poll_interval,
                 request_timeout: raw.electrum.request_timeout,
-                connect_retries: raw.electrum.connect_retries,
                 max_requests_per_tick: raw.electrum.max_requests_per_tick,
                 max_requests_per_second: raw.electrum.max_requests_per_second,
+                max_utxos_per_address: raw.electrum.max_utxos_per_address,
+                address_deadline: raw.electrum.address_deadline,
                 max_tip_age: raw.electrum.max_tip_age,
             },
             outbox: OutboxConfig::from(raw.outbox),
@@ -133,6 +136,7 @@ impl Config {
         for (name, value) in [
             ("electrum.poll_interval", self.electrum.poll_interval),
             ("electrum.request_timeout", self.electrum.request_timeout),
+            ("electrum.address_deadline", self.electrum.address_deadline),
             ("electrum.max_tip_age", self.electrum.max_tip_age),
             ("outbox.poll_interval", self.outbox.poll_interval),
             ("outbox.lease_duration", self.outbox.lease_duration),
@@ -154,6 +158,10 @@ impl Config {
             (
                 "electrum.max_requests_per_second",
                 u64::from(self.electrum.max_requests_per_second),
+            ),
+            (
+                "electrum.max_utxos_per_address",
+                u64::from(self.electrum.max_utxos_per_address),
             ),
             ("limits.request_body_bytes", self.limits.request_body_bytes),
             (
@@ -202,6 +210,22 @@ impl Config {
         }
         if self.outbox.retry_initial > self.outbox.retry_max {
             return Err(ConfigError::InconsistentRetries("outbox"));
+        }
+        // Every tick reserves PROBE_REQUESTS_PER_TICK requests for the
+        // active probe before admitting observation targets, so the
+        // effective per-tick budget —
+        // min(max_requests_per_tick,
+        //     max_requests_per_second * poll_interval_secs)
+        // — must exceed the reservation, or every tick would probe
+        // successfully while admitting zero address lookups forever.
+        let effective_per_tick = ObserverPolicy {
+            poll_interval: self.electrum.poll_interval,
+            max_requests_per_tick: self.electrum.max_requests_per_tick,
+            max_requests_per_second: self.electrum.max_requests_per_second,
+        }
+        .per_tick_budget();
+        if effective_per_tick <= PROBE_REQUESTS_PER_TICK {
+            return Err(ConfigError::InsufficientElectrumBudget);
         }
         Ok(())
     }
@@ -507,16 +531,24 @@ pub struct ElectrumConfig {
     pub endpoint: String,
     pub poll_interval: Duration,
     pub request_timeout: Duration,
-    pub connect_retries: u8,
     /// Hard cap on Electrum lookups admitted to one tick, including the
     /// tick's two probe requests (headers.subscribe + block_header(0)),
     /// which are reserved before observation targets are admitted. Each
     /// admitted target costs exactly one `script_list_unspent` lookup;
     /// there is no bypass and no unmetered admission.
     pub max_requests_per_tick: u32,
-    /// Sustained request budget: per-tick lookups must not exceed this rate
-    /// times the poll interval.
+    /// Sustained request budget: the observer's token bucket refills from
+    /// elapsed wall time at this rate, so no loop cadence (including the
+    /// shortest jitter interval) can sustain a higher request rate.
     pub max_requests_per_second: u32,
+    /// Hard cap on decoded `list_unspent` items accepted for one address.
+    /// Over-limit responses are rejected before any per-UTXO record is
+    /// materialised and fail only that address.
+    pub max_utxos_per_address: u32,
+    /// Per-address wall-clock deadline over connect + call + decode. A
+    /// lookup exceeding it fails only that address; the connection is
+    /// dropped and never reused.
+    pub address_deadline: Duration,
     /// Maximum accepted chain-tip age for readiness. On networks with a
     /// live block cadence, /health/ready answers 503 (not_ready) when the
     /// probed tip is older than this, when the tip height regresses by
@@ -644,6 +676,12 @@ pub enum ConfigError {
     SubsecondPersistenceDuration(&'static str),
     #[error("{0}.retry_initial must not exceed {0}.retry_max")]
     InconsistentRetries(&'static str),
+    #[error(
+        "electrum request budget must exceed the {PROBE_REQUESTS_PER_TICK} reserved probe requests per tick: \
+         min(electrum.max_requests_per_tick, electrum.max_requests_per_second * electrum.poll_interval seconds) \
+         must be greater than {PROBE_REQUESTS_PER_TICK}"
+    )]
+    InsufficientElectrumBudget,
 }
 
 fn decode_base64url_no_pad(value: &str, error: ConfigError) -> Result<Vec<u8>, ConfigError> {
@@ -781,12 +819,17 @@ struct RawElectrumConfig {
     poll_interval: Duration,
     #[serde(default = "default_electrum_request_timeout", with = "humantime_serde")]
     request_timeout: Duration,
-    #[serde(default = "default_electrum_connect_retries")]
-    connect_retries: u8,
     #[serde(default = "default_electrum_max_requests_per_tick")]
     max_requests_per_tick: u32,
     #[serde(default = "default_electrum_max_requests_per_second")]
     max_requests_per_second: u32,
+    #[serde(default = "default_electrum_max_utxos_per_address")]
+    max_utxos_per_address: u32,
+    #[serde(
+        default = "default_electrum_address_deadline",
+        with = "humantime_serde"
+    )]
+    address_deadline: Duration,
     #[serde(default = "default_electrum_max_tip_age", with = "humantime_serde")]
     max_tip_age: Duration,
 }
@@ -799,16 +842,20 @@ const fn default_electrum_max_requests_per_second() -> u32 {
     5
 }
 
+const fn default_electrum_max_utxos_per_address() -> u32 {
+    200
+}
+
+const fn default_electrum_address_deadline() -> Duration {
+    Duration::from_secs(5)
+}
+
 const fn default_electrum_max_tip_age() -> Duration {
     Duration::from_secs(4 * 60 * 60)
 }
 
 fn default_electrum_request_timeout() -> Duration {
     Duration::from_secs(10)
-}
-
-fn default_electrum_connect_retries() -> u8 {
-    1
 }
 
 fn default_outbox_batch_size() -> u32 {

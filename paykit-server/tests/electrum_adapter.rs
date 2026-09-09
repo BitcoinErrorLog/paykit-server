@@ -23,7 +23,9 @@ use bitcoin::{
 use paykit_server::{
     bitcoin::{ObservationTarget, TrackedOutput},
     config::BitcoinNetwork,
-    workers::observer::{ElectrumAdapter, ElectrumPort, ObserverError},
+    workers::observer::{
+        AddressFailureReason, ElectrumAdapter, ElectrumPort, FailedObservation, ObserverError,
+    },
 };
 
 const TIP_HEIGHT: usize = 120;
@@ -46,16 +48,46 @@ fn unspent_entry(label: u64, value_sats: u64, height: usize) -> serde_json::Valu
     })
 }
 
+/// A syntactically valid JSON result item whose `tx_hash` cannot decode
+/// into `ListUnspentRes`: any code path that converts items before
+/// checking the item-count cap fails with a decode error instead.
+fn undecodable_entry(label: u64) -> serde_json::Value {
+    serde_json::json!({
+        "tx_hash": format!("not-a-txid-{label}"),
+        "tx_pos": 0,
+        "value": 546,
+        "height": TIP_HEIGHT,
+    })
+}
+
 fn outpoint(label: u64) -> OutPoint {
     OutPoint::new(Txid::from_str(&format!("{label:064x}")).unwrap(), 0)
 }
 
+fn failed(address: &Address, reason: AddressFailureReason) -> FailedObservation {
+    FailedObservation {
+        address: address.to_string(),
+        reason,
+    }
+}
+
+/// Test adapter matching the production defaults: the configured UTXO cap
+/// (200) and a generous 5s per-address deadline.
 async fn connect(server: &ProtocolServer) -> ElectrumAdapter {
+    connect_bounded(server, 200, Duration::from_secs(5)).await
+}
+
+async fn connect_bounded(
+    server: &ProtocolServer,
+    max_utxos_per_address: usize,
+    address_deadline: Duration,
+) -> ElectrumAdapter {
     ElectrumAdapter::connect(
         server.endpoint(),
         BitcoinNetwork::Regtest,
         Duration::from_secs(1),
-        1,
+        max_utxos_per_address,
+        address_deadline,
     )
     .await
     .unwrap()
@@ -259,7 +291,10 @@ async fn a_utxo_height_above_the_tip_fails_only_that_address() {
         .await
         .unwrap();
 
-    assert_eq!(report.failed, vec![address.to_string()]);
+    assert_eq!(
+        report.failed,
+        vec![failed(&address, AddressFailureReason::Error)]
+    );
     assert_eq!(report.observed, vec![other.to_string()]);
     assert_eq!(report.outputs.len(), 1);
     assert_eq!(report.outputs[0].sats, 50_000);
@@ -314,13 +349,139 @@ async fn a_per_address_timeout_isolates_the_failed_address_and_the_rest_are_obse
         .await
         .unwrap();
 
-    assert_eq!(report.failed, vec![stalled.to_string()]);
+    assert_eq!(
+        report.failed,
+        vec![failed(&stalled, AddressFailureReason::Error)]
+    );
     assert_eq!(
         report.observed,
         vec![healthy_a.to_string(), healthy_b.to_string()],
         "the timed-out address must not discard the other addresses' observations"
     );
     assert_eq!(report.outputs.len(), 2);
+    // Retry-path evidence: exactly one list_unspent per admitted target —
+    // the timed-out lookup is NOT reissued (client retries are pinned at
+    // zero; the observer's own next tick is the retry).
+    server.assert_rpc_counts(3, 0, 0);
+}
+
+#[tokio::test]
+async fn an_oversized_listunspent_response_fails_only_that_address_before_materialising_records() {
+    let dusted = fixture_address();
+    let healthy = Address::p2wpkh(
+        &CompressedPublicKey::from_str(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap(),
+        Network::Regtest,
+    );
+    // Literal fixtures: the dusted address answers with a 10k-item
+    // listunspent response whose items cannot even decode into
+    // ListUnspentRes; the healthy address answers normally. The cap (200)
+    // must fire BEFORE any per-item conversion: a convert-first code path
+    // would fail with AddressFailureReason::Error instead.
+    const DUST: u64 = 10_000;
+    let server = ProtocolServer::start_multi(
+        Network::Regtest,
+        vec![
+            (
+                dusted.script_pubkey(),
+                serde_json::Value::Array((1..=DUST).map(undecodable_entry).collect()),
+            ),
+            (
+                healthy.script_pubkey(),
+                serde_json::json!([unspent_entry(7, 30_000, TIP_HEIGHT)]),
+            ),
+        ],
+    )
+    .await;
+    let adapter = connect(&server).await;
+
+    let started = std::time::Instant::now();
+    let report = adapter
+        .observations(
+            TIP_HEIGHT as u32,
+            &[
+                ObservationTarget::new(dusted.to_string(), None),
+                ObservationTarget::new(healthy.to_string(), None),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.failed,
+        vec![failed(&dusted, AddressFailureReason::ResponseTooLarge)],
+        "the over-cap response is rejected by the item-count cap, not by a \
+         per-item decode — no 10k-element record vector is ever built"
+    );
+    assert_eq!(
+        report.observed,
+        vec![healthy.to_string()],
+        "the next seller is observed in the same tick"
+    );
+    assert_eq!(report.outputs.len(), 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the rejection happens well within the per-address deadline"
+    );
+    server.assert_rpc_counts(2, 0, 0);
+}
+
+#[tokio::test]
+async fn a_trickling_response_exceeding_the_address_deadline_fails_only_that_address() {
+    let trickled = fixture_address();
+    let healthy = Address::p2wpkh(
+        &CompressedPublicKey::from_str(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap(),
+        Network::Regtest,
+    );
+    // The trickled address's response arrives after 10s — well past the
+    // 300ms per-address deadline and past the 1s client socket timeout, so
+    // only the wall-clock deadline can bound it; the healthy address
+    // answers immediately.
+    let server = ProtocolServer::start_multi_with_stall(
+        Network::Regtest,
+        trickled.script_pubkey(),
+        Duration::from_secs(10),
+        vec![(
+            healthy.script_pubkey(),
+            serde_json::json!([unspent_entry(8, 40_000, TIP_HEIGHT)]),
+        )],
+    )
+    .await;
+    let adapter = connect_bounded(&server, 200, Duration::from_millis(300)).await;
+
+    let started = std::time::Instant::now();
+    let report = adapter
+        .observations(
+            TIP_HEIGHT as u32,
+            &[
+                ObservationTarget::new(trickled.to_string(), None),
+                ObservationTarget::new(healthy.to_string(), None),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.failed,
+        vec![failed(&trickled, AddressFailureReason::Deadline)]
+    );
+    assert_eq!(
+        report.observed,
+        vec![healthy.to_string()],
+        "the deadline returns to the tick and the next seller is observed \
+         over a fresh connection"
+    );
+    assert_eq!(report.outputs.len(), 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the 300ms deadline bounds the wait; the 10s trickle never completes"
+    );
+    server.assert_rpc_counts(2, 0, 0);
 }
 
 #[tokio::test]
@@ -361,7 +522,8 @@ async fn classifies_endpoint_outage_as_retryable_unavailable() {
         endpoint,
         BitcoinNetwork::Regtest,
         Duration::from_millis(50),
-        0,
+        200,
+        Duration::from_secs(5),
     )
     .await;
 
@@ -402,7 +564,8 @@ async fn probe_classifies_endpoint_outage_as_retryable_unavailable() {
         endpoint,
         BitcoinNetwork::Regtest,
         Duration::from_millis(50),
-        0,
+        200,
+        Duration::from_secs(5),
     )
     .unwrap();
 
