@@ -136,10 +136,17 @@ never a transaction fetch — so the request *count* is bounded by the
   and the over-cap window is treated as USED (it only advances the start
   index; the 50-window bound still refuses with
   `account_history_too_deep`), never attributed to individual addresses.
-  (electrum-client 0.25 does not expose its transport stream — it buffers
-  the whole response line and parses JSON internally — so the response
-  line itself is still read and JSON-decoded by the client; the cap plus
-  the deadline is the strongest bound the pinned client permits.)
+  (A pre-decode response-BYTE cap is feasible on the pinned
+  electrum-client 0.25 through the public `RawClient<S>` — it accepts
+  any `S: Read + Write` via `impl From<S>` (raw_client.rs:191-214), and
+  `batch_call` runs over it (raw_client.rs:897-906), so a capped `Read`
+  wrapper around the TCP/TLS stream can reject an over-limit response
+  before `BufReader` growth or JSON decode. It changes how the shared
+  Electrum client is constructed, so it lands as a separate transport
+  slice on the observer branch; it is deliberately not part of this
+  slice. Until it lands: whole-line client buffering — the client reads
+  and buffers the entire response line internally, and the item cap
+  applies after that buffering.)
 - **Per-window wall-clock deadline.** Connect + call + decode for one
   window must finish within `electrum.claim_scan_window_deadline`
   (default 5s). The blocking socket read cannot be cancelled, so on
@@ -151,20 +158,37 @@ never a transaction fetch — so the request *count* is bounded by the
   window fetches run at once process-wide (default 2, config-validated
   non-zero, a semaphore owned by the claim adapter); over the bound a
   claim fails `claim_scan_unavailable` immediately, before any blocking
-  task or Electrum call exists — there is no queueing.
+  task or Electrum call exists — there is no queueing. Each permit is
+  owned by the blocking call it admits, not by the awaiting side: it is
+  released only when that call's blocking socket read actually returns.
+  A read orphaned past its window deadline therefore keeps its slot
+  occupied until the read ends — bounded at latest by
+  `electrum.request_timeout` on the wire — so the bound holds in live
+  blocking threads and sockets, not merely in awaited windows.
 
 **Residual risk:** the request *count* is O(1) per window, but the
 *response size* grows with the scanned addresses' history depth, so a
 claimed account whose scanned address carries an arbitrarily large
-history can still produce a large or slow response. The per-window
-wall-clock deadline above (`electrum.claim_scan_window_deadline`) bounds
-how long the scan *waits*, but the blocking socket read behind it cannot
-be cancelled: an over-deadline response keeps one blocking-pool thread
-and its socket occupied until the read returns — bounded at latest by
-`electrum.request_timeout` on the wire, and bounded in count by the
-`electrum.max_concurrent_claim_scans` semaphore — so the residual is
-thread/socket occupancy by abandoned reads, never unbounded claim
-latency and never unbounded blocking-pool growth.
+history can still produce a large or slow response. Two residuals stand,
+both bounded:
+
+1. **Whole-line client buffering until the transport-level byte cap
+   slice lands; the item cap applies after buffering.** A hostile or
+   organic single response line is fully read into memory by the client
+   before the item-count cap can reject it. The transport-level byte cap
+   (capped `Read` wrapper around `RawClient<S>`, above) closes this; the
+   per-window deadline and the concurrency bound below cap how long and
+   how many such buffers can exist at once.
+2. **Thread/socket occupancy by abandoned reads.** The per-window
+   wall-clock deadline (`electrum.claim_scan_window_deadline`) bounds
+   how long the scan *waits*, but the blocking socket read behind it
+   cannot be cancelled: an over-deadline response keeps one
+   blocking-pool thread, its socket, and its semaphore permit occupied
+   until the read returns — bounded at latest by
+   `electrum.request_timeout` on the wire, and bounded in count by the
+   `electrum.max_concurrent_claim_scans` semaphore (the permit outlives
+   the abandoned wait by construction) — so the residual is never
+   unbounded claim latency and never unbounded blocking-pool growth.
 
 ## Budgeting rule
 

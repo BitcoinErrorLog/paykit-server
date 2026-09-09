@@ -1259,6 +1259,9 @@ pub struct ElectrumAdapter {
     /// Process-wide bound on concurrent claim-scan window fetches, shared
     /// across clones, so concurrent claims cannot grow the blocking pool
     /// unboundedly. Only the claim scan (`ChainHistoryPort`) draws permits.
+    /// Each permit is owned by the blocking call it admits and released
+    /// only when that call's socket read returns, so the bound covers
+    /// reads orphaned past their window deadline too.
     claim_scan_permits: Arc<Semaphore>,
 }
 
@@ -1601,14 +1604,16 @@ impl ElectrumPort for ElectrumAdapter {
 ///   addresses): that only advances the start index, and the 50-window
 ///   scan bound still yields `account_history_too_deep`, so a seller with
 ///   a deep-history address is never derivable onto and never permanently
-///   refused by the cap. (electrum-client 0.25 does not expose the
-///   transport stream: `RawClient::_reader_thread` buffers the entire
-///   response line with an unbounded `BufRead::read_line` and parses it
-///   internally, and the public `raw_call`/`batch_call` return already
-///   materialised `serde_json::Value`s, so a raw-BYTE cap before JSON
-///   decode is not implementable through its public API. The item cap
-///   plus the per-window deadline is the strongest bound the pinned
-///   client permits; the residual is documented in
+///   refused by the cap. (A raw-BYTE cap before JSON decode IS feasible
+///   on the pinned electrum-client 0.25 through the public
+///   `RawClient<S>` — it accepts any `S: Read + Write` via `impl
+///   From<S>` (raw_client.rs:191-214), so a capped `Read` wrapper around
+///   the TCP/TLS stream can reject an over-limit response before
+///   `BufReader` growth or JSON decode — but it changes how the shared
+///   Electrum client is constructed, so it lands as a separate
+///   transport slice on the observer branch. Until that slice lands the
+///   residual stands: the client buffers the whole response line
+///   internally before the item cap applies. See
 ///   docs/observer-threat-model.md under "claim-time scan".)
 /// - **Per-window wall-clock deadline.** Connect + call + decode must
 ///   finish within `claim_scan_window_deadline`. The blocking socket read
@@ -1619,6 +1624,11 @@ impl ElectrumPort for ElectrumAdapter {
 /// - **Concurrency bound.** At most `max_concurrent_claim_scans` window
 ///   fetches run at once across the process; over the bound the window
 ///   fails `Unavailable` immediately (no queueing, no Electrum call).
+///   The permit is owned by the blocking call itself, not by the awaiting
+///   side: it is released only when the blocking socket read actually
+///   returns, so a read orphaned past its window deadline still occupies
+///   its slot (bounded at latest by `electrum.request_timeout` on the
+///   wire) and the bound holds in live blocking threads and sockets.
 #[async_trait]
 impl ChainHistoryPort for ElectrumAdapter {
     async fn history_presence_batch(
@@ -1627,7 +1637,7 @@ impl ChainHistoryPort for ElectrumAdapter {
     ) -> Result<Vec<bool>, ClaimScanError> {
         // Concurrency bound first: over it the claim scan is unavailable
         // immediately, before any blocking task or Electrum call exists.
-        let _permit = self
+        let permit = self
             .claim_scan_permits
             .clone()
             .try_acquire_owned()
@@ -1636,6 +1646,16 @@ impl ChainHistoryPort for ElectrumAdapter {
         let scripts = scripts.to_vec();
         let max_items = self.max_history_items_per_window;
         let fetch = tokio::task::spawn_blocking(move || {
+            // The permit lives exactly as long as the Electrum I/O it
+            // admits: it is owned by this blocking call and released only
+            // when the call returns — never when the awaiting side gives
+            // up on the per-window deadline. A window whose socket read
+            // outlives its deadline therefore keeps its slot occupied
+            // until the read ends (bounded at latest by the client
+            // `electrum.request_timeout` on the wire), so the semaphore
+            // bounds live blocking threads and sockets, not just awaited
+            // windows.
+            let _permit = permit;
             let client = adapter
                 .raw_client_blocking()
                 .map_err(|_| ClaimScanError::Unavailable)?;
@@ -1680,7 +1700,10 @@ impl ChainHistoryPort for ElectrumAdapter {
         // handle is abandoned: the scan fails the window Unavailable, the
         // connection is never reused, and the detached task exits when the
         // socket read returns (bounded at latest by
-        // `electrum.request_timeout` on the wire).
+        // `electrum.request_timeout` on the wire). The semaphore permit
+        // moved into the blocking closure above stays held for exactly that
+        // long too: the slot frees only when the read actually ends, not
+        // when the deadline fires.
         match tokio::time::timeout(self.claim_scan_window_deadline, fetch).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) | Err(_) => Err(ClaimScanError::Unavailable),

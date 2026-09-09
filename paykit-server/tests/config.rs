@@ -286,6 +286,64 @@ fn rejects_invalid_network_origin_key_zero_values_and_inconsistent_retries() {
 }
 
 #[test]
+fn rejects_zero_max_history_items_per_window_with_literal_message() {
+    let input = valid_toml().replace(
+        "endpoint = \"ssl://electrum.example:50002\"",
+        "endpoint = \"ssl://electrum.example:50002\"\nmax_history_items_per_window = 0",
+    );
+
+    let error = Config::from_toml_and_environment(&input, environment())
+        .expect_err("max_history_items_per_window = 0 should be rejected");
+    assert_eq!(
+        error.to_string(),
+        "electrum.max_history_items_per_window must be greater than zero"
+    );
+}
+
+#[test]
+fn rejects_zero_max_concurrent_claim_scans_with_literal_message() {
+    let input = valid_toml().replace(
+        "endpoint = \"ssl://electrum.example:50002\"",
+        "endpoint = \"ssl://electrum.example:50002\"\nmax_concurrent_claim_scans = 0",
+    );
+
+    let error = Config::from_toml_and_environment(&input, environment())
+        .expect_err("max_concurrent_claim_scans = 0 should be rejected");
+    assert_eq!(
+        error.to_string(),
+        "electrum.max_concurrent_claim_scans must be greater than zero"
+    );
+}
+
+#[test]
+fn rejects_zero_claim_scan_window_deadline_with_literal_message() {
+    let input = valid_toml().replace(
+        "endpoint = \"ssl://electrum.example:50002\"",
+        "endpoint = \"ssl://electrum.example:50002\"\nclaim_scan_window_deadline = \"0s\"",
+    );
+
+    let error = Config::from_toml_and_environment(&input, environment())
+        .expect_err("claim_scan_window_deadline = \"0s\" should be rejected");
+    assert_eq!(
+        error.to_string(),
+        "electrum.claim_scan_window_deadline must be greater than zero"
+    );
+}
+
+#[test]
+fn applies_documented_claim_scan_defaults_when_keys_are_absent() {
+    let config = Config::from_toml_and_environment(&valid_toml(), environment())
+        .expect("default claim-scan bounds");
+
+    assert_eq!(config.electrum.max_history_items_per_window, 2_000);
+    assert_eq!(
+        config.electrum.claim_scan_window_deadline,
+        Duration::from_secs(5)
+    );
+    assert_eq!(config.electrum.max_concurrent_claim_scans, 2);
+}
+
+#[test]
 fn rejects_public_keys_without_the_pubky_prefix() {
     for unprefixed in [
         KEY.strip_prefix("pubky").unwrap(),
