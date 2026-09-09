@@ -51,6 +51,12 @@ endpoint = "ssl://electrum.example.invalid:50002"
 poll_interval = "10s"
 request_timeout = "10s"
 connect_retries = 1
+# Hard cap on Electrum requests per observer tick, and the sustained rate
+# budget: per-tick estimated requests never exceed max_requests_per_second
+# times poll_interval. Over-budget targets are deferred to the next tick,
+# oldest-last-observed first.
+max_requests_per_tick = 1000
+max_requests_per_second = 5
 
 [outbox]
 poll_interval = "5s"

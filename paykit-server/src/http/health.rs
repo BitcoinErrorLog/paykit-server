@@ -19,9 +19,19 @@ struct LiveResponse {
 struct ReadyResponse {
     status: &'static str,
     postgres: &'static str,
-    electrum: &'static str,
+    electrum: ElectrumResponse,
     paykit_delivery: &'static str,
     outbox: &'static str,
+}
+
+#[derive(Serialize)]
+struct ElectrumResponse {
+    state: &'static str,
+    available: bool,
+    tip_height: Option<u32>,
+    tip_age_secs: Option<u64>,
+    last_probe_at: Option<u64>,
+    genesis_ok: bool,
 }
 
 pub fn router(runtime: Arc<Runtime>) -> Router {
@@ -45,7 +55,14 @@ async fn ready(State(runtime): State<Arc<Runtime>>) -> impl IntoResponse {
     let body = Json(ReadyResponse {
         status,
         postgres: report.postgres.as_str(),
-        electrum: report.electrum.as_str(),
+        electrum: ElectrumResponse {
+            state: report.electrum.as_str(),
+            available: report.electrum_probe.available,
+            tip_height: report.electrum_probe.tip_height,
+            tip_age_secs: report.electrum_probe.tip_age_secs,
+            last_probe_at: report.electrum_probe.last_probe_at,
+            genesis_ok: report.electrum_probe.genesis_ok,
+        },
         paykit_delivery: report.paykit_delivery.as_str(),
         outbox: report.outbox.as_str(),
     });

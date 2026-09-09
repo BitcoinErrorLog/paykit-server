@@ -23,6 +23,7 @@ pub struct Metrics {
     outbox_permanent_failures: Counter,
     electrum_available: Gauge,
     electrum_last_success_age_seconds: Gauge,
+    electrum_backlog_oldest_age_seconds: Gauge,
     payment_states: Gauge,
     runtime_active: Gauge,
     session_validation_results: Counter,
@@ -38,6 +39,7 @@ impl Metrics {
         let outbox_permanent_failures = Counter::default();
         let electrum_available = Gauge::default();
         let electrum_last_success_age_seconds = Gauge::default();
+        let electrum_backlog_oldest_age_seconds = Gauge::default();
         let payment_states = Gauge::default();
         let runtime_active = Gauge::default();
         let session_validation_results = Counter::default();
@@ -77,6 +79,11 @@ impl Metrics {
             electrum_last_success_age_seconds.clone(),
         );
         registry.register(
+            "paykit_electrum_backlog_oldest_age_seconds",
+            "Age of the oldest pending Electrum observation.",
+            electrum_backlog_oldest_age_seconds.clone(),
+        );
+        registry.register(
             "paykit_payment_states",
             "Aggregate persisted payment-state count.",
             payment_states.clone(),
@@ -100,6 +107,7 @@ impl Metrics {
             outbox_permanent_failures,
             electrum_available,
             electrum_last_success_age_seconds,
+            electrum_backlog_oldest_age_seconds,
             payment_states,
             runtime_active,
             session_validation_results,
@@ -124,6 +132,9 @@ impl Metrics {
     }
     pub fn set_electrum_last_success_age_seconds(&self, seconds: i64) {
         self.electrum_last_success_age_seconds.set(seconds.max(0));
+    }
+    pub fn set_electrum_backlog_oldest_age_seconds(&self, seconds: i64) {
+        self.electrum_backlog_oldest_age_seconds.set(seconds.max(0));
     }
     pub fn set_payment_states(&self, value: i64) {
         self.payment_states.set(value);

@@ -13,7 +13,7 @@ use paykit_server::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
         NewReaderPayloadFactory, NewReaderPayloads, PersistenceError, run_migrations,
     },
-    workers::observer::{ElectrumPort, ObserverError, observe_once},
+    workers::observer::{ElectrumPort, ObservationReport, ObserverError, TipProbe, observe_once},
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::Row;
@@ -189,9 +189,25 @@ struct FixedBatch(Vec<ObservedOutput>);
 impl ElectrumPort for FixedBatch {
     async fn observations(
         &self,
-        _targets: &[ObservationTarget],
-    ) -> Result<Vec<ObservedOutput>, ObserverError> {
-        Ok(self.0.clone())
+        targets: &[ObservationTarget],
+    ) -> Result<ObservationReport, ObserverError> {
+        Ok(ObservationReport {
+            outputs: self.0.clone(),
+            history: targets
+                .iter()
+                .map(|target| paykit_server::workers::observer::TargetHistory {
+                    address: target.address().to_owned(),
+                    tx_count: 0,
+                })
+                .collect(),
+        })
+    }
+
+    async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        Ok(TipProbe {
+            height: 0,
+            time_unix: 0,
+        })
     }
 }
 
@@ -1179,5 +1195,54 @@ async fn payment_record_integrity_rejects_row_and_type_envelope_swaps() {
         Err(PersistenceError::CorruptOrMissing)
     );
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn observation_plan_orders_oldest_observed_first_and_records_tick_budget_facts() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+    store
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator(),
+            reader: &reader(),
+            bundle_binding: b"plan-bundle-b",
+            payment_request_binding: b"plan-request-b",
+            new_reader_payloads: &FixedPayloads("plan-address-b"),
+            payment_request_intent: common::payment_intent(&reader()),
+            required_sats: 100,
+        })
+        .await
+        .unwrap();
+
+    let plan = store.observation_plan().await.unwrap();
+    assert_eq!(plan.len(), 2);
+    assert_eq!(plan[0].target().address(), REGTEST_ADDRESS);
+    assert_eq!(plan[1].target().address(), "plan-address-b");
+    assert_eq!(plan[0].history_tx_count(), None);
+    assert_eq!(plan[1].history_tx_count(), None);
+
+    store
+        .record_observation_tick(&[paykit_server::bitcoin::TargetTickRecord::new(
+            REGTEST_ADDRESS,
+            7,
+        )])
+        .await
+        .unwrap();
+
+    let plan = store.observation_plan().await.unwrap();
+    assert_eq!(plan.len(), 2);
+    assert_eq!(plan[0].target().address(), "plan-address-b");
+    assert_eq!(plan[1].target().address(), REGTEST_ADDRESS);
+    assert_eq!(plan[1].history_tx_count(), Some(7));
+    let persisted: (Option<i32>, bool) = sqlx::query_as(
+        "SELECT observation_history_tx_count, last_observed_at IS NOT NULL \
+         FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(persisted, (Some(7), true));
     database.cleanup().await;
 }

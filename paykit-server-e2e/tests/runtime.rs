@@ -1,10 +1,13 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use paykit_server::{
     Server,
+    bitcoin::ObservationTarget,
     config::{Config, ConfigEnvironment},
     persistence::run_migrations,
     runtime::ComponentState,
+    workers::observer::{ElectrumPort, ObservationReport, ObserverError, TargetHistory, TipProbe},
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use pubky_testnet::EphemeralTestnet;
@@ -78,6 +81,36 @@ async fn unavailable_electrum_endpoint() -> String {
     endpoint
 }
 
+/// Injected Electrum whose active probe always succeeds, so readiness no
+/// longer depends on the removed empty-target shortcut.
+struct HealthyElectrum;
+
+#[async_trait]
+impl ElectrumPort for HealthyElectrum {
+    async fn observations(
+        &self,
+        targets: &[ObservationTarget],
+    ) -> Result<ObservationReport, ObserverError> {
+        Ok(ObservationReport {
+            outputs: Vec::new(),
+            history: targets
+                .iter()
+                .map(|target| TargetHistory {
+                    address: target.address().to_owned(),
+                    tx_count: 0,
+                })
+                .collect(),
+        })
+    }
+
+    async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        Ok(TipProbe {
+            height: 100,
+            time_unix: 1_700_000_000,
+        })
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn production_workers_publish_startup_evidence_before_readiness() {
     let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
@@ -85,10 +118,11 @@ async fn production_workers_publish_startup_evidence_before_readiness() {
     run_migrations(database.pool()).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let endpoint = unavailable_electrum_endpoint().await;
-    let server = Server::build_with_pubky(
+    let server = Server::build_with_transports(
         config(database.database_url(), &endpoint, "1s"),
         database.pool().clone(),
         testnet.sdk().unwrap(),
+        Arc::new(HealthyElectrum),
     )
     .await
     .unwrap();

@@ -209,7 +209,7 @@ stack_role = "proof"
 
 [electrum]
 endpoint = "{electrum_endpoint}"
-poll_interval = "50ms"
+poll_interval = "1s"
 request_timeout = "50ms"
 connect_retries = 0
 

@@ -1,6 +1,6 @@
 //! Direct Bitcoin observation boundary for invoice-specific addresses.
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use bitcoin::OutPoint;
 
@@ -200,4 +200,84 @@ pub enum ObservationAction {
     Update,
     Replace,
     Ignore,
+}
+
+/// One scheduled observation target together with its request-budget
+/// metadata. `history_tx_count` is the transaction count returned by the
+/// previous tick's history fetch (`None` = unknown, budgeted as 1), and
+/// `staleness` is the age of the last successful observation (or of the
+/// invoice itself when it has never been observed).
+#[derive(Clone, PartialEq, Eq)]
+pub struct PlannedObservation {
+    target: ObservationTarget,
+    history_tx_count: Option<u32>,
+    staleness: Duration,
+}
+
+impl PlannedObservation {
+    pub fn new(
+        target: ObservationTarget,
+        history_tx_count: Option<u32>,
+        staleness: Duration,
+    ) -> Self {
+        Self {
+            target,
+            history_tx_count,
+            staleness,
+        }
+    }
+
+    pub fn target(&self) -> &ObservationTarget {
+        &self.target
+    }
+
+    pub fn history_tx_count(&self) -> Option<u32> {
+        self.history_tx_count
+    }
+
+    pub fn staleness(&self) -> Duration {
+        self.staleness
+    }
+
+    /// Estimated Electrum requests for observing this target once: one
+    /// history fetch plus one request per known history transaction.
+    pub fn estimated_requests(&self) -> u64 {
+        1 + u64::from(self.history_tx_count.unwrap_or(1))
+    }
+}
+
+impl fmt::Debug for PlannedObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlannedObservation")
+            .field("target", &self.target)
+            .field("history_tx_count", &self.history_tx_count)
+            .field("staleness", &self.staleness)
+            .finish()
+    }
+}
+
+/// Persisted budget fact for one successfully observed target: the number of
+/// transactions the previous history fetch returned for its address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetTickRecord {
+    address: String,
+    history_tx_count: u32,
+}
+
+impl TargetTickRecord {
+    pub fn new(address: impl Into<String>, history_tx_count: u32) -> Self {
+        Self {
+            address: address.into(),
+            history_tx_count,
+        }
+    }
+
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub fn history_tx_count(&self) -> u32 {
+        self.history_tx_count
+    }
 }

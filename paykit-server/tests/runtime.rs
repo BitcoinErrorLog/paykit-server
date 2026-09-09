@@ -14,8 +14,8 @@ use axum::{
     routing::get,
 };
 use paykit_server::runtime::{
-    ComponentState, DependencyCheck, PostgresDependency, Runtime, operational_router,
-    shutdown_and_drain,
+    ComponentState, DependencyCheck, ElectrumProbe, PostgresDependency, Runtime,
+    operational_router, shutdown_and_drain,
 };
 use paykit_server::{
     Server,
@@ -95,6 +95,9 @@ async fn task9_components_start_not_ready_until_runtime_evidence_arrives() {
     runtime.set_electrum_available(true);
     runtime.set_paykit_delivery_available(true);
     runtime.set_outbox_available(true);
+    // Without a fresh probe, worker evidence alone leaves Electrum degraded.
+    assert_eq!(runtime.readiness().await.status, ComponentState::Degraded);
+    runtime.record_electrum_probe(ElectrumProbe::success(1, 1_700_000_000));
     assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
 }
 
@@ -141,6 +144,7 @@ async fn task9_panicking_request_releases_admission_for_shutdown_drain() {
 async fn health_schemas_and_status_codes_are_secret_free() {
     let runtime = runtime(true, 1);
     runtime.set_electrum_available(true);
+    runtime.record_electrum_probe(ElectrumProbe::success(800_000, 1_700_000_000));
     runtime.set_paykit_delivery_available(true);
     runtime.set_outbox_available(true);
     let app = operational_router(Router::new(), runtime);
@@ -159,10 +163,34 @@ async fn health_schemas_and_status_codes_are_secret_free() {
         .await
         .unwrap();
     assert_eq!(ready.status(), StatusCode::OK);
-    assert_eq!(
-        to_bytes(ready.into_body(), 1024).await.unwrap(),
-        "{\"status\":\"ready\",\"postgres\":\"ready\",\"electrum\":\"ready\",\"paykit_delivery\":\"ready\",\"outbox\":\"ready\"}"
-    );
+    let body = to_bytes(ready.into_body(), 1024).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["status"], "ready");
+    assert_eq!(parsed["postgres"], "ready");
+    assert_eq!(parsed["paykit_delivery"], "ready");
+    assert_eq!(parsed["outbox"], "ready");
+    let electrum = &parsed["electrum"];
+    assert_eq!(electrum["state"], "ready");
+    assert_eq!(electrum["available"], true);
+    assert_eq!(electrum["tip_height"], 800_000);
+    assert_eq!(electrum["genesis_ok"], true);
+    assert!(electrum["tip_age_secs"].as_u64().is_some());
+    assert!(electrum["last_probe_at"].as_u64().is_some());
+}
+
+#[tokio::test]
+async fn health_reports_electrum_unavailable_without_a_fresh_probe() {
+    let runtime = runtime(true, 1);
+    runtime.set_electrum_available(true);
+    runtime.record_electrum_probe(ElectrumProbe::genesis_mismatch());
+    runtime.set_paykit_delivery_available(true);
+    runtime.set_outbox_available(true);
+
+    let report = runtime.readiness().await;
+    assert_eq!(report.electrum, ComponentState::Degraded);
+    assert!(!report.electrum_probe.available);
+    assert!(!report.electrum_probe.genesis_ok);
+    assert!(report.electrum_probe.last_probe_at.is_some());
 }
 
 #[tokio::test]

@@ -14,7 +14,10 @@ use zeroize::Zeroizing;
 use crate::{
     application::payment_status::PersistedPaymentStatus,
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
-    bitcoin::{DirectBinding, ObservationAction, ObservationTarget, TrackedOutput},
+    bitcoin::{
+        DirectBinding, ObservationAction, ObservationTarget, PlannedObservation, TargetTickRecord,
+        TrackedOutput,
+    },
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
     domain::locks::{CreatorPubky, ReaderPubky},
     domain::payment::BitcoinOutpoint,
@@ -255,78 +258,157 @@ impl InvoiceStore {
         .map_err(|_| PersistenceError::Unavailable)?;
 
         rows.into_iter()
+            .map(|row| self.decrypt_target(row))
+            .collect()
+    }
+
+    /// Loads every non-final invoice as an authenticated observation plan
+    /// entry, ordered oldest successful observation first so budget exhaustion
+    /// defers the freshest targets rather than the stalest.
+    pub async fn observation_plan(&self) -> Result<Vec<PlannedObservation>, PersistenceError> {
+        let rows = sqlx::query_as::<_, ObservationPlanRow>(
+            "SELECT invoices.id AS invoice_id, creators.creator_lookup_hash, \
+                    invoices.payment_record_envelope, invoices.bitcoin_address_lookup_hash, \
+                    invoices.derivation_index_lookup_hash, observations.id AS observation_id, \
+                    observations.observation_envelope, observations.outpoint_lookup_hash, \
+                    invoices.observation_history_tx_count, \
+                    GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (NOW() - \
+                        COALESCE(invoices.last_observed_at, invoices.created_at)))))::BIGINT \
+                        AS staleness_secs \
+             FROM invoices JOIN creators ON creators.id = invoices.creator_id \
+             LEFT JOIN bitcoin_observations AS observations \
+               ON observations.invoice_id = invoices.id AND observations.active \
+             WHERE NOT (invoices.payment_status = 'confirmed' \
+                        AND invoices.confirmation_count = 6 AND invoices.amount_matched) \
+             ORDER BY COALESCE(invoices.last_observed_at, invoices.created_at), invoices.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+
+        rows.into_iter()
             .map(|row| {
-                let creator_hash = lookup_hash_from_storage(&row.creator_lookup_hash)?;
+                let staleness_secs = u64::try_from(row.staleness_secs)
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                let history_tx_count = row
+                    .observation_history_tx_count
+                    .map(u32::try_from)
+                    .transpose()
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                let target = self.decrypt_target(row.target)?;
+                Ok(PlannedObservation::new(
+                    target,
+                    history_tx_count,
+                    std::time::Duration::from_secs(staleness_secs),
+                ))
+            })
+            .collect()
+    }
+
+    /// Records the previous tick's per-target history sizes and stamps every
+    /// recorded target as successfully observed just now.
+    pub async fn record_observation_tick(
+        &self,
+        records: &[TargetTickRecord],
+    ) -> Result<(), PersistenceError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        for record in records {
+            let address_lookup_hash = self
+                .crypto
+                .bitcoin_address_lookup_hash(record.address().as_bytes());
+            let history_tx_count = i32::try_from(record.history_tx_count())
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            sqlx::query(
+                "UPDATE invoices SET observation_history_tx_count = $1, \
+                 last_observed_at = NOW(), updated_at = NOW() \
+                 WHERE bitcoin_address_lookup_hash = $2",
+            )
+            .bind(history_tx_count)
+            .bind(address_lookup_hash.as_bytes().as_slice())
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
+        tx.commit().await.map_err(|_| PersistenceError::Unavailable)
+    }
+
+    fn decrypt_target(
+        &self,
+        row: ObservationTargetRow,
+    ) -> Result<ObservationTarget, PersistenceError> {
+        let creator_hash = lookup_hash_from_storage(&row.creator_lookup_hash)?;
+        let plaintext = self
+            .crypto
+            .decrypt(
+                &EnvelopeContext::invoice_payment_record(creator_hash, row.invoice_id),
+                &EncryptedEnvelope::from_bytes(row.payment_record_envelope),
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let payment: InvoicePaymentRecordV1 =
+            postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        if payment.version != 1
+            || row.bitcoin_address_lookup_hash
+                != self
+                    .crypto
+                    .bitcoin_address_lookup_hash(payment.bitcoin_address.as_bytes())
+                    .as_bytes()
+            || row.derivation_index_lookup_hash
+                != self
+                    .crypto
+                    .bitcoin_derivation_index_lookup_hash(creator_hash, payment.derivation_index)
+                    .as_bytes()
+        {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+
+        let current = match (
+            row.observation_id,
+            row.observation_envelope,
+            row.outpoint_lookup_hash,
+        ) {
+            (None, None, None) => None,
+            (Some(id), Some(envelope), Some(outpoint_hash)) => {
                 let plaintext = self
                     .crypto
                     .decrypt(
-                        &EnvelopeContext::invoice_payment_record(creator_hash, row.invoice_id),
-                        &EncryptedEnvelope::from_bytes(row.payment_record_envelope),
+                        &EnvelopeContext::bitcoin_observation_for_invoice(
+                            creator_hash,
+                            id,
+                            row.invoice_id,
+                        ),
+                        &EncryptedEnvelope::from_bytes(envelope),
                     )
                     .map_err(|_| PersistenceError::CorruptOrMissing)?;
-                let payment: InvoicePaymentRecordV1 = postcard::from_bytes(&plaintext)
+                let observation: BitcoinObservationV1 = postcard::from_bytes(&plaintext)
                     .map_err(|_| PersistenceError::CorruptOrMissing)?;
-                if payment.version != 1
-                    || row.bitcoin_address_lookup_hash
+                if observation.version != 1
+                    || outpoint_hash
                         != self
                             .crypto
-                            .bitcoin_address_lookup_hash(payment.bitcoin_address.as_bytes())
-                            .as_bytes()
-                    || row.derivation_index_lookup_hash
-                        != self
-                            .crypto
-                            .bitcoin_derivation_index_lookup_hash(
-                                creator_hash,
-                                payment.derivation_index,
-                            )
+                            .bitcoin_outpoint_lookup_hash(observation.outpoint.as_bytes())
                             .as_bytes()
                 {
                     return Err(PersistenceError::CorruptOrMissing);
                 }
-
-                let current = match (
-                    row.observation_id,
-                    row.observation_envelope,
-                    row.outpoint_lookup_hash,
-                ) {
-                    (None, None, None) => None,
-                    (Some(id), Some(envelope), Some(outpoint_hash)) => {
-                        let plaintext = self
-                            .crypto
-                            .decrypt(
-                                &EnvelopeContext::bitcoin_observation_for_invoice(
-                                    creator_hash,
-                                    id,
-                                    row.invoice_id,
-                                ),
-                                &EncryptedEnvelope::from_bytes(envelope),
-                            )
-                            .map_err(|_| PersistenceError::CorruptOrMissing)?;
-                        let observation: BitcoinObservationV1 = postcard::from_bytes(&plaintext)
-                            .map_err(|_| PersistenceError::CorruptOrMissing)?;
-                        if observation.version != 1
-                            || outpoint_hash
-                                != self
-                                    .crypto
-                                    .bitcoin_outpoint_lookup_hash(observation.outpoint.as_bytes())
-                                    .as_bytes()
-                        {
-                            return Err(PersistenceError::CorruptOrMissing);
-                        }
-                        let outpoint = observation
-                            .outpoint
-                            .parse::<bitcoin::OutPoint>()
-                            .map_err(|_| PersistenceError::CorruptOrMissing)?;
-                        if outpoint.to_string() != observation.outpoint {
-                            return Err(PersistenceError::CorruptOrMissing);
-                        }
-                        Some(TrackedOutput::new(outpoint, observation.observed_sats))
-                    }
-                    _ => return Err(PersistenceError::CorruptOrMissing),
-                };
-                Ok(ObservationTarget::new(payment.bitcoin_address, current))
-            })
-            .collect()
+                let outpoint = observation
+                    .outpoint
+                    .parse::<bitcoin::OutPoint>()
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                if outpoint.to_string() != observation.outpoint {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                Some(TrackedOutput::new(outpoint, observation.observed_sats))
+            }
+            _ => return Err(PersistenceError::CorruptOrMissing),
+        };
+        Ok(ObservationTarget::new(payment.bitcoin_address, current))
     }
 
     /// Checks durable invoice idempotency before mutable external validation.
@@ -1119,6 +1201,14 @@ struct ObservationTargetRow {
     observation_id: Option<Uuid>,
     observation_envelope: Option<Vec<u8>>,
     outpoint_lookup_hash: Option<Vec<u8>>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ObservationPlanRow {
+    #[sqlx(flatten)]
+    target: ObservationTargetRow,
+    observation_history_tx_count: Option<i32>,
+    staleness_secs: i64,
 }
 
 #[derive(sqlx::FromRow)]

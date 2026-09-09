@@ -88,6 +88,8 @@ impl Config {
                 poll_interval: raw.electrum.poll_interval,
                 request_timeout: raw.electrum.request_timeout,
                 connect_retries: raw.electrum.connect_retries,
+                max_requests_per_tick: raw.electrum.max_requests_per_tick,
+                max_requests_per_second: raw.electrum.max_requests_per_second,
             },
             outbox: OutboxConfig::from(raw.outbox),
             limits: LimitsConfig::from(raw.limits),
@@ -139,6 +141,14 @@ impl Config {
         }
         for (name, value) in [
             ("outbox.batch_size", u64::from(self.outbox.batch_size)),
+            (
+                "electrum.max_requests_per_tick",
+                u64::from(self.electrum.max_requests_per_tick),
+            ),
+            (
+                "electrum.max_requests_per_second",
+                u64::from(self.electrum.max_requests_per_second),
+            ),
             ("limits.request_body_bytes", self.limits.request_body_bytes),
             (
                 "limits.lock_resource_bytes",
@@ -175,6 +185,7 @@ impl Config {
             }
         }
         for (name, value) in [
+            ("electrum.poll_interval", self.electrum.poll_interval),
             ("outbox.lease_duration", self.outbox.lease_duration),
             ("outbox.retry_initial", self.outbox.retry_initial),
             ("outbox.retry_max", self.outbox.retry_max),
@@ -483,6 +494,11 @@ pub struct ElectrumConfig {
     pub poll_interval: Duration,
     pub request_timeout: Duration,
     pub connect_retries: u8,
+    /// Hard cap on Electrum requests issued per observer tick.
+    pub max_requests_per_tick: u32,
+    /// Sustained request budget: per-tick estimated requests must not exceed
+    /// this rate times the poll interval.
+    pub max_requests_per_second: u32,
 }
 
 #[derive(Debug)]
@@ -729,6 +745,18 @@ struct RawElectrumConfig {
     request_timeout: Duration,
     #[serde(default = "default_electrum_connect_retries")]
     connect_retries: u8,
+    #[serde(default = "default_electrum_max_requests_per_tick")]
+    max_requests_per_tick: u32,
+    #[serde(default = "default_electrum_max_requests_per_second")]
+    max_requests_per_second: u32,
+}
+
+const fn default_electrum_max_requests_per_tick() -> u32 {
+    1000
+}
+
+const fn default_electrum_max_requests_per_second() -> u32 {
+    5
 }
 
 fn default_electrum_request_timeout() -> Duration {

@@ -2,10 +2,10 @@
 
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -77,11 +77,97 @@ impl Drop for AdmissionGuard {
     }
 }
 
+/// One recorded Electrum tip probe. A probe that reached the endpoint but
+/// proved the wrong chain records `genesis_ok: false` with no tip facts.
+#[derive(Clone, Copy, Debug)]
+pub struct ElectrumProbe {
+    probed_at: Instant,
+    probed_at_unix: u64,
+    tip_height: Option<u32>,
+    tip_time_unix: Option<u32>,
+    genesis_ok: bool,
+}
+
+impl ElectrumProbe {
+    /// Records a successful tip probe against the configured chain.
+    pub fn success(tip_height: u32, tip_time_unix: u32) -> Self {
+        Self {
+            probed_at: Instant::now(),
+            probed_at_unix: unix_now(),
+            tip_height: Some(tip_height),
+            tip_time_unix: Some(tip_time_unix),
+            genesis_ok: true,
+        }
+    }
+
+    /// Records a reached endpoint whose genesis block is not the configured
+    /// network's genesis block.
+    pub fn genesis_mismatch() -> Self {
+        Self {
+            probed_at: Instant::now(),
+            probed_at_unix: unix_now(),
+            tip_height: None,
+            tip_time_unix: None,
+            genesis_ok: false,
+        }
+    }
+
+    fn is_available(&self, freshness: Duration) -> bool {
+        self.genesis_ok && self.probed_at.elapsed() <= freshness
+    }
+
+    /// Secret-free probe report for the health surface.
+    pub fn report(&self, freshness: Duration) -> ElectrumProbeReport {
+        let now = unix_now();
+        ElectrumProbeReport {
+            available: self.is_available(freshness),
+            tip_height: self.tip_height,
+            tip_age_secs: self
+                .tip_time_unix
+                .map(|tip_time| now.saturating_sub(u64::from(tip_time))),
+            last_probe_at: Some(self.probed_at_unix),
+            genesis_ok: self.genesis_ok,
+        }
+    }
+}
+
+/// Health-surface view of the most recent Electrum probe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ElectrumProbeReport {
+    pub available: bool,
+    pub tip_height: Option<u32>,
+    pub tip_age_secs: Option<u64>,
+    pub last_probe_at: Option<u64>,
+    pub genesis_ok: bool,
+}
+
+impl ElectrumProbeReport {
+    fn never_probed() -> Self {
+        Self {
+            available: false,
+            tip_height: None,
+            tip_age_secs: None,
+            last_probe_at: None,
+            genesis_ok: false,
+        }
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+const DEFAULT_ELECTRUM_PROBE_FRESHNESS: Duration = Duration::from_secs(20);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Readiness {
     pub status: ComponentState,
     pub postgres: ComponentState,
     pub electrum: ComponentState,
+    pub electrum_probe: ElectrumProbeReport,
     pub paykit_delivery: ComponentState,
     pub outbox: ComponentState,
 }
@@ -116,6 +202,8 @@ pub struct Runtime {
     idle: Notify,
     capacity: Arc<tokio::sync::Semaphore>,
     electrum: AtomicU8,
+    electrum_probe: Mutex<Option<ElectrumProbe>>,
+    electrum_probe_freshness: Mutex<Duration>,
     paykit_enqueue: AtomicU8,
     paykit_reconciliation: AtomicU8,
     outbox_enqueue: AtomicU8,
@@ -139,6 +227,8 @@ impl Runtime {
             idle: Notify::new(),
             capacity: Arc::new(tokio::sync::Semaphore::new(max_concurrent_requests)),
             electrum: AtomicU8::new(NOT_READY),
+            electrum_probe: Mutex::new(None),
+            electrum_probe_freshness: Mutex::new(DEFAULT_ELECTRUM_PROBE_FRESHNESS),
             paykit_enqueue: AtomicU8::new(NOT_READY),
             paykit_reconciliation: AtomicU8::new(NOT_READY),
             outbox_enqueue: AtomicU8::new(NOT_READY),
@@ -159,6 +249,32 @@ impl Runtime {
         self.electrum
             .store(if available { READY } else { DEGRADED }, Ordering::Release);
         self.metrics.set_electrum_available(available);
+    }
+    /// Records the most recent Electrum tip probe result.
+    pub fn record_electrum_probe(&self, probe: ElectrumProbe) {
+        *self
+            .electrum_probe
+            .lock()
+            .expect("electrum probe mutex is not poisoned") = Some(probe);
+    }
+    /// Sets the observer poll interval; a probe older than two intervals is
+    /// stale and Electrum is reported unavailable.
+    pub fn set_electrum_probe_interval(&self, poll_interval: Duration) {
+        *self
+            .electrum_probe_freshness
+            .lock()
+            .expect("electrum probe freshness mutex is not poisoned") = 2 * poll_interval;
+    }
+    fn electrum_probe_report(&self) -> ElectrumProbeReport {
+        let freshness = *self
+            .electrum_probe_freshness
+            .lock()
+            .expect("electrum probe freshness mutex is not poisoned");
+        self.electrum_probe
+            .lock()
+            .expect("electrum probe mutex is not poisoned")
+            .map(|probe| probe.report(freshness))
+            .unwrap_or_else(ElectrumProbeReport::never_probed)
     }
     pub fn set_paykit_delivery_available(&self, available: bool) {
         self.set_paykit_enqueue_available(available);
@@ -211,7 +327,12 @@ impl Runtime {
         } else {
             ComponentState::Ready
         };
-        let electrum = ComponentState::from_atomic(self.electrum.load(Ordering::Acquire));
+        let electrum_probe = self.electrum_probe_report();
+        let electrum = match ComponentState::from_atomic(self.electrum.load(Ordering::Acquire)) {
+            ComponentState::NotReady => ComponentState::NotReady,
+            ComponentState::Ready if electrum_probe.available => ComponentState::Ready,
+            _ => ComponentState::Degraded,
+        };
         let paykit_delivery = ComponentState::combine(
             ComponentState::from_atomic(self.paykit_enqueue.load(Ordering::Acquire)),
             ComponentState::from_atomic(self.paykit_reconciliation.load(Ordering::Acquire)),
@@ -238,6 +359,7 @@ impl Runtime {
             status,
             postgres,
             electrum,
+            electrum_probe,
             paykit_delivery,
             outbox,
         }
@@ -377,6 +499,7 @@ mod tests {
     async fn task9_composite_worker_health_requires_both_owned_loops() {
         let runtime = Runtime::new(Arc::new(ReadyPostgres), 1);
         runtime.set_electrum_available(true);
+        runtime.record_electrum_probe(ElectrumProbe::success(1, 1_700_000_000));
 
         runtime.set_outbox_enqueue_available(true);
         runtime.set_paykit_enqueue_available(true);

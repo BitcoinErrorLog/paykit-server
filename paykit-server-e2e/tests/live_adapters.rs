@@ -277,7 +277,8 @@ async fn live_electrum_observes_known_output_and_confirmations() {
             Some(TrackedOutput::new(outpoint, sats)),
         )])
         .await
-        .unwrap();
+        .unwrap()
+        .outputs;
 
     let observation = observations
         .iter()

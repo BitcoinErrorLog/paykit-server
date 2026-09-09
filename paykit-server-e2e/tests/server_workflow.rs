@@ -41,7 +41,7 @@ use paykit_server::{
     domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
     persistence::{CreatorCredentials, CreatorStore, PostgresStorageAdapter, SdkStateStore},
     startup::initialize_database,
-    workers::observer::{ElectrumPort, ObserverError},
+    workers::observer::{ElectrumPort, ObservationReport, ObserverError, TargetHistory, TipProbe},
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
@@ -111,22 +111,38 @@ impl ElectrumPort for DeterministicElectrum {
     async fn observations(
         &self,
         targets: &[ObservationTarget],
-    ) -> Result<Vec<ObservedOutput>, ObserverError> {
-        Ok(targets
-            .iter()
-            .filter_map(|target| {
-                self.outputs
-                    .get(target.address())
-                    .map(|(sats, outpoint)| ObservedOutput {
-                        network: BitcoinNetwork::Testnet,
-                        address: target.address().to_owned(),
-                        outpoint: *outpoint,
-                        sats: *sats,
-                        confirmations: 6,
-                        present: true,
-                    })
-            })
-            .collect())
+    ) -> Result<ObservationReport, ObserverError> {
+        Ok(ObservationReport {
+            outputs: targets
+                .iter()
+                .filter_map(|target| {
+                    self.outputs
+                        .get(target.address())
+                        .map(|(sats, outpoint)| ObservedOutput {
+                            network: BitcoinNetwork::Testnet,
+                            address: target.address().to_owned(),
+                            outpoint: *outpoint,
+                            sats: *sats,
+                            confirmations: 6,
+                            present: true,
+                        })
+                })
+                .collect(),
+            history: targets
+                .iter()
+                .map(|target| TargetHistory {
+                    address: target.address().to_owned(),
+                    tx_count: u32::from(self.outputs.contains_key(target.address())),
+                })
+                .collect(),
+        })
+    }
+
+    async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        Ok(TipProbe {
+            height: 100,
+            time_unix: 1_700_000_000,
+        })
     }
 }
 
@@ -363,7 +379,7 @@ network = "testnet"
 stack_role = "proof"
 [electrum]
 endpoint = "tcp://127.0.0.1:1"
-poll_interval = "{poll_interval}"
+poll_interval = "1s"
 request_timeout = "1s"
 connect_retries = 0
 [outbox]

@@ -58,7 +58,8 @@ async fn emits_typed_output_identity_amount_and_confirmations_from_electrum() {
     let observations = adapter
         .observations(&[ObservationTarget::new(address.to_string(), None)])
         .await
-        .unwrap();
+        .unwrap()
+        .outputs;
 
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0].outpoint, OutPoint::new(txid, 0));
@@ -91,7 +92,8 @@ async fn emits_absence_when_a_tracked_prefinal_outpoint_disappears_from_history(
             Some(TrackedOutput::new(outpoint, 90_000)),
         )])
         .await
-        .unwrap();
+        .unwrap()
+        .outputs;
 
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0].outpoint, outpoint);
@@ -195,7 +197,8 @@ async fn treats_nonpositive_history_heights_as_unconfirmed_through_bdk() {
     let observations = adapter
         .observations(&[ObservationTarget::new(address.to_string(), None)])
         .await
-        .unwrap();
+        .unwrap()
+        .outputs;
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0].confirmations, 0);
     assert!(observations[0].present);
@@ -235,8 +238,14 @@ async fn reconnects_and_reuses_the_same_adapter_after_transport_disconnect() {
     .unwrap();
     let targets = [ObservationTarget::new(address.to_string(), None)];
 
-    assert_eq!(adapter.observations(&targets).await.unwrap().len(), 1);
-    assert_eq!(adapter.observations(&targets).await.unwrap().len(), 1);
+    assert_eq!(
+        adapter.observations(&targets).await.unwrap().outputs.len(),
+        1
+    );
+    assert_eq!(
+        adapter.observations(&targets).await.unwrap().outputs.len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -453,4 +462,58 @@ fn serve_connection(mut stream: TcpStream, fixture: Arc<ProtocolFixture>) {
             break;
         }
     }
+}
+
+#[tokio::test]
+async fn probe_reports_the_tip_and_verifies_the_endpoint_genesis() {
+    let server = ProtocolServer::start_empty(Network::Regtest, 120, ScriptBuf::new()).await;
+    let adapter = ElectrumAdapter::connect(
+        server.endpoint(),
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(1),
+        1,
+    )
+    .await
+    .unwrap();
+
+    let tip = adapter.probe().await.unwrap();
+    assert_eq!(tip.height, 120);
+    assert!(tip.time_unix > 0);
+}
+
+#[tokio::test]
+async fn probe_rejects_an_endpoint_serving_the_wrong_genesis() {
+    let server = ProtocolServer::start_empty(Network::Signet, 120, ScriptBuf::new()).await;
+    let adapter = ElectrumAdapter::connect(
+        server.endpoint(),
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(1),
+        1,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        adapter.probe().await,
+        Err(paykit_server::workers::observer::ObserverError::WrongNetwork)
+    );
+}
+
+#[tokio::test]
+async fn probe_classifies_endpoint_outage_as_retryable_unavailable() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let adapter = ElectrumAdapter::configured(
+        endpoint,
+        BitcoinNetwork::Regtest,
+        Duration::from_millis(50),
+        0,
+    )
+    .unwrap();
+
+    assert_eq!(
+        adapter.probe().await,
+        Err(paykit_server::workers::observer::ObserverError::Unavailable)
+    );
 }

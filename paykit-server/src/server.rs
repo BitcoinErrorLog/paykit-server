@@ -27,7 +27,10 @@ use crate::{
     setup::{SetupLimits, SetupService, SystemClock},
     setup_orchestration::PubkyCompanionRelay,
     workers::{
-        observer::{ElectrumAdapter, ElectrumPort, ObserverError, observe_once},
+        observer::{
+            ElectrumAdapter, ElectrumPort, ObservationBackend, ObserverError, ObserverPolicy,
+            observation_loop,
+        },
         outbox::{ProcessingHealth, process_claim_with_health, process_reconciliation_with_health},
     },
 };
@@ -76,7 +79,7 @@ struct WorkerComponents {
     outbox_lease_duration: Duration,
     outbox_retry_initial: Duration,
     outbox_retry_max: Duration,
-    electrum_poll_interval: Duration,
+    electrum_policy: ObserverPolicy,
 }
 
 impl Server {
@@ -241,6 +244,7 @@ impl Server {
             Arc::new(PostgresDependency::new(pool.clone())),
             64,
         ));
+        runtime.set_electrum_probe_interval(config.electrum.poll_interval);
         let router = operational_router(business_routes, runtime.clone());
         let workers = WorkerComponents {
             pool,
@@ -257,7 +261,11 @@ impl Server {
             outbox_lease_duration: config.outbox.lease_duration,
             outbox_retry_initial: config.outbox.retry_initial,
             outbox_retry_max: config.outbox.retry_max,
-            electrum_poll_interval: config.electrum.poll_interval,
+            electrum_policy: ObserverPolicy {
+                poll_interval: config.electrum.poll_interval,
+                max_requests_per_tick: config.electrum.max_requests_per_tick,
+                max_requests_per_second: config.electrum.max_requests_per_second,
+            },
         };
 
         Ok(Self {
@@ -574,38 +582,14 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
 }
 
 async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
-    let mut interval = tokio::time::interval(workers.electrum_poll_interval);
-    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            _ = runtime.cancelled() => break,
-            _ = interval.tick() => {}
-        }
-        if !runtime.may_start_worker_claim() {
-            break;
-        }
-        let targets = match workers.invoices.observation_targets().await {
-            Ok(targets) => targets,
-            Err(_) => {
-                runtime.set_electrum_available(false);
-                continue;
-            }
-        };
-        if targets.is_empty() {
-            runtime.set_electrum_available(true);
-            continue;
-        }
-        runtime.set_electrum_available(
-            observe_once(
-                workers.electrum.as_ref(),
-                &workers.invoices,
-                &workers.bitcoin_network,
-                &targets,
-            )
-            .await
-            .is_ok(),
-        );
-    }
+    observation_loop(
+        workers.electrum.clone(),
+        Arc::new(workers.invoices.clone()) as Arc<dyn ObservationBackend>,
+        workers.bitcoin_network.clone(),
+        workers.electrum_policy,
+        runtime,
+    )
+    .await;
 }
 
 fn configured_pubky(network: PaykitNetwork) -> Result<Pubky, ServerBuildError> {
