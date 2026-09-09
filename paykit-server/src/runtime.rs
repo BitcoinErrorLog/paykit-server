@@ -79,6 +79,8 @@ impl Drop for AdmissionGuard {
 
 const DEFAULT_ELECTRUM_PROBE_FRESHNESS: Duration = Duration::from_secs(20);
 const DEFAULT_ELECTRUM_MAX_TIP_AGE: Duration = Duration::from_secs(4 * 60 * 60);
+/// Consecutive active probe results required to change offer availability.
+const OFFER_AVAILABILITY_HYSTERESIS: u8 = 3;
 /// A tip timestamp further than this in the future is invalid under
 /// Bitcoin's own MAX_FUTURE_BLOCK_TIME rule: the peer's clock cannot be
 /// trusted, so the tip proves nothing about endpoint freshness.
@@ -256,6 +258,7 @@ pub struct Readiness {
     pub postgres: ComponentState,
     pub electrum: ComponentState,
     pub electrum_probe: ElectrumProbeReport,
+    pub bitcoin_offer_available: bool,
     /// Observation targets currently flagged `observation_overrun` and
     /// excluded from the head-of-line budget bypass.
     pub electrum_overrun_targets: u64,
@@ -290,6 +293,9 @@ impl DependencyCheck for PostgresDependency {
 struct ElectrumProbeState {
     probe: Option<ElectrumProbe>,
     progress: TipProgress,
+    consecutive_probe_failures: u8,
+    consecutive_probe_successes: u8,
+    offer_available: bool,
 }
 
 /// Shared, injectable lifecycle state. Worker adapters report availability here;
@@ -332,7 +338,10 @@ impl Runtime {
             electrum: AtomicU8::new(NOT_READY),
             electrum_overrun_targets: AtomicU64::new(0),
             bitcoin_creation_enabled: AtomicBool::new(true),
-            electrum_probe: Mutex::new(ElectrumProbeState::default()),
+            electrum_probe: Mutex::new(ElectrumProbeState {
+                offer_available: true,
+                ..ElectrumProbeState::default()
+            }),
             electrum_probe_freshness: Mutex::new(DEFAULT_ELECTRUM_PROBE_FRESHNESS),
             electrum_max_tip_age: Mutex::new(Some(DEFAULT_ELECTRUM_MAX_TIP_AGE)),
             paykit_enqueue: AtomicU8::new(NOT_READY),
@@ -380,6 +389,32 @@ impl Runtime {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         probe.advance(&mut state.progress);
         state.probe = Some(probe);
+        if probe.genesis_ok {
+            state.consecutive_probe_failures = 0;
+            state.consecutive_probe_successes = state.consecutive_probe_successes.saturating_add(1);
+            if state.consecutive_probe_successes >= OFFER_AVAILABILITY_HYSTERESIS {
+                state.offer_available = true;
+            }
+        } else {
+            state.consecutive_probe_successes = 0;
+            state.consecutive_probe_failures = state.consecutive_probe_failures.saturating_add(1);
+            if state.consecutive_probe_failures >= OFFER_AVAILABILITY_HYSTERESIS {
+                state.offer_available = false;
+            }
+        }
+    }
+    /// Records an active Electrum probe failure for the offer-availability
+    /// hysteresis gate.
+    pub fn record_electrum_probe_failure(&self) {
+        let mut state = self
+            .electrum_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.consecutive_probe_successes = 0;
+        state.consecutive_probe_failures = state.consecutive_probe_failures.saturating_add(1);
+        if state.consecutive_probe_failures >= OFFER_AVAILABILITY_HYSTERESIS {
+            state.offer_available = false;
+        }
     }
     /// Sets the observer poll interval; a probe older than three intervals
     /// (covering ±20% jitter plus tick duration) is stale and Electrum is
@@ -476,6 +511,11 @@ impl Runtime {
             ComponentState::Ready
         };
         let (electrum_probe, probe_verdict) = self.electrum_probe_evaluation();
+        let offer_available = self
+            .electrum_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .offer_available;
         let electrum = match (
             ComponentState::from_atomic(self.electrum.load(Ordering::Acquire)),
             probe_verdict,
@@ -517,6 +557,9 @@ impl Runtime {
             electrum_probe,
             electrum_overrun_targets: self.electrum_overrun_targets.load(Ordering::Acquire),
             bitcoin_creation_enabled: self.bitcoin_creation_enabled.load(Ordering::Acquire),
+            bitcoin_offer_available: self.bitcoin_creation_enabled.load(Ordering::Acquire)
+                && offer_available
+                && probe_verdict != ProbeVerdict::NotReady,
             paykit_delivery,
             outbox,
         }

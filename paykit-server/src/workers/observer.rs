@@ -391,6 +391,7 @@ pub async fn observe_tick(
             return ObserverTickOutcome::ProbeFailed(ObserverError::WrongNetwork);
         }
         Err(error) => {
+            runtime.record_electrum_probe_failure();
             runtime.set_electrum_available(false);
             return ObserverTickOutcome::ProbeFailed(error);
         }

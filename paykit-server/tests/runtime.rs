@@ -112,6 +112,24 @@ async fn task9_components_start_not_ready_until_runtime_evidence_arrives() {
 }
 
 #[tokio::test]
+async fn bitcoin_offer_availability_uses_three_probe_hysteresis() {
+    let runtime = runtime(true, 1);
+
+    assert!(runtime.readiness().await.bitcoin_offer_available);
+    runtime.record_electrum_probe_failure();
+    runtime.record_electrum_probe_failure();
+    assert!(runtime.readiness().await.bitcoin_offer_available);
+    runtime.record_electrum_probe_failure();
+    assert!(!runtime.readiness().await.bitcoin_offer_available);
+
+    runtime.record_electrum_probe(ElectrumProbe::success(1, fresh_tip_time()));
+    runtime.record_electrum_probe(ElectrumProbe::success(2, fresh_tip_time()));
+    assert!(!runtime.readiness().await.bitcoin_offer_available);
+    runtime.record_electrum_probe(ElectrumProbe::success(3, fresh_tip_time()));
+    assert!(runtime.readiness().await.bitcoin_offer_available);
+}
+
+#[tokio::test]
 async fn electrum_readiness_requires_a_fresh_chain_tip_unless_the_check_is_skipped() {
     let runtime = runtime(true, 1);
     runtime.set_electrum_available(true);
@@ -151,6 +169,7 @@ async fn a_stale_tip_fails_readiness_closed_with_http_503() {
     assert_eq!(parsed["status"], "not_ready");
     assert_eq!(parsed["electrum"]["state"], "not_ready");
     assert_eq!(parsed["electrum"]["available"], false);
+    assert_eq!(parsed["bitcoin_offer_available"], false);
 }
 
 #[tokio::test]
@@ -168,6 +187,7 @@ async fn a_tip_height_regression_fails_readiness_closed_until_the_tip_recovers()
     assert!(!report.electrum_probe.available);
     assert_eq!(report.electrum, ComponentState::NotReady);
     assert_eq!(report.status, ComponentState::NotReady);
+    assert!(!report.bitcoin_offer_available);
 
     // The regression stays visible while the tip remains below the
     // previously observed maximum.
@@ -318,6 +338,9 @@ async fn health_schemas_and_status_codes_are_secret_free() {
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(parsed["status"], "ready");
     assert_eq!(parsed["postgres"], "ready");
+    assert_eq!(parsed["bitcoin_offer_available"], true);
+    assert_eq!(parsed["electrum_tip_height"], 800_000);
+    assert!(parsed["electrum_tip_age_seconds"].as_u64().is_some());
     assert_eq!(parsed["paykit_delivery"], "ready");
     assert_eq!(parsed["outbox"], "ready");
     let electrum = &parsed["electrum"];
@@ -342,6 +365,47 @@ async fn health_reports_electrum_unavailable_without_a_fresh_probe() {
     assert!(!report.electrum_probe.available);
     assert!(!report.electrum_probe.genesis_ok);
     assert!(report.electrum_probe.last_probe_at.is_some());
+}
+
+#[tokio::test]
+async fn creation_kill_switch_only_changes_offer_field() {
+    let runtime = runtime(true, 1);
+    runtime.set_electrum_available(true);
+    runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
+    runtime.set_paykit_delivery_available(true);
+    runtime.set_outbox_available(true);
+    let before = runtime.readiness().await;
+    runtime.set_bitcoin_creation_enabled(false);
+    let after = runtime.readiness().await;
+    assert_eq!(after.status, before.status);
+    assert_eq!(after.electrum, before.electrum);
+    assert!(!after.bitcoin_offer_available);
+
+    let app = operational_router(Router::new(), runtime);
+    let ready = app
+        .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+    let body = to_bytes(ready.into_body(), 1024).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["status"], "ready");
+    assert_eq!(parsed["electrum"]["state"], "ready");
+    assert_eq!(parsed["bitcoin_offer_available"], false);
+}
+
+#[tokio::test]
+async fn health_tip_fields_are_null_before_the_first_probe() {
+    let runtime = runtime(true, 1);
+    let app = operational_router(Router::new(), runtime);
+    let ready = app
+        .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let body = to_bytes(ready.into_body(), 1024).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(parsed["electrum_tip_height"].is_null());
+    assert!(parsed["electrum_tip_age_seconds"].is_null());
 }
 
 #[tokio::test]

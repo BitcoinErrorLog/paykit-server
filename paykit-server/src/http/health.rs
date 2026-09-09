@@ -21,6 +21,9 @@ struct ReadyResponse {
     postgres: &'static str,
     electrum: ElectrumResponse,
     bitcoin_creation_enabled: bool,
+    bitcoin_offer_available: bool,
+    electrum_tip_height: Option<u32>,
+    electrum_tip_age_seconds: Option<u64>,
     paykit_delivery: &'static str,
     outbox: &'static str,
 }
@@ -67,6 +70,9 @@ async fn ready(State(runtime): State<Arc<Runtime>>) -> impl IntoResponse {
             overrun_targets: report.electrum_overrun_targets,
         },
         bitcoin_creation_enabled: report.bitcoin_creation_enabled,
+        bitcoin_offer_available: report.bitcoin_offer_available,
+        electrum_tip_height: report.electrum_probe.tip_height,
+        electrum_tip_age_seconds: report.electrum_probe.tip_age_secs,
         paykit_delivery: report.paykit_delivery.as_str(),
         outbox: report.outbox.as_str(),
     });
