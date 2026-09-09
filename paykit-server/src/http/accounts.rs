@@ -85,6 +85,7 @@ pub fn accounts_router(state: AccountsState) -> Router {
     Router::new()
         .route("/v0/accounts/claim", post(claim))
         .route("/v0/accounts/{creator}", get(exists))
+        .route("/v0/accounts/{creator}/status", get(allocation_status))
         .layer(middleware::from_fn(
             move |request: axum::extract::Request, next: Next| {
                 let state = cors_state.clone();
@@ -147,6 +148,14 @@ struct ClaimBody {
     auth_token: String,
     account_xpub: String,
     account_index: u32,
+    /// The channel the Shop client asserts (design §B.8.6): `manual` or
+    /// `bitkit_watch_only_v1`. Missing is treated as `manual`; any value is
+    /// recorded verbatim.
+    claim_channel: Option<String>,
+    /// Optional requested mode. Honored only as a refusal: `pasted_auto` is
+    /// rejected unconditionally with `allocation_mode_not_enabled`
+    /// (§B.8.6 r6); the server decides every accepted mode itself.
+    allocation_mode: Option<String>,
 }
 
 async fn claim(State(state): State<AccountsState>, body: Json<ClaimBody>) -> Response {
@@ -162,6 +171,8 @@ async fn claim(State(state): State<AccountsState>, body: Json<ClaimBody>) -> Res
         auth_token: body.0.auth_token,
         account_xpub: body.0.account_xpub,
         account_index: body.0.account_index,
+        claim_channel: body.0.claim_channel,
+        allocation_mode: body.0.allocation_mode,
     };
     match state.service.claim(request).await {
         Ok(outcome) => (
@@ -174,6 +185,8 @@ async fn claim(State(state): State<AccountsState>, body: Json<ClaimBody>) -> Res
                 "key_fingerprint": outcome.key_fingerprint,
                 "first_derived_address": outcome.first_derived_address,
                 "stack_id": outcome.stack_id,
+                "allocation_mode": outcome.allocation_mode,
+                "downgrade_reason": outcome.downgrade_reason,
             })),
         )
             .into_response(),
@@ -238,6 +251,11 @@ fn claim_error(error: ManualClaimError) -> Response {
             "unavailable",
             "marker publication or persistence is unavailable",
         ),
+        ManualClaimError::AllocationModeNotEnabled => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "allocation_mode_not_enabled",
+            "the requested allocation mode is not enabled on this stack",
+        ),
     };
     (
         status,
@@ -255,4 +273,81 @@ async fn exists(State(state): State<AccountsState>, Path(creator): Path<String>)
         Ok(claimed) => (StatusCode::OK, Json(json!({ "claimed": claimed }))).into_response(),
         Err(_) => ApiError::InternalError.into_response(),
     }
+}
+
+/// The authenticated seller's own allocation status (design §B.8.6): the
+/// mode, the claim channel recorded at claim time, the downgrade reason if
+/// any, and the detection evidence metadata (§B.8.7 is W1.14's, so the
+/// evidence list is always empty here). It is the seller's own data about
+/// their own creator record: authentication is the same capability-scoped
+/// Pubky AuthToken the claim carries (in the `Authorization: Bearer`
+/// header), the token's signer must BE the addressed creator, and the
+/// response carries no key material beyond what the claim response returns.
+/// 401 unauthenticated, 403 for any other authenticated identity.
+async fn allocation_status(
+    State(state): State<AccountsState>,
+    Path(creator): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let creator = match parse_creator(&creator) {
+        Ok(creator) => creator,
+        Err(_) => return ApiError::InvalidRequest.into_response(),
+    };
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let Some(token) = token else {
+        return status_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_token",
+            "a capability-scoped auth token is required",
+        );
+    };
+    match state.service.authenticate_claim_token(token) {
+        Ok(signer) if signer == creator => {}
+        Ok(_) => {
+            return status_error(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "allocation status is visible to the addressed seller only",
+            );
+        }
+        Err(_) => {
+            return status_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+                "auth token verification failed",
+            );
+        }
+    }
+    match state.service.allocation_status(&creator).await {
+        Ok(Some(status)) => (
+            StatusCode::OK,
+            Json(json!({
+                "creator": creator.to_string(),
+                "allocation_mode": status.allocation_mode,
+                "claim_channel": status.claim_channel,
+                "downgrade_reason": status.downgrade_reason,
+                // §B.8.7 detection evidence metadata: no evidence rows exist
+                // until W1.14's sentinel detection records them.
+                "evidence": [],
+            })),
+        )
+            .into_response(),
+        Ok(None) => status_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no watch-only account is claimed for this seller",
+        ),
+        Err(_) => ApiError::InternalError.into_response(),
+    }
+}
+
+fn status_error(status: StatusCode, code: &'static str, message: &'static str) -> Response {
+    (
+        status,
+        Json(json!({ "error": { "code": code, "message": message } })),
+    )
+        .into_response()
 }

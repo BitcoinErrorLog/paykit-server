@@ -289,6 +289,7 @@ async fn create_creator(
             ),
             &state,
             &key_tail(counter_seed),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();

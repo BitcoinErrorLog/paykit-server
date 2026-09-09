@@ -219,6 +219,9 @@ impl SetupCompleter for RealSetupCompleter {
             // The companion flow performs no claim-time history scan (§B.5
             // binds the manual claim endpoint); no cursor floor is applied.
             next_child_index_floor: None,
+            // ...and §B.8.6's claim-channel checks bind the claim endpoint
+            // too, so a companion setup is shared_manual by construction.
+            allocation: crate::allocation::ClaimAllocation::companion_default(),
         };
         match receive_verify_commit(
             self.relay.as_ref(),
@@ -260,6 +263,13 @@ pub(crate) struct CreatorSetupCommit {
     /// Bitkit companion flow, which does not scan; the manual claim endpoint
     /// always sets it.
     pub(crate) next_child_index_floor: Option<i64>,
+    /// The claim's allocation decision (design §B.8.6), persisted inside the
+    /// same commit. The companion flow sets
+    /// [`ClaimAllocation::companion_default`]: it carries no `claim_channel`
+    /// assertion and performs no claim-time scan, so it is `shared_manual`
+    /// by construction. On re-authentication the store may only keep or
+    /// downgrade the existing mode — never edit a creator into `exclusive`.
+    pub(crate) allocation: crate::allocation::ClaimAllocation,
 }
 
 impl CreatorSetupCommit {
@@ -325,10 +335,19 @@ impl CreatorSetupCommit {
                 claim.account_index,
             );
             let persistence = match existing {
-                Some(_) => self.creators.reauthenticate(&credentials, &key_tail).await,
+                Some(_) => {
+                    self.creators
+                        .reauthenticate(&credentials, &key_tail, &self.allocation)
+                        .await
+                }
                 None => self
                     .creators
-                    .create(&credentials, &StorageState::default(), &key_tail)
+                    .create(
+                        &credentials,
+                        &StorageState::default(),
+                        &key_tail,
+                        &self.allocation,
+                    )
                     .await
                     .map(|_| ()),
             };

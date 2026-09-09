@@ -30,13 +30,17 @@ use rand::{TryRngCore, rngs::OsRng};
 use url::Url;
 
 use crate::{
+    allocation::{
+        CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1, CLAIM_CHANNEL_MANUAL, REQUESTED_MODE_PASTED_AUTO,
+        decide_allocation,
+    },
     application::create_invoice::derive_bip84_p2wpkh_address,
     bitkit_claim::{ClaimError, WatchOnlyAccountClaim, required_capabilities},
     chain_history::{ChainHistoryPort, ClaimScanError, scan_claim_start_index},
     config::{BitcoinNetwork, StackRole},
     domain::locks::{CreatorPubky, parse_creator},
     key_identity::{canonical_key_tail, key_fingerprint},
-    persistence::CreatorStore,
+    persistence::{CreatorAllocationStatus, CreatorStore},
     real_setup::{CreatorSetupCommit, MarkerPublisher, validate_xpub},
 };
 
@@ -59,6 +63,15 @@ pub struct ManualClaimRequest {
     /// network kind).
     pub account_xpub: String,
     pub account_index: u32,
+    /// The channel the Shop client asserts (design §B.8.6): `manual` or
+    /// `bitkit_watch_only_v1`, recorded verbatim. `None` is treated — and
+    /// recorded — as `manual`: a bare key carries nothing to corroborate.
+    pub claim_channel: Option<String>,
+    /// The allocation mode the client requests, when it requests one. The
+    /// server decides the mode from the §B.8.6 corroborating checks and
+    /// honors no request — but a request for `pasted_auto` is refused
+    /// unconditionally with `allocation_mode_not_enabled` (§B.8.6 r6).
+    pub allocation_mode: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +93,12 @@ pub struct ManualClaimOutcome {
     /// This stack's identity, `{stack_role}:{instance_uuid}` (the
     /// `stack_id` contract).
     pub stack_id: String,
+    /// The creator's allocation mode after this claim (design §B.8.6):
+    /// `exclusive` or `shared_manual`.
+    pub allocation_mode: &'static str,
+    /// The fixed §B.8.8 downgrade-reason identifier when the claim was
+    /// downgraded to `shared_manual`; `None` for an `exclusive` claim.
+    pub downgrade_reason: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +135,10 @@ pub enum ManualClaimError {
     SessionUnavailable,
     /// Marker publication or durable persistence failed; retryable.
     Unavailable,
+    /// The claim requested `allocation_mode = 'pasted_auto'`. Refused
+    /// unconditionally — on every code path, under every configuration, and
+    /// with no enabling flag anywhere (design §B.8.6 r6, Sol P1).
+    AllocationModeNotEnabled,
 }
 
 /// Session minting is a narrow seam so unit tests can exercise validation,
@@ -269,32 +292,51 @@ impl ManualClaimService {
         &self,
         request: ManualClaimRequest,
     ) -> Result<ManualClaimOutcome, ManualClaimError> {
-        let token_bytes = URL_SAFE_NO_PAD
-            .decode(request.auth_token.as_bytes())
-            .map_err(|_| ManualClaimError::InvalidToken)?;
-        if token_bytes.len() < MIN_TOKEN_LENGTH {
-            return Err(ManualClaimError::InvalidToken);
+        // `pasted_auto` is refused unconditionally (design §B.8.6 r6, Sol
+        // P1): no configuration flag, operator toggle or per-seller override
+        // exists anywhere, so this check reads nothing and is the FIRST
+        // thing the claim path does — before token verification, before any
+        // gate, on every code path and under every configuration.
+        if request.allocation_mode.as_deref() == Some(REQUESTED_MODE_PASTED_AUTO) {
+            return Err(ManualClaimError::AllocationModeNotEnabled);
         }
-        let token = AuthToken::verify(&token_bytes).map_err(|_| ManualClaimError::InvalidToken)?;
-        if token.capabilities().to_string() != self.required_capabilities {
-            return Err(ManualClaimError::InvalidCapabilities);
-        }
+        let token = self.verify_claim_token(&request.auth_token)?;
+        // A missing channel is treated — and recorded — as `manual`
+        // (design §B.8.6: a paste is "a bare key and nothing else", so
+        // anything that is not the Bitkit channel is manual entry).
+        let channel = request
+            .claim_channel
+            .clone()
+            .unwrap_or_else(|| CLAIM_CHANNEL_MANUAL.to_owned());
         // Claim gate order (design §B.6): xpub parse → depth/child-number
         // cross-check → bounded account range → deny-list (role-gated) →
         // fingerprint↔seller check → chain scan → session mint/persist.
         // Every gate before the scan refuses without touching Electrum.
-        let claim = validate_claimed_account(
+        //
+        // The depth/child-number cross-check is scoped by channel (design
+        // §B.8.6): under `bitkit_watch_only_v1` a declared-vs-hardened
+        // mismatch DOWNGRADES with `account_index_mismatch` — the claim is
+        // accepted on the key's own hardened child index, which is the only
+        // self-consistent (xpub, index) pair invoice derivation can use —
+        // while every other channel keeps the §B.6 refusal ("the submitted
+        // account_index is cross-checked against the key bytes and cannot be
+        // misdeclared").
+        let validated = validate_claimed_account(
             &request.account_xpub,
             request.account_index,
+            &channel,
             &self.bitcoin_network,
             self.stack_role,
         )?;
+        let claim = validated.claim;
 
         // Fingerprint↔seller pre-check (design §B.8.5). The claiming creator
         // is the verified token's signer — the session minted below is
         // required to match it — so a refused claim never reaches Electrum.
         // The authoritative check is the binding write inside the
-        // claim-commit transaction, which the primary key serializes.
+        // claim-commit transaction, which the primary key serializes. This
+        // is the one §B.8.6 corroborating fact that stays a refusal: §B.8.5
+        // makes a key shared by two sellers a hard `key_claimed_by_other_seller`.
         let key_tail = canonical_key_tail(&claim.serialized_xpub);
         let token_creator: CreatorPubky =
             parse_creator(&PubkyPublicKey::from_public_key(token.public_key()).to_app_key())
@@ -315,10 +357,10 @@ impl ManualClaimService {
         let canonical_xpub = Xpub::decode(&claim.serialized_xpub)
             .map_err(|_| ManualClaimError::InvalidXpub)?
             .to_string();
-        let start_index = scan_claim_start_index(
+        let scan = scan_claim_start_index(
             self.history.as_ref(),
             &canonical_xpub,
-            request.account_index,
+            claim.account_index,
             &self.bitcoin_network,
         )
         .await
@@ -327,9 +369,19 @@ impl ManualClaimService {
             ClaimScanError::HistoryTooDeep => ManualClaimError::AccountHistoryTooDeep,
         })?;
 
+        // The §B.8.6 corroborating checks, evaluated AFTER the gates and the
+        // scan from data already computed — no additional Electrum calls.
+        // Any failure downgrades with a named §B.8.8 reason; none refuses.
+        let allocation = decide_allocation(
+            &channel,
+            request.account_index,
+            validated.index_mismatch,
+            scan.saw_history,
+        );
+
         let capabilities = Capabilities::try_from(self.required_capabilities.as_str())
             .map_err(|_| ManualClaimError::InvalidCapabilities)?;
-        let session = self.minter.mint(&token_bytes, &capabilities).await?;
+        let session = self.minter.mint(&token.serialize(), &capabilities).await?;
 
         // The relay channel is unauthenticated, so bind the minted session to
         // the exact token signer this request presented.
@@ -367,34 +419,37 @@ impl ManualClaimService {
             stack_role: self.stack_role,
             receiver_path: self.receiver_path.clone(),
             marker_capabilities: CreatorSetupCommit::marker_capabilities(),
-            next_child_index_floor: Some(i64::from(start_index)),
+            next_child_index_floor: Some(i64::from(scan.start_index)),
+            allocation: allocation.clone(),
         };
         let key_fingerprint = key_fingerprint(&claim.serialized_xpub);
         let next_child_index = commit
-            .publish_readback_and_commit_reporting(claim)
+            .publish_readback_and_commit_reporting(claim.clone())
             .await
             .map_err(|error| match error {
                 ClaimError::AccountMismatch => ManualClaimError::AccountMismatch,
                 ClaimError::KeyClaimedByOtherSeller => ManualClaimError::KeyClaimedByOtherSeller,
                 _ => ManualClaimError::Unavailable,
             })?
-            .unwrap_or(i64::from(start_index));
+            .unwrap_or(i64::from(scan.start_index));
         // The address at the returned cursor: derived with the same function
         // invoice addresses use, on this stack's network (design §B.6).
         let first_derived_address = derive_bip84_p2wpkh_address(
             &canonical_xpub,
-            request.account_index,
+            claim.account_index,
             &self.bitcoin_network,
             next_child_index,
         )
         .map_err(|_| ManualClaimError::Unavailable)?;
         Ok(ManualClaimOutcome {
             creator: creator.to_string(),
-            account_index: request.account_index,
+            account_index: claim.account_index,
             next_child_index,
             key_fingerprint,
             first_derived_address,
             stack_id: self.stack_id.clone(),
+            allocation_mode: allocation.mode.as_str(),
+            downgrade_reason: allocation.downgrade_reason.map(|reason| reason.as_str()),
         })
     }
 
@@ -407,6 +462,59 @@ impl ManualClaimService {
             .map(|credentials| credentials.is_some())
             .map_err(|_| ManualClaimError::Unavailable)
     }
+
+    /// Verifies a capability-scoped claim token OFFLINE and returns the
+    /// creator its signer identity binds. Used by the authenticated seller
+    /// status surface; the claim path uses the same verification before the
+    /// relay session exchange.
+    pub fn authenticate_claim_token(
+        &self,
+        auth_token: &str,
+    ) -> Result<CreatorPubky, ManualClaimError> {
+        let token = self.verify_claim_token(auth_token)?;
+        parse_creator(&PubkyPublicKey::from_public_key(token.public_key()).to_app_key())
+            .map_err(|_| ManualClaimError::InvalidToken)
+    }
+
+    /// The authenticated seller's own allocation status (design §B.8.6):
+    /// mode, recorded claim channel, downgrade reason if any. Detection
+    /// evidence metadata is §B.8.7's (W1.14) and not yet recorded.
+    pub async fn allocation_status(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<Option<CreatorAllocationStatus>, ManualClaimError> {
+        self.creators
+            .allocation_status(creator)
+            .await
+            .map_err(|_| ManualClaimError::Unavailable)
+    }
+
+    /// Decodes and verifies the `AuthToken` and its exact capability set —
+    /// the offline half of claim authentication, shared by the claim path
+    /// and the seller status surface.
+    fn verify_claim_token(&self, auth_token: &str) -> Result<AuthToken, ManualClaimError> {
+        let token_bytes = URL_SAFE_NO_PAD
+            .decode(auth_token.as_bytes())
+            .map_err(|_| ManualClaimError::InvalidToken)?;
+        if token_bytes.len() < MIN_TOKEN_LENGTH {
+            return Err(ManualClaimError::InvalidToken);
+        }
+        let token = AuthToken::verify(&token_bytes).map_err(|_| ManualClaimError::InvalidToken)?;
+        if token.capabilities().to_string() != self.required_capabilities {
+            return Err(ManualClaimError::InvalidCapabilities);
+        }
+        Ok(token)
+    }
+}
+
+/// The validated claim plus the §B.8.6 index-agreement fact: whether the
+/// declared `account_index` disagrees with the key's own hardened child
+/// number. Under `bitkit_watch_only_v1` a mismatch is not a refusal — it
+/// downgrades the claim with `account_index_mismatch` — so the fact is
+/// reported to the allocation decision rather than folded into an error.
+struct ValidatedClaim {
+    claim: WatchOnlyAccountClaim,
+    index_mismatch: bool,
 }
 
 /// Parses the base58 account xpub, then reuses the companion flow's exact
@@ -415,24 +523,56 @@ impl ManualClaimService {
 /// external chain). The named range and deny-list refusals pass through; a
 /// client presenting zpub form is rejected here — zpub→xpub normalization is
 /// the client's job (SLIP-132 version-byte rewrite before POST, design §B.6).
+///
+/// The declared-vs-hardened cross-check is channel-scoped (design §B.8.6):
+/// under `bitkit_watch_only_v1` a disagreement DOWNGRADES the claim rather
+/// than refusing it, and the claim proceeds on the key's own hardened child
+/// index — the only (xpub, index) pair the invoice derivation path can use,
+/// so the account stays sellable in `shared_manual`. Every other channel
+/// keeps the §B.6 refusal: a paste cannot misdeclare its index.
 fn validate_claimed_account(
     account_xpub: &str,
     account_index: u32,
+    channel: &str,
     network: &BitcoinNetwork,
     stack_role: StackRole,
-) -> Result<WatchOnlyAccountClaim, ManualClaimError> {
+) -> Result<ValidatedClaim, ManualClaimError> {
     let xpub = Xpub::from_str(account_xpub).map_err(|_| ManualClaimError::InvalidXpub)?;
     let serialized_xpub = xpub.encode();
-    validate_xpub(&serialized_xpub, account_index, network, stack_role).map_err(
-        |error| match error {
+    // The key's own hardened child number IS its account index (design
+    // §B.6): a BIP84 account xpub is depth 3 with a hardened child. A key
+    // without that shape has no account semantics at all and stays a hard
+    // refusal on every channel.
+    if xpub.depth != 3 {
+        return Err(ManualClaimError::InvalidXpub);
+    }
+    let key_index = match xpub.child_number {
+        bitcoin::bip32::ChildNumber::Hardened { index } => index,
+        bitcoin::bip32::ChildNumber::Normal { .. } => return Err(ManualClaimError::InvalidXpub),
+    };
+    let index_mismatch = key_index != account_index;
+    let effective_index = if index_mismatch {
+        if channel == CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1 {
+            key_index
+        } else {
+            return Err(ManualClaimError::InvalidXpub);
+        }
+    } else {
+        account_index
+    };
+    validate_xpub(&serialized_xpub, effective_index, network, stack_role).map_err(|error| {
+        match error {
             ClaimError::AccountIndexOutOfRange => ManualClaimError::AccountIndexOutOfRange,
             ClaimError::KeyDenyListed => ManualClaimError::KeyDenyListed,
             _ => ManualClaimError::InvalidXpub,
+        }
+    })?;
+    Ok(ValidatedClaim {
+        claim: WatchOnlyAccountClaim {
+            account_index: effective_index,
+            serialized_xpub,
         },
-    )?;
-    Ok(WatchOnlyAccountClaim {
-        account_index,
-        serialized_xpub,
+        index_mismatch,
     })
 }
 
@@ -463,16 +603,20 @@ mod tests {
 
     #[test]
     fn accepts_a_network_correct_account_xpub_at_its_hardened_index() {
-        let claim = validate_claimed_account(
+        let validated = validate_claimed_account(
             &regtest_account_tpub(3),
             3,
+            CLAIM_CHANNEL_MANUAL,
             &BitcoinNetwork::Regtest,
             StackRole::Proof,
         )
         .unwrap();
-        assert_eq!(claim.account_index, 3);
+        assert_eq!(validated.claim.account_index, 3);
+        assert!(!validated.index_mismatch);
         assert_eq!(
-            Xpub::decode(&claim.serialized_xpub).unwrap().to_string(),
+            Xpub::decode(&validated.claim.serialized_xpub)
+                .unwrap()
+                .to_string(),
             regtest_account_tpub(3)
         );
     }
@@ -483,23 +627,52 @@ mod tests {
             validate_claimed_account(
                 &regtest_account_tpub(0),
                 0,
+                CLAIM_CHANNEL_MANUAL,
                 &BitcoinNetwork::Mainnet,
                 StackRole::Proof
-            ),
+            )
+            .map(|validated| validated.claim),
             Err(ManualClaimError::InvalidXpub)
         );
+        // The declared-vs-hardened cross-check keeps its §B.6 refusal on the
+        // manual channel (§B.8.6 downgrades it only under the Bitkit one).
         assert_eq!(
             validate_claimed_account(
                 &regtest_account_tpub(0),
                 1,
+                CLAIM_CHANNEL_MANUAL,
                 &BitcoinNetwork::Regtest,
                 StackRole::Proof
-            ),
+            )
+            .map(|validated| validated.claim),
             Err(ManualClaimError::InvalidXpub)
         );
         assert_eq!(
-            validate_claimed_account("not-an-xpub", 0, &BitcoinNetwork::Regtest, StackRole::Proof),
+            validate_claimed_account(
+                "not-an-xpub",
+                0,
+                CLAIM_CHANNEL_MANUAL,
+                &BitcoinNetwork::Regtest,
+                StackRole::Proof
+            )
+            .map(|validated| validated.claim),
             Err(ManualClaimError::InvalidXpub)
         );
+    }
+
+    #[test]
+    fn bitkit_channel_mismatch_proceeds_on_the_keys_own_hardened_index() {
+        // Declared 4 against an account-2 key: the Bitkit channel downgrades
+        // (§B.8.6) instead of refusing, on the key's own index.
+        let validated = validate_claimed_account(
+            &regtest_account_tpub(2),
+            4,
+            CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1,
+            &BitcoinNetwork::Regtest,
+            StackRole::Proof,
+        )
+        .unwrap();
+        assert!(validated.index_mismatch);
+        assert_eq!(validated.claim.account_index, 2);
     }
 }

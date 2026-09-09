@@ -82,6 +82,7 @@ async fn store(database: &TestDatabase) -> InvoiceStore {
             ),
             &StorageState::default(),
             &key_tail(18),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();
@@ -134,6 +135,7 @@ async fn create_other_creator(database: &TestDatabase) {
             ),
             &StorageState::default(),
             &key_tail(19),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
         )
         .await
         .unwrap();

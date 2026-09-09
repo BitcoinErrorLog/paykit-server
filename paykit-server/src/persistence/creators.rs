@@ -9,6 +9,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
+    allocation::{AllocationMode, ClaimAllocation},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
     domain::locks::{CreatorPubky, parse_creator},
     persistence::PersistenceError,
@@ -220,12 +221,17 @@ impl CreatorStore {
 
     /// Inserts a creator and its initial full SDK state atomically, binding
     /// the claim's canonical key tail to this creator in the same
-    /// transaction (design B.8.5).
+    /// transaction (design B.8.5). The claim's allocation decision (design
+    /// B.8.6) is written in that same transaction: the INSERT is the ONLY
+    /// statement in the system that can set `allocation_mode = 'exclusive'`,
+    /// and only when the claim-channel checks computed it — creation is the
+    /// sole `— → exclusive` transition in the design's table.
     pub async fn create(
         &self,
         credentials: &CreatorCredentials,
         state: &StorageState,
         key_tail: &[u8; 65],
+        allocation: &ClaimAllocation,
     ) -> Result<PersistedCreator, PersistenceError> {
         let lookup_hash = self
             .crypto
@@ -247,8 +253,12 @@ impl CreatorStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         self.bind_key_tail(&mut tx, key_tail, &lookup_hash).await?;
-        sqlx::query("INSERT INTO creators (id, creator_lookup_hash, credential_envelope) VALUES ($1, $2, $3)")
-            .bind(id).bind(lookup_hash.as_bytes().as_slice()).bind(credential_envelope.as_bytes()).execute(&mut *tx).await.map_err(|_| PersistenceError::Unavailable)?;
+        sqlx::query("INSERT INTO creators (id, creator_lookup_hash, credential_envelope, allocation_mode, claim_channel, downgrade_reason) VALUES ($1, $2, $3, $4, $5, $6)")
+            .bind(id).bind(lookup_hash.as_bytes().as_slice()).bind(credential_envelope.as_bytes())
+            .bind(allocation.mode.as_str())
+            .bind(allocation.channel.as_deref())
+            .bind(allocation.downgrade_reason.map(|reason| reason.as_str()))
+            .execute(&mut *tx).await.map_err(|_| PersistenceError::Unavailable)?;
         sqlx::query("INSERT INTO sdk_states (creator_id, state_envelope) VALUES ($1, $2)")
             .bind(id)
             .bind(state_envelope.as_bytes())
@@ -342,10 +352,29 @@ impl CreatorStore {
         self.decrypt_credentials(&row)
     }
 
+    /// The creator's allocation status for the authenticated seller status
+    /// surface (design §B.8.6): the mode, the verbatim claim channel recorded
+    /// at claim time, and the downgrade reason if any. Secret-free plaintext
+    /// columns only; no key material is read. `None` when the creator never
+    /// claimed. Detection evidence metadata (§B.8.7) is W1.14's and is not
+    /// read here yet.
+    pub async fn allocation_status(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<Option<CreatorAllocationStatus>, PersistenceError> {
+        let hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        sqlx::query_as::<_, CreatorAllocationStatus>(
+            "SELECT allocation_mode, claim_channel, downgrade_reason FROM creators WHERE creator_lookup_hash = $1",
+        )
+        .bind(hash.as_bytes().as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)
+    }
+
     /// Loads an existing creator when present. A present but unauthenticatable
     /// row is an error rather than an invitation to overwrite it during setup.
-    pub async fn load_optional(
-        &self,
+    pub async fn load_optional(        &self,
         creator: &CreatorPubky,
     ) -> Result<Option<CreatorCredentials>, PersistenceError> {
         let hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
@@ -363,10 +392,19 @@ impl CreatorStore {
     /// The claim's canonical key tail is bound to this creator in the same
     /// transaction: a re-claim by the same creator is unaffected, and a tail
     /// ever claimed by a different creator is refused (design B.8.5).
+    ///
+    /// Allocation on re-claim (design B.8.6): a re-authentication may only
+    /// KEEP or DOWNGRADE the creator's mode — there is no edit that moves a
+    /// creator into `exclusive`. An `exclusive` creator whose re-claim passes
+    /// every corroborating check keeps its mode (the UPDATE then touches no
+    /// allocation columns); every other re-claim lands on the one UPDATE
+    /// below, whose `allocation_mode` literal is `shared_manual` — no
+    /// re-claim path contains a statement that can write `exclusive`.
     pub async fn reauthenticate(
         &self,
         replacement: &CreatorCredentials,
         key_tail: &[u8; 65],
+        allocation: &ClaimAllocation,
     ) -> Result<(), PersistenceError> {
         let hash = self
             .crypto
@@ -383,6 +421,12 @@ impl CreatorStore {
         {
             return Err(PersistenceError::ReauthenticationMismatch);
         }
+        let existing_mode: String =
+            sqlx::query_scalar("SELECT allocation_mode FROM creators WHERE id = $1")
+                .bind(row.id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
         self.bind_key_tail(&mut tx, key_tail, &hash).await?;
         let updated = CreatorCredentials::from_secret_parts(
             existing.creator,
@@ -399,14 +443,36 @@ impl CreatorStore {
                 &bytes,
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        sqlx::query(
-            "UPDATE creators SET credential_envelope = $1, updated_at = NOW() WHERE id = $2",
-        )
-        .bind(envelope.as_bytes())
-        .bind(row.id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| PersistenceError::Unavailable)?;
+        if existing_mode == AllocationMode::Exclusive.as_str()
+            && allocation.mode == AllocationMode::Exclusive
+        {
+            // Keep: the re-claim re-proved every corroborating check on the
+            // same immutable account. Only the session secret and the
+            // verbatim channel of the latest claim move.
+            sqlx::query(
+                "UPDATE creators SET credential_envelope = $1, claim_channel = $2, updated_at = NOW() WHERE id = $3",
+            )
+            .bind(envelope.as_bytes())
+            .bind(allocation.channel.as_deref())
+            .bind(row.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        } else {
+            // Downgrade (or stay shared): the re-claim's own decision is
+            // recorded verbatim. The literal below is the ONLY mode this
+            // statement can write.
+            sqlx::query(
+                "UPDATE creators SET credential_envelope = $1, claim_channel = $2, allocation_mode = 'shared_manual', downgrade_reason = $3, updated_at = NOW() WHERE id = $4",
+            )
+            .bind(envelope.as_bytes())
+            .bind(allocation.channel.as_deref())
+            .bind(allocation.downgrade_reason.map(|reason| reason.as_str()))
+            .bind(row.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
         tx.commit().await.map_err(|_| PersistenceError::Unavailable)
     }
 
@@ -484,6 +550,14 @@ pub(crate) struct CreatorRow {
     pub(crate) id: Uuid,
     pub(crate) creator_lookup_hash: Vec<u8>,
     pub(crate) credential_envelope: Vec<u8>,
+}
+
+/// The seller-visible allocation status row (design §B.8.6).
+#[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
+pub struct CreatorAllocationStatus {
+    pub allocation_mode: String,
+    pub claim_channel: Option<String>,
+    pub downgrade_reason: Option<String>,
 }
 impl CreatorRow {
     pub(crate) fn lookup_hash(&self) -> Result<LookupHash, PersistenceError> {
