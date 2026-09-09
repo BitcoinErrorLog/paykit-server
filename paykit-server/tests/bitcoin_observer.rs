@@ -899,8 +899,9 @@ mod tick {
         // Attacker scenario: 50 permanently-failing disclosed addresses
         // (each dusted past max_utxos_per_address so its lookup fails
         // fast) ahead of one honest seller in the oldest-first plan, at
-        // the default steady-state budget of 48 lookups per tick (50
-        // tokens minus the two reserved probe requests). Because failed
+        // this test's configured budget of 48 lookups per tick (a
+        // 50-token bucket minus the two reserved probe requests).
+        // Because failed
         // targets are failure-stamped, they rotate behind the rest of
         // the plan exactly like successes: the honest target is attempted
         // by the second tick and every attacker target within
@@ -926,8 +927,8 @@ mod tick {
             attempt_clock: Mutex::new(0),
         };
         let runtime = runtime();
-        // 50 tokens: the probe reserves 2, leaving the default
-        // steady-state 48 lookups per tick.
+        // 50 tokens: the probe reserves 2, leaving this test's
+        // configured budget of 48 lookups per tick.
         let mut state = state(&policy(50));
 
         for _ in 0..5 {

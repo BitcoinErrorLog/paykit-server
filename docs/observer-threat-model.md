@@ -178,17 +178,32 @@ plan orders oldest attempt first (`COALESCE(last_attempted_at,
 last_observed_at, created_at)`). Failed targets therefore rotate behind
 the rest of the plan exactly like successes — a permanently failing
 target cannot hold the head. **Fairness:** with F permanently failing
-targets among N pending targets and a per-tick lookup budget B, every
-target — honest or failing — is *attempted* at least once per
-⌈N ÷ B⌉ ticks, and the attacker's F addresses cost exactly F slots per
-rotation, never more. (Before failure stamping, F ≥ B permanently
-failing targets — each dusted with `max_utxos_per_address` + 1 UTXOs, ≈
-48 × 201 dust outputs at defaults, on invoices that never expire out of
+targets and N other pending targets, every target — honest or failing —
+is *attempted* at least once per ⌈(N + F) ÷ B⌉ ticks, where B is the
+per-tick address budget: the tokens the shared bucket holds for address
+lookups after the tick's two probe requests are reserved. B is not a
+configured constant: the production limiter starts with a full
+1000-token burst, then refills from elapsed wall time at
+`max_requests_per_second` (default 5/s) — 40 tokens over the shortest
+jittered 8 s poll, so after the 2-token probe reservation the
+steady-state default is B = 38 addresses per tick (≈ 4.75
+addresses/s) — and concurrent Electrum callers (invoice-creation
+snapshots, claim scans, first-bind fetches) draw from the same bucket,
+so the initial burst and contention change B tick to tick. The bound
+is over a fixed population: continuous invoice creation adds to N, but
+a never-attempted row (NULL `last_attempted_at`) falls through the
+`COALESCE(last_attempted_at, last_observed_at, created_at)` plan key to
+its own `created_at`/`last_observed_at`, so it sorts only among the
+never-attempted rows and enters behind every row attempted before it —
+new invoices cannot starve already-attempted rows. The attacker's F
+addresses cost exactly F slots per rotation, never more. (Before
+failure stamping, F ≥ B permanently failing targets — each dusted with
+`max_utxos_per_address` + 1 UTXOs, on invoices that never expire out of
 the plan — held the head forever and honest sellers were attempted
 never.) **Residual:** the attacker still slows every seller's attempt
 interval by the F extra targets in the rotation: worst-case
-honest-seller delay is ⌈(N) ÷ B⌉ ticks including the F attacker
-targets, versus ⌈(N − F) ÷ B⌉ without them — bounded, not starvation.
+honest-seller delay is ⌈(N + F) ÷ B⌉ ticks including the F attacker
+targets, versus ⌈N ÷ B⌉ without them — bounded, not starvation.
 
 ## Acceptable degradation
 
@@ -244,8 +259,11 @@ A dusted seller's own invoice may be observed more slowly: its target
 keeps failing, rotates behind the plan via the failure stamp, and is
 retried once per rotation, consuming one slot per rotation. Every other
 seller's targets are still attempted at least once per
-⌈N ÷ per-tick budget⌉ ticks (N now includes the attacker's failing
-targets, so F of them stretch the rotation but can never starve it), the
+⌈(N + F) ÷ B⌉ ticks (N other pending targets, F of them the
+attacker's failing targets, and B the per-tick address budget after the
+probe reservation — moved tick to tick by the initial 1000-token burst
+and by concurrent Electrum callers — so the F targets stretch the
+rotation but can never starve it), the
 shared endpoint's request rate stays inside the configured sustained
 budget, and `bitcoin_offer_available` never degrades because of
 per-address failures. Payment semantics (outpoint/value/presence,
