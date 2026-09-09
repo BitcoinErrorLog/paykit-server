@@ -123,6 +123,7 @@ impl Server {
             config.electrum.request_timeout,
             usize::try_from(config.electrum.max_utxos_per_address).unwrap_or(usize::MAX),
             config.electrum.address_deadline,
+            config.electrum.max_response_bytes,
         )
         .map_err(map_electrum_error)?;
         Self::build_with_clients(config, pool, pubky, Arc::new(electrum)).await

@@ -7,10 +7,13 @@
 //! history RPCs or fetching a historical transaction: the request
 //! count is exactly one per observed address and cannot be expanded by an
 //! attacker dusting a disclosed invoice address. The response work is
-//! bounded too: the decoded item count is capped before any per-UTXO
-//! record is materialised and every address runs under a wall-clock
-//! deadline, and every per-address failure is isolated — it never
-//! degrades endpoint availability or the tick's other observations.
+//! bounded too: every connection's stream is byte-capped per response
+//! line (see [`crate::workers::electrum`]) before the client buffers or
+//! decodes anything, the decoded item count is capped before any
+//! per-UTXO record is materialised, and every address runs under a
+//! wall-clock deadline, and every per-address failure is isolated — it
+//! never degrades endpoint availability or the tick's other
+//! observations.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -22,8 +25,7 @@ use std::{
 use async_trait::async_trait;
 use bitcoin::{Address, Network, hex::DisplayHex};
 use electrum_client::{
-    Client, ConfigBuilder, ElectrumApi, Error as ElectrumError, ListUnspentRes, Param,
-    ToElectrumScriptHash,
+    ElectrumApi, Error as ElectrumError, ListUnspentRes, Param, ToElectrumScriptHash,
 };
 use rand::Rng;
 
@@ -33,6 +35,7 @@ use crate::{
     domain::payment::BitcoinOutpoint,
     persistence::{BitcoinObservationInput, InvoiceStore, PersistenceError},
     runtime::{ElectrumProbe, Runtime},
+    workers::electrum::{self, CappedClient},
 };
 
 /// Oldest-observation age that triggers the backlog metric and WARN log.
@@ -85,8 +88,10 @@ pub struct TipProbe {
 /// (`paykit_electrum_observation_address_failures{reason=...}`).
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum AddressFailureReason {
-    /// The lookup errored: transport timeout, malformed response, or an
-    /// inconsistent height relative to the probed tip.
+    /// The lookup errored: transport timeout, malformed response, a
+    /// response line over `electrum.max_response_bytes` (the transport
+    /// cap fails the read before decode), or an inconsistent height
+    /// relative to the probed tip.
     Error,
     /// The response listed more UTXOs than `electrum.max_utxos_per_address`;
     /// it was rejected before any per-UTXO record was materialised.
@@ -998,6 +1003,13 @@ pub struct ElectrumAdapter {
     /// Per-address wall-clock deadline over connect + call + decode
     /// (`electrum.address_deadline`).
     address_deadline: Duration,
+    /// Transport-level cap on one Electrum response line
+    /// (`electrum.max_response_bytes`): every connection this adapter
+    /// opens is a [`CappedClient`], so no single response line larger
+    /// than this is ever held in memory — the read fails before the
+    /// client's `BufReader` grows or any JSON decode runs, and the
+    /// poisoned connection is torn down.
+    max_response_bytes: u64,
 }
 
 impl ElectrumAdapter {
@@ -1008,26 +1020,20 @@ impl ElectrumAdapter {
         timeout: Duration,
         max_utxos_per_address: usize,
         address_deadline: Duration,
+        max_response_bytes: u64,
     ) -> Result<Self, ObserverError> {
         let endpoint = endpoint.into();
-        let parsed = url::Url::parse(&endpoint).map_err(|_| ObserverError::Unavailable)?;
-        if !matches!(parsed.scheme(), "tcp" | "ssl")
-            || parsed.host_str().is_none()
-            || parsed.port().is_none()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || !matches!(parsed.path(), "" | "/")
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-        {
-            return Err(ObserverError::Unavailable);
-        }
+        // Refuse everything but tcp://host:port and ssl://host:port
+        // (including socks5://) at startup: the proxy transport is not
+        // routed through the capped wrapper.
+        electrum::ElectrumEndpoint::parse(&endpoint).map_err(|_| ObserverError::Unavailable)?;
         Ok(Self {
             endpoint: endpoint.into(),
             network,
             timeout,
             max_utxos_per_address,
             address_deadline,
+            max_response_bytes,
         })
     }
 
@@ -1037,6 +1043,7 @@ impl ElectrumAdapter {
         timeout: Duration,
         max_utxos_per_address: usize,
         address_deadline: Duration,
+        max_response_bytes: u64,
     ) -> Result<Self, ObserverError> {
         let adapter = Self::configured(
             endpoint,
@@ -1044,41 +1051,42 @@ impl ElectrumAdapter {
             timeout,
             max_utxos_per_address,
             address_deadline,
+            max_response_bytes,
         )?;
         adapter.raw_client().await?;
         Ok(adapter)
     }
 
-    /// electrum-client call retries stay at zero: each admitted target is
-    /// exactly one request, charged once against the sustained budget, and
-    /// the observer's own next tick is the retry.
-    fn client_config(&self) -> electrum_client::Config {
-        ConfigBuilder::new()
-            .timeout(Some(self.timeout))
-            .retry(0)
-            .build()
-    }
-
-    async fn raw_client(&self) -> Result<Client, ObserverError> {
-        let config = self.client_config();
+    /// Opens one fresh capped connection. There are no client-side call
+    /// retries: each admitted target is exactly one request, charged once
+    /// against the sustained budget, and the observer's own next tick is
+    /// the retry. Connecting performs no Electrum RPC (the TLS handshake
+    /// is transport I/O, not an Electrum request, and the client does not
+    /// negotiate `server.version`), so a (re)connect is never a budgeted
+    /// send.
+    async fn raw_client(&self) -> Result<CappedClient, ObserverError> {
         let endpoint = self.endpoint.clone();
-        tokio::task::spawn_blocking(move || Client::from_config(&endpoint, config))
-            .await
-            .map_err(|_| ObserverError::Unavailable)?
-            .map_err(|_| ObserverError::Unavailable)
+        let timeout = self.timeout;
+        let max_response_bytes = self.max_response_bytes;
+        tokio::task::spawn_blocking(move || {
+            electrum::connect(&endpoint, timeout, max_response_bytes)
+        })
+        .await
+        .map_err(|_| ObserverError::Unavailable)?
+        .map_err(|_| ObserverError::Unavailable)
     }
 
-    fn raw_client_blocking(&self) -> Result<Client, ElectrumError> {
-        Client::from_config(&self.endpoint, self.client_config())
+    fn raw_client_blocking(&self) -> Result<CappedClient, std::io::Error> {
+        electrum::connect(&self.endpoint, self.timeout, self.max_response_bytes)
     }
 }
 
 /// Outcome of one address's connect + call + decode inside the blocking
 /// pool. A successful lookup hands the connection back for reuse; a failed
-/// one drops it (its response stream may be desynchronized) so the next
-/// address reconnects.
+/// one drops it (its response stream may be desynchronized — a poisoned
+/// capped stream can never be resumed) so the next address reconnects.
 enum AddressAttempt {
-    Observed(Box<Client>, Vec<ObservedOutput>),
+    Observed(Box<CappedClient>, Vec<ObservedOutput>),
     Failed(AddressFailureReason),
     ConnectFailed,
 }
@@ -1091,7 +1099,7 @@ impl ElectrumPort for ElectrumAdapter {
         targets: &[ObservationTarget],
     ) -> Result<ObservationReport, ObserverError> {
         let mut report = ObservationReport::default();
-        let mut client: Option<Client> = None;
+        let mut client: Option<CappedClient> = None;
         for (index, target) in targets.iter().enumerate() {
             let adapter = self.clone();
             let target = target.clone();
@@ -1182,20 +1190,19 @@ impl ElectrumPort for ElectrumAdapter {
 /// raw call. The decoded item count is capped at `max_utxos` BEFORE any
 /// per-UTXO record is materialised: an over-limit response fails this
 /// address with [`AddressFailureReason::ResponseTooLarge`] and no record
-/// vector is built for it. (electrum-client 0.25 does not expose the
-/// transport stream: `RawClient::_reader_thread` buffers the entire
-/// response line with an unbounded `BufRead::read_line` and parses it
-/// internally, and the public `ElectrumApi::raw_call` returns an already
-/// materialised `serde_json::Value`, so a raw-byte cap before JSON decode
-/// is not implementable through its public API. The decoded-item cap plus
-/// the per-address deadline in [`ElectrumAdapter::observations`] is the
-/// strongest bound the pinned client permits.) Every returned item becomes
-/// a present output; a previously tracked outpoint missing from the
-/// unspent set becomes the same absence record the settlement layer
-/// already consumes. Any error fails this address only; the caller
-/// isolates it from the rest of the tick.
+/// vector is built for it. Below the item cap sits the transport cap: the
+/// client's stream is a [`crate::workers::electrum::CappedStream`], so a
+/// response line larger than `electrum.max_response_bytes` fails the read
+/// (with the literal `electrum response exceeds max_response_bytes`
+/// error) before the client's `BufReader` buffers it or any JSON decode
+/// runs; the poisoned connection is torn down by the caller and the next
+/// address reconnects. Every returned item becomes a present output; a
+/// previously tracked outpoint missing from the unspent set becomes the
+/// same absence record the settlement layer already consumes. Any error
+/// fails this address only; the caller isolates it from the rest of the
+/// tick.
 fn observe_address_blocking(
-    client: &Client,
+    client: &CappedClient,
     network: &BitcoinNetwork,
     tip_height: u32,
     target: &ObservationTarget,

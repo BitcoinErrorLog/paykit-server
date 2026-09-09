@@ -321,6 +321,7 @@ fn parses_accepted_durations_and_uses_ledger_defaults() {
     assert_eq!(config.electrum.max_requests_per_second, 5);
     assert_eq!(config.electrum.max_utxos_per_address, 200);
     assert_eq!(config.electrum.address_deadline, Duration::from_secs(5));
+    assert_eq!(config.electrum.max_response_bytes, 1024 * 1024);
     assert_eq!(config.outbox.poll_interval, Duration::from_secs(5));
     assert_eq!(config.outbox.batch_size, 16);
     assert_eq!(config.outbox.lease_duration, Duration::from_secs(30));
@@ -444,6 +445,30 @@ fn rejects_electrum_budgets_with_zero_post_probe_capacity() {
             "{name}: {error}"
         );
     }
+}
+
+#[test]
+fn rejects_a_response_cap_below_the_64kib_floor_with_the_literal_message() {
+    let error = Config::from_toml_and_environment(
+        &electrum_toml("max_response_bytes = 65535"),
+        environment(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "electrum.max_response_bytes must be at least 65536 bytes (64 KiB)"
+    );
+}
+
+#[test]
+fn accepts_a_response_cap_at_the_64kib_floor() {
+    assert!(
+        Config::from_toml_and_environment(
+            &electrum_toml("max_response_bytes = 65536"),
+            environment()
+        )
+        .is_ok()
+    );
 }
 
 #[test]

@@ -23,8 +23,11 @@ use electrum_client::{ScriptHash, ToElectrumScriptHash};
 use paykit_server::{
     bitcoin::{ObservationTarget, TrackedOutput},
     config::BitcoinNetwork,
-    workers::observer::{
-        AddressFailureReason, ElectrumAdapter, ElectrumPort, FailedObservation, ObserverError,
+    workers::{
+        electrum::DEFAULT_MAX_RESPONSE_BYTES,
+        observer::{
+            AddressFailureReason, ElectrumAdapter, ElectrumPort, FailedObservation, ObserverError,
+        },
     },
 };
 
@@ -72,15 +75,23 @@ fn failed(address: &Address, reason: AddressFailureReason) -> FailedObservation 
 }
 
 /// Test adapter matching the production defaults: the configured UTXO cap
-/// (200) and a generous 5s per-address deadline.
+/// (200), a generous 5s per-address deadline, and the default 1 MiB
+/// response-line cap.
 async fn connect(server: &ProtocolServer) -> ElectrumAdapter {
-    connect_bounded(server, 200, Duration::from_secs(5)).await
+    connect_bounded(
+        server,
+        200,
+        Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .await
 }
 
 async fn connect_bounded(
     server: &ProtocolServer,
     max_utxos_per_address: usize,
     address_deadline: Duration,
+    max_response_bytes: u64,
 ) -> ElectrumAdapter {
     ElectrumAdapter::connect(
         server.endpoint(),
@@ -88,6 +99,7 @@ async fn connect_bounded(
         Duration::from_secs(1),
         max_utxos_per_address,
         address_deadline,
+        max_response_bytes,
     )
     .await
     .unwrap()
@@ -429,6 +441,71 @@ async fn an_oversized_listunspent_response_fails_only_that_address_before_materi
 }
 
 #[tokio::test]
+async fn an_over_cap_response_line_fails_the_read_before_decode_and_the_next_address_reconnects() {
+    let capped = fixture_address();
+    let healthy = Address::p2wpkh(
+        &CompressedPublicKey::from_str(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap(),
+        Network::Regtest,
+    );
+    // Literal fixtures: the capped address's listunspent response is a
+    // single JSON line far above a 4 KiB transport cap (100 items at
+    // ~100 bytes each); the healthy address answers a small line. The
+    // item-count cap (200) would NOT fire for the capped address: the
+    // failure must come from the transport cap, surfacing as an isolated
+    // per-address `error` — the read fails before the client buffers or
+    // JSON-decodes the line.
+    let server = ProtocolServer::start_multi(
+        Network::Regtest,
+        vec![
+            (
+                capped.script_pubkey(),
+                serde_json::Value::Array(
+                    (1..=100)
+                        .map(|label| unspent_entry(label, 546, TIP_HEIGHT))
+                        .collect(),
+                ),
+            ),
+            (
+                healthy.script_pubkey(),
+                serde_json::json!([unspent_entry(7, 30_000, TIP_HEIGHT)]),
+            ),
+        ],
+    )
+    .await;
+    let adapter = connect_bounded(&server, 200, Duration::from_secs(5), 4 * 1024).await;
+
+    let report = adapter
+        .observations(
+            TIP_HEIGHT as u32,
+            &[
+                ObservationTarget::new(capped.to_string(), None),
+                ObservationTarget::new(healthy.to_string(), None),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.failed,
+        vec![failed(&capped, AddressFailureReason::Error)],
+        "the over-cap line fails the read (transport cap), isolated to \
+         that address"
+    );
+    assert_eq!(
+        report.observed,
+        vec![healthy.to_string()],
+        "the poisoned connection is torn down and the next seller is \
+         observed over a fresh capped connection"
+    );
+    assert_eq!(report.outputs.len(), 1);
+    // One lookup per target; the capped lookup is NOT reissued.
+    server.assert_rpc_counts(2, 0, 0);
+}
+
+#[tokio::test]
 async fn a_trickling_response_exceeding_the_address_deadline_fails_only_that_address() {
     let trickled = fixture_address();
     let healthy = Address::p2wpkh(
@@ -452,7 +529,13 @@ async fn a_trickling_response_exceeding_the_address_deadline_fails_only_that_add
         )],
     )
     .await;
-    let adapter = connect_bounded(&server, 200, Duration::from_millis(300)).await;
+    let adapter = connect_bounded(
+        &server,
+        200,
+        Duration::from_millis(300),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .await;
 
     let started = std::time::Instant::now();
     let report = adapter
@@ -524,6 +607,7 @@ async fn classifies_endpoint_outage_as_retryable_unavailable() {
         Duration::from_millis(50),
         200,
         Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
     )
     .await;
 
@@ -566,6 +650,7 @@ async fn probe_classifies_endpoint_outage_as_retryable_unavailable() {
         Duration::from_millis(50),
         200,
         Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
     )
     .unwrap();
 

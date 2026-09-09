@@ -3037,6 +3037,7 @@ dependencies = [
  "prometheus-client",
  "pubky 0.8.0",
  "rand 0.9.5",
+ "rustls",
  "serde",
  "serde_ignored",
  "serde_json",
@@ -3052,6 +3053,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webpki-roots 0.25.4",
  "zeroize",
 ]
 

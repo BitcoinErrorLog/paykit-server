@@ -9,7 +9,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
-use crate::workers::observer::{ObserverPolicy, PROBE_REQUESTS_PER_TICK};
+use crate::workers::{
+    electrum::MIN_MAX_RESPONSE_BYTES,
+    observer::{ObserverPolicy, PROBE_REQUESTS_PER_TICK},
+};
 
 #[derive(Debug)]
 pub struct Config {
@@ -97,6 +100,7 @@ impl Config {
                 max_requests_per_second: raw.electrum.max_requests_per_second,
                 max_utxos_per_address: raw.electrum.max_utxos_per_address,
                 address_deadline: raw.electrum.address_deadline,
+                max_response_bytes: raw.electrum.max_response_bytes,
                 max_tip_age: raw.electrum.max_tip_age,
             },
             outbox: OutboxConfig::from(raw.outbox),
@@ -226,6 +230,9 @@ impl Config {
         .per_tick_budget();
         if effective_per_tick <= PROBE_REQUESTS_PER_TICK {
             return Err(ConfigError::InsufficientElectrumBudget);
+        }
+        if self.electrum.max_response_bytes < MIN_MAX_RESPONSE_BYTES {
+            return Err(ConfigError::ElectrumResponseCapBelowFloor);
         }
         Ok(())
     }
@@ -549,6 +556,12 @@ pub struct ElectrumConfig {
     /// lookup exceeding it fails only that address; the connection is
     /// dropped and never reused.
     pub address_deadline: Duration,
+    /// Transport-level cap on one Electrum response line, in bytes. Every
+    /// connection wraps its stream in a capped reader, so no single
+    /// response line larger than this is ever held in memory: the read
+    /// fails before the client buffers or decodes it, and the poisoned
+    /// connection is torn down. Floor: 64 KiB (startup refuses less).
+    pub max_response_bytes: u64,
     /// Maximum accepted chain-tip age for readiness. On networks with a
     /// live block cadence, /health/ready answers 503 (not_ready) when the
     /// probed tip is older than this, when the tip height regresses by
@@ -682,6 +695,8 @@ pub enum ConfigError {
          must be greater than {PROBE_REQUESTS_PER_TICK}"
     )]
     InsufficientElectrumBudget,
+    #[error("electrum.max_response_bytes must be at least 65536 bytes (64 KiB)")]
+    ElectrumResponseCapBelowFloor,
 }
 
 fn decode_base64url_no_pad(value: &str, error: ConfigError) -> Result<Vec<u8>, ConfigError> {
@@ -830,6 +845,8 @@ struct RawElectrumConfig {
         with = "humantime_serde"
     )]
     address_deadline: Duration,
+    #[serde(default = "default_electrum_max_response_bytes")]
+    max_response_bytes: u64,
     #[serde(default = "default_electrum_max_tip_age", with = "humantime_serde")]
     max_tip_age: Duration,
 }
@@ -848,6 +865,10 @@ const fn default_electrum_max_utxos_per_address() -> u32 {
 
 const fn default_electrum_address_deadline() -> Duration {
     Duration::from_secs(5)
+}
+
+const fn default_electrum_max_response_bytes() -> u64 {
+    crate::workers::electrum::DEFAULT_MAX_RESPONSE_BYTES
 }
 
 const fn default_electrum_max_tip_age() -> Duration {

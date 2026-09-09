@@ -274,6 +274,7 @@ async fn live_electrum_observes_known_output_and_confirmations() {
         Duration::from_secs(15),
         200,
         Duration::from_secs(5),
+        paykit_server::workers::electrum::DEFAULT_MAX_RESPONSE_BYTES,
     )
     .await
     .unwrap();

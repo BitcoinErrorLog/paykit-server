@@ -80,6 +80,14 @@ max_utxos_per_address = 200
 # cannot be cancelled, so the abandoned read still exits at latest when
 # request_timeout elapses on the wire.
 address_deadline = "5s"
+# Transport-level cap on one Electrum response line, in bytes. Every
+# connection the server opens wraps its stream in a capped reader, so no
+# single response line larger than this is ever held in memory: the read
+# fails with "electrum response exceeds max_response_bytes" before the
+# client buffers or JSON-decodes the line, and the poisoned connection is
+# torn down (the next lookup reconnects). Default 1 MiB; startup refuses
+# values below 64 KiB.
+max_response_bytes = 1048576
 # Readiness also requires a trustworthy chain tip: a probed tip older than
 # max_tip_age, a tip-height regression beyond the six-block reorg
 # tolerance, or a tip height that stops advancing within this window marks
