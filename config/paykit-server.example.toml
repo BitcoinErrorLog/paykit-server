@@ -55,29 +55,16 @@ endpoint = "ssl://electrum.example.invalid:50002"
 poll_interval = "10s"
 request_timeout = "10s"
 connect_retries = 1
-# Cap on Electrum requests admitted to one tick's budgeted batch, plus the
-# sustained rate budget: per-tick estimated requests never exceed
-# max_requests_per_second times poll_interval. Each tick's two probe
-# requests (headers.subscribe + block_header(0)) are reserved from the
-# budget. Over-budget targets are deferred to the next tick,
-# oldest-last-observed first, except that the first non-overrun target
-# whose estimate alone exceeds the budget is always observed
-# (head-of-line bypass, cost logged) so expensive targets can never halt
-# observation of the others. The bypass is what the budget does NOT
-# bound: a bypassed target costing more than max_target_requests is
-# flagged observation_overrun (ERROR log with the invoice id, counted on
-# /health and in the metrics) and loses the bypass on later ticks, and a
-# bypass cost above twice the budget raises an ERROR log and a metric.
+# Hard cap on Electrum lookups admitted to one observer tick, plus the
+# sustained rate budget: per-tick lookups never exceed
+# max_requests_per_second times poll_interval. Each admitted observation
+# target costs exactly one script_list_unspent lookup, and each tick's two
+# probe requests (headers.subscribe + block_header(0)) are reserved from
+# the budget. Targets beyond the budget are deferred to the next tick,
+# oldest-last-observed first; there is no bypass and no unmetered
+# admission. See docs/observer-threat-model.md.
 max_requests_per_tick = 1000
 max_requests_per_second = 5
-# Per-target cost bound for the head-of-line bypass described above.
-# max_target_requests = 500
-# Slow lane for overrun-flagged targets: at most one flagged target is
-# observed every this many ticks, so a flagged target keeps converging
-# towards a fresh stamp — and towards the flag clearing once its stamped
-# estimate drops back to or below max_target_requests. See
-# docs/observation-overrun-recovery.md for the manual clear path.
-# overrun_lane_interval_ticks = 10
 # Readiness also requires a trustworthy chain tip: a probed tip older than
 # max_tip_age, a tip-height regression beyond the six-block reorg
 # tolerance, or a tip height that stops advancing within this window marks

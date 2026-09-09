@@ -58,7 +58,7 @@ Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report sec
 
 ## Executable boundary
 
-`paykit-server` composes and supervises the production HTTP routes, Paykit delivery workers, and BDK Electrum observer in one process.
+`paykit-server` composes and supervises the production HTTP routes, Paykit delivery workers, and Electrum observer in one process.
 
 Public operational routes:
 
@@ -186,7 +186,7 @@ The invoice API returns after durable intent commit. It does not wait for Encryp
 
 ## Bitcoin settlement semantics
 
-Each invoice receives a unique BIP84 external-chain address. Observation uses the configured `bdk_electrum` adapter and persists complete validated batches atomically.
+Each invoice receives a unique BIP84 external-chain address. Observation uses one raw `script_list_unspent` lookup per tracked address (exactly one Electrum request per address, no history fetch or transaction fanout; see [`docs/observer-threat-model.md`](docs/observer-threat-model.md)) and persists complete validated batches atomically.
 
 - Outputs are evaluated independently; split or multi-output payments are not aggregated.
 - A single amount-matched output is sufficient for the factual amount match.
