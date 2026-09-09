@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use paykit_server::config::{Config, ConfigEnvironment, PaykitNetwork};
+use paykit_server::config::{Config, ConfigEnvironment, ConfigError, PaykitNetwork};
 
 const KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
@@ -354,6 +354,93 @@ fn parses_outbox_retry_budget_and_rejects_zero_values() {
         let error = Config::from_toml_and_environment(&input, environment()).unwrap_err();
         assert_eq!(error.to_string(), expected, "{field}");
     }
+}
+
+#[test]
+fn rejects_max_attempts_below_floor() {
+    let input = valid_toml().replace(
+        "poll_interval = \"5s\"",
+        "poll_interval = \"5s\"\nmax_attempts = 2",
+    );
+    let error = Config::from_toml_and_environment(&input, environment()).unwrap_err();
+    assert!(matches!(
+        &error,
+        ConfigError::OutboxMaxAttemptsTooLow {
+            value: 2,
+            minimum: 3
+        }
+    ));
+    assert_eq!(
+        error.to_string(),
+        "outbox.max_attempts must be at least 3 (got 2)"
+    );
+}
+
+#[test]
+fn accepts_max_attempts_at_floor() {
+    let input = valid_toml().replace(
+        "poll_interval = \"5s\"",
+        "poll_interval = \"5s\"\nmax_attempts = 3",
+    );
+    assert!(Config::from_toml_and_environment(&input, environment()).is_ok());
+}
+
+#[test]
+fn rejects_max_age_below_one_hour_floor() {
+    let input = valid_toml().replace(
+        "poll_interval = \"5s\"",
+        "poll_interval = \"5s\"\nmax_age = \"3599s\"",
+    );
+    let error = Config::from_toml_and_environment(&input, environment()).unwrap_err();
+    match &error {
+        ConfigError::OutboxMaxAgeTooLow { value, minimum } => {
+            assert_eq!(*value, Duration::from_secs(3599));
+            assert_eq!(*minimum, Duration::from_secs(3600));
+        }
+        other => panic!("unexpected config error: {other:?}"),
+    }
+    assert_eq!(
+        error.to_string(),
+        "outbox.max_age must be at least 3600s (got 3599s)"
+    );
+}
+
+#[test]
+fn accepts_max_age_at_one_hour_floor() {
+    let input = valid_toml().replace(
+        "poll_interval = \"5s\"",
+        "poll_interval = \"5s\"\nmax_age = \"1h\"",
+    );
+    assert!(Config::from_toml_and_environment(&input, environment()).is_ok());
+}
+
+#[test]
+fn rejects_max_age_below_three_retry_max_intervals() {
+    let input = valid_toml().replace(
+        "poll_interval = \"5s\"",
+        "poll_interval = \"5s\"\nretry_max = \"1h\"\nmax_age = \"10799s\"",
+    );
+    let error = Config::from_toml_and_environment(&input, environment()).unwrap_err();
+    match &error {
+        ConfigError::OutboxMaxAgeTooLow { value, minimum } => {
+            assert_eq!(*value, Duration::from_secs(10799));
+            assert_eq!(*minimum, Duration::from_secs(10800));
+        }
+        other => panic!("unexpected config error: {other:?}"),
+    }
+    assert_eq!(
+        error.to_string(),
+        "outbox.max_age must be at least 10800s (got 10799s)"
+    );
+}
+
+#[test]
+fn accepts_max_age_at_three_retry_max_intervals() {
+    let input = valid_toml().replace(
+        "poll_interval = \"5s\"",
+        "poll_interval = \"5s\"\nretry_max = \"1h\"\nmax_age = \"3h\"",
+    );
+    assert!(Config::from_toml_and_environment(&input, environment()).is_ok());
 }
 
 #[test]

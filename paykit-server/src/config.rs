@@ -215,6 +215,24 @@ impl Config {
         if self.outbox.retry_initial > self.outbox.retry_max {
             return Err(ConfigError::InconsistentRetries("outbox"));
         }
+        if self.outbox.max_attempts < 3 {
+            return Err(ConfigError::OutboxMaxAttemptsTooLow {
+                value: self.outbox.max_attempts,
+                minimum: 3,
+            });
+        }
+        let minimum_max_age = Duration::from_secs(60 * 60).max(
+            self.outbox
+                .retry_max
+                .checked_mul(3)
+                .unwrap_or(Duration::MAX),
+        );
+        if self.outbox.max_age < minimum_max_age {
+            return Err(ConfigError::OutboxMaxAgeTooLow {
+                value: self.outbox.max_age,
+                minimum: minimum_max_age,
+            });
+        }
         Ok(())
     }
 }
@@ -680,6 +698,10 @@ pub enum ConfigError {
     SubsecondPersistenceDuration(&'static str),
     #[error("{0}.retry_initial must not exceed {0}.retry_max")]
     InconsistentRetries(&'static str),
+    #[error("outbox.max_attempts must be at least {minimum} (got {value})")]
+    OutboxMaxAttemptsTooLow { value: u32, minimum: u32 },
+    #[error("outbox.max_age must be at least {minimum:?} (got {value:?})")]
+    OutboxMaxAgeTooLow { value: Duration, minimum: Duration },
 }
 
 fn decode_base64url_no_pad(value: &str, error: ConfigError) -> Result<Vec<u8>, ConfigError> {

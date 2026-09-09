@@ -105,7 +105,9 @@ retry_max = "5m"
 # permanently_failed rows never degrade /health/ready — they are retained
 # for operator review only, and their count is exposed as the informational
 # outbox_permanently_failed field. Requeue SQL is in
-# docs/task12-outbox-recovery.md. Both values must be greater than zero.
+# docs/task12-outbox-recovery.md. Retry-budget floors are max_attempts >= 3
+# and max_age >= max(1h, 3 * retry_max); there is no emergency override, so
+# operators clear rows through the existing requeue/ops path.
 # max_attempts = 50
 # max_age = "7d"
 
