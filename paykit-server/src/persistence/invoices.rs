@@ -86,6 +86,10 @@ pub struct PendingCandidate {
     pub outpoint: bitcoin::OutPoint,
 }
 
+fn output_can_bind(observed_sats: u64, required_sats: u64) -> bool {
+    observed_sats >= required_sats
+}
+
 /// Produces payloads after the creator-row lock determines the child index.
 pub trait NewReaderPayloadFactory: Send + Sync {
     fn for_child_index(&self, child_index: i64) -> Result<NewReaderPayloads, PersistenceError>;
@@ -258,7 +262,8 @@ impl InvoiceStore {
             "SELECT invoices.id, creators.creator_lookup_hash,
                     invoices.payment_record_envelope, invoices.bitcoin_address_lookup_hash,
                     invoices.derivation_index_lookup_hash
-             FROM invoices JOIN creators ON creators.id = invoices.creator_id",
+             FROM invoices JOIN creators ON creators.id = invoices.creator_id
+             WHERE invoices.baseline_state <> 'legacy_unbaselined'",
         )
         .fetch_all(&self.pool)
         .await
@@ -339,7 +344,8 @@ impl InvoiceStore {
              FROM invoices JOIN creators ON creators.id = invoices.creator_id \
              LEFT JOIN bitcoin_observations AS observations \
                ON observations.invoice_id = invoices.id AND observations.active \
-             WHERE invoices.baseline_state = 'observing' AND NOT (invoices.payment_status = 'confirmed' \
+             WHERE invoices.baseline_state = 'observing' AND NOT invoices.integrity_failed
+               AND NOT (invoices.payment_status = 'confirmed' \
                         AND invoices.confirmation_count = 6 AND invoices.amount_matched) \
              ORDER BY COALESCE(invoices.last_observed_at, invoices.created_at), invoices.id",
         )
@@ -721,15 +727,60 @@ impl InvoiceStore {
     }
 
     pub async fn fail_creation_baseline(&self, invoice_id: Uuid) -> Result<(), PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         sqlx::query(
             "UPDATE invoices SET baseline_state = 'void_baseline_failed', updated_at = NOW()
              WHERE id = $1 AND baseline_state = 'awaiting_baseline'",
         )
         .bind(invoice_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         Ok(())
+    }
+
+    pub async fn sweep_stale_creation_baselines(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<u64, PersistenceError> {
+        let timeout_seconds =
+            i64::try_from(timeout.as_secs()).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let rows = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM invoices
+             WHERE baseline_state = 'awaiting_baseline'
+               AND created_at <= NOW() - make_interval(secs => $1)
+             FOR UPDATE",
+        )
+        .bind(timeout_seconds)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if !rows.is_empty() {
+            sqlx::query(
+                "UPDATE invoices SET baseline_state = 'void_baseline_failed', updated_at = NOW()
+                 WHERE id = ANY($1) AND baseline_state = 'awaiting_baseline'",
+            )
+            .bind(&rows)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(u64::try_from(rows.len()).unwrap_or(u64::MAX))
     }
 
     pub async fn pending_candidates(&self) -> Result<Vec<PendingCandidate>, PersistenceError> {
@@ -738,10 +789,14 @@ impl InvoiceStore {
              FROM bitcoin_observation_candidates AS candidates
              JOIN invoices ON invoices.id = candidates.invoice_id
              WHERE NOT candidates.approved
+               AND candidates.state = 'pending'
+               AND candidates.next_attempt_at <= NOW()
                AND invoices.baseline_state = 'observing'
+               AND NOT invoices.integrity_failed
                AND NOT (invoices.payment_status = 'confirmed'
                         AND invoices.confirmation_count = 6 AND invoices.amount_matched)
-             ORDER BY candidates.confirmed_height, candidates.created_at",
+             ORDER BY candidates.next_attempt_at, candidates.confirmed_height,
+                      candidates.created_at",
         )
         .fetch_all(&self.pool)
         .await
@@ -757,6 +812,65 @@ impl InvoiceStore {
                 })
             })
             .collect()
+    }
+
+    pub async fn record_candidate_failure(
+        &self,
+        candidate: &PendingCandidate,
+        error_kind: &str,
+        max_attempts: u32,
+    ) -> Result<(), PersistenceError> {
+        let max_attempts =
+            i32::try_from(max_attempts).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let row = sqlx::query_as::<_, (Uuid, i32, String)>(
+            "UPDATE bitcoin_observation_candidates
+             SET attempt_count = attempt_count + 1,
+                 last_attempt_at = NOW(),
+                 last_error_kind = $4,
+                 state = CASE WHEN attempt_count + 1 >= $5
+                              THEN 'unfetchable' ELSE 'pending' END,
+                 next_attempt_at = NOW() + make_interval(
+                     secs => LEAST(3600, 30 * power(2, LEAST(attempt_count, 7)))::INTEGER
+                 ),
+                 updated_at = NOW()
+             WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND state = 'pending'
+             RETURNING invoice_id, attempt_count, state",
+        )
+        .bind(candidate.invoice_id)
+        .bind(candidate.outpoint.txid.to_string())
+        .bind(
+            i32::try_from(candidate.outpoint.vout)
+                .map_err(|_| PersistenceError::CorruptOrMissing)?,
+        )
+        .bind(error_kind)
+        .bind(max_attempts)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if let Some((invoice_id, attempts, state)) = row
+            && state == "unfetchable"
+        {
+            sqlx::query(
+                "UPDATE invoices SET baseline_state = 'manual_review', updated_at = NOW()
+                 WHERE id = $1 AND baseline_state = 'observing'",
+            )
+            .bind(invoice_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            tracing::error!(
+                invoice_id = %invoice_id,
+                attempts,
+                error_kind,
+                "candidate transaction exhausted bounded retries; invoice requires manual review"
+            );
+        }
+        tx.commit().await.map_err(|_| PersistenceError::Unavailable)
     }
 
     pub async fn resolve_candidate(
@@ -815,6 +929,14 @@ impl InvoiceStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| PersistenceError::Unavailable)?;
+            sqlx::query(
+                "UPDATE invoices SET baseline_state = 'manual_review', updated_at = NOW()
+                 WHERE id = $1 AND baseline_state = 'observing'",
+            )
+            .bind(candidate.invoice_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         } else {
             let row = sqlx::query_as::<_, (i32, i32, Vec<u8>, Vec<u8>)>(
                 "SELECT candidates.confirmations, candidates.confirmed_height,
@@ -849,7 +971,8 @@ impl InvoiceStore {
                 return Err(PersistenceError::CorruptOrMissing);
             }
             sqlx::query(
-                "UPDATE bitcoin_observation_candidates SET approved = TRUE, updated_at = NOW()
+                "UPDATE bitcoin_observation_candidates
+                 SET approved = TRUE, state = 'approved', updated_at = NOW()
                  WHERE invoice_id = $1 AND txid = $2 AND vout = $3",
             )
             .bind(candidate.invoice_id)
@@ -893,6 +1016,7 @@ impl InvoiceStore {
         outpoint: &BitcoinOutpoint,
         observed_sats: u64,
         confirmations: u32,
+        confirmed_height: Option<u32>,
         present: bool,
     ) -> Result<bool, PersistenceError> {
         self.apply_bitcoin_observation_with_gate(
@@ -900,7 +1024,7 @@ impl InvoiceStore {
             outpoint,
             observed_sats,
             confirmations,
-            (confirmations > 0).then_some(confirmations),
+            confirmed_height,
             present,
             false,
         )
@@ -966,19 +1090,10 @@ impl InvoiceStore {
         &self,
         observations: &[BitcoinObservationInput],
     ) -> Result<usize, PersistenceError> {
-        if observations.is_empty() {
-            return Ok(0);
-        }
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| PersistenceError::Unavailable)?;
         let mut applied = 0;
         for observation in observations {
-            if self
-                .apply_bitcoin_observation_in_tx(
-                    &mut tx,
+            match self
+                .apply_bitcoin_observation_with_gate(
                     &observation.address,
                     &observation.outpoint,
                     observation.observed_sats,
@@ -987,15 +1102,55 @@ impl InvoiceStore {
                     observation.present,
                     true,
                 )
-                .await?
+                .await
             {
-                applied += 1;
+                Ok(true) => applied += 1,
+                Ok(false) => {}
+                Err(PersistenceError::CorruptOrMissing) => {
+                    self.mark_invoice_integrity_failed(&observation.address)
+                        .await?;
+                }
+                Err(error) => return Err(error),
             }
         }
-        tx.commit()
-            .await
-            .map_err(|_| PersistenceError::Unavailable)?;
         Ok(applied)
+    }
+
+    async fn mark_invoice_integrity_failed(&self, address: &str) -> Result<(), PersistenceError> {
+        let address_lookup_hash = self.crypto.bitcoin_address_lookup_hash(address.as_bytes());
+        let result = sqlx::query_as::<_, (Uuid, bool, i32)>(
+            "WITH current AS (
+                 SELECT id,
+                        integrity_last_logged_at IS NULL
+                        OR integrity_last_logged_at <= NOW() - INTERVAL '5 minutes' AS should_log
+                 FROM invoices
+                 WHERE bitcoin_address_lookup_hash = $1
+                 FOR UPDATE
+             )
+             UPDATE invoices
+             SET integrity_failed = TRUE,
+                 integrity_failure_count = integrity_failure_count + 1,
+                 integrity_failed_at = COALESCE(integrity_failed_at, NOW()),
+                 integrity_last_logged_at = CASE WHEN current.should_log
+                                                THEN NOW()
+                                                ELSE invoices.integrity_last_logged_at END,
+                 updated_at = NOW()
+             FROM current
+             WHERE invoices.id = current.id
+             RETURNING invoices.id, current.should_log, invoices.integrity_failure_count",
+        )
+        .bind(address_lookup_hash.as_bytes().as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if let Some((invoice_id, true, failure_count)) = result {
+            tracing::error!(
+                invoice_id = %invoice_id,
+                failure_count,
+                "invoice observation integrity validation failed; invoice excluded from future batches"
+            );
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1121,7 +1276,7 @@ impl InvoiceStore {
             return Ok(true);
         }
         if present
-            && observed_sats == required
+            && output_can_bind(observed_sats, required)
             && confirmations > 0
             && !approved_candidate
             && require_candidate
@@ -1135,7 +1290,9 @@ impl InvoiceStore {
                     txid = EXCLUDED.txid, vout = EXCLUDED.vout,
                     confirmations = EXCLUDED.confirmations,
                     confirmed_height = EXCLUDED.confirmed_height,
-                    approved = FALSE, updated_at = NOW()
+                    approved = FALSE, attempt_count = 0, last_attempt_at = NULL,
+                    next_attempt_at = NOW(), last_error_kind = NULL,
+                    state = 'pending', updated_at = NOW()
                  WHERE EXCLUDED.confirmed_height
                     < bitcoin_observation_candidates.confirmed_height",
             )
@@ -1268,7 +1425,7 @@ impl InvoiceStore {
         if observation_write.rows_affected() != 1 {
             return Err(PersistenceError::Conflict);
         }
-        let amount_matched = present && observed_sats >= required;
+        let amount_matched = present && output_can_bind(observed_sats, required);
         let reported_confirmations = if amount_matched {
             incoming_confirmations.min(6)
         } else if present {

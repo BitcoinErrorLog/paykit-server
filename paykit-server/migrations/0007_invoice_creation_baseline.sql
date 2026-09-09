@@ -1,8 +1,17 @@
+-- Legacy invoices predate the V2 creation baseline and are deliberately
+-- excluded from observation. Production and proof databases for this rail
+-- are created empty; no migration may silently make a legacy row observable.
 ALTER TABLE invoices
-    ADD COLUMN baseline_state TEXT NOT NULL DEFAULT 'observing',
+    ADD COLUMN baseline_state TEXT NOT NULL DEFAULT 'legacy_unbaselined',
     ADD COLUMN creation_chain_height INTEGER NOT NULL DEFAULT 0,
     ADD CONSTRAINT invoices_baseline_state_check CHECK (
-        baseline_state IN ('awaiting_baseline', 'observing', 'void_baseline_failed')
+        baseline_state IN (
+            'legacy_unbaselined',
+            'awaiting_baseline',
+            'observing',
+            'void_baseline_failed',
+            'manual_review'
+        )
     ),
     ADD CONSTRAINT invoices_creation_chain_height_check CHECK (creation_chain_height >= 0);
 

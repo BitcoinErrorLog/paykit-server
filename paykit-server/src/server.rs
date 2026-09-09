@@ -173,58 +173,75 @@ impl Server {
             },
         );
 
-        let invoice_service = Arc::new(CreateInvoiceService::new(
-            Arc::new(CreatorSessionValidator {
-                creators: creators.clone(),
-                pubky: pubky.clone(),
-            }),
-            Arc::new(PubkyLockFetcher {
-                storage: pubky.public_storage(),
-                max_bytes: config.limits.lock_resource_bytes,
-                timeout: config.limits.lock_fetch_timeout,
-            }),
-            Arc::new(PubkyMarkerDiscovery {
-                storage: pubky.public_storage(),
-            }),
-            config.paykit.receiver_path_priority.clone(),
-            config.paykit.receiver_path.clone(),
-            Arc::new(creators.clone()),
-            config.deployment_invariants().bitcoin_network.clone(),
-            config.bitcoin.creation_enabled,
-            Arc::new(invoices.clone()),
-            electrum.clone(),
-            usize::try_from(config.electrum.max_creation_history_entries)
-                .expect("validated history cap fits usize"),
-            usize::try_from(config.electrum.max_transaction_bytes)
-                .expect("validated transaction cap fits usize"),
-            Arc::new(PaykitIntentBuilder::for_network(
-                &config.deployment_invariants().bitcoin_network,
-            )),
+        let electrum_request_limiter = RequestLimiter::new(
+            u64::from(config.electrum.max_requests_per_tick),
+            u64::from(config.electrum.max_requests_per_second),
+        );
+        let creation_snapshot_slots = Arc::new(tokio::sync::Semaphore::new(
+            usize::try_from(config.electrum.max_concurrent_creation_snapshots)
+                .expect("validated creation snapshot concurrency fits usize"),
         ));
+        let invoice_service = Arc::new(
+            CreateInvoiceService::new(
+                Arc::new(CreatorSessionValidator {
+                    creators: creators.clone(),
+                    pubky: pubky.clone(),
+                }),
+                Arc::new(PubkyLockFetcher {
+                    storage: pubky.public_storage(),
+                    max_bytes: config.limits.lock_resource_bytes,
+                    timeout: config.limits.lock_fetch_timeout,
+                }),
+                Arc::new(PubkyMarkerDiscovery {
+                    storage: pubky.public_storage(),
+                }),
+                config.paykit.receiver_path_priority.clone(),
+                config.paykit.receiver_path.clone(),
+                Arc::new(creators.clone()),
+                config.deployment_invariants().bitcoin_network.clone(),
+                config.bitcoin.creation_enabled,
+                Arc::new(invoices.clone()),
+                electrum.clone(),
+                usize::try_from(config.electrum.max_creation_history_entries)
+                    .expect("validated history cap fits usize"),
+                usize::try_from(config.electrum.max_transaction_bytes)
+                    .expect("validated transaction cap fits usize"),
+                Arc::new(PaykitIntentBuilder::for_network(
+                    &config.deployment_invariants().bitcoin_network,
+                )),
+            )
+            .with_electrum_controls(
+                electrum_request_limiter.clone(),
+                creation_snapshot_slots.clone(),
+            ),
+        );
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
-        let payment_request_service = Arc::new(MarketplacePaymentRequestService::new(
-            Arc::new(CreatorSessionValidator {
-                creators: creators.clone(),
-                pubky: pubky.clone(),
-            }),
-            Arc::new(PubkyMarkerDiscovery {
-                storage: pubky.public_storage(),
-            }),
-            config.paykit.receiver_path_priority.clone(),
-            config.paykit.receiver_path.clone(),
-            Arc::new(creators.clone()),
-            config.deployment_invariants().bitcoin_network.clone(),
-            config.bitcoin.creation_enabled,
-            Arc::new(invoices.clone()),
-            electrum.clone(),
-            usize::try_from(config.electrum.max_creation_history_entries)
-                .expect("validated history cap fits usize"),
-            usize::try_from(config.electrum.max_transaction_bytes)
-                .expect("validated transaction cap fits usize"),
-            Arc::new(PaykitIntentBuilder::for_network(
-                &config.deployment_invariants().bitcoin_network,
-            )),
-        ));
+        let payment_request_service = Arc::new(
+            MarketplacePaymentRequestService::new(
+                Arc::new(CreatorSessionValidator {
+                    creators: creators.clone(),
+                    pubky: pubky.clone(),
+                }),
+                Arc::new(PubkyMarkerDiscovery {
+                    storage: pubky.public_storage(),
+                }),
+                config.paykit.receiver_path_priority.clone(),
+                config.paykit.receiver_path.clone(),
+                Arc::new(creators.clone()),
+                config.deployment_invariants().bitcoin_network.clone(),
+                config.bitcoin.creation_enabled,
+                Arc::new(invoices.clone()),
+                electrum.clone(),
+                usize::try_from(config.electrum.max_creation_history_entries)
+                    .expect("validated history cap fits usize"),
+                usize::try_from(config.electrum.max_transaction_bytes)
+                    .expect("validated transaction cap fits usize"),
+                Arc::new(PaykitIntentBuilder::for_network(
+                    &config.deployment_invariants().bitcoin_network,
+                )),
+            )
+            .with_electrum_controls(electrum_request_limiter.clone(), creation_snapshot_slots),
+        );
         let manual_claims = Arc::new(ManualClaimService::new(
             pubky.clone(),
             Arc::new(RelayLoopbackSessionMinter::new(
@@ -262,10 +279,7 @@ impl Server {
         // budget config: the observer tick and every non-tick Electrum
         // caller (creation snapshot fetches, first-bind candidate fetch,
         // claim-time history scan) charge this single bucket.
-        runtime.set_electrum_request_limiter(RequestLimiter::new(
-            u64::from(config.electrum.max_requests_per_tick),
-            u64::from(config.electrum.max_requests_per_second),
-        ));
+        runtime.set_electrum_request_limiter(electrum_request_limiter);
         // Regtest tips are mined on demand and can be arbitrarily old
         // without indicating endpoint trouble, so the tip-age check only
         // applies to networks with a live block cadence.
@@ -296,6 +310,7 @@ impl Server {
                 max_requests_per_second: config.electrum.max_requests_per_second,
                 max_transaction_bytes: usize::try_from(config.electrum.max_transaction_bytes)
                     .expect("validated transaction cap fits usize"),
+                baseline_completion_timeout: config.electrum.baseline_completion_timeout,
             },
         };
 

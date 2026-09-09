@@ -33,7 +33,7 @@ use crate::{
         AtomicInvoiceInput, AtomicInvoiceResult, CreatorStore, InvoicePreflight, InvoiceStore,
         NewReaderPayloadFactory, NewReaderPayloads, PersistenceError,
     },
-    workers::observer::{CreationSnapshot, ElectrumPort},
+    workers::observer::{CreationSnapshot, ElectrumPort, PROBE_REQUESTS_PER_TICK, RequestLimiter},
 };
 
 const REQUEST_DEADLINE: Duration = Duration::from_secs(15);
@@ -368,6 +368,8 @@ pub struct CreateInvoiceService {
     electrum: Arc<dyn ElectrumPort>,
     max_creation_history_entries: usize,
     max_transaction_bytes: usize,
+    electrum_limiter: RequestLimiter,
+    creation_snapshot_slots: Arc<tokio::sync::Semaphore>,
     intents: Arc<dyn IntentBuilder>,
     clock: Arc<dyn DeadlineClock>,
 }
@@ -436,6 +438,8 @@ impl CreateInvoiceService {
             electrum,
             max_creation_history_entries,
             max_transaction_bytes,
+            electrum_limiter: RequestLimiter::new(u64::MAX, u64::MAX),
+            creation_snapshot_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             intents,
             clock,
         }
@@ -472,6 +476,16 @@ impl CreateInvoiceService {
             max_transaction_bytes,
             intents,
         )
+    }
+
+    pub fn with_electrum_controls(
+        mut self,
+        limiter: RequestLimiter,
+        creation_snapshot_slots: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
+        self.electrum_limiter = limiter;
+        self.creation_snapshot_slots = creation_snapshot_slots;
+        self
     }
 
     pub async fn create(
@@ -586,12 +600,26 @@ impl CreateInvoiceService {
             .for_child_index(created.reader_child_index())
             .map_err(map_store)?
             .bitcoin_address;
+        let reservation = self
+            .electrum_limiter
+            .reserve_or_wait(3, Instant::now() + Duration::from_secs(2))
+            .await;
+        let snapshot_slot = self.creation_snapshot_slots.clone().acquire_owned().await;
+        if reservation.is_err() || snapshot_slot.is_err() {
+            self.store
+                .fail_creation_baseline(created.invoice_id())
+                .await
+                .map_err(map_store)?;
+            return Err(CreateInvoiceError::Unavailable);
+        }
+        let _snapshot_slot = snapshot_slot.expect("checked creation snapshot semaphore");
         let snapshot = self
             .electrum
             .creation_snapshot(
                 &address,
                 self.max_creation_history_entries,
                 self.max_transaction_bytes,
+                &self.electrum_limiter,
             )
             .await;
         let snapshot = match snapshot {
@@ -604,6 +632,21 @@ impl CreateInvoiceService {
                 return Err(CreateInvoiceError::Unavailable);
             }
         };
+        if self
+            .electrum_limiter
+            .reserve_or_wait(
+                PROBE_REQUESTS_PER_TICK,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .is_err()
+        {
+            self.store
+                .fail_creation_baseline(created.invoice_id())
+                .await
+                .map_err(map_store)?;
+            return Err(CreateInvoiceError::Unavailable);
+        }
         let probe = self.electrum.probe().await;
         if !matches!(probe, Ok(probe) if probe.height.abs_diff(snapshot.tip_height) <= 3) {
             self.store

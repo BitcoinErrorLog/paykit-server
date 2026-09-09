@@ -47,6 +47,7 @@ pub const PROBE_REQUESTS_PER_TICK: u64 = 2;
 /// permanently failing target is visible without flooding the log, while
 /// the per-tick summary WARN still records every tick's failure count.
 const ADDRESS_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const MAX_CANDIDATE_ATTEMPTS: u32 = 12;
 
 const BACKOFF_INITIAL: Duration = Duration::from_secs(30);
 const BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
@@ -151,6 +152,7 @@ pub trait ElectrumPort: Send + Sync {
         _address: &str,
         _max_history_entries: usize,
         _max_transaction_bytes: usize,
+        _request_limiter: &RequestLimiter,
     ) -> Result<CreationSnapshot, ObserverError> {
         Err(ObserverError::Unavailable)
     }
@@ -192,6 +194,21 @@ pub enum ObserverError {
     ObservationStampMiss,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateFailureKind {
+    Fetch,
+    Persistence,
+}
+
+impl CandidateFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::Persistence => "persistence",
+        }
+    }
+}
+
 /// Durable side of the observer: plans, applies, and records one tick. The
 /// production implementation is [`InvoiceStore`]; tests inject fakes.
 #[async_trait]
@@ -218,6 +235,19 @@ pub trait ObservationBackend: Send + Sync {
         _inputs: &[OutPoint],
     ) -> Result<(), ObserverError> {
         Err(ObserverError::Persistence)
+    }
+    async fn record_candidate_failure(
+        &self,
+        _candidate: &PendingCandidate,
+        _kind: CandidateFailureKind,
+    ) -> Result<(), ObserverError> {
+        Err(ObserverError::Persistence)
+    }
+    async fn sweep_stale_creation_baselines(
+        &self,
+        _timeout: Duration,
+    ) -> Result<u64, ObserverError> {
+        Ok(0)
     }
 }
 
@@ -262,6 +292,30 @@ impl ObservationBackend for InvoiceStore {
             .await
             .map_err(map_persistence)
     }
+
+    async fn record_candidate_failure(
+        &self,
+        candidate: &PendingCandidate,
+        kind: CandidateFailureKind,
+    ) -> Result<(), ObserverError> {
+        InvoiceStore::record_candidate_failure(
+            self,
+            candidate,
+            kind.as_str(),
+            MAX_CANDIDATE_ATTEMPTS,
+        )
+        .await
+        .map_err(map_persistence)
+    }
+
+    async fn sweep_stale_creation_baselines(
+        &self,
+        timeout: Duration,
+    ) -> Result<u64, ObserverError> {
+        InvoiceStore::sweep_stale_creation_baselines(self, timeout)
+            .await
+            .map_err(map_persistence)
+    }
 }
 
 /// Cluster-wide observer leadership boundary. Exactly one replica may run
@@ -300,6 +354,7 @@ pub struct ObserverPolicy {
     /// interval — can sustain more requests per second.
     pub max_requests_per_second: u32,
     pub max_transaction_bytes: usize,
+    pub baseline_completion_timeout: Duration,
 }
 
 impl ObserverPolicy {
@@ -617,6 +672,8 @@ pub struct ObserverTickState {
     /// ERROR log; reset by any tick with at least one successful lookup, so
     /// the next zero-success streak logs again.
     zero_success_logged: bool,
+    max_transaction_bytes: usize,
+    baseline_completion_timeout: Duration,
 }
 
 impl ObserverTickState {
@@ -624,17 +681,31 @@ impl ObserverTickState {
     /// for tests that drive ticks in isolation. Production uses
     /// [`Self::with_limiter`] with the app-owned shared limiter.
     pub fn new(policy: &ObserverPolicy) -> Self {
-        Self::with_limiter(RequestLimiter::from_policy(policy))
+        let mut state = Self::with_limiter_and_transaction_cap(
+            RequestLimiter::from_policy(policy),
+            policy.max_transaction_bytes,
+        );
+        state.baseline_completion_timeout = policy.baseline_completion_timeout;
+        state
     }
 
     /// Tick state over the app-owned shared limiter: the tick and every
     /// other Electrum caller draw from one bucket, so a busy non-tick
     /// caller shrinks the next tick's admission and vice versa.
     pub fn with_limiter(limiter: RequestLimiter) -> Self {
+        Self::with_limiter_and_transaction_cap(limiter, 400_000)
+    }
+
+    pub fn with_limiter_and_transaction_cap(
+        limiter: RequestLimiter,
+        max_transaction_bytes: usize,
+    ) -> Self {
         Self {
             budget: limiter,
             failure_log: AddressFailureLog::new(),
             zero_success_logged: false,
+            max_transaction_bytes,
+            baseline_completion_timeout: Duration::from_secs(60),
         }
     }
 
@@ -757,6 +828,12 @@ pub async fn observe_tick(
     runtime: &Runtime,
     state: &mut ObserverTickState,
 ) -> ObserverTickOutcome {
+    if let Err(error) = backend
+        .sweep_stale_creation_baselines(state.baseline_completion_timeout)
+        .await
+    {
+        return ObserverTickOutcome::ObservationFailed(error);
+    }
     let tip = match port.probe().await {
         Ok(tip) => {
             runtime.record_electrum_probe(ElectrumProbe::success(tip.height, tip.time_unix));
@@ -904,16 +981,24 @@ pub async fn observe_tick(
     if u64::try_from(processed).unwrap_or(u64::MAX) < lookup_budget
         && let Ok(candidates) = backend.pending_candidates().await
         && let Some(candidate) = candidates.first()
-        && let Ok(transaction) = port
-            .candidate_transaction(candidate.outpoint.txid, policy.max_transaction_bytes)
-            .await
-        && transaction.txid == candidate.outpoint.txid
-        && let Err(error) = backend
-            .resolve_candidate(candidate, &transaction.inputs)
-            .await
+        && state.budget.try_reserve(1).is_ok()
     {
-        runtime.set_electrum_available(false);
-        return ObserverTickOutcome::ObservationFailed(error);
+        let failure = match port
+            .candidate_transaction(candidate.outpoint.txid, state.max_transaction_bytes)
+            .await
+        {
+            Ok(transaction) if transaction.txid == candidate.outpoint.txid => backend
+                .resolve_candidate(candidate, &transaction.inputs)
+                .await
+                .err()
+                .map(|_| CandidateFailureKind::Persistence),
+            Ok(_) | Err(_) => Some(CandidateFailureKind::Fetch),
+        };
+        if let Some(kind) = failure
+            && let Err(error) = backend.record_candidate_failure(candidate, kind).await
+        {
+            return ObserverTickOutcome::ObservationFailed(error);
+        }
     }
     let misses = match backend.record_observation_tick(&report.observed).await {
         Ok(misses) => misses,
@@ -965,7 +1050,11 @@ pub async fn observation_loop(
     // runtime at startup, so non-tick Electrum callers (creation snapshot
     // fetches, first-bind candidate fetch, claim-time history scan) draw
     // from the same bucket the tick does.
-    let mut state = ObserverTickState::with_limiter(runtime.electrum_request_limiter());
+    let mut state = ObserverTickState::with_limiter_and_transaction_cap(
+        runtime.electrum_request_limiter(),
+        policy.max_transaction_bytes,
+    );
+    state.baseline_completion_timeout = policy.baseline_completion_timeout;
     let mut first_tick = true;
     let mut was_leader = true;
     loop {
@@ -1043,7 +1132,8 @@ impl ElectrumAdapter {
             endpoint: self.endpoint.clone(),
             network: self.network.clone(),
             timeout: self.timeout,
-            retries: self.retries,
+            max_utxos_per_address: self.max_utxos_per_address,
+            address_deadline: self.address_deadline,
         }
     }
 
@@ -1136,13 +1226,14 @@ impl ElectrumPort for ElectrumAdapter {
         address: &str,
         max_history_entries: usize,
         max_transaction_bytes: usize,
+        request_limiter: &RequestLimiter,
     ) -> Result<CreationSnapshot, ObserverError> {
         let adapter = self.clone_for_fetch();
         let address = address.to_owned();
+        let request_limiter = request_limiter.clone();
         tokio::task::spawn_blocking(move || {
             let client = adapter.raw_client_blocking().map_err(map_electrum)?;
             let address = parse_address(&address, adapter.network.as_bitcoin_network())?;
-            let notification = client.block_headers_subscribe().map_err(map_electrum)?;
             let history = client
                 .script_get_history(address.script_pubkey().as_script())
                 .map_err(map_electrum)?;
@@ -1164,6 +1255,9 @@ impl ElectrumPort for ElectrumAdapter {
                 .collect::<Result<Vec<_>, ObserverError>>()?;
             let mut unconfirmed_inputs = Vec::new();
             for entry in history.into_iter().filter(|entry| entry.height <= 0) {
+                request_limiter
+                    .try_reserve(1)
+                    .map_err(|_| ObserverError::Unavailable)?;
                 let transaction =
                     fetch_transaction_blocking(&client, entry.tx_hash, max_transaction_bytes)?;
                 unconfirmed_inputs.extend(
@@ -1177,6 +1271,7 @@ impl ElectrumPort for ElectrumAdapter {
             baseline_outputs.dedup();
             unconfirmed_inputs.sort_unstable();
             unconfirmed_inputs.dedup();
+            let notification = client.block_headers_subscribe().map_err(map_electrum)?;
             Ok(CreationSnapshot {
                 tip_height: u32::try_from(notification.height)
                     .map_err(|_| ObserverError::InvalidObservation)?,
@@ -1383,7 +1478,7 @@ fn observe_address_blocking(
             confirmed_height: (item.height != 0)
                 .then(|| u32::try_from(item.height))
                 .transpose()
-                .map_err(|_| ObserverError::InvalidObservation)?,
+                .map_err(|_| AddressFailureReason::Error)?,
             present: true,
         });
     }
@@ -1739,6 +1834,7 @@ mod tests {
             max_requests_per_tick: 1000,
             max_requests_per_second: 5,
             max_transaction_bytes: 400_000,
+            baseline_completion_timeout: Duration::from_secs(60),
         };
         assert_eq!(policy.per_tick_budget(), 50);
         let capped = ObserverPolicy {

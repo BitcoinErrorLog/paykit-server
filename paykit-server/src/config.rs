@@ -1,6 +1,6 @@
 use std::{fmt, time::Duration};
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::VerifyingKey;
 use paykit_lib::PaykitReceiverPath;
 use pubky::PublicKey;
@@ -100,6 +100,8 @@ impl Config {
                 max_tip_age: raw.electrum.max_tip_age,
                 max_creation_history_entries: raw.electrum.max_creation_history_entries,
                 max_transaction_bytes: raw.electrum.max_transaction_bytes,
+                max_concurrent_creation_snapshots: raw.electrum.max_concurrent_creation_snapshots,
+                baseline_completion_timeout: raw.electrum.baseline_completion_timeout,
             },
             outbox: OutboxConfig::from(raw.outbox),
             limits: LimitsConfig::from(raw.limits),
@@ -140,6 +142,10 @@ impl Config {
             ("electrum.request_timeout", self.electrum.request_timeout),
             ("electrum.address_deadline", self.electrum.address_deadline),
             ("electrum.max_tip_age", self.electrum.max_tip_age),
+            (
+                "electrum.baseline_completion_timeout",
+                self.electrum.baseline_completion_timeout,
+            ),
             ("outbox.poll_interval", self.outbox.poll_interval),
             ("outbox.lease_duration", self.outbox.lease_duration),
             ("outbox.retry_initial", self.outbox.retry_initial),
@@ -172,6 +178,10 @@ impl Config {
             (
                 "electrum.max_transaction_bytes",
                 u64::from(self.electrum.max_transaction_bytes),
+            ),
+            (
+                "electrum.max_concurrent_creation_snapshots",
+                u64::from(self.electrum.max_concurrent_creation_snapshots),
             ),
             ("limits.request_body_bytes", self.limits.request_body_bytes),
             (
@@ -232,10 +242,18 @@ impl Config {
             poll_interval: self.electrum.poll_interval,
             max_requests_per_tick: self.electrum.max_requests_per_tick,
             max_requests_per_second: self.electrum.max_requests_per_second,
+            max_transaction_bytes: usize::try_from(self.electrum.max_transaction_bytes)
+                .unwrap_or(usize::MAX),
+            baseline_completion_timeout: self.electrum.baseline_completion_timeout,
         }
         .per_tick_budget();
         if effective_per_tick <= PROBE_REQUESTS_PER_TICK {
             return Err(ConfigError::InsufficientElectrumBudget);
+        }
+        if self.deployment_invariants.stack_role == StackRole::Production
+            && self.deployment_invariants.bitcoin_network != BitcoinNetwork::Mainnet
+        {
+            return Err(ConfigError::ProductionRequiresMainnet);
         }
         Ok(())
     }
@@ -577,6 +595,10 @@ pub struct ElectrumConfig {
     pub max_creation_history_entries: u32,
     /// Maximum raw transaction response accepted by bounded transaction fetches.
     pub max_transaction_bytes: u32,
+    /// Maximum creation snapshots allowed to occupy the blocking pool concurrently.
+    pub max_concurrent_creation_snapshots: u32,
+    /// Maximum age of an invoice left between creation commit and baseline completion.
+    pub baseline_completion_timeout: Duration,
 }
 
 #[derive(Debug)]
@@ -666,6 +688,8 @@ pub enum ConfigError {
     MissingStackRole,
     #[error("[deployment] stack_role must be production or proof")]
     InvalidStackRole,
+    #[error("deployment invariant refused: stack_role=production requires bitcoin.network=mainnet")]
+    ProductionRequiresMainnet,
     #[error("{0} must be a valid absolute URL")]
     InvalidUrl(&'static str),
     #[error(
@@ -676,9 +700,7 @@ pub enum ConfigError {
     InvalidReceiverPath,
     #[error("paykit.network must be mainnet or testnet")]
     InvalidPaykitNetwork,
-    #[error(
-        "paykit.receiver_path_priority entries must be canonical Paykit receiver app segments"
-    )]
+    #[error("paykit.receiver_path_priority entries must be canonical Paykit receiver app segments")]
     InvalidReceiverPathPriority,
     #[error("paykit.receiver_path_priority must not be empty")]
     EmptyReceiverPathPriority,
@@ -852,6 +874,13 @@ struct RawElectrumConfig {
     max_creation_history_entries: u32,
     #[serde(default = "default_electrum_max_transaction_bytes")]
     max_transaction_bytes: u32,
+    #[serde(default = "default_electrum_max_concurrent_creation_snapshots")]
+    max_concurrent_creation_snapshots: u32,
+    #[serde(
+        default = "default_electrum_baseline_completion_timeout",
+        with = "humantime_serde"
+    )]
+    baseline_completion_timeout: Duration,
 }
 
 const fn default_electrum_max_requests_per_tick() -> u32 {
@@ -876,6 +905,14 @@ const fn default_electrum_max_creation_history_entries() -> u32 {
 
 const fn default_electrum_max_transaction_bytes() -> u32 {
     400_000
+}
+
+const fn default_electrum_max_concurrent_creation_snapshots() -> u32 {
+    4
+}
+
+const fn default_electrum_baseline_completion_timeout() -> Duration {
+    Duration::from_secs(60)
 }
 
 const fn default_electrum_max_tip_age() -> Duration {
