@@ -132,6 +132,16 @@ mod tick {
         Runtime::new(Arc::new(ReadyPostgres), 1)
     }
 
+    fn fresh_tip_time() -> u32 {
+        u32::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
+    }
+
     fn policy(budget: u32) -> ObserverPolicy {
         ObserverPolicy {
             poll_interval: Duration::from_secs(10),
@@ -155,7 +165,7 @@ mod tick {
             Self {
                 probe: Ok(TipProbe {
                     height: 100,
-                    time_unix: 1_700_000_000,
+                    time_unix: fresh_tip_time(),
                 }),
                 history_tx_counts: history_tx_counts
                     .into_iter()
@@ -199,6 +209,7 @@ mod tick {
                             .unwrap_or(0),
                     })
                     .collect(),
+                request_count: 0,
             })
         }
 
@@ -230,6 +241,7 @@ mod tick {
                     PlannedObservation::new(
                         ObservationTarget::new(entry.address.clone(), None),
                         entry.history_tx_count,
+                        None,
                         Duration::from_secs(entry.staleness_secs),
                     )
                 })
@@ -375,12 +387,15 @@ mod tick {
             applied: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
-        // Costs: 2 + 3 + 1 + 1 = 7 estimated; budget 5 admits the first two.
+        // Costs: 2 + 3 + 1 + 1 = 7 estimated. Policy budget 7 reserves the
+        // tick's two probe requests (headers.subscribe + block_header(0)),
+        // leaving 5, which admits the first two targets only. Without the
+        // reservation all four would fit and nothing would be deferred.
         let outcome = observe_tick(
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(5),
+            &policy(7),
             &runtime,
         )
         .await;
@@ -402,7 +417,7 @@ mod tick {
             &port,
             &backend,
             &BitcoinNetwork::Regtest,
-            &policy(5),
+            &policy(7),
             &runtime,
         )
         .await;

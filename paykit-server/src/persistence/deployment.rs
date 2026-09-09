@@ -71,7 +71,7 @@ impl DeploymentStore {
                 .await
                 .map_err(|_| PersistenceError::Unavailable),
             None => {
-                sqlx::query(
+                let adopted = sqlx::query(
                     "UPDATE deployment_metadata SET stack_role = $1, updated_at = NOW() \
                      WHERE id = 1 AND stack_role IS NULL",
                 )
@@ -79,6 +79,13 @@ impl DeploymentStore {
                 .execute(&mut *transaction)
                 .await
                 .map_err(|_| PersistenceError::Unavailable)?;
+                // The row is held FOR UPDATE, so the adopt-once update must
+                // apply to exactly one row; anything else means the adoption
+                // did not happen and boot must refuse rather than continue
+                // with an unset role.
+                if adopted.rows_affected() != 1 {
+                    return Err(PersistenceError::DeploymentRoleAdoption);
+                }
                 transaction
                     .commit()
                     .await
@@ -102,6 +109,9 @@ pub enum PersistenceError {
     /// Stored deployment metadata differs from typed startup configuration.
     #[error("deployment metadata does not match configuration")]
     DeploymentMismatch,
+    /// The adopt-once stack role update did not apply to exactly one row.
+    #[error("stack role adoption did not apply to exactly one deployment row")]
+    DeploymentRoleAdoption,
     /// A persisted row is missing, malformed, or could not be authenticated.
     #[error("persisted state is missing or corrupt")]
     CorruptOrMissing,

@@ -85,6 +85,16 @@ async fn unavailable_electrum_endpoint() -> String {
 /// longer depends on the removed empty-target shortcut.
 struct HealthyElectrum;
 
+fn fresh_tip_time() -> u32 {
+    u32::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+}
+
 #[async_trait]
 impl ElectrumPort for HealthyElectrum {
     async fn observations(
@@ -100,13 +110,14 @@ impl ElectrumPort for HealthyElectrum {
                     tx_count: 0,
                 })
                 .collect(),
+            request_count: 0,
         })
     }
 
     async fn probe(&self) -> Result<TipProbe, ObserverError> {
         Ok(TipProbe {
             height: 100,
-            time_unix: 1_700_000_000,
+            time_unix: fresh_tip_time(),
         })
     }
 }

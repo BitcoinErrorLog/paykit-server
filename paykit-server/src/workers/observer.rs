@@ -27,6 +27,11 @@ use crate::{
 /// Oldest-observation age that triggers the backlog metric and WARN log.
 pub const BACKLOG_ALERT_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
+/// Requests reserved from each tick's budget for the active health probe
+/// (`headers.subscribe` + `block_header(0)`), so the configured rate bounds
+/// the probe and the observation batch together.
+pub const PROBE_REQUESTS_PER_TICK: u64 = 2;
+
 const BACKOFF_INITIAL: Duration = Duration::from_secs(30);
 const BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
 
@@ -65,12 +70,16 @@ pub struct TargetHistory {
     pub tx_count: u32,
 }
 
-/// One tick's observation response: matched outputs plus the per-target
-/// history sizes that feed the next tick's request budget.
+/// One tick's observation response: matched outputs, the per-target
+/// history sizes, and the actual number of Electrum requests the adapter
+/// issued for the batch. The request count is measured at the client and
+/// feeds the next tick's per-target cost estimate.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ObservationReport {
     pub outputs: Vec<ObservedOutput>,
     pub history: Vec<TargetHistory>,
+    /// Electrum requests actually issued for this batch.
+    pub request_count: u64,
 }
 
 /// Production Electrum adapters are injected here. This boundary deliberately
@@ -149,7 +158,9 @@ impl ObservationBackend for InvoiceStore {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObserverPolicy {
     pub poll_interval: Duration,
-    /// Hard cap on Electrum requests issued per tick.
+    /// Hard cap on Electrum requests issued per tick. The tick's probe
+    /// requests ([`PROBE_REQUESTS_PER_TICK`]) are reserved from this cap
+    /// before observation targets are admitted.
     pub max_requests_per_tick: u32,
     /// Sustained rate budget; the per-tick allowance is this rate times the
     /// poll interval, so estimated requests per second stay at or below it.
@@ -325,11 +336,16 @@ pub async fn observe_tick(
         );
     }
 
-    let selection = select_within_budget(plan, policy.per_tick_budget());
+    // The active probe issues requests of its own; reserve them so the
+    // configured rate bounds the probe and the observation batch together.
+    let target_budget = policy
+        .per_tick_budget()
+        .saturating_sub(PROBE_REQUESTS_PER_TICK);
+    let selection = select_within_budget(plan, target_budget);
     if let Some(cost) = selection.bypassed_head_cost {
         tracing::warn!(
             estimated_requests = cost,
-            budget = policy.per_tick_budget(),
+            budget = target_budget,
             hard_cap = policy.max_requests_per_tick,
             "oldest observation target exceeds the per-tick request budget; \
              observing it alone to preserve liveness"
@@ -344,6 +360,11 @@ pub async fn observe_tick(
             deferred,
         };
     }
+    let estimated_batch_requests: u64 = selection
+        .batch
+        .iter()
+        .map(PlannedObservation::estimated_requests)
+        .sum();
     let targets: Vec<ObservationTarget> = selection
         .batch
         .iter()
@@ -356,6 +377,13 @@ pub async fn observe_tick(
             return ObserverTickOutcome::ObservationFailed(error);
         }
     };
+    tracing::info!(
+        estimated_requests = estimated_batch_requests,
+        actual_requests = report.request_count,
+        targets = targets.len(),
+        deferred,
+        "electrum observation batch completed"
+    );
     if let Err(error) = backend
         .apply_observations(network, &targets, report.outputs)
         .await
@@ -363,10 +391,22 @@ pub async fn observe_tick(
         runtime.set_electrum_available(false);
         return ObserverTickOutcome::ObservationFailed(error);
     }
+    // Attribute the measured batch request count evenly across the batch's
+    // targets so a systematically under-estimated mix raises every target's
+    // next-tick estimate.
+    let batch_size = u64::try_from(targets.len()).unwrap_or(1).max(1);
+    let per_target_request_count =
+        u32::try_from(report.request_count.div_ceil(batch_size)).unwrap_or(u32::MAX);
     let records: Vec<TargetTickRecord> = report
         .history
         .iter()
-        .map(|history| TargetTickRecord::new(history.address.clone(), history.tx_count))
+        .map(|history| {
+            TargetTickRecord::new(
+                history.address.clone(),
+                history.tx_count,
+                per_target_request_count,
+            )
+        })
         .collect();
     if let Err(error) = backend.record_observation_tick(&records).await {
         runtime.set_electrum_available(false);
@@ -467,9 +507,11 @@ impl ElectrumAdapter {
         Ok(adapter)
     }
 
-    async fn client(&self) -> Result<Arc<BdkElectrumClient<Client>>, ObserverError> {
-        let client = self.raw_client().await?;
-        Ok(Arc::new(BdkElectrumClient::new(client)))
+    /// Connects a fresh client pair: the raw client (whose request counter
+    /// is readable) and the BDK sync client layered over it.
+    async fn client(&self) -> Result<(Arc<Client>, BdkElectrumClient<Arc<Client>>), ObserverError> {
+        let raw = Arc::new(self.raw_client().await?);
+        Ok((raw.clone(), BdkElectrumClient::new(raw)))
     }
 
     async fn raw_client(&self) -> Result<Client, ObserverError> {
@@ -491,12 +533,19 @@ impl ElectrumPort for ElectrumAdapter {
         &self,
         targets: &[ObservationTarget],
     ) -> Result<ObservationReport, ObserverError> {
-        let client = self.client().await?;
+        let (raw, client) = self.client().await?;
         let network = self.network.clone();
         let targets = targets.to_vec();
-        tokio::task::spawn_blocking(move || observe_blocking(&client, &network, &targets))
-            .await
-            .map_err(|_| ObserverError::Unavailable)?
+        tokio::task::spawn_blocking(move || {
+            let before = raw.calls_made().map_err(map_electrum)?;
+            let mut report = observe_blocking(&client, &network, &targets)?;
+            let after = raw.calls_made().map_err(map_electrum)?;
+            report.request_count = u64::try_from(after.saturating_sub(before))
+                .map_err(|_| ObserverError::InvalidObservation)?;
+            Ok(report)
+        })
+        .await
+        .map_err(|_| ObserverError::Unavailable)?
     }
 
     async fn probe(&self) -> Result<TipProbe, ObserverError> {
@@ -520,7 +569,7 @@ impl ElectrumPort for ElectrumAdapter {
 }
 
 fn observe_blocking(
-    client: &BdkElectrumClient<Client>,
+    client: &BdkElectrumClient<Arc<Client>>,
     network: &BitcoinNetwork,
     targets: &[ObservationTarget],
 ) -> Result<ObservationReport, ObserverError> {
@@ -646,6 +695,9 @@ fn observe_blocking(
     Ok(ObservationReport {
         outputs: observations,
         history,
+        // Filled in by the caller, which measures the client request counter
+        // around this sync.
+        request_count: 0,
     })
 }
 
@@ -665,18 +717,6 @@ fn parse_address(address: &str, network: Network) -> Result<Address, ObserverErr
         .map_err(|_| ObserverError::InvalidObservation)?
         .require_network(network)
         .map_err(|_| ObserverError::WrongNetwork)
-}
-
-/// Applies one fetched batch. Invalid networks or unrequested addresses fail
-/// before any database write.
-pub async fn observe_once(
-    port: &dyn ElectrumPort,
-    invoices: &InvoiceStore,
-    network: &BitcoinNetwork,
-    targets: &[ObservationTarget],
-) -> Result<usize, ObserverError> {
-    let report = port.observations(targets).await?;
-    ObservationBackend::apply_observations(invoices, network, targets, report.outputs).await
 }
 
 fn validate_batch(
@@ -757,7 +797,7 @@ mod tests {
     }
 
     fn planned(label: &str, history_tx_count: Option<u32>) -> PlannedObservation {
-        PlannedObservation::new(target(label), history_tx_count, Duration::ZERO)
+        PlannedObservation::new(target(label), history_tx_count, None, Duration::ZERO)
     }
 
     fn labels(entries: &[PlannedObservation]) -> Vec<String> {
@@ -777,6 +817,14 @@ mod tests {
         let selection = select_within_budget(plan, u64::MAX);
         // 1+1 (unknown counts as 1), 1+0, 1+4.
         assert_eq!(selection.estimated_requests, 8);
+    }
+
+    #[test]
+    fn budget_uses_the_measured_request_count_when_it_exceeds_the_structural_estimate() {
+        let measured = PlannedObservation::new(target("d"), Some(4), Some(12), Duration::ZERO);
+        assert_eq!(measured.estimated_requests(), 12);
+        let structural = PlannedObservation::new(target("e"), Some(4), Some(2), Duration::ZERO);
+        assert_eq!(structural.estimated_requests(), 5);
     }
 
     #[test]
@@ -834,6 +882,7 @@ mod tests {
                     PlannedObservation::new(
                         ObservationTarget::new(address.clone(), None),
                         Some(9),
+                        None,
                         Duration::ZERO,
                     )
                 })

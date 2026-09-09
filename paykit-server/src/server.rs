@@ -247,6 +247,13 @@ impl Server {
             64,
         ));
         runtime.set_electrum_probe_interval(config.electrum.poll_interval);
+        // Regtest tips are mined on demand and can be arbitrarily old
+        // without indicating endpoint trouble, so the tip-age check only
+        // applies to networks with a live block cadence.
+        runtime.set_electrum_max_tip_age(match config.deployment_invariants().bitcoin_network {
+            crate::config::BitcoinNetwork::Regtest => None,
+            _ => Some(config.electrum.max_tip_age),
+        });
         runtime.set_bitcoin_creation_enabled(config.bitcoin.creation_enabled);
         let router = operational_router(business_routes, runtime.clone());
         let workers = WorkerComponents {

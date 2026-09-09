@@ -57,10 +57,18 @@ request_timeout = "10s"
 connect_retries = 1
 # Hard cap on Electrum requests per observer tick, and the sustained rate
 # budget: per-tick estimated requests never exceed max_requests_per_second
-# times poll_interval. Over-budget targets are deferred to the next tick,
-# oldest-last-observed first.
+# times poll_interval. Each tick's two probe requests (headers.subscribe +
+# block_header(0)) are reserved from the budget. Over-budget targets are
+# deferred to the next tick, oldest-last-observed first, except that the
+# single oldest target is always observed (logging the overrun) so one
+# expensive target can never halt observation of the others.
 max_requests_per_tick = 1000
 max_requests_per_second = 5
+# Readiness also requires a fresh chain tip: a probed tip older than
+# max_tip_age marks Electrum unavailable on /health/ready. Ignored on
+# regtest, whose tips are mined on demand and can be arbitrarily old
+# without indicating endpoint trouble.
+# max_tip_age = "4h"
 
 [outbox]
 poll_interval = "5s"

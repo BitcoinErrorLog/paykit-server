@@ -135,15 +135,26 @@ impl ElectrumPort for DeterministicElectrum {
                     tx_count: u32::from(self.outputs.contains_key(target.address())),
                 })
                 .collect(),
+            request_count: 0,
         })
     }
 
     async fn probe(&self) -> Result<TipProbe, ObserverError> {
         Ok(TipProbe {
             height: 100,
-            time_unix: 1_700_000_000,
+            time_unix: fresh_tip_time(),
         })
     }
+}
+
+fn fresh_tip_time() -> u32 {
+    u32::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
 }
 
 async fn build_pubky_testnet() -> EphemeralTestnet {

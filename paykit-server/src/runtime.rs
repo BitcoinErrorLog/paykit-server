@@ -112,15 +112,29 @@ impl ElectrumProbe {
         }
     }
 
-    fn is_available(&self, freshness: Duration) -> bool {
-        self.genesis_ok && self.probed_at.elapsed() <= freshness
+    fn is_available(&self, freshness: Duration, max_tip_age: Option<Duration>) -> bool {
+        if !self.genesis_ok || self.probed_at.elapsed() > freshness {
+            return false;
+        }
+        match (max_tip_age, self.tip_time_unix) {
+            (Some(max_tip_age), Some(tip_time_unix)) => {
+                unix_now().saturating_sub(u64::from(tip_time_unix)) <= max_tip_age.as_secs()
+            }
+            _ => true,
+        }
     }
 
-    /// Secret-free probe report for the health surface.
-    pub fn report(&self, freshness: Duration) -> ElectrumProbeReport {
+    /// Secret-free probe report for the health surface. `max_tip_age` bounds
+    /// the accepted chain-tip age; `None` skips the tip-age check (regtest
+    /// deployments, whose tips are arbitrarily old by design).
+    pub fn report(
+        &self,
+        freshness: Duration,
+        max_tip_age: Option<Duration>,
+    ) -> ElectrumProbeReport {
         let now = unix_now();
         ElectrumProbeReport {
-            available: self.is_available(freshness),
+            available: self.is_available(freshness, max_tip_age),
             tip_height: self.tip_height,
             tip_age_secs: self
                 .tip_time_unix
@@ -161,6 +175,7 @@ fn unix_now() -> u64 {
 }
 
 const DEFAULT_ELECTRUM_PROBE_FRESHNESS: Duration = Duration::from_secs(20);
+const DEFAULT_ELECTRUM_MAX_TIP_AGE: Duration = Duration::from_secs(4 * 60 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Readiness {
@@ -206,6 +221,7 @@ pub struct Runtime {
     bitcoin_creation_enabled: AtomicBool,
     electrum_probe: Mutex<Option<ElectrumProbe>>,
     electrum_probe_freshness: Mutex<Duration>,
+    electrum_max_tip_age: Mutex<Option<Duration>>,
     paykit_enqueue: AtomicU8,
     paykit_reconciliation: AtomicU8,
     outbox_enqueue: AtomicU8,
@@ -232,6 +248,7 @@ impl Runtime {
             bitcoin_creation_enabled: AtomicBool::new(true),
             electrum_probe: Mutex::new(None),
             electrum_probe_freshness: Mutex::new(DEFAULT_ELECTRUM_PROBE_FRESHNESS),
+            electrum_max_tip_age: Mutex::new(Some(DEFAULT_ELECTRUM_MAX_TIP_AGE)),
             paykit_enqueue: AtomicU8::new(NOT_READY),
             paykit_reconciliation: AtomicU8::new(NOT_READY),
             outbox_enqueue: AtomicU8::new(NOT_READY),
@@ -260,28 +277,44 @@ impl Runtime {
     }
     /// Records the most recent Electrum tip probe result.
     pub fn record_electrum_probe(&self, probe: ElectrumProbe) {
+        // A poisoned lock must not take down the readiness path: the
+        // critical section holds no user code, so the inner value is sound.
         *self
             .electrum_probe
             .lock()
-            .expect("electrum probe mutex is not poisoned") = Some(probe);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(probe);
     }
-    /// Sets the observer poll interval; a probe older than two intervals is
-    /// stale and Electrum is reported unavailable.
+    /// Sets the observer poll interval; a probe older than three intervals
+    /// (covering ±20% jitter plus tick duration) is stale and Electrum is
+    /// reported unavailable.
     pub fn set_electrum_probe_interval(&self, poll_interval: Duration) {
         *self
             .electrum_probe_freshness
             .lock()
-            .expect("electrum probe freshness mutex is not poisoned") = 2 * poll_interval;
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = 3 * poll_interval;
+    }
+    /// Sets the maximum accepted chain-tip age for readiness. `None` skips
+    /// the tip-age check: regtest tips are mined on demand and can be
+    /// arbitrarily old without indicating endpoint trouble.
+    pub fn set_electrum_max_tip_age(&self, max_tip_age: Option<Duration>) {
+        *self
+            .electrum_max_tip_age
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = max_tip_age;
     }
     fn electrum_probe_report(&self) -> ElectrumProbeReport {
         let freshness = *self
             .electrum_probe_freshness
             .lock()
-            .expect("electrum probe freshness mutex is not poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let max_tip_age = *self
+            .electrum_max_tip_age
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.electrum_probe
             .lock()
-            .expect("electrum probe mutex is not poisoned")
-            .map(|probe| probe.report(freshness))
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map(|probe| probe.report(freshness, max_tip_age))
             .unwrap_or_else(ElectrumProbeReport::never_probed)
     }
     pub fn set_paykit_delivery_available(&self, available: bool) {
@@ -508,7 +541,10 @@ mod tests {
     async fn task9_composite_worker_health_requires_both_owned_loops() {
         let runtime = Runtime::new(Arc::new(ReadyPostgres), 1);
         runtime.set_electrum_available(true);
-        runtime.record_electrum_probe(ElectrumProbe::success(1, 1_700_000_000));
+        runtime.record_electrum_probe(ElectrumProbe::success(
+            1,
+            u32::try_from(unix_now()).unwrap_or(u32::MAX),
+        ));
 
         runtime.set_outbox_enqueue_available(true);
         runtime.set_paykit_enqueue_available(true);

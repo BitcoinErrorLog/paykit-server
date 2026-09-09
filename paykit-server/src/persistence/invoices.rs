@@ -239,29 +239,6 @@ impl InvoiceStore {
         Ok(())
     }
 
-    /// Loads every non-final invoice as an authenticated Electrum observation target.
-    pub async fn observation_targets(&self) -> Result<Vec<ObservationTarget>, PersistenceError> {
-        let rows = sqlx::query_as::<_, ObservationTargetRow>(
-            "SELECT invoices.id AS invoice_id, creators.creator_lookup_hash, \
-                    invoices.payment_record_envelope, invoices.bitcoin_address_lookup_hash, \
-                    invoices.derivation_index_lookup_hash, observations.id AS observation_id, \
-                    observations.observation_envelope, observations.outpoint_lookup_hash \
-             FROM invoices JOIN creators ON creators.id = invoices.creator_id \
-             LEFT JOIN bitcoin_observations AS observations \
-               ON observations.invoice_id = invoices.id AND observations.active \
-             WHERE NOT (invoices.payment_status = 'confirmed' \
-                        AND invoices.confirmation_count = 6 AND invoices.amount_matched) \
-             ORDER BY invoices.id",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|_| PersistenceError::Unavailable)?;
-
-        rows.into_iter()
-            .map(|row| self.decrypt_target(row))
-            .collect()
-    }
-
     /// Loads every non-final invoice as an authenticated observation plan
     /// entry, ordered oldest successful observation first so budget exhaustion
     /// defers the freshest targets rather than the stalest.
@@ -272,6 +249,7 @@ impl InvoiceStore {
                     invoices.derivation_index_lookup_hash, observations.id AS observation_id, \
                     observations.observation_envelope, observations.outpoint_lookup_hash, \
                     invoices.observation_history_tx_count, \
+                    invoices.observation_request_count, \
                     GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (NOW() - \
                         COALESCE(invoices.last_observed_at, invoices.created_at)))))::BIGINT \
                         AS staleness_secs \
@@ -295,18 +273,25 @@ impl InvoiceStore {
                     .map(u32::try_from)
                     .transpose()
                     .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                let last_request_count = row
+                    .observation_request_count
+                    .map(u32::try_from)
+                    .transpose()
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
                 let target = self.decrypt_target(row.target)?;
                 Ok(PlannedObservation::new(
                     target,
                     history_tx_count,
+                    last_request_count,
                     std::time::Duration::from_secs(staleness_secs),
                 ))
             })
             .collect()
     }
 
-    /// Records the previous tick's per-target history sizes and stamps every
-    /// recorded target as successfully observed just now.
+    /// Records the previous tick's per-target history sizes and measured
+    /// request costs, and stamps every recorded target as successfully
+    /// observed just now.
     pub async fn record_observation_tick(
         &self,
         records: &[TargetTickRecord],
@@ -325,12 +310,16 @@ impl InvoiceStore {
                 .bitcoin_address_lookup_hash(record.address().as_bytes());
             let history_tx_count = i32::try_from(record.history_tx_count())
                 .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            let request_count = i32::try_from(record.request_count())
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
             sqlx::query(
                 "UPDATE invoices SET observation_history_tx_count = $1, \
+                 observation_request_count = $2, \
                  last_observed_at = NOW(), updated_at = NOW() \
-                 WHERE bitcoin_address_lookup_hash = $2",
+                 WHERE bitcoin_address_lookup_hash = $3",
             )
             .bind(history_tx_count)
+            .bind(request_count)
             .bind(address_lookup_hash.as_bytes().as_slice())
             .execute(&mut *tx)
             .await
@@ -1208,6 +1197,7 @@ struct ObservationPlanRow {
     #[sqlx(flatten)]
     target: ObservationTargetRow,
     observation_history_tx_count: Option<i32>,
+    observation_request_count: Option<i32>,
     staleness_secs: i64,
 }
 

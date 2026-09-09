@@ -738,6 +738,7 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
                         tx_count: 0,
                     })
                     .collect(),
+                request_count: 0,
             })
         }
 
@@ -755,6 +756,7 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
         async fn observation_plan(&self) -> Result<Vec<PlannedObservation>, ObserverError> {
             Ok(vec![PlannedObservation::new(
                 ObservationTarget::new("bc1qexisting-invoice", None),
+                None,
                 None,
                 std::time::Duration::from_secs(30),
             )])

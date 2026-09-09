@@ -204,13 +204,16 @@ pub enum ObservationAction {
 
 /// One scheduled observation target together with its request-budget
 /// metadata. `history_tx_count` is the transaction count returned by the
-/// previous tick's history fetch (`None` = unknown, budgeted as 1), and
-/// `staleness` is the age of the last successful observation (or of the
-/// invoice itself when it has never been observed).
+/// previous tick's history fetch (`None` = unknown, budgeted as 1),
+/// `last_request_count` is the per-target share of the actual Electrum
+/// request count measured for the batch that last observed it (`None` =
+/// never measured), and `staleness` is the age of the last successful
+/// observation (or of the invoice itself when it has never been observed).
 #[derive(Clone, PartialEq, Eq)]
 pub struct PlannedObservation {
     target: ObservationTarget,
     history_tx_count: Option<u32>,
+    last_request_count: Option<u32>,
     staleness: Duration,
 }
 
@@ -218,11 +221,13 @@ impl PlannedObservation {
     pub fn new(
         target: ObservationTarget,
         history_tx_count: Option<u32>,
+        last_request_count: Option<u32>,
         staleness: Duration,
     ) -> Self {
         Self {
             target,
             history_tx_count,
+            last_request_count,
             staleness,
         }
     }
@@ -235,14 +240,22 @@ impl PlannedObservation {
         self.history_tx_count
     }
 
+    pub fn last_request_count(&self) -> Option<u32> {
+        self.last_request_count
+    }
+
     pub fn staleness(&self) -> Duration {
         self.staleness
     }
 
-    /// Estimated Electrum requests for observing this target once: one
-    /// history fetch plus one request per known history transaction.
+    /// Estimated Electrum requests for observing this target once: the
+    /// larger of the structural estimate (one history fetch plus one
+    /// request per known history transaction) and the actual per-target
+    /// request cost measured for the batch that last observed it.
     pub fn estimated_requests(&self) -> u64 {
-        1 + u64::from(self.history_tx_count.unwrap_or(1))
+        let structural = 1 + u64::from(self.history_tx_count.unwrap_or(1));
+        let observed = u64::from(self.last_request_count.unwrap_or(0));
+        structural.max(observed)
     }
 }
 
@@ -257,19 +270,23 @@ impl fmt::Debug for PlannedObservation {
     }
 }
 
-/// Persisted budget fact for one successfully observed target: the number of
-/// transactions the previous history fetch returned for its address.
+/// Persisted budget facts for one successfully observed target: the number
+/// of transactions the previous history fetch returned for its address, and
+/// its share of the actual Electrum request count measured for that batch
+/// (the batch total divided by the batch size, rounded up).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetTickRecord {
     address: String,
     history_tx_count: u32,
+    request_count: u32,
 }
 
 impl TargetTickRecord {
-    pub fn new(address: impl Into<String>, history_tx_count: u32) -> Self {
+    pub fn new(address: impl Into<String>, history_tx_count: u32, request_count: u32) -> Self {
         Self {
             address: address.into(),
             history_tx_count,
+            request_count,
         }
     }
 
@@ -279,5 +296,9 @@ impl TargetTickRecord {
 
     pub fn history_tx_count(&self) -> u32 {
         self.history_tx_count
+    }
+
+    pub fn request_count(&self) -> u32 {
+        self.request_count
     }
 }

@@ -13,7 +13,9 @@ use paykit_server::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
         NewReaderPayloadFactory, NewReaderPayloads, PersistenceError, run_migrations,
     },
-    workers::observer::{ElectrumPort, ObservationReport, ObserverError, TipProbe, observe_once},
+    workers::observer::{
+        ElectrumPort, ObservationBackend, ObservationReport, ObserverError, TipProbe,
+    },
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::Row;
@@ -200,6 +202,7 @@ impl ElectrumPort for FixedBatch {
                     tx_count: 0,
                 })
                 .collect(),
+            request_count: 0,
         })
     }
 
@@ -209,6 +212,28 @@ impl ElectrumPort for FixedBatch {
             time_unix: 0,
         })
     }
+}
+
+/// Applies one fetched batch through the same validate-then-apply path the
+/// observer tick uses, for one explicit target set.
+async fn observe_once(
+    port: &FixedBatch,
+    store: &InvoiceStore,
+    network: &BitcoinNetwork,
+    targets: &[ObservationTarget],
+) -> Result<usize, ObserverError> {
+    let report = port.observations(targets).await?;
+    ObservationBackend::apply_observations(store, network, targets, report.outputs).await
+}
+
+/// Every non-final invoice as an observation target, via the durable plan.
+async fn observation_targets(store: &InvoiceStore) -> Vec<ObservationTarget> {
+    ObservationBackend::observation_plan(store)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|planned| planned.target().clone())
+        .collect()
 }
 
 async fn batch_invoice(database: &TestDatabase) -> (InvoiceStore, uuid::Uuid) {
@@ -255,7 +280,7 @@ async fn assert_invoice_has_no_observation_writes(database: &TestDatabase, invoi
 async fn observation_targets_reconstruct_active_output_and_exclude_final_invoice() {
     let database = TestDatabase::create().await;
     let (store, _) = batch_invoice(&database).await;
-    let targets = store.observation_targets().await.unwrap();
+    let targets = observation_targets(&store).await;
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0], invoice_target());
 
@@ -267,7 +292,7 @@ async fn observation_targets_reconstruct_active_output_and_exclude_final_invoice
             .await
             .unwrap()
     );
-    let targets = store.observation_targets().await.unwrap();
+    let targets = observation_targets(&store).await;
     assert_eq!(
         targets,
         vec![tracked_invoice_target(provider_outpoint, 100)]
@@ -279,7 +304,7 @@ async fn observation_targets_reconstruct_active_output_and_exclude_final_invoice
             .await
             .unwrap()
     );
-    assert!(store.observation_targets().await.unwrap().is_empty());
+    assert!(observation_targets(&store).await.is_empty());
     database.cleanup().await;
 }
 
@@ -1226,6 +1251,7 @@ async fn observation_plan_orders_oldest_observed_first_and_records_tick_budget_f
         .record_observation_tick(&[paykit_server::bitcoin::TargetTickRecord::new(
             REGTEST_ADDRESS,
             7,
+            3,
         )])
         .await
         .unwrap();
@@ -1235,14 +1261,19 @@ async fn observation_plan_orders_oldest_observed_first_and_records_tick_budget_f
     assert_eq!(plan[0].target().address(), "plan-address-b");
     assert_eq!(plan[1].target().address(), REGTEST_ADDRESS);
     assert_eq!(plan[1].history_tx_count(), Some(7));
-    let persisted: (Option<i32>, bool) = sqlx::query_as(
-        "SELECT observation_history_tx_count, last_observed_at IS NOT NULL \
+    assert_eq!(plan[1].last_request_count(), Some(3));
+    // The measured per-target request cost (3) is below the structural
+    // estimate (1 + 7), so the structural estimate still bounds the target.
+    assert_eq!(plan[1].estimated_requests(), 8);
+    let persisted: (Option<i32>, Option<i32>, bool) = sqlx::query_as(
+        "SELECT observation_history_tx_count, observation_request_count, \
+         last_observed_at IS NOT NULL \
          FROM invoices WHERE id = $1",
     )
     .bind(invoice_id)
     .fetch_one(database.pool())
     .await
     .unwrap();
-    assert_eq!(persisted, (Some(7), true));
+    assert_eq!(persisted, (Some(7), Some(3), true));
     database.cleanup().await;
 }

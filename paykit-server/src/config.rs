@@ -94,6 +94,7 @@ impl Config {
                 connect_retries: raw.electrum.connect_retries,
                 max_requests_per_tick: raw.electrum.max_requests_per_tick,
                 max_requests_per_second: raw.electrum.max_requests_per_second,
+                max_tip_age: raw.electrum.max_tip_age,
             },
             outbox: OutboxConfig::from(raw.outbox),
             limits: LimitsConfig::from(raw.limits),
@@ -132,6 +133,7 @@ impl Config {
         for (name, value) in [
             ("electrum.poll_interval", self.electrum.poll_interval),
             ("electrum.request_timeout", self.electrum.request_timeout),
+            ("electrum.max_tip_age", self.electrum.max_tip_age),
             ("outbox.poll_interval", self.outbox.poll_interval),
             ("outbox.lease_duration", self.outbox.lease_duration),
             ("outbox.retry_initial", self.outbox.retry_initial),
@@ -506,11 +508,18 @@ pub struct ElectrumConfig {
     pub poll_interval: Duration,
     pub request_timeout: Duration,
     pub connect_retries: u8,
-    /// Hard cap on Electrum requests issued per observer tick.
+    /// Hard cap on Electrum requests issued per observer tick, including the
+    /// tick's two probe requests (headers.subscribe + block_header(0)),
+    /// which are reserved before observation targets are admitted.
     pub max_requests_per_tick: u32,
     /// Sustained request budget: per-tick estimated requests must not exceed
     /// this rate times the poll interval.
     pub max_requests_per_second: u32,
+    /// Maximum accepted chain-tip age for readiness: a probed tip older than
+    /// this marks Electrum unavailable on /health/ready. Skipped on regtest,
+    /// whose tips are mined on demand and can be arbitrarily old without
+    /// indicating endpoint trouble.
+    pub max_tip_age: Duration,
 }
 
 #[derive(Debug)]
@@ -767,6 +776,8 @@ struct RawElectrumConfig {
     max_requests_per_tick: u32,
     #[serde(default = "default_electrum_max_requests_per_second")]
     max_requests_per_second: u32,
+    #[serde(default = "default_electrum_max_tip_age", with = "humantime_serde")]
+    max_tip_age: Duration,
 }
 
 const fn default_electrum_max_requests_per_tick() -> u32 {
@@ -775,6 +786,10 @@ const fn default_electrum_max_requests_per_tick() -> u32 {
 
 const fn default_electrum_max_requests_per_second() -> u32 {
     5
+}
+
+const fn default_electrum_max_tip_age() -> Duration {
+    Duration::from_secs(4 * 60 * 60)
 }
 
 fn default_electrum_request_timeout() -> Duration {

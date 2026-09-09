@@ -78,6 +78,16 @@ fn runtime(pg: bool, capacity: usize) -> Arc<Runtime> {
     Arc::new(Runtime::new(Arc::new(Check(AtomicBool::new(pg))), capacity))
 }
 
+fn fresh_tip_time() -> u32 {
+    u32::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+}
+
 async fn intentional_panic_handler() -> &'static str {
     panic!("intentional handler panic")
 }
@@ -97,8 +107,28 @@ async fn task9_components_start_not_ready_until_runtime_evidence_arrives() {
     runtime.set_outbox_available(true);
     // Without a fresh probe, worker evidence alone leaves Electrum degraded.
     assert_eq!(runtime.readiness().await.status, ComponentState::Degraded);
-    runtime.record_electrum_probe(ElectrumProbe::success(1, 1_700_000_000));
+    runtime.record_electrum_probe(ElectrumProbe::success(1, fresh_tip_time()));
     assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
+}
+
+#[tokio::test]
+async fn electrum_readiness_requires_a_fresh_chain_tip_unless_the_check_is_skipped() {
+    let runtime = runtime(true, 1);
+    runtime.set_electrum_available(true);
+    runtime.set_paykit_delivery_available(true);
+    runtime.set_outbox_available(true);
+    // A tip from 2020 is far older than the default four-hour maximum.
+    runtime.record_electrum_probe(ElectrumProbe::success(1, 1_600_000_000));
+    let report = runtime.readiness().await;
+    assert!(!report.electrum_probe.available);
+    assert_eq!(report.electrum, ComponentState::Degraded);
+
+    // Regtest deployments skip the tip-age check: blocks are mined on
+    // demand, so an arbitrarily old tip says nothing about endpoint health.
+    runtime.set_electrum_max_tip_age(None);
+    let report = runtime.readiness().await;
+    assert!(report.electrum_probe.available);
+    assert_eq!(report.electrum, ComponentState::Ready);
 }
 
 #[tokio::test]
@@ -144,7 +174,7 @@ async fn task9_panicking_request_releases_admission_for_shutdown_drain() {
 async fn health_schemas_and_status_codes_are_secret_free() {
     let runtime = runtime(true, 1);
     runtime.set_electrum_available(true);
-    runtime.record_electrum_probe(ElectrumProbe::success(800_000, 1_700_000_000));
+    runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
     runtime.set_paykit_delivery_available(true);
     runtime.set_outbox_available(true);
     let app = operational_router(Router::new(), runtime);
