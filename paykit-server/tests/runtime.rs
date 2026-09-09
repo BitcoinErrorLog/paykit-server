@@ -19,7 +19,8 @@ use paykit_server::runtime::{
 };
 use paykit_server::{
     Server,
-    config::{Config, ConfigEnvironment},
+    config::{Config, ConfigEnvironment, StackRole},
+    persistence::StackIdentity,
 };
 use tower::ServiceExt;
 
@@ -75,6 +76,13 @@ impl DependencyCheck for Check {
 }
 fn runtime(pg: bool, capacity: usize) -> Arc<Runtime> {
     Arc::new(Runtime::new(Arc::new(Check(AtomicBool::new(pg))), capacity))
+}
+
+fn test_stack_identity() -> StackIdentity {
+    StackIdentity::new(
+        StackRole::Proof,
+        "6f1d0c2a-9b47-4e35-8a10-73c5e2d84b19".parse().unwrap(),
+    )
 }
 
 fn fresh_tip_time() -> u32 {
@@ -397,6 +405,48 @@ async fn health_schemas_and_status_codes_are_secret_free() {
 }
 
 #[tokio::test]
+async fn health_ready_reports_the_stack_id_regardless_of_status() {
+    // Ready and not-ready stacks must both say who they are: the stack_id is
+    // the reference value the marketplace's resolution arm compares its
+    // pinned outbox row against.
+    let ready_runtime = runtime(true, 1);
+    ready_runtime.set_stack_id(test_stack_identity().stack_id());
+    ready_runtime.set_electrum_available(true);
+    for _ in 0..3 {
+        ready_runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
+    }
+    ready_runtime.set_paykit_delivery_available(true);
+    ready_runtime.set_outbox_available(true);
+    let app = operational_router(Router::new(), ready_runtime);
+    let ready = app
+        .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+    let body = to_bytes(ready.into_body(), 1024).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        parsed["stack_id"],
+        "proof:6f1d0c2a-9b47-4e35-8a10-73c5e2d84b19"
+    );
+
+    let not_ready_runtime = runtime(false, 1);
+    not_ready_runtime.set_stack_id(test_stack_identity().stack_id());
+    let app = operational_router(Router::new(), not_ready_runtime);
+    let not_ready = app
+        .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(not_ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(not_ready.into_body(), 1024).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        parsed["stack_id"], "proof:6f1d0c2a-9b47-4e35-8a10-73c5e2d84b19",
+        "a degraded stack must still say who it is"
+    );
+}
+
+#[tokio::test]
 async fn health_reports_electrum_unavailable_without_a_fresh_probe() {
     let runtime = runtime(true, 1);
     runtime.set_electrum_available(true);
@@ -570,9 +620,13 @@ async fn metrics_have_no_user_controlled_labels_or_identifiers() {
 
 #[tokio::test]
 async fn production_constructor_mounts_all_routes() {
-    let server = Server::build(production_config("tcp://127.0.0.1:1"), lazy_pool())
-        .await
-        .unwrap();
+    let server = Server::build(
+        production_config("tcp://127.0.0.1:1"),
+        lazy_pool(),
+        test_stack_identity(),
+    )
+    .await
+    .unwrap();
     let app = server.router();
     for (request, expected) in [
         (
@@ -617,9 +671,13 @@ async fn production_constructor_allows_electrum_to_be_temporarily_unavailable() 
     let endpoint = format!("tcp://{}", listener.local_addr().unwrap());
     drop(listener);
     assert!(
-        Server::build(production_config(&endpoint), lazy_pool())
-            .await
-            .is_ok()
+        Server::build(
+            production_config(&endpoint),
+            lazy_pool(),
+            test_stack_identity()
+        )
+        .await
+        .is_ok()
     );
 }
 
@@ -629,6 +687,7 @@ async fn production_constructor_rejects_malformed_electrum_adapter_configuration
         Server::build(
             production_config("https://electrum.example:50002/path?token=secret"),
             lazy_pool(),
+            test_stack_identity(),
         )
         .await
         .is_err()

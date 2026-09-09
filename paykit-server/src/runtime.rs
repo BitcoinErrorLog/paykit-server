@@ -273,9 +273,14 @@ fn unix_now() -> u64 {
         .unwrap_or_default()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Readiness {
     pub status: ComponentState,
+    /// This stack's identity, `{stack_role}:{instance_uuid}`. Present on
+    /// every readiness response regardless of status: it is the reference
+    /// value the marketplace's resolution arm compares its pinned outbox row
+    /// against, so a degraded stack must still say who it is.
+    pub stack_id: String,
     pub postgres: ComponentState,
     pub electrum: ComponentState,
     pub electrum_probe: ElectrumProbeReport,
@@ -326,6 +331,7 @@ struct ElectrumProbeState {
 /// they never publish endpoint, identity, or provider-error data.
 pub struct Runtime {
     dependency: Arc<dyn DependencyCheck>,
+    stack_id: Mutex<String>,
     stopping: AtomicBool,
     cancelled: Notify,
     in_flight: AtomicUsize,
@@ -354,6 +360,7 @@ impl Runtime {
         metrics.set_runtime_active(true);
         Self {
             dependency,
+            stack_id: Mutex::new(String::new()),
             stopping: AtomicBool::new(false),
             cancelled: Notify::new(),
             in_flight: AtomicUsize::new(0),
@@ -407,6 +414,14 @@ impl Runtime {
         self.electrum
             .store(if available { READY } else { DEGRADED }, Ordering::Release);
         self.metrics.set_electrum_available(available);
+    }
+    /// Publishes this stack's minted identity (`{stack_role}:{instance_uuid}`)
+    /// for every readiness response.
+    pub fn set_stack_id(&self, stack_id: String) {
+        *self
+            .stack_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = stack_id;
     }
     /// Publishes whether this stack accepts new Bitcoin payment-request binds.
     pub fn set_bitcoin_creation_enabled(&self, enabled: bool) {
@@ -587,6 +602,11 @@ impl Runtime {
         };
         Readiness {
             status,
+            stack_id: self
+                .stack_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
             postgres,
             electrum,
             electrum_probe,

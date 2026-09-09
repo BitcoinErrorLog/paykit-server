@@ -126,9 +126,12 @@ async fn production_workers_publish_startup_evidence_before_readiness() {
     run_migrations(database.pool()).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let endpoint = unavailable_electrum_endpoint().await;
+    let config = config(database.database_url(), &endpoint, "1s");
+    let stack_identity = stack_identity(database.pool(), &config).await;
     let server = Server::build_with_transports(
-        config(database.database_url(), &endpoint, "1s"),
+        config,
         database.pool().clone(),
+        stack_identity,
         testnet.sdk().unwrap(),
         Arc::new(HealthyElectrum),
     )
@@ -171,9 +174,12 @@ async fn shutdown_deadline_aborts_a_database_blocked_owned_worker() {
     run_migrations(database.pool()).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let endpoint = unavailable_electrum_endpoint().await;
+    let config = config(database.database_url(), &endpoint, "100ms");
+    let stack_identity = stack_identity(database.pool(), &config).await;
     let server = Server::build_with_pubky(
-        config(database.database_url(), &endpoint, "100ms"),
+        config,
         database.pool().clone(),
+        stack_identity,
         testnet.sdk().unwrap(),
     )
     .await
@@ -226,4 +232,15 @@ async fn shutdown_deadline_aborts_a_database_blocked_owned_worker() {
     sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
     drop(lock);
     database.cleanup().await;
+}
+/// Mints (once) and reads this test database's stack identity, as the
+/// production boot path does inside `initialize_database`.
+async fn stack_identity(
+    pool: &sqlx::PgPool,
+    config: &Config,
+) -> paykit_server::persistence::StackIdentity {
+    paykit_server::persistence::DeploymentStore::new(pool)
+        .stack_identity(config.deployment_invariants().stack_role)
+        .await
+        .unwrap()
 }

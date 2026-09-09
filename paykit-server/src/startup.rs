@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::{
     config::Config,
     crypto::Crypto,
-    persistence::{CreatorStore, DeploymentStore, InvoiceStore, run_migrations},
+    persistence::{CreatorStore, DeploymentStore, InvoiceStore, StackIdentity, run_migrations},
 };
 
 /// Secret-free failures from database initialization before the listener binds.
@@ -34,9 +34,26 @@ pub enum StartupError {
     PaymentRecordIntegrity,
 }
 
-/// Connects, migrates, validates deployment invariants, and authenticates every
-/// persisted Creator credential and SDK state before returning a ready database.
-pub async fn initialize_database(config: &Config) -> Result<PgPool, StartupError> {
+/// A database that completed fail-closed startup: the connection pool and the
+/// stack identity minted (once) inside the deployment-adoption transaction.
+pub struct InitializedDatabase {
+    pub pool: PgPool,
+    pub stack_identity: StackIdentity,
+}
+
+impl std::fmt::Debug for InitializedDatabase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InitializedDatabase")
+            .field("pool", &"<redacted>")
+            .field("stack_id", &self.stack_identity.stack_id())
+            .finish()
+    }
+}
+
+/// Connects, migrates, validates deployment invariants, mints or reads the
+/// stack identity, and authenticates every persisted Creator credential and
+/// SDK state before returning a ready database.
+pub async fn initialize_database(config: &Config) -> Result<InitializedDatabase, StartupError> {
     let pool = PgPoolOptions::new()
         .connect(config.database_url())
         .await
@@ -44,7 +61,7 @@ pub async fn initialize_database(config: &Config) -> Result<PgPool, StartupError
     run_migrations(&pool)
         .await
         .map_err(|_| StartupError::Migration)?;
-    DeploymentStore::new(&pool)
+    let stack_identity = DeploymentStore::new(&pool)
         .initialize(config.deployment_invariants())
         .await
         .map_err(|_| StartupError::Deployment)?;
@@ -62,5 +79,8 @@ pub async fn initialize_database(config: &Config) -> Result<PgPool, StartupError
         .scan_payment_record_integrity()
         .await
         .map_err(|_| StartupError::PaymentRecordIntegrity)?;
-    Ok(pool)
+    Ok(InitializedDatabase {
+        pool,
+        stack_identity,
+    })
 }

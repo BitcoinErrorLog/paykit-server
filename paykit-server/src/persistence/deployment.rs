@@ -2,8 +2,46 @@
 
 use sqlx::PgPool;
 use thiserror::Error;
+use uuid::Uuid;
 
-use crate::config::DeploymentInvariants;
+use crate::config::{DeploymentInvariants, StackRole};
+
+/// This stack's identity, `stack_id = {stack_role}:{instance_uuid}`. The
+/// instance UUID is minted once per database into the single-row
+/// `stack_identity` table inside the same boot transaction that adopts the
+/// deployment role, and is never rewritten; the role alone is deliberately
+/// not the identity, because a replacement production stack carries the same
+/// role (the same-role/wrong-instance mixup the pin exists to catch).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StackIdentity {
+    role: StackRole,
+    instance_uuid: Uuid,
+}
+
+impl StackIdentity {
+    /// Constructs an identity from its two halves. Production identities are
+    /// minted by [`DeploymentStore`]; this constructor serves test
+    /// compositions that never touch a database.
+    pub fn new(role: StackRole, instance_uuid: Uuid) -> Self {
+        Self {
+            role,
+            instance_uuid,
+        }
+    }
+    /// The configured deployment role half of the identity.
+    pub fn role(&self) -> StackRole {
+        self.role
+    }
+    /// The per-database instance UUID half of the identity.
+    pub fn instance_uuid(&self) -> Uuid {
+        self.instance_uuid
+    }
+    /// The canonical `{stack_role}:{instance_uuid}` form carried on the claim
+    /// response, `/health/ready`, and every stack-pinned message.
+    pub fn stack_id(&self) -> String {
+        format!("{}:{}", self.role.as_str(), self.instance_uuid)
+    }
+}
 
 /// Postgres repository for the singleton deployment invariant record.
 #[derive(Clone, Debug)]
@@ -23,10 +61,15 @@ impl DeploymentStore {
     /// is unset (a database created before roles existed), so the configured
     /// role is written exactly once; from then on every boot compares the
     /// stored role with the configured one and refuses to start on mismatch.
+    ///
+    /// The stack identity is minted in the same transaction: a boot that
+    /// finds no `stack_identity` row inserts a fresh v4 UUID (`ON CONFLICT DO
+    /// NOTHING`), and every boot reads the row back, so the returned identity
+    /// is byte-identical across restarts and distinct across databases.
     pub async fn initialize(
         &self,
         invariants: &DeploymentInvariants,
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<StackIdentity, PersistenceError> {
         self.initialize_inner(invariants, None).await
     }
 
@@ -41,9 +84,27 @@ impl DeploymentStore {
         invariants: &DeploymentInvariants,
         lock_held: tokio::sync::oneshot::Sender<()>,
         release: tokio::sync::oneshot::Receiver<()>,
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<StackIdentity, PersistenceError> {
         self.initialize_inner(invariants, Some((lock_held, release)))
             .await
+    }
+
+    /// Reads the minted stack identity, minting it first when none exists.
+    /// Boot compositions that do not run the full startup path (E2E fixtures)
+    /// use this; the production boot mints inside [`Self::initialize`]'s
+    /// deployment-adoption transaction instead.
+    pub async fn stack_identity(&self, role: StackRole) -> Result<StackIdentity, PersistenceError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let identity = mint_or_read_stack_identity(&mut transaction, role).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(identity)
     }
 
     async fn initialize_inner(
@@ -53,7 +114,7 @@ impl DeploymentStore {
             tokio::sync::oneshot::Sender<()>,
             tokio::sync::oneshot::Receiver<()>,
         )>,
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<StackIdentity, PersistenceError> {
         let mut transaction = self
             .pool
             .begin()
@@ -99,12 +160,9 @@ impl DeploymentStore {
         }
         match existing.stack_role.as_deref() {
             Some(role) if role != invariants.stack_role.as_str() => {
-                Err(PersistenceError::DeploymentMismatch)
+                return Err(PersistenceError::DeploymentMismatch);
             }
-            Some(_) => transaction
-                .commit()
-                .await
-                .map_err(|_| PersistenceError::Unavailable),
+            Some(_) => {}
             None => {
                 let adopted = sqlx::query(
                     "UPDATE deployment_metadata SET stack_role = $1, updated_at = NOW() \
@@ -121,13 +179,43 @@ impl DeploymentStore {
                 if adopted.rows_affected() != 1 {
                     return Err(PersistenceError::DeploymentRoleAdoption);
                 }
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|_| PersistenceError::Unavailable)
             }
         }
+        // Mint the stack identity once, in the same boot transaction that
+        // adopts the role, and read the surviving row back: never rewritten.
+        let identity = mint_or_read_stack_identity(&mut transaction, invariants.stack_role).await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(identity)
     }
+}
+
+/// Mints the single-row `stack_identity` when absent (racing boots insert
+/// different candidate UUIDs; `ON CONFLICT DO NOTHING` plus the singleton
+/// primary key makes exactly one survive) and reads the surviving row back.
+async fn mint_or_read_stack_identity(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    role: StackRole,
+) -> Result<StackIdentity, PersistenceError> {
+    sqlx::query(
+        "INSERT INTO stack_identity (singleton, instance_uuid) VALUES (TRUE, $1) \
+         ON CONFLICT (singleton) DO NOTHING",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&mut **transaction)
+    .await
+    .map_err(|_| PersistenceError::Unavailable)?;
+    let instance_uuid: Uuid =
+        sqlx::query_scalar("SELECT instance_uuid FROM stack_identity WHERE singleton = TRUE")
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+    Ok(StackIdentity {
+        role,
+        instance_uuid,
+    })
 }
 
 #[derive(sqlx::FromRow)]
@@ -153,6 +241,10 @@ pub enum PersistenceError {
     /// Existing credentials disagree with an attempted reauthentication.
     #[error("reauthentication credentials do not match the persisted account")]
     ReauthenticationMismatch,
+    /// The canonical key tail was already claimed by a different creator on
+    /// this stack (design B.8.5: the binding never expires).
+    #[error("watch-only key material is claimed by a different creator")]
+    KeyClaimedByOtherSeller,
     /// The persistence backend could not complete the operation.
     #[error("persistence operation failed")]
     Unavailable,
