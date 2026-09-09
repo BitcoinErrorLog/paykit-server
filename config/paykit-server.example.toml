@@ -54,17 +54,32 @@ stack_role = "proof"
 endpoint = "ssl://electrum.example.invalid:50002"
 poll_interval = "10s"
 request_timeout = "10s"
-connect_retries = 1
-# Hard cap on Electrum lookups admitted to one observer tick, plus the
-# sustained rate budget: per-tick lookups never exceed
-# max_requests_per_second times poll_interval. Each admitted observation
-# target costs exactly one script_list_unspent lookup, and each tick's two
-# probe requests (headers.subscribe + block_header(0)) are reserved from
-# the budget. Targets beyond the budget are deferred to the next tick,
-# oldest-last-observed first; there is no bypass and no unmetered
-# admission. See docs/observer-threat-model.md.
+# Sustained request budget and burst capacity, as a token bucket: tokens
+# refill from elapsed wall time at max_requests_per_second up to
+# max_requests_per_tick, so no loop cadence (including the shortest ±20%
+# jitter interval) can sustain a higher request rate. Each admitted
+# observation target costs exactly one script_list_unspent lookup —
+# client-side call retries are pinned at zero, so the observer's own next
+# tick is the only retry — and each tick's two probe requests
+# (headers.subscribe + block_header(0)) are charged against the bucket.
+# The effective per-tick budget min(max_requests_per_tick,
+# max_requests_per_second * poll_interval seconds) must exceed 2 (the
+# probe reservation) or startup is rejected. Targets beyond the budget are
+# deferred to the next tick, oldest-last-observed first; there is no
+# bypass and no unmetered admission. See docs/observer-threat-model.md.
 max_requests_per_tick = 1000
 max_requests_per_second = 5
+# Hard cap on decoded list_unspent items accepted for one address. A
+# response listing more UTXOs is rejected before any per-UTXO record is
+# materialised and fails only that address (metric label
+# response_too_large); the target stays stale and retried next tick.
+max_utxos_per_address = 200
+# Per-address wall-clock deadline over connect + call + decode. A lookup
+# exceeding it fails only that address (metric label deadline); the
+# connection is dropped and never reused. The blocking socket read itself
+# cannot be cancelled, so the abandoned read still exits at latest when
+# request_timeout elapses on the wire.
+address_deadline = "5s"
 # Readiness also requires a trustworthy chain tip: a probed tip older than
 # max_tip_age, a tip-height regression beyond the six-block reorg
 # tolerance, or a tip height that stops advancing within this window marks
