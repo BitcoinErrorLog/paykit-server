@@ -275,6 +275,7 @@ impl Server {
                 poll_interval: config.electrum.poll_interval,
                 max_requests_per_tick: config.electrum.max_requests_per_tick,
                 max_requests_per_second: config.electrum.max_requests_per_second,
+                max_target_requests: config.electrum.max_target_requests,
             },
         };
 

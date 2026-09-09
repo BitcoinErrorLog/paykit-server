@@ -117,6 +117,14 @@ pub trait ObservationBackend: Send + Sync {
         targets: &[ObservationTarget],
         outputs: Vec<ObservedOutput>,
     ) -> Result<usize, ObserverError>;
+    /// Flags the named target addresses as `observation_overrun` and
+    /// returns the ids of the invoices newly flagged by this call, for
+    /// ERROR-level reporting. Flagged targets lose the head-of-line budget
+    /// bypass on later ticks.
+    async fn mark_observation_overrun(
+        &self,
+        addresses: &[String],
+    ) -> Result<Vec<uuid::Uuid>, ObserverError>;
     /// Persists per-target history sizes and stamps the targets observed.
     async fn record_observation_tick(
         &self,
@@ -144,6 +152,15 @@ impl ObservationBackend for InvoiceStore {
             .map_err(map_persistence)
     }
 
+    async fn mark_observation_overrun(
+        &self,
+        addresses: &[String],
+    ) -> Result<Vec<uuid::Uuid>, ObserverError> {
+        InvoiceStore::mark_observation_overrun(self, addresses)
+            .await
+            .map_err(map_persistence)
+    }
+
     async fn record_observation_tick(
         &self,
         records: &[TargetTickRecord],
@@ -158,13 +175,24 @@ impl ObservationBackend for InvoiceStore {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObserverPolicy {
     pub poll_interval: Duration,
-    /// Hard cap on Electrum requests issued per tick. The tick's probe
-    /// requests ([`PROBE_REQUESTS_PER_TICK`]) are reserved from this cap
-    /// before observation targets are admitted.
+    /// Cap on Electrum requests admitted to one tick's budgeted batch. The
+    /// tick's probe requests ([`PROBE_REQUESTS_PER_TICK`]) are reserved
+    /// from this cap before observation targets are admitted. This bounds
+    /// only the budgeted tail: the single oldest target is always observed
+    /// (head-of-line bypass) even when its estimate exceeds the cap, to
+    /// preserve liveness. The bypassed head is bounded separately by
+    /// `max_target_requests` and the overrun exclusion, and a bypass cost
+    /// above twice the budget raises an ERROR log and a metric.
     pub max_requests_per_tick: u32,
     /// Sustained rate budget; the per-tick allowance is this rate times the
     /// poll interval, so estimated requests per second stay at or below it.
     pub max_requests_per_second: u32,
+    /// Per-target cost bound for the head-of-line bypass: a bypassed head
+    /// whose estimated requests exceed this is flagged `observation_overrun`
+    /// (logged at ERROR with the invoice id, counted on /health and in the
+    /// metrics) and excluded from the bypass on later ticks, so one
+    /// unbounded-history address cannot monopolise the endpoint.
+    pub max_target_requests: u32,
 }
 
 impl ObserverPolicy {
@@ -197,7 +225,10 @@ pub struct BudgetSelection {
 ///   cost alone exceeds `budget` (head-of-line bypass). A bypassed head does
 ///   not consume the budget, so cheaper targets are still admitted this
 ///   tick; its cost is reported via `bypassed_head_cost` so the caller can
-///   log the overrun against the hard per-tick cap.
+///   log the overrun against the per-tick cap. A target flagged
+///   `observation_overrun` (its cost exceeded the per-target bound on an
+///   earlier bypass) is excluded from the bypass and deferred like any
+///   other over-budget entry, so it can no longer monopolise the endpoint.
 /// * A later over-budget entry is skipped without blocking: entries behind
 ///   it that still fit are admitted.
 ///
@@ -218,7 +249,7 @@ pub fn select_within_budget(plan: Vec<PlannedObservation>, budget: u64) -> Budge
         if used.saturating_add(cost) <= budget {
             used += cost;
             batch.push(entry);
-        } else if position == 0 {
+        } else if position == 0 && !entry.is_observation_overrun() {
             bypassed_head_cost = Some(cost);
             batch.push(entry);
         } else {
@@ -371,6 +402,11 @@ pub async fn observe_tick(
     runtime.metrics().set_electrum_backlog_oldest_age_seconds(
         i64::try_from(oldest_staleness.as_secs()).unwrap_or(i64::MAX),
     );
+    let overrun_targets = plan
+        .iter()
+        .filter(|entry| entry.is_observation_overrun())
+        .count();
+    runtime.set_electrum_overrun_targets(u64::try_from(overrun_targets).unwrap_or(u64::MAX));
     if oldest_staleness > BACKLOG_ALERT_THRESHOLD {
         tracing::warn!(
             staleness_secs = oldest_staleness.as_secs(),
@@ -384,14 +420,60 @@ pub async fn observe_tick(
         .per_tick_budget()
         .saturating_sub(PROBE_REQUESTS_PER_TICK);
     let selection = select_within_budget(plan, target_budget);
-    if let Some(cost) = selection.bypassed_head_cost {
-        tracing::warn!(
-            estimated_requests = cost,
-            budget = target_budget,
-            hard_cap = policy.max_requests_per_tick,
-            "oldest observation target exceeds the per-tick request budget; \
-             observing it alone to preserve liveness"
-        );
+    match selection.bypassed_head_cost {
+        Some(cost) => {
+            runtime
+                .metrics()
+                .set_electrum_bypassed_head_requests(i64::try_from(cost).unwrap_or(i64::MAX));
+            tracing::warn!(
+                estimated_requests = cost,
+                budget = target_budget,
+                cap = policy.max_requests_per_tick,
+                "oldest observation target exceeds the per-tick request budget; \
+                 observing it alone to preserve liveness"
+            );
+            if cost > target_budget.saturating_mul(2) {
+                runtime.metrics().electrum_bypassed_head_budget_violation();
+                tracing::error!(
+                    estimated_requests = cost,
+                    budget = target_budget,
+                    "bypassed observation head costs more than twice the per-tick budget"
+                );
+            }
+            // The bypass preserves liveness but must not be unbounded: a
+            // head beyond the per-target bound is flagged so later ticks
+            // defer it instead of re-syncing its unbounded history. The
+            // flag is persisted before the fetch so even a failed sync
+            // (e.g. the endpoint disconnecting mid-history) cannot reset
+            // the exclusion.
+            if cost > u64::from(policy.max_target_requests)
+                && let Some(head) = selection.batch.first()
+            {
+                let head_address = head.target().address().to_owned();
+                match backend
+                    .mark_observation_overrun(std::slice::from_ref(&head_address))
+                    .await
+                {
+                    Ok(invoice_ids) => {
+                        if !invoice_ids.is_empty() {
+                            tracing::error!(
+                                invoice_ids = ?invoice_ids,
+                                estimated_requests = cost,
+                                max_target_requests = policy.max_target_requests,
+                                "observation target exceeds the per-target request bound; \
+                                 flagged observation_overrun and excluded from the \
+                                 head-of-line bypass on later ticks"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        runtime.set_electrum_available(false);
+                        return ObserverTickOutcome::ObservationFailed(error);
+                    }
+                }
+            }
+        }
+        None => runtime.metrics().set_electrum_bypassed_head_requests(0),
     }
     let processed = selection.batch.len();
     let deferred = selection.deferred.len();
@@ -969,6 +1051,24 @@ mod tests {
     }
 
     #[test]
+    fn an_overrun_head_is_deferred_instead_of_bypassing_the_budget() {
+        let flagged = vec![
+            planned("big", Some(10)).with_observation_overrun(true),
+            planned("cheap", Some(0)),
+        ];
+        let selection = select_within_budget(flagged, 2);
+        assert_eq!(labels(&selection.batch), vec!["addr-cheap"]);
+        assert_eq!(labels(&selection.deferred), vec!["addr-big"]);
+        assert_eq!(selection.bypassed_head_cost, None);
+
+        // Without the flag the same head bypasses the budget.
+        let unflagged = vec![planned("big", Some(10)), planned("cheap", Some(0))];
+        let selection = select_within_budget(unflagged, 2);
+        assert_eq!(labels(&selection.batch), vec!["addr-big", "addr-cheap"]);
+        assert_eq!(selection.bypassed_head_cost, Some(11));
+    }
+
+    #[test]
     fn attribution_gives_the_expensive_target_its_own_cost() {
         // One dusted target (structural estimate 201) in a batch of twenty
         // cheap targets (estimate 1 each).
@@ -1021,6 +1121,7 @@ mod tests {
             poll_interval: Duration::from_secs(10),
             max_requests_per_tick: 1000,
             max_requests_per_second: 5,
+            max_target_requests: 500,
         };
         assert_eq!(policy.per_tick_budget(), 50);
         let capped = ObserverPolicy {

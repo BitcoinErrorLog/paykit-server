@@ -771,6 +771,13 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
             Ok(0)
         }
 
+        async fn mark_observation_overrun(
+            &self,
+            _addresses: &[String],
+        ) -> Result<Vec<uuid::Uuid>, ObserverError> {
+            Ok(Vec::new())
+        }
+
         async fn record_observation_tick(
             &self,
             _records: &[TargetTickRecord],
@@ -798,6 +805,7 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
             poll_interval: std::time::Duration::from_secs(10),
             max_requests_per_tick: 100,
             max_requests_per_second: 5,
+            max_target_requests: 500,
         },
         &runtime,
     )

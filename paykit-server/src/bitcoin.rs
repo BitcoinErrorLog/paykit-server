@@ -215,6 +215,7 @@ pub struct PlannedObservation {
     history_tx_count: Option<u32>,
     last_request_count: Option<u32>,
     staleness: Duration,
+    observation_overrun: bool,
 }
 
 impl PlannedObservation {
@@ -229,7 +230,22 @@ impl PlannedObservation {
             history_tx_count,
             last_request_count,
             staleness,
+            observation_overrun: false,
         }
+    }
+
+    /// Marks the target as flagged `observation_overrun`: its estimated
+    /// cost exceeded the configured per-target bound under the head-of-line
+    /// bypass, so later ticks no longer bypass the budget for it.
+    pub fn with_observation_overrun(mut self, overrun: bool) -> Self {
+        self.observation_overrun = overrun;
+        self
+    }
+
+    /// Whether the target was flagged for exceeding the per-target request
+    /// bound and is excluded from the head-of-line budget bypass.
+    pub fn is_observation_overrun(&self) -> bool {
+        self.observation_overrun
     }
 
     pub fn target(&self) -> &ObservationTarget {
@@ -266,6 +282,7 @@ impl fmt::Debug for PlannedObservation {
             .field("target", &self.target)
             .field("history_tx_count", &self.history_tx_count)
             .field("staleness", &self.staleness)
+            .field("observation_overrun", &self.observation_overrun)
             .finish()
     }
 }

@@ -55,15 +55,23 @@ endpoint = "ssl://electrum.example.invalid:50002"
 poll_interval = "10s"
 request_timeout = "10s"
 connect_retries = 1
-# Hard cap on Electrum requests per observer tick, and the sustained rate
-# budget: per-tick estimated requests never exceed max_requests_per_second
-# times poll_interval. Each tick's two probe requests (headers.subscribe +
-# block_header(0)) are reserved from the budget. Over-budget targets are
-# deferred to the next tick, oldest-last-observed first, except that the
-# single oldest target is always observed (logging the overrun) so one
-# expensive target can never halt observation of the others.
+# Cap on Electrum requests admitted to one tick's budgeted batch, plus the
+# sustained rate budget: per-tick estimated requests never exceed
+# max_requests_per_second times poll_interval. Each tick's two probe
+# requests (headers.subscribe + block_header(0)) are reserved from the
+# budget. Over-budget targets are deferred to the next tick,
+# oldest-last-observed first, except that the single oldest target is
+# always observed (head-of-line bypass, cost logged) so one expensive
+# target can never halt observation of the others. The bypass is what the
+# budget does NOT bound: a bypassed head costing more than
+# max_target_requests is flagged observation_overrun (ERROR log with the
+# invoice id, counted on /health and in the metrics) and loses the bypass
+# on later ticks, and a bypass cost above twice the budget raises an ERROR
+# log and a metric.
 max_requests_per_tick = 1000
 max_requests_per_second = 5
+# Per-target cost bound for the head-of-line bypass described above.
+# max_target_requests = 500
 # Readiness also requires a fresh chain tip: a probed tip older than
 # max_tip_age marks Electrum unavailable on /health/ready. Ignored on
 # regtest, whose tips are mined on demand and can be arbitrarily old

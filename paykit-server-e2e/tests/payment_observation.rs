@@ -1224,6 +1224,36 @@ async fn payment_record_integrity_rejects_row_and_type_envelope_swaps() {
 }
 
 #[tokio::test]
+async fn observation_overrun_marks_once_and_the_plan_reports_the_flag() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+
+    let flagged = store
+        .mark_observation_overrun(&[REGTEST_ADDRESS.to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(flagged, vec![invoice_id]);
+    // Already flagged: a repeat marks nothing new.
+    let flagged_again = store
+        .mark_observation_overrun(&[REGTEST_ADDRESS.to_owned()])
+        .await
+        .unwrap();
+    assert!(flagged_again.is_empty());
+
+    let persisted: bool =
+        sqlx::query_scalar("SELECT observation_overrun FROM invoices WHERE id = $1")
+            .bind(invoice_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert!(persisted);
+    let plan = store.observation_plan().await.unwrap();
+    assert_eq!(plan.len(), 1);
+    assert!(plan[0].is_observation_overrun());
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn observation_plan_orders_oldest_observed_first_and_records_tick_budget_facts() {
     let database = TestDatabase::create().await;
     let (store, invoice_id) = batch_invoice(&database).await;

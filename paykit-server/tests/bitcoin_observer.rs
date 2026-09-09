@@ -147,6 +147,7 @@ mod tick {
             poll_interval: Duration::from_secs(10),
             max_requests_per_tick: budget,
             max_requests_per_second: 100,
+            max_target_requests: 500,
         }
     }
 
@@ -231,6 +232,7 @@ mod tick {
         history_tx_count: Option<u32>,
         last_request_count: Option<u32>,
         staleness_secs: u64,
+        observation_overrun: bool,
     }
 
     impl FakeEntry {
@@ -240,6 +242,7 @@ mod tick {
                 history_tx_count,
                 last_request_count: None,
                 staleness_secs,
+                observation_overrun: false,
             }
         }
     }
@@ -248,6 +251,7 @@ mod tick {
     struct FakeBackend {
         entries: Mutex<Vec<FakeEntry>>,
         applied: Mutex<Vec<Vec<String>>>,
+        marked_overrun: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -264,6 +268,7 @@ mod tick {
                         entry.last_request_count,
                         Duration::from_secs(entry.staleness_secs),
                     )
+                    .with_observation_overrun(entry.observation_overrun)
                 })
                 .collect())
         }
@@ -281,6 +286,25 @@ mod tick {
                     .collect(),
             );
             Ok(0)
+        }
+
+        async fn mark_observation_overrun(
+            &self,
+            addresses: &[String],
+        ) -> Result<Vec<uuid::Uuid>, ObserverError> {
+            let mut marked = self.marked_overrun.lock().unwrap();
+            let mut entries = self.entries.lock().unwrap();
+            let mut invoice_ids = Vec::new();
+            for address in addresses {
+                marked.push(address.clone());
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.address == *address)
+                    && !entry.observation_overrun
+                {
+                    entry.observation_overrun = true;
+                    invoice_ids.push(uuid::Uuid::new_v4());
+                }
+            }
+            Ok(invoice_ids)
         }
 
         async fn record_observation_tick(
@@ -390,6 +414,7 @@ mod tick {
                 FakeEntry::new("freshest", Some(0), 60),
             ]),
             applied: Mutex::new(Vec::new()),
+            marked_overrun: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
         // Costs: 2 + 3 + 1 + 1 = 7 estimated. Policy budget 7 reserves the
@@ -464,6 +489,7 @@ mod tick {
                     .collect(),
             ),
             applied: Mutex::new(Vec::new()),
+            marked_overrun: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
 
@@ -506,6 +532,7 @@ mod tick {
                 FakeEntry::new("cheap-b", Some(0), 120),
             ]),
             applied: Mutex::new(Vec::new()),
+            marked_overrun: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
 
@@ -556,6 +583,7 @@ mod tick {
         let backend = FakeBackend {
             entries: Mutex::new(entries),
             applied: Mutex::new(Vec::new()),
+            marked_overrun: Mutex::new(Vec::new()),
         };
         let runtime = runtime();
 
@@ -615,5 +643,79 @@ mod tick {
                 "cheap target {index} must be admitted on the next tick"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_head_beyond_the_target_bound_is_flagged_and_loses_the_bypass() {
+        // The head's estimate (1 + 600 history transactions) exceeds
+        // max_target_requests (500): it is still observed this tick for
+        // liveness, but flagged observation_overrun so it can no longer
+        // monopolise the endpoint from the next tick on.
+        let port = FakeElectrum::healthy_with_history([("huge", 600)]);
+        let backend = FakeBackend {
+            entries: Mutex::new(vec![
+                FakeEntry::new("huge", Some(600), 600),
+                FakeEntry::new("cheap", Some(0), 300),
+            ]),
+            applied: Mutex::new(Vec::new()),
+            marked_overrun: Mutex::new(Vec::new()),
+        };
+        let runtime = runtime();
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(100),
+            &runtime,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 2,
+                deferred: 0
+            },
+            "the over-bound head is still observed once, for liveness"
+        );
+        assert_eq!(
+            backend.marked_overrun.lock().unwrap().as_slice(),
+            &["huge".to_owned()],
+            "the over-bound head must be flagged observation_overrun"
+        );
+        {
+            let entries = backend.entries.lock().unwrap();
+            let huge = entries
+                .iter()
+                .find(|entry| entry.address == "huge")
+                .expect("huge target recorded");
+            assert!(huge.observation_overrun);
+        }
+
+        // Next tick: the flagged head no longer bypasses the budget, so it
+        // is deferred and only the cheap target is observed; the overrun
+        // count is published for the health surface and metrics.
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &policy(100),
+            &runtime,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 1,
+                deferred: 1
+            },
+            "the flagged head is deferred instead of bypassing again"
+        );
+        {
+            let calls = port.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[1], vec!["cheap".to_owned()]);
+        }
+        assert_eq!(runtime.readiness().await.electrum_overrun_targets, 1);
     }
 }

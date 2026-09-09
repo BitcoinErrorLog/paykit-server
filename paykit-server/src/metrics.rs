@@ -24,6 +24,9 @@ pub struct Metrics {
     electrum_available: Gauge,
     electrum_last_success_age_seconds: Gauge,
     electrum_backlog_oldest_age_seconds: Gauge,
+    electrum_bypassed_head_requests: Gauge,
+    electrum_bypassed_head_budget_violations: Counter,
+    electrum_observation_overrun_targets: Gauge,
     payment_states: Gauge,
     runtime_active: Gauge,
     session_validation_results: Counter,
@@ -40,6 +43,9 @@ impl Metrics {
         let electrum_available = Gauge::default();
         let electrum_last_success_age_seconds = Gauge::default();
         let electrum_backlog_oldest_age_seconds = Gauge::default();
+        let electrum_bypassed_head_requests = Gauge::default();
+        let electrum_bypassed_head_budget_violations = Counter::default();
+        let electrum_observation_overrun_targets = Gauge::default();
         let payment_states = Gauge::default();
         let runtime_active = Gauge::default();
         let session_validation_results = Counter::default();
@@ -84,6 +90,21 @@ impl Metrics {
             electrum_backlog_oldest_age_seconds.clone(),
         );
         registry.register(
+            "paykit_electrum_bypassed_head_requests",
+            "Estimated request cost of the last budget-bypassed head observation target.",
+            electrum_bypassed_head_requests.clone(),
+        );
+        registry.register(
+            "paykit_electrum_bypassed_head_budget_violations",
+            "Ticks whose bypassed head cost exceeded twice the per-tick budget.",
+            electrum_bypassed_head_budget_violations.clone(),
+        );
+        registry.register(
+            "paykit_electrum_observation_overrun_targets",
+            "Observation targets excluded from the head-of-line bypass for exceeding the per-target request bound.",
+            electrum_observation_overrun_targets.clone(),
+        );
+        registry.register(
             "paykit_payment_states",
             "Aggregate persisted payment-state count.",
             payment_states.clone(),
@@ -108,6 +129,9 @@ impl Metrics {
             electrum_available,
             electrum_last_success_age_seconds,
             electrum_backlog_oldest_age_seconds,
+            electrum_bypassed_head_requests,
+            electrum_bypassed_head_budget_violations,
+            electrum_observation_overrun_targets,
             payment_states,
             runtime_active,
             session_validation_results,
@@ -135,6 +159,15 @@ impl Metrics {
     }
     pub fn set_electrum_backlog_oldest_age_seconds(&self, seconds: i64) {
         self.electrum_backlog_oldest_age_seconds.set(seconds.max(0));
+    }
+    pub fn set_electrum_bypassed_head_requests(&self, requests: i64) {
+        self.electrum_bypassed_head_requests.set(requests.max(0));
+    }
+    pub fn electrum_bypassed_head_budget_violation(&self) {
+        self.electrum_bypassed_head_budget_violations.inc();
+    }
+    pub fn set_electrum_observation_overrun_targets(&self, count: i64) {
+        self.electrum_observation_overrun_targets.set(count.max(0));
     }
     pub fn set_payment_states(&self, value: i64) {
         self.payment_states.set(value);

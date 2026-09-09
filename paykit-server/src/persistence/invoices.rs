@@ -250,6 +250,7 @@ impl InvoiceStore {
                     observations.observation_envelope, observations.outpoint_lookup_hash, \
                     invoices.observation_history_tx_count, \
                     invoices.observation_request_count, \
+                    invoices.observation_overrun, \
                     GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (NOW() - \
                         COALESCE(invoices.last_observed_at, invoices.created_at)))))::BIGINT \
                         AS staleness_secs \
@@ -284,9 +285,41 @@ impl InvoiceStore {
                     history_tx_count,
                     last_request_count,
                     std::time::Duration::from_secs(staleness_secs),
-                ))
+                )
+                .with_observation_overrun(row.observation_overrun))
             })
             .collect()
+    }
+
+    /// Flags the invoices behind the given target addresses as
+    /// `observation_overrun`, excluding them from the head-of-line budget
+    /// bypass on later ticks. Returns the ids of the invoices newly flagged
+    /// by this call so the caller can report them at ERROR level.
+    pub async fn mark_observation_overrun(
+        &self,
+        addresses: &[String],
+    ) -> Result<Vec<Uuid>, PersistenceError> {
+        if addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let lookup_hashes: Vec<Vec<u8>> = addresses
+            .iter()
+            .map(|address| {
+                self.crypto
+                    .bitcoin_address_lookup_hash(address.as_bytes())
+                    .as_bytes()
+                    .to_vec()
+            })
+            .collect();
+        sqlx::query_scalar(
+            "UPDATE invoices SET observation_overrun = TRUE, updated_at = NOW() \
+             WHERE bitcoin_address_lookup_hash = ANY($1) AND NOT observation_overrun \
+             RETURNING id",
+        )
+        .bind(&lookup_hashes)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)
     }
 
     /// Records the previous tick's per-target history sizes and measured
@@ -1198,6 +1231,7 @@ struct ObservationPlanRow {
     target: ObservationTargetRow,
     observation_history_tx_count: Option<i32>,
     observation_request_count: Option<i32>,
+    observation_overrun: bool,
     staleness_secs: i64,
 }
 

@@ -94,6 +94,7 @@ impl Config {
                 connect_retries: raw.electrum.connect_retries,
                 max_requests_per_tick: raw.electrum.max_requests_per_tick,
                 max_requests_per_second: raw.electrum.max_requests_per_second,
+                max_target_requests: raw.electrum.max_target_requests,
                 max_tip_age: raw.electrum.max_tip_age,
             },
             outbox: OutboxConfig::from(raw.outbox),
@@ -154,6 +155,10 @@ impl Config {
             (
                 "electrum.max_requests_per_second",
                 u64::from(self.electrum.max_requests_per_second),
+            ),
+            (
+                "electrum.max_target_requests",
+                u64::from(self.electrum.max_target_requests),
             ),
             ("limits.request_body_bytes", self.limits.request_body_bytes),
             (
@@ -508,13 +513,24 @@ pub struct ElectrumConfig {
     pub poll_interval: Duration,
     pub request_timeout: Duration,
     pub connect_retries: u8,
-    /// Hard cap on Electrum requests issued per observer tick, including the
-    /// tick's two probe requests (headers.subscribe + block_header(0)),
-    /// which are reserved before observation targets are admitted.
+    /// Cap on Electrum requests admitted to one tick's budgeted batch,
+    /// including the tick's two probe requests (headers.subscribe +
+    /// block_header(0)), which are reserved before observation targets are
+    /// admitted. This is not an absolute per-tick bound: the single oldest
+    /// target is always observed (head-of-line bypass) even when its
+    /// estimate exceeds the cap, to preserve liveness. The bypassed head is
+    /// bounded separately by `max_target_requests`, and a bypass cost above
+    /// twice the budget raises an ERROR log and a metric.
     pub max_requests_per_tick: u32,
     /// Sustained request budget: per-tick estimated requests must not exceed
     /// this rate times the poll interval.
     pub max_requests_per_second: u32,
+    /// Per-target cost bound for the head-of-line bypass: a bypassed head
+    /// whose estimated requests exceed this is flagged `observation_overrun`
+    /// (logged at ERROR with the invoice id, counted on /health and in the
+    /// metrics) and excluded from the bypass on later ticks, so one
+    /// unbounded-history address cannot monopolise the endpoint.
+    pub max_target_requests: u32,
     /// Maximum accepted chain-tip age for readiness: a probed tip older than
     /// this marks Electrum unavailable on /health/ready. Skipped on regtest,
     /// whose tips are mined on demand and can be arbitrarily old without
@@ -776,6 +792,8 @@ struct RawElectrumConfig {
     max_requests_per_tick: u32,
     #[serde(default = "default_electrum_max_requests_per_second")]
     max_requests_per_second: u32,
+    #[serde(default = "default_electrum_max_target_requests")]
+    max_target_requests: u32,
     #[serde(default = "default_electrum_max_tip_age", with = "humantime_serde")]
     max_tip_age: Duration,
 }
@@ -786,6 +804,10 @@ const fn default_electrum_max_requests_per_tick() -> u32 {
 
 const fn default_electrum_max_requests_per_second() -> u32 {
     5
+}
+
+const fn default_electrum_max_target_requests() -> u32 {
+    500
 }
 
 const fn default_electrum_max_tip_age() -> Duration {
