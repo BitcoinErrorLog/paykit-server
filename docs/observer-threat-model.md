@@ -87,7 +87,7 @@ bound of one `address_deadline`. Mitigations:
   any per-UTXO record is materialised — no record vector is built for it.
   The two caps are coupled at startup: configuration load refuses an
   `electrum.max_utxos_per_address` whose maximum reply (items × the
-  160-byte per-item wire bound, plus the JSON-RPC envelope) would exceed
+  176-byte per-item wire bound, plus the JSON-RPC envelope) would exceed
   `electrum.max_response_bytes`, so the item cap can never demand a
   response the transport byte cap refuses.
 - **Per-address wall-clock deadline.** Connect + call + decode for one

@@ -1,6 +1,11 @@
 use std::time::Duration;
 
-use paykit_server::config::{Config, ConfigEnvironment, PaykitNetwork};
+use paykit_server::config::{
+    Config, ConfigEnvironment, LISTUNSPENT_RESPONSE_ENVELOPE_BYTES, PaykitNetwork,
+};
+use paykit_server::workers::electrum::{
+    LISTUNSPENT_ITEM_BYTES_UPPER_BOUND, MAX_MAX_RESPONSE_BYTES, MIN_MAX_RESPONSE_BYTES,
+};
 
 const KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
@@ -507,25 +512,41 @@ fn rejects_a_response_cap_above_the_16mib_ceiling_with_the_literal_message() {
 
 #[test]
 fn the_utxo_item_cap_must_fit_inside_the_response_byte_cap() {
-    // Default configuration: 200 items × 160 B + envelope ≪ 1 MiB.
+    // Default configuration: 200 items × the per-item wire bound +
+    // envelope ≪ 1 MiB.
     assert!(Config::from_toml_and_environment(&valid_toml(), environment()).is_ok());
-    // 200 000 items × 160 B = 32 000 000 B > 16 MiB: the byte cap would
-    // poison the item cap's own maximum reply, so startup refuses the
-    // coupling with a literal diagnostic naming both fields and the
-    // arithmetic.
+    // The largest item cap the 16 MiB byte-cap ceiling admits is
+    // floor((ceiling − envelope) / per-item bound); one item more and
+    // the byte cap would poison the item cap's own maximum reply, so
+    // startup refuses the coupling with a literal diagnostic naming
+    // both fields and the arithmetic.
+    let max_items = (MAX_MAX_RESPONSE_BYTES - LISTUNSPENT_RESPONSE_ENVELOPE_BYTES)
+        / LISTUNSPENT_ITEM_BYTES_UPPER_BOUND;
     let error = Config::from_toml_and_environment(
-        &electrum_toml("max_utxos_per_address = 200000\nmax_response_bytes = 16777216"),
+        &electrum_toml(&format!(
+            "max_utxos_per_address = {}\nmax_response_bytes = {}",
+            max_items + 1,
+            MAX_MAX_RESPONSE_BYTES
+        )),
         environment(),
     )
     .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "electrum.max_utxos_per_address 200000 × 160 B exceeds electrum.max_response_bytes 16777216"
+        format!(
+            "electrum.max_utxos_per_address {} × {} B exceeds electrum.max_response_bytes {}",
+            max_items + 1,
+            LISTUNSPENT_ITEM_BYTES_UPPER_BOUND,
+            MAX_MAX_RESPONSE_BYTES
+        )
     );
-    // 100 000 items × 160 B + envelope < 16 MiB: accepted.
+    // Exactly max_items fits inside the ceiling: accepted.
     assert!(
         Config::from_toml_and_environment(
-            &electrum_toml("max_utxos_per_address = 100000\nmax_response_bytes = 16777216"),
+            &electrum_toml(&format!(
+                "max_utxos_per_address = {}\nmax_response_bytes = {}",
+                max_items, MAX_MAX_RESPONSE_BYTES
+            )),
             environment(),
         )
         .is_ok()
@@ -534,17 +555,29 @@ fn the_utxo_item_cap_must_fit_inside_the_response_byte_cap() {
 
 #[test]
 fn the_utxo_item_cap_at_the_response_byte_floor_refuses_a_self_poisoning_config() {
-    // 586 items × 160 B + envelope = 94 784 B > 64 KiB: at the response
-    // byte cap's floor this item cap would self-poison its own largest
-    // legitimate reply, so startup refuses it.
+    // At the response byte cap's 64 KiB floor the largest admitted item
+    // cap is floor((floor − envelope) / per-item bound); one item more
+    // would self-poison its own largest legitimate reply, so startup
+    // refuses it.
+    let max_items = (MIN_MAX_RESPONSE_BYTES - LISTUNSPENT_RESPONSE_ENVELOPE_BYTES)
+        / LISTUNSPENT_ITEM_BYTES_UPPER_BOUND;
     let error = Config::from_toml_and_environment(
-        &electrum_toml("max_utxos_per_address = 586\nmax_response_bytes = 65536"),
+        &electrum_toml(&format!(
+            "max_utxos_per_address = {}\nmax_response_bytes = {}",
+            max_items + 1,
+            MIN_MAX_RESPONSE_BYTES
+        )),
         environment(),
     )
     .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "electrum.max_utxos_per_address 586 × 160 B exceeds electrum.max_response_bytes 65536"
+        format!(
+            "electrum.max_utxos_per_address {} × {} B exceeds electrum.max_response_bytes {}",
+            max_items + 1,
+            LISTUNSPENT_ITEM_BYTES_UPPER_BOUND,
+            MIN_MAX_RESPONSE_BYTES
+        )
     );
     // The default (200 items, 1 MiB) stays accepted.
     assert!(Config::from_toml_and_environment(&valid_toml(), environment()).is_ok());

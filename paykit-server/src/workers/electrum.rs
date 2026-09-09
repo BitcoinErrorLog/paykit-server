@@ -56,22 +56,20 @@ pub const DEFAULT_MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 pub const MIN_MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
 /// Wire-size upper bound for one `blockchain.scripthash.listunspent`
-/// item: `{"tx_hash":"<64 hex>","tx_pos":<u32>,"height":<u32>,`
-/// `"value":<u64>}`. The fixed text (braces, quotes, field names,
-/// commas) is 107 bytes; the numeric fields take at most
-/// digits(u32::MAX) + digits(u32::MAX) + digits(u64::MAX) =
-/// 10 + 10 + 20 = 40 bytes, so the true bound is **147 bytes** for any
-/// item the observer accepts, and 160 rounds it up with headroom. (If
-/// every numeric field were serialised at full `usize` width the item
-/// would be 167 bytes, but block heights and output indices are u32
-/// values in practice; the coupling rule below exists to bound
-/// *legitimate* replies, and an item that large still fits the 16 MiB
-/// transport ceiling at any accepted item cap.) Config validation
-/// refuses an `electrum.max_utxos_per_address` whose maximum reply
-/// (items × this bound, plus the JSON-RPC envelope) would exceed
-/// `electrum.max_response_bytes`, so the item cap can never demand a
-/// response the transport byte cap refuses.
-pub const LISTUNSPENT_ITEM_BYTES_UPPER_BOUND: u64 = 160;
+/// item: `{"tx_hash":"<64 hex>","tx_pos":<usize>,"height":<usize>,`
+/// `"value":<u64>}` — the field types of electrum-client 0.25's
+/// `ListUnspentRes`. The fixed text (braces, quotes, field names,
+/// commas, and the 64 hex digits of the txid) is 107 bytes; on 64-bit
+/// targets `tx_pos: usize` and `height: usize` can each serialise as up
+/// to digits(u64::MAX) = 20 decimal digits, and `value: u64` as up to
+/// 20 digits, so the numeric fields take at most 20 + 20 + 20 = 60
+/// bytes and the true bound is 107 + 20 + 20 + 20 = **167 bytes** for
+/// any item the observer accepts. 176 rounds 167 up with headroom.
+/// Config validation refuses an `electrum.max_utxos_per_address` whose
+/// maximum reply (items × this bound, plus the JSON-RPC envelope) would
+/// exceed `electrum.max_response_bytes`, so the item cap can never
+/// demand a response the transport byte cap refuses.
+pub const LISTUNSPENT_ITEM_BYTES_UPPER_BOUND: u64 = 176;
 
 /// Ceiling for `electrum.max_response_bytes`: 16 MiB. Startup refuses a
 /// larger value. Justification from the design's own caps: the largest
@@ -79,8 +77,8 @@ pub const LISTUNSPENT_ITEM_BYTES_UPPER_BOUND: u64 = 160;
 /// `blockchain.scripthash.listunspent` reply of at most
 /// `electrum.max_utxos_per_address` items (default 200) of at most
 /// [`LISTUNSPENT_ITEM_BYTES_UPPER_BOUND`] bytes each, so the default
-/// configuration's largest response is ≈ 32 KiB and even a
-/// 100 000-item configuration stays under ~16 MiB. The only other
+/// configuration's largest response is ≈ 35 KiB and even a
+/// 95 000-item configuration stays under ~16 MiB. The only other
 /// responses are the tick's probe replies (`headers.subscribe` and
 /// `block_header(0)`: an 80-byte header hex-encoded plus envelope, well
 /// under 1 KiB). 16 MiB therefore bounds every legitimate response with
@@ -367,6 +365,37 @@ mod tests {
         let mut out = Vec::new();
         stream.read_to_end(&mut out)?;
         Ok(out)
+    }
+
+    #[test]
+    fn a_maximal_serialised_listunspent_item_fits_the_wire_bound() {
+        // electrum-client 0.25's `ListUnspentRes` has `tx_pos: usize`,
+        // `height: usize`, and `value: u64`: on 64-bit targets each
+        // numeric field serialises as up to digits(u64::MAX) = 20
+        // decimal digits, so a maximal wire item is 107 fixed bytes +
+        // 20 + 20 + 20 = 167 bytes — the arithmetic the coupling rule's
+        // per-item bound must cover.
+        let item = format!(
+            "{{\"tx_hash\":\"{}\",\"tx_pos\":{},\"height\":{},\"value\":{}}}",
+            "ff".repeat(32),
+            usize::MAX,
+            usize::MAX,
+            u64::MAX
+        );
+        // The string is a genuine maximal item the observer accepts...
+        let decoded: electrum_client::ListUnspentRes =
+            serde_json::from_str(&item).expect("maximal wire item decodes");
+        assert_eq!(decoded.tx_pos, usize::MAX);
+        assert_eq!(decoded.height, usize::MAX);
+        assert_eq!(decoded.value, u64::MAX);
+        // ...so its wire size must fit the per-item bound.
+        assert!(
+            item.len() as u64 <= LISTUNSPENT_ITEM_BYTES_UPPER_BOUND,
+            "maximal listunspent item serialises to {} bytes but \
+             LISTUNSPENT_ITEM_BYTES_UPPER_BOUND is {}",
+            item.len(),
+            LISTUNSPENT_ITEM_BYTES_UPPER_BOUND
+        );
     }
 
     #[test]

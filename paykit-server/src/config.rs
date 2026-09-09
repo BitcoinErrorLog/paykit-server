@@ -20,7 +20,7 @@ use crate::workers::{
 /// Allowance for the JSON-RPC envelope around a `listunspent` reply
 /// (`{"jsonrpc":"2.0","id":<u64>,"result":[…]}` plus separators): well
 /// under 1 KiB. Used only by the item-cap/byte-cap coupling rule.
-const LISTUNSPENT_RESPONSE_ENVELOPE_BYTES: u64 = 1024;
+pub const LISTUNSPENT_RESPONSE_ENVELOPE_BYTES: u64 = 1024;
 
 #[derive(Debug)]
 pub struct Config {
@@ -251,8 +251,8 @@ impl Config {
         // LISTUNSPENT_ITEM_BYTES_UPPER_BOUND bytes each plus the
         // JSON-RPC envelope; if that exceeds max_response_bytes, the
         // byte cap would poison the server's own largest legitimate
-        // response, so startup refuses the configuration. u32 × 160
-        // cannot overflow u64.
+        // response, so startup refuses the configuration. u32 ×
+        // LISTUNSPENT_ITEM_BYTES_UPPER_BOUND (176) cannot overflow u64.
         let largest_legitimate_response = u64::from(self.electrum.max_utxos_per_address)
             * LISTUNSPENT_ITEM_BYTES_UPPER_BOUND
             + LISTUNSPENT_RESPONSE_ENVELOPE_BYTES;
