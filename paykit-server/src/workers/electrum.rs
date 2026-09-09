@@ -67,8 +67,11 @@ fn response_cap_error() -> io::Error {
 /// the stream poisons itself: every later read fails with
 /// [`RESPONSE_CAP_ERROR_MESSAGE`]. A poisoned stream can never resume a
 /// half-read line; the connection must be torn down and re-established by
-/// the caller. Writes pass through uncapped (requests are small and
-/// self-generated).
+/// the caller. Each read requests at most the current line's remaining
+/// budget plus one byte from the inner stream, so a poisoned line of ANY
+/// length consumes exactly `max_response_bytes + 1` bytes from the source
+/// before the read fails — never more. Writes pass through uncapped
+/// (requests are small and self-generated).
 ///
 /// `CappedStream<S>` is `Send + 'static` whenever `S` is, so it can cross
 /// into the blocking pool inside `RawClient`. `RawClient` requires no
@@ -101,7 +104,17 @@ impl<S: Read + Write> Read for CappedStream<S> {
         if self.poisoned {
             return Err(response_cap_error());
         }
-        let n = self.inner.read(buf)?;
+        // Never request more than the current line's remaining budget
+        // plus one byte from the inner stream: without the clamp an
+        // oversize line would be consumed (and held in the caller's
+        // buffer) up to the caller's buffer size before the cap check
+        // below runs. With it, the byte AFTER the cap is the last byte
+        // ever consumed for a poisoned line — an over-cap line of any
+        // length costs the source exactly `max_response_bytes + 1` bytes
+        // of consumption before the read fails.
+        let remaining_line_budget = self.max_response_bytes - self.line_bytes;
+        let clamped_len = (remaining_line_budget + 1).min(buf.len() as u64) as usize;
+        let n = self.inner.read(&mut buf[..clamped_len])?;
         for (index, &byte) in buf[..n].iter().enumerate() {
             if byte == b'\n' {
                 self.line_bytes = 0;
@@ -350,19 +363,96 @@ mod tests {
     fn a_multi_line_burst_fails_only_at_the_oversize_line() {
         let small = b"{\"id\":0,\"result\":[]}\n".to_vec();
         assert!((small.len() as u64) < CAP);
-        let mut oversize = vec![b'x'; CAP as usize];
+        // Far larger than the cap so the source-consumption clamp (not
+        // the burst length) is what stops the read.
+        let mut oversize = vec![b'x'; (CAP + 4096) as usize];
         oversize.push(b'\n');
         let burst = [small.clone(), oversize].concat();
         let mut stream = capped_cursor(&burst);
-        // One read over the whole burst delivers only the complete small
-        // line; the oversize second line fails only at line 2.
         let mut buf = [0u8; 512];
-        let n = stream.read(&mut buf).expect("line 1 is delivered intact");
-        assert_eq!(&buf[..n], small.as_slice());
+        // Reads deliver the complete small line (followed by at most a
+        // clamped prefix of the oversize one); the oversize line's
+        // newline is never consumed — the read fails with the literal
+        // cap error first.
+        let mut delivered = Vec::new();
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => panic!("the stream ended before the cap error"),
+                Ok(n) => delivered.extend_from_slice(&buf[..n]),
+                Err(error) => {
+                    assert_eq!(error.to_string(), RESPONSE_CAP_ERROR_MESSAGE);
+                    break;
+                }
+            }
+        }
+        assert!(
+            delivered.starts_with(&small),
+            "the small line is delivered intact"
+        );
+        assert!(
+            delivered.len() <= small.len() + (CAP + 1) as usize,
+            "at most cap + 1 bytes of the oversize line are ever delivered"
+        );
+        // Poisoned: every later read fails with the same literal error.
         let error = stream.read(&mut buf).unwrap_err();
         assert_eq!(error.to_string(), RESPONSE_CAP_ERROR_MESSAGE);
         // Writes pass through uncapped even after poisoning.
         assert_eq!(stream.write(b"request\n").unwrap(), 8);
+    }
+
+    /// A `Read + Write` source that counts the total bytes ever consumed
+    /// from it, proving the clamp bounds what a poisoned line costs.
+    struct CountingStream {
+        inner: Cursor<Vec<u8>>,
+        consumed: usize,
+    }
+
+    impl Read for CountingStream {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.consumed += n;
+            Ok(n)
+        }
+    }
+
+    impl Write for CountingStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_over_cap_line_consumes_exactly_cap_plus_one_bytes_from_the_source() {
+        // CAP + 4096 content bytes, then a newline that must never be
+        // consumed: the cap trips first.
+        let mut line = vec![b'x'; (CAP + 4096) as usize];
+        line.push(b'\n');
+        let mut stream = CappedStream::new(
+            CountingStream {
+                inner: Cursor::new(line),
+                consumed: 0,
+            },
+            CAP,
+        );
+        let mut buf = [0u8; 8192];
+        let error = loop {
+            match stream.read(&mut buf) {
+                Ok(delivered) => {
+                    assert!(delivered > 0, "the source never EOFs before the cap trips");
+                }
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.to_string(), RESPONSE_CAP_ERROR_MESSAGE);
+        assert_eq!(
+            stream.inner.consumed,
+            (CAP + 1) as usize,
+            "a poisoned line costs the source exactly cap + 1 bytes, never cap + N"
+        );
     }
 
     #[test]
