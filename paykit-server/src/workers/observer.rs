@@ -120,17 +120,19 @@ pub struct FailedObservation {
 
 /// One tick's observation response with per-address outcomes. `outputs`
 /// holds the matched outputs of every successfully looked-up address;
-/// `observed` and `failed` partition the requested target addresses so the
-/// tick stamps only successful lookups and leaves failed targets stale for
-/// the next tick. One failed address never discards the others' results.
+/// `observed` and `failed` partition the requested target addresses. The
+/// tick stamps every attempted address — observed with the success
+/// stamp, failed with the failure stamp — so both rotate behind the
+/// plan, while failed targets keep their `last_observed_at` staleness.
+/// One failed address never discards the others' results.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ObservationReport {
     pub outputs: Vec<ObservedOutput>,
     /// Target addresses whose `list_unspent` lookup succeeded.
     pub observed: Vec<String>,
     /// Target addresses whose lookup timed out, exceeded the UTXO cap or
-    /// the per-address deadline, or errored; they keep their staleness and
-    /// lead the next tick's plan.
+    /// the per-address deadline, or errored; they keep their staleness
+    /// but rotate behind the rest of the plan like successes.
     pub failed: Vec<FailedObservation>,
 }
 
@@ -171,7 +173,7 @@ pub enum ObserverError {
 /// production implementation is [`InvoiceStore`]; tests inject fakes.
 #[async_trait]
 pub trait ObservationBackend: Send + Sync {
-    /// Loads the non-final observation plan, oldest successful observation first.
+    /// Loads the non-final observation plan, oldest attempt first.
     async fn observation_plan(&self) -> Result<Vec<PlannedObservation>, ObserverError>;
     /// Validates and persists one fetched batch for the requested targets.
     async fn apply_observations(
@@ -180,10 +182,18 @@ pub trait ObservationBackend: Send + Sync {
         targets: &[ObservationTarget],
         outputs: Vec<ObservedOutput>,
     ) -> Result<usize, ObserverError>;
-    /// Stamps the successfully observed target addresses. Returns the
-    /// number of records whose stamp matched no invoice row; misses are
-    /// logged and counted but never abort the other records.
-    async fn record_observation_tick(&self, addresses: &[String]) -> Result<u64, ObserverError>;
+    /// Stamps the tick's attempted target addresses: observed targets
+    /// with a success stamp (`last_observed_at` + `last_attempted_at`),
+    /// failed targets with a failure stamp (`last_attempted_at` only) so
+    /// they rotate behind the plan exactly like successes and cannot
+    /// starve it. Returns the number of records whose stamp matched no
+    /// invoice row; misses are logged and counted but never abort the
+    /// other records.
+    async fn record_observation_tick(
+        &self,
+        observed: &[String],
+        failed: &[String],
+    ) -> Result<u64, ObserverError>;
 }
 
 #[async_trait]
@@ -206,8 +216,12 @@ impl ObservationBackend for InvoiceStore {
             .map_err(map_persistence)
     }
 
-    async fn record_observation_tick(&self, addresses: &[String]) -> Result<u64, ObserverError> {
-        InvoiceStore::record_observation_tick(self, addresses)
+    async fn record_observation_tick(
+        &self,
+        observed: &[String],
+        failed: &[String],
+    ) -> Result<u64, ObserverError> {
+        InvoiceStore::record_observation_tick(self, observed, failed)
             .await
             .map_err(map_persistence)
     }
@@ -269,13 +283,14 @@ pub struct BudgetSelection {
     pub deferred: Vec<PlannedObservation>,
 }
 
-/// Walks the oldest-first plan and admits exactly as many targets as the
-/// lookup budget allows; the remainder is deferred to the next tick and,
-/// keeping its staleness, is admitted first then. Every target costs
-/// exactly one lookup, so admission is a strict prefix of the plan: no
-/// bypass, no skipping, no slow lane. Observing a target stamps it, so an
-/// admitted target rotates behind the deferred tail and every target is
-/// observed within a bounded number of ticks.
+/// Walks the oldest-attempt-first plan and admits exactly as many targets
+/// as the lookup budget allows; the remainder is deferred to the next
+/// tick and, being the least recently attempted, is admitted first then.
+/// Every target costs exactly one lookup, so admission is a strict prefix
+/// of the plan: no bypass, no skipping, no slow lane. Attempting a target
+/// stamps it — success or failure — so an admitted target rotates behind
+/// the deferred tail and every target is attempted within a bounded
+/// number of ticks.
 pub fn select_within_budget(plan: Vec<PlannedObservation>, budget: u64) -> BudgetSelection {
     let admit = usize::try_from(budget).unwrap_or(usize::MAX);
     let mut plan = plan;
@@ -523,7 +538,7 @@ impl RequestLimiter {
 
     /// Rewinds the refill clock by `elapsed`, so deterministic tests can
     /// simulate wall time passing exactly as the production loop's real
-    /// sleep between ticks would. Not for production callers.
+    /// sleep between ticks would. Test-only; no production caller.
     pub fn rewind_refill_clock(&self, elapsed: Duration) {
         let mut budget = self.lock();
         if let Some(rewound) = budget.last_refill.checked_sub(elapsed) {
@@ -575,6 +590,7 @@ impl ObserverTickState {
     /// Tick state over a private limiter built from the policy's budget —
     /// for tests that drive ticks in isolation. Production uses
     /// [`Self::with_limiter`] with the app-owned shared limiter.
+    /// Test-only; no production caller.
     pub fn new(policy: &ObserverPolicy) -> Self {
         Self::with_limiter(RequestLimiter::from_policy(policy))
     }
@@ -597,6 +613,7 @@ impl ObserverTickState {
 
     /// Whether the current zero-success streak has already emitted its one
     /// ERROR log (the log gate; exposed for tests and diagnostics).
+    /// Test-only; no production caller.
     pub fn zero_success_logged(&self) -> bool {
         self.zero_success_logged
     }
@@ -605,6 +622,7 @@ impl ObserverTickState {
     /// refills as if that much wall time had passed since the previous
     /// tick. The production loop gets the same refill from its real sleep
     /// between ticks; deterministic tests use this to space ticks.
+    /// Test-only; no production caller.
     pub fn rewind_budget_clock(&mut self, elapsed: Duration) {
         self.budget.rewind_refill_clock(elapsed);
     }
@@ -883,7 +901,21 @@ pub async fn observe_tick(
         runtime.set_electrum_available(false);
         return ObserverTickOutcome::ObservationFailed(error);
     }
-    let misses = match backend.record_observation_tick(&report.observed).await {
+    // Stamp every ATTEMPTED target: observed targets with the success
+    // stamp, failed targets with the failure stamp, so both rotate
+    // behind the rest of the oldest-first plan. Stamping only successes
+    // would let a run of permanently failing targets hold the plan's
+    // head forever and starve every honest seller of attempts; the
+    // failed targets keep their `last_observed_at` staleness either way.
+    let failed_addresses: Vec<String> = report
+        .failed
+        .iter()
+        .map(|failure| failure.address.clone())
+        .collect();
+    let misses = match backend
+        .record_observation_tick(&report.observed, &failed_addresses)
+        .await
+    {
         Ok(misses) => misses,
         Err(error) => {
             runtime.set_electrum_available(false);
@@ -904,9 +936,9 @@ pub async fn observe_tick(
         return ObserverTickOutcome::ObservationFailed(ObserverError::ObservationStampMiss);
     }
     // Isolated per-address failures degrade only the failed targets (they
-    // keep their staleness and lead the next plan); they never degrade
-    // endpoint availability. The endpoint degrades solely on a probe or
-    // connect failure, handled above.
+    // keep their staleness, though they rotate behind the plan like
+    // successes); they never degrade endpoint availability. The endpoint
+    // degrades solely on a probe or connect failure, handled above.
     runtime.set_electrum_available(true);
     ObserverTickOutcome::Observed {
         processed,
@@ -1001,7 +1033,11 @@ pub struct ElectrumAdapter {
     /// rejected before any per-UTXO record is materialised.
     max_utxos_per_address: usize,
     /// Per-address wall-clock deadline over connect + call + decode
-    /// (`electrum.address_deadline`).
+    /// (`electrum.address_deadline`). The tick's probe shares it: the
+    /// per-read socket timeout does not bound a drip-feeding endpoint,
+    /// so without a wall-clock bound on the probe a slow-drip
+    /// `headers.subscribe` reply would stall the tick forever — no
+    /// backoff, no availability change, no failover.
     address_deadline: Duration,
     /// Transport-level cap on one Electrum response line
     /// (`electrum.max_response_bytes`): every connection this adapter
@@ -1169,7 +1205,7 @@ impl ElectrumPort for ElectrumAdapter {
     async fn probe(&self) -> Result<TipProbe, ObserverError> {
         let client = self.raw_client().await?;
         let network = self.network.clone();
-        tokio::task::spawn_blocking(move || {
+        let probe = tokio::task::spawn_blocking(move || {
             let notification = client.block_headers_subscribe().map_err(map_electrum)?;
             let genesis = client.block_header(0).map_err(map_electrum)?;
             if genesis.block_hash().to_string() != expected_genesis_hash(&network) {
@@ -1180,9 +1216,23 @@ impl ElectrumPort for ElectrumAdapter {
                     .map_err(|_| ObserverError::InvalidObservation)?,
                 time_unix: notification.header.time,
             })
-        })
-        .await
-        .map_err(|_| ObserverError::Unavailable)?
+        });
+        // Wall-clock deadline over the whole probe, reusing the
+        // per-address `electrum.address_deadline` knob: the per-read
+        // socket timeout (`electrum.request_timeout`) does not bound a
+        // drip-feeding endpoint that answers one byte per interval, so
+        // without this a slow-drip `headers.subscribe` reply would stall
+        // the tick forever — no backoff, no `set_electrum_available`,
+        // no metrics, leadership never released. Expiry fails the probe
+        // as `Unavailable`, the same endpoint-level condition as a
+        // connect outage, so the existing backoff/metrics/availability
+        // path applies unchanged. As with the per-address path, the
+        // blocking socket read cannot be cancelled: the abandoned
+        // blocking task and its socket exit only when the read returns.
+        match tokio::time::timeout(self.address_deadline, probe).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) | Err(_) => Err(ObserverError::Unavailable),
+        }
     }
 }
 

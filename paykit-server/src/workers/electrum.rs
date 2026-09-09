@@ -57,13 +57,21 @@ pub const MIN_MAX_RESPONSE_BYTES: u64 = 64 * 1024;
 
 /// Wire-size upper bound for one `blockchain.scripthash.listunspent`
 /// item: `{"tx_hash":"<64 hex>","tx_pos":<u32>,"height":<u32>,`
-/// `"value":<u64>}` — 64 hex characters plus the field names, JSON
-/// punctuation, and the longest u32/u64 digit strings stays under 110
-/// bytes. Config validation refuses an `electrum.max_utxos_per_address`
-/// whose maximum reply (items × this bound, plus the JSON-RPC envelope)
-/// would exceed `electrum.max_response_bytes`, so the item cap can
-/// never demand a response the transport byte cap refuses.
-pub const LISTUNSPENT_ITEM_BYTES_UPPER_BOUND: u64 = 110;
+/// `"value":<u64>}`. The fixed text (braces, quotes, field names,
+/// commas) is 107 bytes; the numeric fields take at most
+/// digits(u32::MAX) + digits(u32::MAX) + digits(u64::MAX) =
+/// 10 + 10 + 20 = 40 bytes, so the true bound is **147 bytes** for any
+/// item the observer accepts, and 160 rounds it up with headroom. (If
+/// every numeric field were serialised at full `usize` width the item
+/// would be 167 bytes, but block heights and output indices are u32
+/// values in practice; the coupling rule below exists to bound
+/// *legitimate* replies, and an item that large still fits the 16 MiB
+/// transport ceiling at any accepted item cap.) Config validation
+/// refuses an `electrum.max_utxos_per_address` whose maximum reply
+/// (items × this bound, plus the JSON-RPC envelope) would exceed
+/// `electrum.max_response_bytes`, so the item cap can never demand a
+/// response the transport byte cap refuses.
+pub const LISTUNSPENT_ITEM_BYTES_UPPER_BOUND: u64 = 160;
 
 /// Ceiling for `electrum.max_response_bytes`: 16 MiB. Startup refuses a
 /// larger value. Justification from the design's own caps: the largest
@@ -71,8 +79,8 @@ pub const LISTUNSPENT_ITEM_BYTES_UPPER_BOUND: u64 = 110;
 /// `blockchain.scripthash.listunspent` reply of at most
 /// `electrum.max_utxos_per_address` items (default 200) of at most
 /// [`LISTUNSPENT_ITEM_BYTES_UPPER_BOUND`] bytes each, so the default
-/// configuration's largest response is ≈ 21 KiB and even a
-/// 100 000-item configuration stays under ~11 MiB. The only other
+/// configuration's largest response is ≈ 32 KiB and even a
+/// 100 000-item configuration stays under ~16 MiB. The only other
 /// responses are the tick's probe replies (`headers.subscribe` and
 /// `block_header(0)`: an 80-byte header hex-encoded plus envelope, well
 /// under 1 KiB). 16 MiB therefore bounds every legitimate response with
@@ -245,6 +253,12 @@ impl ElectrumEndpoint {
             host: host.to_owned(),
             port,
         })
+    }
+
+    /// Whether the endpoint uses the TLS (`ssl://`) transport. Config
+    /// validation uses this for the mainnet plaintext refusal.
+    pub fn use_tls(&self) -> bool {
+        self.use_tls
     }
 }
 

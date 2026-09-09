@@ -507,9 +507,9 @@ fn rejects_a_response_cap_above_the_16mib_ceiling_with_the_literal_message() {
 
 #[test]
 fn the_utxo_item_cap_must_fit_inside_the_response_byte_cap() {
-    // Default configuration: 200 items × 110 B + envelope ≪ 1 MiB.
+    // Default configuration: 200 items × 160 B + envelope ≪ 1 MiB.
     assert!(Config::from_toml_and_environment(&valid_toml(), environment()).is_ok());
-    // 200 000 items × 110 B = 22 000 000 B > 16 MiB: the byte cap would
+    // 200 000 items × 160 B = 32 000 000 B > 16 MiB: the byte cap would
     // poison the item cap's own maximum reply, so startup refuses the
     // coupling with a literal diagnostic naming both fields and the
     // arithmetic.
@@ -520,9 +520,9 @@ fn the_utxo_item_cap_must_fit_inside_the_response_byte_cap() {
     .unwrap_err();
     assert_eq!(
         error.to_string(),
-        "electrum.max_utxos_per_address 200000 × 110 B exceeds electrum.max_response_bytes 16777216"
+        "electrum.max_utxos_per_address 200000 × 160 B exceeds electrum.max_response_bytes 16777216"
     );
-    // 100 000 items × 110 B + envelope < 16 MiB: accepted.
+    // 100 000 items × 160 B + envelope < 16 MiB: accepted.
     assert!(
         Config::from_toml_and_environment(
             &electrum_toml("max_utxos_per_address = 100000\nmax_response_bytes = 16777216"),
@@ -530,6 +530,24 @@ fn the_utxo_item_cap_must_fit_inside_the_response_byte_cap() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn the_utxo_item_cap_at_the_response_byte_floor_refuses_a_self_poisoning_config() {
+    // 586 items × 160 B + envelope = 94 784 B > 64 KiB: at the response
+    // byte cap's floor this item cap would self-poison its own largest
+    // legitimate reply, so startup refuses it.
+    let error = Config::from_toml_and_environment(
+        &electrum_toml("max_utxos_per_address = 586\nmax_response_bytes = 65536"),
+        environment(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "electrum.max_utxos_per_address 586 × 160 B exceeds electrum.max_response_bytes 65536"
+    );
+    // The default (200 items, 1 MiB) stays accepted.
+    assert!(Config::from_toml_and_environment(&valid_toml(), environment()).is_ok());
 }
 
 fn mainnet_toml(endpoint: &str) -> String {
@@ -566,6 +584,39 @@ fn accepts_an_ssl_electrum_endpoint_on_mainnet() {
             environment()
         )
         .is_ok()
+    );
+}
+
+#[test]
+fn refuses_a_malformed_ssl_electrum_endpoint_on_mainnet_at_config_load() {
+    // `ssl://host:port/tcp://` carries a path the endpoint parser
+    // refuses; delegating the pre-check to the parser refuses it at
+    // config load with the same literal adapter construction would use,
+    // instead of later at startup.
+    let error = Config::from_toml_and_environment(
+        &mainnet_toml("ssl://electrum.example:50002/tcp://"),
+        environment(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "electrum endpoint scheme must be tcp:// or ssl://"
+    );
+}
+
+#[test]
+fn refuses_an_uppercase_ssl_scheme_on_mainnet() {
+    // Fail closed on scheme case: `SSL://` is refused even though the
+    // URL parser would normalize it to `ssl`.
+    let error = Config::from_toml_and_environment(
+        &mainnet_toml("SSL://electrum.example:50002"),
+        environment(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "bitcoin.network mainnet requires an ssl:// electrum.endpoint; \
+         the SSL:// scheme is plaintext and refused"
     );
 }
 

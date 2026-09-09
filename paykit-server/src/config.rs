@@ -11,7 +11,8 @@ use url::Url;
 
 use crate::workers::{
     electrum::{
-        LISTUNSPENT_ITEM_BYTES_UPPER_BOUND, MAX_MAX_RESPONSE_BYTES, MIN_MAX_RESPONSE_BYTES,
+        ENDPOINT_SCHEME_ERROR_MESSAGE, ElectrumEndpoint, LISTUNSPENT_ITEM_BYTES_UPPER_BOUND,
+        MAX_MAX_RESPONSE_BYTES, MIN_MAX_RESPONSE_BYTES,
     },
     observer::{ObserverPolicy, PROBE_REQUESTS_PER_TICK},
 };
@@ -250,7 +251,7 @@ impl Config {
         // LISTUNSPENT_ITEM_BYTES_UPPER_BOUND bytes each plus the
         // JSON-RPC envelope; if that exceeds max_response_bytes, the
         // byte cap would poison the server's own largest legitimate
-        // response, so startup refuses the configuration. u32 × 110
+        // response, so startup refuses the configuration. u32 × 160
         // cannot overflow u64.
         let largest_legitimate_response = u64::from(self.electrum.max_utxos_per_address)
             * LISTUNSPENT_ITEM_BYTES_UPPER_BOUND
@@ -266,13 +267,22 @@ impl Config {
         // acceptable transport is TLS (`tcp://` stays allowed on
         // regtest/signet/testnet for local fulcrum-style endpoints).
         if self.deployment_invariants.bitcoin_network == BitcoinNetwork::Mainnet {
+            // Delegate endpoint-shape validation to the same parser the
+            // adapter construction uses, so a malformed endpoint (for
+            // example `ssl://host:port/tcp://`) is refused at config load
+            // with the parser's own literal instead of later at adapter
+            // construction.
+            let endpoint = ElectrumEndpoint::parse(&self.electrum.endpoint)
+                .map_err(|_| ConfigError::InvalidElectrumEndpoint(ENDPOINT_SCHEME_ERROR_MESSAGE))?;
+            // Fail closed on scheme case as well: `SSL://` is refused
+            // even though the URL parser would normalize it to `ssl`.
             let scheme = self
                 .electrum
                 .endpoint
                 .split("://")
                 .next()
                 .unwrap_or_default();
-            if scheme != "ssl" {
+            if scheme != "ssl" || !endpoint.use_tls() {
                 return Err(ConfigError::PlaintextElectrumEndpointOnMainnet(
                     scheme.to_owned(),
                 ));
@@ -758,6 +768,8 @@ pub enum ConfigError {
         "bitcoin.network mainnet requires an ssl:// electrum.endpoint; the {0}:// scheme is plaintext and refused"
     )]
     PlaintextElectrumEndpointOnMainnet(String),
+    #[error("{0}")]
+    InvalidElectrumEndpoint(&'static str),
 }
 
 fn decode_base64url_no_pad(value: &str, error: ConfigError) -> Result<Vec<u8>, ConfigError> {

@@ -315,8 +315,14 @@ impl InvoiceStore {
     }
 
     /// Loads every non-final invoice as an authenticated observation plan
-    /// entry, ordered oldest successful observation first so budget exhaustion
-    /// defers the freshest targets rather than the stalest.
+    /// entry, ordered oldest ATTEMPT first (`last_attempted_at`, falling
+    /// back to `last_observed_at` and then `created_at` for rows that
+    /// predate attempt stamping) so budget exhaustion defers the most
+    /// recently attempted targets and a permanently failing target
+    /// rotates behind the rest of the plan exactly like a success.
+    /// `staleness_secs` deliberately still derives from the last
+    /// SUCCESSFUL observation (`last_observed_at`): a failing target
+    /// keeps its staleness for backlog alerting even as it rotates.
     pub async fn observation_plan(&self) -> Result<Vec<PlannedObservation>, PersistenceError> {
         let rows = sqlx::query_as::<_, ObservationPlanRow>(
             "SELECT invoices.id AS invoice_id, creators.creator_lookup_hash, \
@@ -331,7 +337,8 @@ impl InvoiceStore {
                ON observations.invoice_id = invoices.id AND observations.active \
              WHERE NOT (invoices.payment_status = 'confirmed' \
                         AND invoices.confirmation_count = 6 AND invoices.amount_matched) \
-             ORDER BY COALESCE(invoices.last_observed_at, invoices.created_at), invoices.id",
+              ORDER BY COALESCE(invoices.last_attempted_at, invoices.last_observed_at, \
+                                invoices.created_at), invoices.id",
         )
         .fetch_all(&self.pool)
         .await
@@ -350,8 +357,15 @@ impl InvoiceStore {
             .collect()
     }
 
-    /// Stamps every recorded target address as successfully observed just
-    /// now, rotating it behind the rest of the oldest-first plan.
+    /// Stamps one tick's ATTEMPTED target addresses, rotating each behind
+    /// the rest of the oldest-first plan. Observed targets are stamped
+    /// with both `last_observed_at` (success; drives staleness and
+    /// backlog alerting) and `last_attempted_at` (drives scheduling);
+    /// failed targets are stamped with `last_attempted_at` only, so they
+    /// rotate to the tail exactly like successes while keeping their
+    /// staleness. Without the failure stamp a permanently failing target
+    /// would keep the head of the plan and, at enough failing targets,
+    /// starve every honest seller of attempts.
     ///
     /// Every record's UPDATE must match exactly one invoice row: a zero-row
     /// stamp means the lookup hash derived from the observer's canonical
@@ -362,9 +376,10 @@ impl InvoiceStore {
     /// in the return value, but never abort the remaining records.
     pub async fn record_observation_tick(
         &self,
-        addresses: &[String],
+        observed: &[String],
+        failed: &[String],
     ) -> Result<u64, PersistenceError> {
-        if addresses.is_empty() {
+        if observed.is_empty() && failed.is_empty() {
             return Ok(0);
         }
         let mut tx = self
@@ -373,12 +388,25 @@ impl InvoiceStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         let mut misses = 0_u64;
-        for address in addresses {
+        for (address, succeeded) in observed
+            .iter()
+            .map(|address| (address, true))
+            .chain(failed.iter().map(|address| (address, false)))
+        {
             let address_lookup_hash = self.crypto.bitcoin_address_lookup_hash(address.as_bytes());
-            let stamped = sqlx::query(
-                "UPDATE invoices SET last_observed_at = NOW(), updated_at = NOW() \
-                 WHERE bitcoin_address_lookup_hash = $1",
-            )
+            let stamped = if succeeded {
+                sqlx::query(
+                    "UPDATE invoices \
+                     SET last_observed_at = NOW(), last_attempted_at = NOW(), updated_at = NOW() \
+                     WHERE bitcoin_address_lookup_hash = $1",
+                )
+            } else {
+                sqlx::query(
+                    "UPDATE invoices \
+                     SET last_attempted_at = NOW(), updated_at = NOW() \
+                     WHERE bitcoin_address_lookup_hash = $1",
+                )
+            }
             .bind(address_lookup_hash.as_bytes().as_slice())
             .execute(&mut *tx)
             .await

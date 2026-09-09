@@ -55,7 +55,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(applied_versions, vec![1, 2, 3, 4, 5, 6, 7]);
 
     let retired_observation_budget_columns: Vec<String> = sqlx::query_scalar(
         "SELECT table_name || '.' || column_name
