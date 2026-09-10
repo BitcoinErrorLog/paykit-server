@@ -27,8 +27,8 @@ use paykit_server::{
     application::create_invoice::{
         CreateInvoiceError, CreateInvoiceRequest, CreateInvoiceService, CreatorXpubProvider,
         DeadlineClock, IntentBuilder, InvoicePersistence, LockFetchError, LockFetcher,
-        MarkerDiscovery, OfferAvailability, PaykitIntentBuilder, SessionValidationError,
-        SessionValidator, derive_bip84_p2wpkh_address,
+        MarkerDiscovery, OFFER_AVAILABILITY_TIMEOUT, OfferAvailability, PaykitIntentBuilder,
+        SessionValidationError, SessionValidator, derive_bip84_p2wpkh_address,
     },
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     config::{BitcoinNetwork, Config, ConfigEnvironment},
@@ -1464,6 +1464,79 @@ async fn hidden_offer_refuses_first_time_binds_without_consuming_anything() {
     // The read-only preflight ran (no cursor advance); nothing else did:
     // no session validation, no lock fetch, no store mutation, and no
     // Electrum request (no listunspent, no snapshot, no probe).
+    assert_eq!(store.preflight_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.baseline_completions.load(Ordering::SeqCst), 0);
+    assert_eq!(store.baseline_failures.load(Ordering::SeqCst), 0);
+    assert_eq!(session.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(locks.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(electrum.0.load(Ordering::SeqCst), 0);
+}
+
+/// A readiness read that never resolves. The gate must not wait on it
+/// forever: OFFER_AVAILABILITY_TIMEOUT bounds the read and the branch
+/// fails CLOSED (unavailable), never open.
+struct HangingAvailability;
+
+#[async_trait]
+impl OfferAvailability for HangingAvailability {
+    async fn bitcoin_offer_available(&self) -> bool {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn hanging_availability_read_times_out_fail_closed_without_consuming_anything() {
+    let session = Arc::new(FakeSession {
+        result: Ok(()),
+        calls: AtomicUsize::default(),
+        creators: Mutex::new(vec![]),
+    });
+    let locks = Arc::new(FakeLocks {
+        result: Ok(valid_lock()),
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let electrum = Arc::new(CountingBaselineElectrum(AtomicUsize::new(0)));
+    let service = CreateInvoiceService::new(
+        session.clone(),
+        locks.clone(),
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        store.clone(),
+        electrum.clone(),
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+    )
+    .with_offer_availability(Arc::new(HangingAvailability));
+
+    let started = Instant::now();
+    assert_eq!(
+        service.create(request()).await,
+        Err(CreateInvoiceError::BitcoinOfferUnavailable)
+    );
+    let elapsed = started.elapsed();
+    // The refusal comes from the timeout expiring, not from the read
+    // resolving: at least the full timeout elapses, and the bounded read
+    // returns promptly after it (well under a further second).
+    assert!(
+        elapsed >= OFFER_AVAILABILITY_TIMEOUT,
+        "gate answered before the timeout expired ({elapsed:?})"
+    );
+    assert!(
+        elapsed < OFFER_AVAILABILITY_TIMEOUT + Duration::from_secs(1),
+        "gate held the request past the timeout ({elapsed:?})"
+    );
+    // Fail-closed consumed nothing: the read-only preflight ran, but no
+    // store write, no session validation, no lock fetch, no Electrum call.
     assert_eq!(store.preflight_calls.load(Ordering::SeqCst), 1);
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
     assert_eq!(store.baseline_completions.load(Ordering::SeqCst), 0);

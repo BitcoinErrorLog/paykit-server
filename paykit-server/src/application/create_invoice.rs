@@ -114,7 +114,7 @@ impl OfferAvailability for AlwaysAvailableOffer {
 /// Bound on the runtime availability read itself. The read is a readiness
 /// evaluation (atomic state plus one `SELECT 1`), so two seconds is
 /// generous; on expiry the gate fails closed rather than hold the request.
-pub(crate) const OFFER_AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(2);
+pub const OFFER_AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[async_trait]
 pub trait SessionValidator: Send + Sync {
