@@ -649,6 +649,134 @@ async fn preflight_never_replays_an_unpublished_baseline_row() {
 }
 
 #[tokio::test]
+async fn create_atomic_replay_branch_mirrors_preflight_for_every_baseline_state() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+
+    // The race: both preflights read `New`, the winner commits
+    // `awaiting_baseline`, and the loser's create_atomic takes the row
+    // lock second. The unresolved row must answer BaselineInProgress —
+    // never a replay that would run a second snapshot sequence for the
+    // same invoice.
+    let created = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"replay-race-bundle",
+            b"replay-race-request",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .create_awaiting_baseline(input(
+                &creator,
+                &reader,
+                b"replay-race-bundle",
+                b"replay-race-request",
+            ))
+            .await,
+        Err(PersistenceError::BaselineInProgress)
+    );
+
+    // Once the winner published, the identical payload replays normally.
+    store
+        .complete_creation_baseline(created.invoice_id(), 100, &[], &[])
+        .await
+        .unwrap();
+    let replay = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"replay-race-bundle",
+            b"replay-race-request",
+        ))
+        .await
+        .unwrap();
+    assert!(replay.replayed());
+    assert_eq!(replay.invoice_id(), created.invoice_id());
+
+    // A terminally voided binding is spent: Conflict, exactly as preflight
+    // reports it, so the client mints a fresh payment request.
+    let voided = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"replay-voided-bundle",
+            b"replay-voided-request",
+        ))
+        .await
+        .unwrap();
+    store
+        .fail_creation_baseline(voided.invoice_id())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .create_awaiting_baseline(input(
+                &creator,
+                &reader,
+                b"replay-voided-bundle",
+                b"replay-voided-request",
+            ))
+            .await,
+        Err(PersistenceError::Conflict)
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn concurrent_identical_awaiting_baseline_creations_have_exactly_one_baseline_owner() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let other_store = store.clone();
+    let creator = creator();
+    let reader = reader();
+
+    let (first, second) = tokio::join!(
+        store.create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"baseline-race-bundle",
+            b"baseline-race-request",
+        )),
+        other_store.create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"baseline-race-bundle",
+            b"baseline-race-request",
+        ))
+    );
+
+    // Exactly one creation owns the new invoice; the other is told the
+    // baseline is in progress — never voided, never double-charged.
+    let (winners, in_progress): (Vec<_>, Vec<_>) = [first, second]
+        .into_iter()
+        .partition(|result| matches!(result, Ok(created) if !created.replayed()));
+    assert_eq!(winners.len(), 1, "outcomes: {in_progress:?}");
+    assert_eq!(in_progress.len(), 1);
+    assert_eq!(in_progress[0], Err(PersistenceError::BaselineInProgress));
+    for (table, expected) in [("reader_assignments", 1_i64), ("invoices", 1_i64)] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, expected, "unexpected {table} cardinality");
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        1,
+        "exactly one address allocated"
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn concurrent_first_binds_derive_distinct_indices_under_unique_constraint() {
     let database = TestDatabase::create().await;
     let store = invoice_store(&database).await;

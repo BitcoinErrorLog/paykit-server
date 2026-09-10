@@ -27,14 +27,15 @@ use paykit_server::{
     application::create_invoice::{
         CreateInvoiceError, CreateInvoiceRequest, CreateInvoiceService, CreatorXpubProvider,
         DeadlineClock, IntentBuilder, InvoicePersistence, LockFetchError, LockFetcher,
-        MarkerDiscovery, PaykitIntentBuilder, SessionValidationError, SessionValidator,
-        derive_bip84_p2wpkh_address,
+        MarkerDiscovery, OfferAvailability, PaykitIntentBuilder, SessionValidationError,
+        SessionValidator, derive_bip84_p2wpkh_address,
     },
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     domain::locks::{CreatorPubky, parse_addressed_lock_resource, parse_bundle_id, parse_reader},
     http::{auth::SignedLocksAuth, invoices::invoices_router},
     persistence::{AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, PersistenceError},
+    runtime::{DependencyCheck, ElectrumProbe, Runtime},
     workers::observer::{CreationSnapshot, ElectrumPort, ObserverError, RequestLimiter, TipProbe},
 };
 use tower::ServiceExt;
@@ -230,6 +231,11 @@ struct FakeStore {
     create_calls: AtomicUsize,
     baseline_failures: AtomicUsize,
     baseline_completions: AtomicUsize,
+    /// What `create_atomic` reports: a fresh allocation (`false`, the
+    /// honest answer for a `New` preflight) or a race-losing replay of the
+    /// winner's published row (`true`).
+    create_replayed: bool,
+    create_error: Option<PersistenceError>,
 }
 
 impl FakeStore {
@@ -240,6 +246,8 @@ impl FakeStore {
             create_calls: AtomicUsize::default(),
             baseline_failures: AtomicUsize::default(),
             baseline_completions: AtomicUsize::default(),
+            create_replayed: false,
+            create_error: None,
         }
     }
 }
@@ -279,13 +287,16 @@ impl InvoicePersistence for FakeStore {
         _input: AtomicInvoiceInput<'_>,
     ) -> Result<AtomicInvoiceResult, PersistenceError> {
         self.create_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = self.create_error {
+            return Err(error);
+        }
         Ok(AtomicInvoiceResult::new(
             uuid::Uuid::nil(),
             uuid::Uuid::nil(),
             None,
             uuid::Uuid::nil(),
             0,
-            true,
+            self.create_replayed,
         ))
     }
 
@@ -1381,6 +1392,294 @@ async fn new_invoice_discovers_marker_before_atomic_persistence_and_pins_it_in_b
     assert!(
         matches!(captured[1].operation(), DeliveryOperationV1::PaymentRequestProposal { terms } if uuid::Uuid::parse_str(&terms.payment_reference).is_ok())
     );
+}
+
+struct FixedAvailability(bool);
+
+#[async_trait]
+impl OfferAvailability for FixedAvailability {
+    async fn bitcoin_offer_available(&self) -> bool {
+        self.0
+    }
+}
+
+struct ReadyPostgres;
+
+#[async_trait]
+impl DependencyCheck for ReadyPostgres {
+    async fn postgres_ready(&self) -> bool {
+        true
+    }
+}
+
+fn fresh_tip_time() -> u32 {
+    u32::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn hidden_offer_refuses_first_time_binds_without_consuming_anything() {
+    let session = Arc::new(FakeSession {
+        result: Ok(()),
+        calls: AtomicUsize::default(),
+        creators: Mutex::new(vec![]),
+    });
+    let locks = Arc::new(FakeLocks {
+        result: Ok(valid_lock()),
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let electrum = Arc::new(CountingBaselineElectrum(AtomicUsize::new(0)));
+    // Calibration: the static creation flag is ON, so the refusing
+    // predicate here is the runtime gate and nothing else.
+    let service = CreateInvoiceService::new(
+        session.clone(),
+        locks.clone(),
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        store.clone(),
+        electrum.clone(),
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+    )
+    .with_offer_availability(Arc::new(FixedAvailability(false)));
+
+    assert_eq!(
+        service.create(request()).await,
+        Err(CreateInvoiceError::BitcoinOfferUnavailable)
+    );
+    // The read-only preflight ran (no cursor advance); nothing else did:
+    // no session validation, no lock fetch, no store mutation, and no
+    // Electrum request (no listunspent, no snapshot, no probe).
+    assert_eq!(store.preflight_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.baseline_completions.load(Ordering::SeqCst), 0);
+    assert_eq!(store.baseline_failures.load(Ordering::SeqCst), 0);
+    assert_eq!(session.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(locks.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(electrum.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn three_failed_probes_refuse_then_three_successes_permit_a_first_time_bind() {
+    let runtime = Arc::new(Runtime::new(Arc::new(ReadyPostgres), 1));
+    runtime.set_electrum_available(true);
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let electrum = Arc::new(CountingBaselineElectrum(AtomicUsize::new(0)));
+    let service = CreateInvoiceService::new(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        store,
+        electrum.clone(),
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+    )
+    .with_electrum_controls(
+        RequestLimiter::new(100, 100),
+        Arc::new(tokio::sync::Semaphore::new(1)),
+    )
+    .with_offer_availability(runtime.clone());
+
+    for _ in 0..3 {
+        runtime.record_electrum_probe_failure();
+    }
+    assert!(!runtime.readiness().await.bitcoin_offer_available);
+    assert_eq!(
+        service.create(request()).await,
+        Err(CreateInvoiceError::BitcoinOfferUnavailable)
+    );
+    assert_eq!(electrum.0.load(Ordering::SeqCst), 0);
+
+    for height in 1..=3 {
+        runtime.record_electrum_probe(ElectrumProbe::success(height, fresh_tip_time()));
+    }
+    assert!(runtime.readiness().await.bitcoin_offer_available);
+    let created = service.create(request()).await.unwrap();
+    assert!(!created.replayed());
+    assert_eq!(electrum.0.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn exact_replay_is_served_while_the_offer_is_hidden() {
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::ExactReplay));
+    let replayed = service(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        store,
+    )
+    .with_offer_availability(Arc::new(FixedAvailability(false)))
+    .create(request())
+    .await
+    .unwrap();
+    // An exact replay binds nothing new: the gate must not see it.
+    assert!(replayed.replayed());
+}
+
+#[tokio::test]
+async fn hidden_offer_maps_to_503_bitcoin_offer_unavailable_on_the_locks_route() {
+    let key = SigningKey::from_bytes(&[15; 32]);
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let router = invoices_router(Arc::new(
+        service(
+            Arc::new(FakeSession {
+                result: Ok(()),
+                calls: AtomicUsize::default(),
+                creators: Mutex::new(vec![]),
+            }),
+            Arc::new(FakeLocks {
+                result: Ok(valid_lock()),
+                calls: AtomicUsize::default(),
+            }),
+            store,
+        )
+        .with_offer_availability(Arc::new(FixedAvailability(false))),
+    ))
+    .layer(Extension(signed_auth(&key)));
+    let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "bundle_id": BUNDLE,
+        "lock_resource": LOCK_RESOURCE,
+        "reader": reader()
+    }))
+    .unwrap();
+
+    let response = router
+        .oneshot(signed_invoice_request(&key, body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error":{"code":"bitcoin_offer_unavailable","message":"bitcoin offer is temporarily unavailable; retry later"}})
+    );
+}
+
+#[tokio::test]
+async fn replayed_create_atomic_returns_the_published_invoice_without_a_second_baseline() {
+    // The race the FOR UPDATE loser wins late: both preflights read `New`,
+    // the winner committed AND published before the loser's create_atomic
+    // took the row lock. The replayed row must be served as-is — running
+    // the baseline sequence again would double-charge the shared limiter
+    // for one invoice and end in a Conflict.
+    let mut store = FakeStore::with_preflight(InvoicePreflight::New);
+    store.create_replayed = true;
+    let store = Arc::new(store);
+    let electrum = Arc::new(CountingBaselineElectrum(AtomicUsize::new(0)));
+    let service = CreateInvoiceService::new(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        store.clone(),
+        electrum.clone(),
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+    );
+
+    let replayed = service.create(request()).await.unwrap();
+    assert!(replayed.replayed());
+    assert_eq!(store.baseline_completions.load(Ordering::SeqCst), 0);
+    assert_eq!(store.baseline_failures.load(Ordering::SeqCst), 0);
+    assert_eq!(electrum.0.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn raced_awaiting_baseline_row_is_in_progress_and_never_snapshotted_twice() {
+    // The FOR UPDATE loser receives the winner's still-unresolved
+    // `awaiting_baseline` row: the store answers BaselineInProgress under
+    // the row lock (exactly like preflight), and the service must surface
+    // it without touching Electrum or the baseline lifecycle.
+    let mut store = FakeStore::with_preflight(InvoicePreflight::New);
+    store.create_error = Some(PersistenceError::BaselineInProgress);
+    let store = Arc::new(store);
+    let electrum = Arc::new(CountingBaselineElectrum(AtomicUsize::new(0)));
+    let service = CreateInvoiceService::new(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        store.clone(),
+        electrum.clone(),
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+    );
+
+    assert_eq!(
+        service.create(request()).await,
+        Err(CreateInvoiceError::BaselineInProgress)
+    );
+    assert_eq!(store.baseline_completions.load(Ordering::SeqCst), 0);
+    assert_eq!(store.baseline_failures.load(Ordering::SeqCst), 0);
+    assert_eq!(electrum.0.load(Ordering::SeqCst), 0);
 }
 
 #[test]

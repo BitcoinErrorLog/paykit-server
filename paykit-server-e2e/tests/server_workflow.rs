@@ -45,6 +45,7 @@ use paykit_server::{
     persistence::{
         CreatorCredentials, CreatorStore, InvoiceStore, PostgresStorageAdapter, SdkStateStore,
     },
+    runtime::{ElectrumProbe, Runtime},
     startup::initialize_database,
     workers::observer::{
         CandidateTransaction, CreationSnapshot, ElectrumPort, ObservationReport, ObserverError,
@@ -234,6 +235,21 @@ fn fresh_tip_time() -> u32 {
             .as_secs(),
     )
     .unwrap()
+}
+
+/// Drives the three-probe offer-availability hysteresis to visible so the
+/// runtime creation gate admits first-time binds. Tests in this file run
+/// hour-long poll intervals (a tick must not interfere with their
+/// deterministic request logs), so the required three consecutive
+/// successful probes are published directly instead of waited for.
+async fn publish_offerable_probes(runtime: &Runtime) {
+    for _ in 0..3 {
+        runtime.record_electrum_probe(ElectrumProbe::success(300, fresh_tip_time()));
+    }
+    assert!(
+        runtime.readiness().await.bitcoin_offer_available,
+        "three consecutive successful probes must publish the offer"
+    );
 }
 
 async fn build_pubky_testnet() -> EphemeralTestnet {
@@ -1025,6 +1041,7 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     }));
     wait_until_listening(first_address).await;
     wait_until_ready(first_address).await;
+    publish_offerable_probes(&first_runtime).await;
 
     let (invoice_a, invoice_b) = tokio::join!(
         send_http(
@@ -1382,6 +1399,7 @@ async fn a_creation_cancelled_after_commit_is_in_progress_on_retry_and_voided_by
     )
     .await
     .unwrap();
+    let runtime = server.runtime();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -1390,6 +1408,7 @@ async fn a_creation_cancelled_after_commit_is_in_progress_on_retry_and_voided_by
     }));
     wait_until_listening(address).await;
     wait_until_ready(address).await;
+    publish_offerable_probes(&runtime).await;
 
     // Drive the creation until the invoice row is committed
     // (`awaiting_baseline`) and the snapshot read is parked on the gate —
@@ -1497,4 +1516,162 @@ fn key_tail(seed: u64) -> [u8; 65] {
     let mut tail = [0u8; 65];
     tail[..8].copy_from_slice(&seed.to_be_bytes());
     tail
+}
+
+/// Two byte-identical concurrent creations whose preflights can both read
+/// `New` (TOCTOU before the first commits): exactly one creation_snapshot
+/// runs, exactly one address is allocated, the winner publishes, and the
+/// loser is told the baseline is still resolving — never voided, never
+/// double-charged, never a second snapshot for the same invoice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn concurrent_identical_creations_run_exactly_one_baseline_snapshot() {
+    parse_bundle_id(BUNDLE_A).unwrap();
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    let signing_key = SigningKey::from_bytes(&[10; 32]);
+    let server_config = config(database.database_url(), &signing_key, "1h");
+    let initialized = initialize_database(&server_config).await.unwrap();
+    let pool = initialized.pool.clone();
+    let stack_identity = initialized.stack_identity.clone();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone());
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(&pool, crypto.clone());
+
+    let (reader, peer_key, peer_sdk) = create_peer(&bootstrap, &homeserver).await;
+    let creator = create_creator(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        &pool,
+        crypto.clone(),
+        CreatorSpec {
+            seed: 52,
+            account_index: 0,
+            amount_sats: 100,
+            counter_seed: 600,
+        },
+    )
+    .await;
+    link(
+        &creator.sdk,
+        PubkyPublicKey::from_raw_or_app_key(creator.creator.to_string()).unwrap(),
+        &peer_sdk,
+        peer_key,
+    )
+    .await;
+
+    let electrum = Arc::new(GatedSnapshotElectrum {
+        snapshot_starts: AtomicUsize::new(0),
+        release: tokio::sync::Notify::new(),
+    });
+    let server = Server::build_with_transports(
+        server_config,
+        pool.clone(),
+        stack_identity,
+        pubky,
+        electrum.clone(),
+    )
+    .await
+    .unwrap();
+    let runtime = server.runtime();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(server.run_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_until_listening(address).await;
+    wait_until_ready(address).await;
+    publish_offerable_probes(&runtime).await;
+
+    // The winner: drive it until its create_atomic has committed
+    // (`awaiting_baseline`) and its snapshot read is parked on the gate.
+    let winner = tokio::spawn(send_http(
+        address,
+        invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if winner.is_finished() {
+            let response = winner.await.unwrap();
+            panic!(
+                "winning creation finished before the parked snapshot: {} {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            );
+        }
+        if electrum.snapshot_starts.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "winning creation never reached the parked snapshot"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The loser: byte-identical, issued while the winner's baseline is
+    // unresolved. Whether its preflight reads the awaiting row or its
+    // create_atomic serializes behind the winner's row lock, it must be
+    // told the baseline is still resolving — and it must NEVER start a
+    // second snapshot sequence for the same invoice.
+    let loser = send_http(
+        address,
+        invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
+    )
+    .await;
+    assert_eq!(
+        loser.status,
+        StatusCode::CONFLICT,
+        "loser body: {}",
+        String::from_utf8_lossy(&loser.body)
+    );
+    let loser_body: serde_json::Value = serde_json::from_slice(&loser.body).unwrap();
+    assert_eq!(loser_body["error"]["code"], "invoice_baseline_in_progress");
+    assert_eq!(
+        electrum.snapshot_starts.load(Ordering::SeqCst),
+        1,
+        "a replayed creation must never run a second baseline snapshot"
+    );
+
+    electrum.release.notify_waiters();
+    let winner = winner.await.unwrap();
+    assert_eq!(
+        winner.status,
+        StatusCode::NO_CONTENT,
+        "winner body: {}",
+        String::from_utf8_lossy(&winner.body)
+    );
+
+    // Exactly one address was allocated across both creations.
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    for (table, expected) in [("reader_assignments", 1_i64), ("invoices", 1_i64)] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, expected, "unexpected {table} cardinality");
+    }
+
+    // The published invoice now replays exactly.
+    let replay = send_http(
+        address,
+        invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
+    )
+    .await;
+    assert_eq!(replay.status, StatusCode::NO_CONTENT);
+
+    let _ = shutdown_tx.send(());
+    running.await.unwrap().unwrap();
+    pool.close().await;
+    database.cleanup().await;
 }

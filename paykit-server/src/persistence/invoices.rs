@@ -740,7 +740,7 @@ impl InvoiceStore {
             return Err(PersistenceError::CorruptOrMissing);
         }
         let existing = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT id, payment_request_lookup_hash FROM invoices \
+            "SELECT id, payment_request_lookup_hash, baseline_state FROM invoices \
              WHERE creator_id = $1 AND bundle_lookup_hash = $2 FOR UPDATE",
         )
         .bind(creator.id)
@@ -1719,7 +1719,7 @@ impl InvoiceStore {
         }
 
         if let Some(existing) = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT id, payment_request_lookup_hash FROM invoices \
+            "SELECT id, payment_request_lookup_hash, baseline_state FROM invoices \
              WHERE creator_id = $1 AND bundle_lookup_hash = $2 FOR UPDATE",
         )
         .bind(creator.id)
@@ -1729,6 +1729,19 @@ impl InvoiceStore {
         .map_err(|_| PersistenceError::Unavailable)?
         {
             if existing.payment_request_lookup_hash != payment_request_hash.as_bytes() {
+                return Err(PersistenceError::Conflict);
+            }
+            // Mirror `preflight` under the row lock: two byte-identical
+            // creations whose preflights both returned `New` (TOCTOU before
+            // the first commits) serialise here, and the loser receives the
+            // winner's row. An unresolved baseline must NOT be replayed into
+            // a second snapshot sequence, and a terminally voided binding is
+            // spent — both answer exactly as preflight does, so the caller
+            // never double-charges the shared limiter for one invoice.
+            if existing.baseline_state == "awaiting_baseline" {
+                return Err(PersistenceError::BaselineInProgress);
+            }
+            if existing.baseline_state == "void_baseline_failed" {
                 return Err(PersistenceError::Conflict);
             }
             let assignment = self
@@ -2122,6 +2135,7 @@ struct ObservationPlanRow {
 struct ExistingInvoice {
     id: Uuid,
     payment_request_lookup_hash: Vec<u8>,
+    baseline_state: String,
 }
 
 #[derive(sqlx::FromRow)]

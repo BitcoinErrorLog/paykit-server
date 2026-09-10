@@ -69,5 +69,8 @@ fn invoice_error(error: CreateInvoiceError) -> Response {
         CreateInvoiceError::BitcoinCreationDisabled => {
             ApiError::BitcoinCreationDisabled.into_response()
         }
+        CreateInvoiceError::BitcoinOfferUnavailable => {
+            ApiError::BitcoinOfferUnavailable.into_response()
+        }
     }
 }

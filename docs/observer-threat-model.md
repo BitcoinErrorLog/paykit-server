@@ -296,7 +296,14 @@ listunspent + headers.subscribe) plus `PROBE_REQUESTS_PER_TICK` = 2 for
 its post-create probe — 5 tokens per creation — plus 1 token per
 unconfirmed baseline transaction whose inputs it fetches (bounded by
 `electrum.max_creation_history_entries`, default 50), so a single
-maximal creation charges at most 55 tokens. At the defaults (1000-token
+maximal creation charges at most 55 tokens, and the 55-token worst case
+is charged at most once per invoice: a creation that loses the
+`FOR UPDATE` race to an identical in-flight bind receives the winner's
+`awaiting_baseline` row under the row lock and answers
+`invoice_baseline_in_progress` (exactly as preflight does) instead of
+running a second snapshot sequence, while a replay of the already
+published invoice returns its existing terms without touching the
+limiter. At the defaults (1000-token
 cap, 5 tokens/s refill, 10 s ±20 % poll) one 8 s tick window refills 40
 tokens, so once the initial 1000-token burst is spent a single maximal
 creation in a window (55 > 40) out-consumes the refill, and a sustained
@@ -307,6 +314,39 @@ request is sent at all. Creation load therefore slows — and at the
 extreme pauses — observation, but the joint Electrum send rate never
 exceeds the configured limiter, which is exactly the invariant the
 limiter exists to keep.
+
+**W1.4 batching not implemented; why.** JSON-RPC batching was dropped
+from W1.4 by coordinator decision (2026-09-09). The accounting above and
+the response-cap proof (`workers/electrum.rs`) both assume one address
+per request line: the per-tick budget charges exactly one token per
+tracked address and the byte/item caps are proven per single-address
+response. Batching several addresses into one JSON-RPC request would
+require a new aggregate-response-cap design — the caps would have to
+bound the SUM of unrelated addresses' replies and apportion failures
+back to individual addresses — and it would not reduce the count the
+shared limiter charges, which is defined per address lookup, not per
+wire request. The fairness and budget invariants in this document are
+therefore stated, and remain, one-address/one-request.
+
+## Runtime creation gate
+
+A first-time bind (a new invoice or payment request that would allocate
+an address) is gated on the runtime's live `bitcoin_offer_available`
+verdict, in this exact order: (1) the static `bitcoin.creation_enabled`
+kill switch is checked first and refuses with
+`bitcoin_creation_disabled` (403); (2) the runtime availability verdict —
+the same fold `/health/ready` publishes: creation flag, three consecutive
+successful Electrum probes, Electrum component ready, postgres ready —
+refuses with `bitcoin_offer_unavailable` (503) when false, failing
+closed if the verdict cannot be read within two seconds; (3) only then
+does the creation sequence charge the shared Electrum limiter. A refusal
+at either gate consumes no address, advances no cursor, and sends no
+Electrum request. Exact replays (W1.1 replay-by-state) are never gated
+and return the existing terms. Observation is never coupled to this
+gate: while the offer is hidden, existing non-final invoices remain in
+`observation_plan()`, the tick still attempts them in budget order, and
+a funded observation still applies and settles — only NEW binds wait for
+the offer to return.
 
 ## Bounded transaction fetches
 

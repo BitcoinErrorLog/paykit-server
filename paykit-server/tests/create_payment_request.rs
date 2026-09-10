@@ -14,7 +14,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use paykit_server::{
     application::create_invoice::{
         CreateInvoiceError, CreatorXpubProvider, InvoicePersistence, MarkerDiscovery,
-        PaykitIntentBuilder, SessionValidationError, SessionValidator, derive_bip84_p2wpkh_address,
+        OfferAvailability, PaykitIntentBuilder, SessionValidationError, SessionValidator,
+        derive_bip84_p2wpkh_address,
     },
     application::create_payment_request::{
         MarketplacePaymentRequest, MarketplacePaymentRequestService,
@@ -239,7 +240,11 @@ struct CapturingStore {
     replay_calls: AtomicUsize,
     create_calls: AtomicUsize,
     baseline_failures: AtomicUsize,
+    baseline_completions: AtomicUsize,
     captured: Mutex<Vec<CapturedInput>>,
+    /// What `create_atomic` reports: a fresh allocation (`false`) or a
+    /// race-losing replay of the winner's published row (`true`).
+    create_replayed: bool,
 }
 
 impl CapturingStore {
@@ -250,7 +255,9 @@ impl CapturingStore {
             replay_calls: AtomicUsize::default(),
             create_calls: AtomicUsize::default(),
             baseline_failures: AtomicUsize::default(),
+            baseline_completions: AtomicUsize::default(),
             captured: Mutex::new(vec![]),
+            create_replayed: false,
         }
     }
 }
@@ -305,8 +312,17 @@ impl InvoicePersistence for CapturingStore {
             Some(uuid::Uuid::new_v4()),
             uuid::Uuid::new_v4(),
             0,
-            false,
+            self.create_replayed,
         ))
+    }
+
+    async fn complete_creation_baseline(
+        &self,
+        _invoice_id: uuid::Uuid,
+        _snapshot: &CreationSnapshot,
+    ) -> Result<(), PersistenceError> {
+        self.baseline_completions.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 
     async fn fail_creation_baseline(
@@ -1073,4 +1089,89 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
         }
     );
     assert!(!runtime.readiness().await.bitcoin_creation_enabled);
+}
+
+struct FixedAvailability(bool);
+
+#[async_trait]
+impl OfferAvailability for FixedAvailability {
+    async fn bitcoin_offer_available(&self) -> bool {
+        self.0
+    }
+}
+
+#[tokio::test]
+async fn hidden_offer_refuses_first_time_payment_request_binds_without_consuming_anything() {
+    let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    let session = ok_session();
+    // Calibration: the static creation flag is ON, so the refusing
+    // predicate here is the runtime gate and nothing else.
+    let service = service_with_creation(ok_session(), store.clone(), BitcoinNetwork::Mainnet, true)
+        .with_offer_availability(Arc::new(FixedAvailability(false)));
+
+    assert_eq!(
+        service.create(request(50_000)).await,
+        Err(CreateInvoiceError::BitcoinOfferUnavailable)
+    );
+    assert_eq!(store.preflight_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.baseline_completions.load(Ordering::SeqCst), 0);
+    assert_eq!(store.baseline_failures.load(Ordering::SeqCst), 0);
+    assert_eq!(session.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn exact_replay_is_served_while_the_offer_is_hidden() {
+    let store = Arc::new(CapturingStore::with_preflight(
+        InvoicePreflight::ExactReplay,
+    ));
+    let replayed = service(ok_session(), store, BitcoinNetwork::Mainnet)
+        .with_offer_availability(Arc::new(FixedAvailability(false)))
+        .create(request(50_000))
+        .await
+        .unwrap();
+    // An exact replay binds nothing new: the gate must not see it.
+    assert!(replayed.replayed());
+}
+
+#[tokio::test]
+async fn hidden_offer_maps_to_503_bitcoin_offer_unavailable_on_the_marketplace_route() {
+    let locks_key = SigningKey::from_bytes(&[3; 32]);
+    let config = auth_config(&locks_key, None);
+    let auth = Arc::new(SignedLocksAuth::from_config(&config));
+    let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    let router = payment_requests_router(Arc::new(
+        service(ok_session(), store, BitcoinNetwork::Mainnet)
+            .with_offer_availability(Arc::new(FixedAvailability(false))),
+    ))
+    .layer(Extension(auth));
+
+    let response = router
+        .oneshot(signed_request(&locks_key, canonical_body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["error"]["code"], "bitcoin_offer_unavailable");
+}
+
+#[tokio::test]
+async fn replayed_create_atomic_returns_the_published_invoice_without_a_second_baseline() {
+    // Both preflights read `New`, the winner committed AND published
+    // before the loser's create_atomic took the row lock: the replayed row
+    // is served as-is and the baseline sequence never runs twice for one
+    // invoice (no double charge against the shared limiter).
+    let mut store = CapturingStore::with_preflight(InvoicePreflight::New);
+    store.create_replayed = true;
+    let store = Arc::new(store);
+    let replayed = service(ok_session(), store.clone(), BitcoinNetwork::Mainnet)
+        .create(request(50_000))
+        .await
+        .unwrap();
+    assert!(replayed.replayed());
+    assert_eq!(store.baseline_completions.load(Ordering::SeqCst), 0);
+    assert_eq!(store.baseline_failures.load(Ordering::SeqCst), 0);
 }

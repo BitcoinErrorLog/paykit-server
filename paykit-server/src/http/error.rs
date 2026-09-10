@@ -20,6 +20,7 @@ pub enum ApiError {
     InternalError,
     LockNotFound,
     BitcoinCreationDisabled,
+    BitcoinOfferUnavailable,
 }
 
 #[derive(Serialize)]
@@ -100,6 +101,11 @@ impl ApiError {
                 StatusCode::FORBIDDEN,
                 "bitcoin_creation_disabled",
                 "bitcoin payment request creation is disabled",
+            ),
+            Self::BitcoinOfferUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "bitcoin_offer_unavailable",
+                "bitcoin offer is temporarily unavailable; retry later",
             ),
         }
     }

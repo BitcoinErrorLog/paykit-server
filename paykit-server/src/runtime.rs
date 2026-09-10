@@ -301,6 +301,15 @@ pub trait DependencyCheck: Send + Sync + 'static {
     async fn postgres_ready(&self) -> bool;
 }
 
+/// The runtime is the creation paths' live offer-availability verdict:
+/// the same `bitcoin_offer_available` fold `/health/ready` publishes.
+#[async_trait]
+impl crate::application::create_invoice::OfferAvailability for Runtime {
+    async fn bitcoin_offer_available(&self) -> bool {
+        self.readiness().await.bitcoin_offer_available
+    }
+}
+
 pub struct PostgresDependency {
     pool: PgPool,
 }

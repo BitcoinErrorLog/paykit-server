@@ -251,4 +251,11 @@ pub enum PersistenceError {
     /// A requested idempotent binding conflicts with a durable record.
     #[error("persisted state conflicts with the request")]
     Conflict,
+    /// The idempotent payload matches an invoice whose creation baseline
+    /// is still unresolved: the atomic allocation's replay branch found
+    /// the winner's `awaiting_baseline` row, exactly what `preflight`
+    /// reports as [`crate::persistence::InvoicePreflight::BaselineInProgress`].
+    /// The caller must not run a second baseline for the same invoice.
+    #[error("invoice creation baseline is still resolving")]
+    BaselineInProgress,
 }

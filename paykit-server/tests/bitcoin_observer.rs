@@ -147,7 +147,7 @@ mod tick {
     use async_trait::async_trait;
     use bitcoin::{OutPoint, Txid, hashes::Hash};
     use paykit_server::{
-        bitcoin::{ObservationTarget, PlannedObservation},
+        bitcoin::{ObservationTarget, ObservedOutput, PlannedObservation},
         config::BitcoinNetwork,
         persistence::PendingCandidate,
         runtime::{DependencyCheck, Runtime},
@@ -212,6 +212,9 @@ mod tick {
         /// requested, modelling an observation stamp whose lookup hash
         /// matches no invoice row.
         ghost_observed: Vec<String>,
+        /// Funded outputs the port reports alongside the observed
+        /// addresses, modelling a paid invoice settling.
+        funded_outputs: Vec<ObservedOutput>,
         /// When set, every candidate fetch fails with this error.
         candidate_error: Option<ObserverError>,
         calls: Mutex<Vec<Vec<String>>>,
@@ -228,6 +231,7 @@ mod tick {
                 }),
                 failing_addresses: HashSet::new(),
                 ghost_observed: Vec::new(),
+                funded_outputs: Vec::new(),
                 candidate_error: None,
                 calls: Mutex::new(Vec::new()),
                 candidate_calls: Mutex::new(Vec::new()),
@@ -247,6 +251,11 @@ mod tick {
             self
         }
 
+        fn with_funded_output(mut self, output: ObservedOutput) -> Self {
+            self.funded_outputs.push(output);
+            self
+        }
+
         fn with_candidate_error(mut self, error: ObserverError) -> Self {
             self.candidate_error = Some(error);
             self
@@ -257,6 +266,7 @@ mod tick {
                 probe: Err(error),
                 failing_addresses: HashSet::new(),
                 ghost_observed: Vec::new(),
+                funded_outputs: Vec::new(),
                 candidate_error: None,
                 calls: Mutex::new(Vec::new()),
                 candidate_calls: Mutex::new(Vec::new()),
@@ -309,6 +319,7 @@ mod tick {
                 }
             }
             report.observed.extend(self.ghost_observed.iter().cloned());
+            report.outputs.extend(self.funded_outputs.iter().cloned());
             Ok(report)
         }
 
@@ -516,6 +527,104 @@ mod tick {
         assert_eq!(first_bind_requests, 1);
         assert_eq!(already_bound_requests, 0);
         assert_eq!(no_candidate_requests, 0);
+    }
+
+    /// Minimal backend for the continuity proof: one existing non-final
+    /// invoice in the plan, capturing exactly what the tick applies and
+    /// stamps.
+    #[derive(Default)]
+    struct ContinuityBackend {
+        applied: Mutex<Vec<(Vec<String>, usize)>>,
+        stamped: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ObservationBackend for ContinuityBackend {
+        async fn observation_plan(&self) -> Result<Vec<PlannedObservation>, ObserverError> {
+            Ok(vec![PlannedObservation::new(
+                ObservationTarget::new("funded-invoice", None),
+                Duration::from_secs(30),
+            )])
+        }
+
+        async fn apply_observations(
+            &self,
+            _network: &BitcoinNetwork,
+            targets: &[ObservationTarget],
+            outputs: Vec<ObservedOutput>,
+        ) -> Result<usize, ObserverError> {
+            self.applied.lock().unwrap().push((
+                targets
+                    .iter()
+                    .map(|target| target.address().to_owned())
+                    .collect(),
+                outputs.len(),
+            ));
+            Ok(0)
+        }
+
+        async fn record_observation_tick(
+            &self,
+            observed: &[String],
+            _failed: &[String],
+        ) -> Result<u64, ObserverError> {
+            self.stamped.lock().unwrap().push(observed.to_vec());
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn hidden_offer_never_couples_observation_of_existing_invoices() {
+        let port = FakeElectrum::healthy().with_funded_output(ObservedOutput {
+            network: BitcoinNetwork::Regtest,
+            address: "funded-invoice".into(),
+            outpoint: OutPoint::new(Txid::from_byte_array([7; 32]), 0),
+            sats: 50_000,
+            confirmations: 2,
+            confirmed_height: Some(99),
+            present: true,
+        });
+        let backend = ContinuityBackend::default();
+        let runtime = runtime();
+        runtime.set_electrum_available(true);
+        // Three consecutive probe failures hide the offer; the creation
+        // gate refuses first-time binds from here on.
+        for _ in 0..3 {
+            runtime.record_electrum_probe_failure();
+        }
+        assert!(!runtime.readiness().await.bitcoin_offer_available);
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut state(&policy(4)),
+        )
+        .await;
+
+        // Hidden or not, the existing non-final invoice stays in the plan,
+        // the tick still observes it, and its funded output is applied.
+        assert_eq!(
+            outcome,
+            ObserverTickOutcome::Observed {
+                processed: 1,
+                deferred: 0,
+                failed: 0,
+            }
+        );
+        assert_eq!(
+            backend.applied.lock().unwrap().as_slice(),
+            &[(vec!["funded-invoice".to_owned()], 1)]
+        );
+        assert_eq!(
+            backend.stamped.lock().unwrap().as_slice(),
+            &[vec!["funded-invoice".to_owned()]]
+        );
+        // One successful probe does not clear the three-probe hysteresis:
+        // the offer is STILL hidden even as observation settles invoices —
+        // proof the two paths are not coupled.
+        assert!(!runtime.readiness().await.bitcoin_offer_available);
     }
 
     #[tokio::test]

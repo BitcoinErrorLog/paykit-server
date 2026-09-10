@@ -191,6 +191,13 @@ impl Server {
             usize::try_from(config.electrum.max_concurrent_creation_snapshots)
                 .expect("validated creation snapshot concurrency fits usize"),
         ));
+        // The runtime is built before the creation services so both can
+        // gate first-time binds on its live `bitcoin_offer_available`
+        // verdict (read per request, never cached).
+        let runtime = Arc::new(Runtime::new(
+            Arc::new(PostgresDependency::new(pool.clone())),
+            64,
+        ));
         let invoice_service = Arc::new(
             CreateInvoiceService::new(
                 Arc::new(CreatorSessionValidator {
@@ -223,7 +230,8 @@ impl Server {
             .with_electrum_controls(
                 electrum_request_limiter.clone(),
                 creation_snapshot_slots.clone(),
-            ),
+            )
+            .with_offer_availability(runtime.clone()),
         );
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
         let payment_request_service = Arc::new(
@@ -250,7 +258,8 @@ impl Server {
                     &config.deployment_invariants().bitcoin_network,
                 )),
             )
-            .with_electrum_controls(electrum_request_limiter.clone(), creation_snapshot_slots),
+            .with_electrum_controls(electrum_request_limiter.clone(), creation_snapshot_slots)
+            .with_offer_availability(runtime.clone()),
         );
         // The claim-time history scan (design §B.5) reuses the observer's
         // Electrum adapter type and timeout configuration; each scan batch
@@ -308,10 +317,6 @@ impl Server {
                     .layer(Extension(signed_auth)),
             );
 
-        let runtime = Arc::new(Runtime::new(
-            Arc::new(PostgresDependency::new(pool.clone())),
-            64,
-        ));
         runtime.set_stack_id(stack_identity.stack_id());
         runtime.set_electrum_probe_interval(config.electrum.poll_interval);
         // One app-owned Electrum request limiter, built from the validated

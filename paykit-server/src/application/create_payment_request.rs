@@ -21,10 +21,11 @@ use serde_json::{Map, Value};
 use crate::{
     application::{
         create_invoice::{
-            CreateInvoiceError, CreatorXpubProvider, DeadlineClock, DerivedNewReaderPayloads,
-            InvoicePersistence, MarkerDiscovery, PaykitIntentBuilder, SessionValidationError,
-            SessionValidator, SystemDeadlineClock, complete_creation_baseline_within_deadline,
-            draw_nonce_sats, map_store, remaining,
+            AlwaysAvailableOffer, CreateInvoiceError, CreatorXpubProvider, DeadlineClock,
+            DerivedNewReaderPayloads, InvoicePersistence, MarkerDiscovery,
+            OFFER_AVAILABILITY_TIMEOUT, OfferAvailability, PaykitIntentBuilder,
+            SessionValidationError, SessionValidator, SystemDeadlineClock,
+            complete_creation_baseline_within_deadline, draw_nonce_sats, map_store, remaining,
         },
         reader_marker::select_reader_marker,
         semantic_intent::DeliveryIntentV1,
@@ -56,6 +57,7 @@ pub struct MarketplacePaymentRequestService {
     credentials: Arc<dyn CreatorXpubProvider>,
     bitcoin_network: crate::config::BitcoinNetwork,
     bitcoin_creation_enabled: bool,
+    offer_availability: Arc<dyn OfferAvailability>,
     store: Arc<dyn InvoicePersistence>,
     electrum: Arc<dyn ElectrumPort>,
     max_creation_history_entries: usize,
@@ -123,6 +125,7 @@ impl MarketplacePaymentRequestService {
             credentials,
             bitcoin_network,
             bitcoin_creation_enabled,
+            offer_availability: Arc::new(AlwaysAvailableOffer),
             store,
             electrum,
             max_creation_history_entries,
@@ -141,6 +144,14 @@ impl MarketplacePaymentRequestService {
     ) -> Self {
         self.electrum_limiter = limiter;
         self.creation_snapshot_slots = creation_snapshot_slots;
+        self
+    }
+
+    /// Installs the runtime's live offer-availability verdict as the
+    /// first-time-bind gate. Installed once at startup; the verdict itself
+    /// is read per request.
+    pub fn with_offer_availability(mut self, availability: Arc<dyn OfferAvailability>) -> Self {
+        self.offer_availability = availability;
         self
     }
 
@@ -184,11 +195,27 @@ impl MarketplacePaymentRequestService {
                 return Err(CreateInvoiceError::BaselineInProgress);
             }
             // An exact replay above binds nothing new; only first-time binds
-            // are gated by the creation kill switch.
+            // are gated — by the creation kill switch first, then by the
+            // runtime's live offer availability.
             InvoicePreflight::New if !self.bitcoin_creation_enabled => {
                 return Err(CreateInvoiceError::BitcoinCreationDisabled);
             }
             InvoicePreflight::New => {}
+        }
+        // Runtime creation gate, identical to the Locks invoice path
+        // (static flag → live availability → limiter charging). Refusing
+        // here consumes no address, advances no cursor, and charges no
+        // Electrum request; a verdict that cannot be read in time fails
+        // closed. Observation of existing invoices is never gated on this
+        // verdict.
+        let offer_available = tokio::time::timeout(
+            OFFER_AVAILABILITY_TIMEOUT,
+            self.offer_availability.bitcoin_offer_available(),
+        )
+        .await
+        .map_err(|_| CreateInvoiceError::BitcoinOfferUnavailable)?;
+        if !offer_available {
+            return Err(CreateInvoiceError::BitcoinOfferUnavailable);
         }
         let session_remaining = elapsed_remaining(started, self.clock.now())?;
         tokio::time::timeout(session_remaining, self.sessions.validate(&request.creator))
@@ -255,6 +282,13 @@ impl MarketplacePaymentRequestService {
             })
             .await
             .map_err(map_store)?;
+        // As in the Locks invoice path: a replayed row won a creation race
+        // and its baseline belongs to the winner. The winner's
+        // `awaiting_baseline` row is answered `BaselineInProgress` under the
+        // row lock, so a replay that returns here is the published invoice.
+        if created.replayed() {
+            return Ok(created);
+        }
         let address = new_reader_payloads
             .for_child_index(created.reader_child_index())
             .map_err(map_store)?

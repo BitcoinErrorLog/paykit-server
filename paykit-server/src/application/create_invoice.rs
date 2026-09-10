@@ -85,7 +85,36 @@ pub enum CreateInvoiceError {
     Unavailable,
     /// New Bitcoin binds are administratively disabled on this stack.
     BitcoinCreationDisabled,
+    /// The runtime's Bitcoin offer is currently hidden (Electrum probe
+    /// hysteresis, component readiness, or postgres folded into
+    /// `bitcoin_offer_available`): a first-time bind is refused before any
+    /// address is allocated, any cursor advances, or any Electrum request
+    /// is charged. Exact replays are never gated.
+    BitcoinOfferUnavailable,
 }
+
+/// Live read of the runtime's `bitcoin_offer_available` verdict. This is
+/// the creation gate's only coupling to runtime readiness: observation of
+/// existing invoices never consults it. Production wires [`crate::runtime::Runtime`];
+/// tests inject a fixed verdict.
+#[async_trait]
+pub trait OfferAvailability: Send + Sync {
+    async fn bitcoin_offer_available(&self) -> bool;
+}
+
+/// Default for constructors that predate the runtime gate: offer visible.
+pub struct AlwaysAvailableOffer;
+#[async_trait]
+impl OfferAvailability for AlwaysAvailableOffer {
+    async fn bitcoin_offer_available(&self) -> bool {
+        true
+    }
+}
+
+/// Bound on the runtime availability read itself. The read is a readiness
+/// evaluation (atomic state plus one `SELECT 1`), so two seconds is
+/// generous; on expiry the gate fails closed rather than hold the request.
+pub(crate) const OFFER_AVAILABILITY_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[async_trait]
 pub trait SessionValidator: Send + Sync {
@@ -389,6 +418,7 @@ pub struct CreateInvoiceService {
     credentials: Arc<dyn CreatorXpubProvider>,
     bitcoin_network: crate::config::BitcoinNetwork,
     bitcoin_creation_enabled: bool,
+    offer_availability: Arc<dyn OfferAvailability>,
     store: Arc<dyn InvoicePersistence>,
     electrum: Arc<dyn ElectrumPort>,
     max_creation_history_entries: usize,
@@ -459,6 +489,7 @@ impl CreateInvoiceService {
             credentials,
             bitcoin_network,
             bitcoin_creation_enabled,
+            offer_availability: Arc::new(AlwaysAvailableOffer),
             store,
             electrum,
             max_creation_history_entries,
@@ -513,6 +544,14 @@ impl CreateInvoiceService {
         self
     }
 
+    /// Installs the runtime's live offer-availability verdict as the
+    /// first-time-bind gate. Installed once at startup; the verdict itself
+    /// is read per request.
+    pub fn with_offer_availability(mut self, availability: Arc<dyn OfferAvailability>) -> Self {
+        self.offer_availability = availability;
+        self
+    }
+
     pub async fn create(
         &self,
         request: CreateInvoiceRequest,
@@ -551,11 +590,27 @@ impl CreateInvoiceService {
                 return Err(CreateInvoiceError::BaselineInProgress);
             }
             // An exact replay above binds nothing new; only first-time binds
-            // are gated by the creation kill switch.
+            // are gated — by the creation kill switch first, then by the
+            // runtime's live offer availability.
             InvoicePreflight::New if !self.bitcoin_creation_enabled => {
                 return Err(CreateInvoiceError::BitcoinCreationDisabled);
             }
             InvoicePreflight::New => {}
+        }
+        // Runtime creation gate (ordering: static creation flag above →
+        // live availability here → limiter charging in the baseline
+        // sequence below). Refusing here consumes no address, advances no
+        // cursor, and charges no Electrum request; a verdict that cannot
+        // be read in time fails closed. Observation of existing invoices
+        // is never gated on this verdict.
+        let offer_available = tokio::time::timeout(
+            OFFER_AVAILABILITY_TIMEOUT,
+            self.offer_availability.bitcoin_offer_available(),
+        )
+        .await
+        .map_err(|_| CreateInvoiceError::BitcoinOfferUnavailable)?;
+        if !offer_available {
+            return Err(CreateInvoiceError::BitcoinOfferUnavailable);
         }
         let session_remaining = remaining(started, self.clock.now())?;
         tokio::time::timeout(session_remaining, self.sessions.validate(&creator))
@@ -632,6 +687,17 @@ impl CreateInvoiceService {
             })
             .await
             .map_err(map_store)?;
+        // A replayed row won a creation race (both preflights read `New`
+        // before the winner committed). Its baseline belongs to the
+        // winner: running the sequence here would double-charge the
+        // shared limiter for one invoice and end in a Conflict. The
+        // winner's `awaiting_baseline` row never reaches this point —
+        // the store answers `BaselineInProgress` under the row lock,
+        // exactly like preflight — so a replay that returns here is the
+        // published invoice, served with its existing terms.
+        if created.replayed() {
+            return Ok(created);
+        }
         let address = new_reader_payloads
             .for_child_index(created.reader_child_index())
             .map_err(map_store)?
@@ -757,6 +823,7 @@ pub(crate) fn remaining(start: Instant, now: Instant) -> Result<Duration, Create
 pub(crate) fn map_store(error: PersistenceError) -> CreateInvoiceError {
     match error {
         PersistenceError::Conflict => CreateInvoiceError::Conflict,
+        PersistenceError::BaselineInProgress => CreateInvoiceError::BaselineInProgress,
         PersistenceError::Unavailable => CreateInvoiceError::Unavailable,
         _ => CreateInvoiceError::Unavailable,
     }
