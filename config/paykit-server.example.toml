@@ -40,6 +40,13 @@ network = "testnet"
 # the stable code bitcoin_creation_disabled while existing invoices keep
 # being observed. Defaults to true.
 # creation_enabled = true
+# Lifetime of a `prepared` invoice awaiting the marketplace's signed
+# activation (two-phase creation, design §B.11): prepare_expires_at is
+# stamped as created_at + prepare_ttl at creation commit, and the observer
+# tick's reaper voids the invoice once it elapses. Far longer than any
+# plausible marketplace commit-plus-outbox latency, far shorter than the
+# marketplace's 1 h hold window. Defaults to 15 minutes.
+# prepare_ttl = "15min"
 
 [deployment]
 # Required, no default. "production" serves real-money traffic; "proof" marks

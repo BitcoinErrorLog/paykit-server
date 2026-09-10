@@ -99,6 +99,7 @@ impl Config {
             },
             bitcoin: BitcoinConfig {
                 creation_enabled: raw.bitcoin.creation_enabled,
+                prepare_ttl: raw.bitcoin.prepare_ttl,
             },
             electrum: ElectrumConfig {
                 endpoint: raw.electrum.endpoint,
@@ -161,6 +162,7 @@ impl Config {
                 "electrum.baseline_completion_timeout",
                 self.electrum.baseline_completion_timeout,
             ),
+            ("bitcoin.prepare_ttl", self.bitcoin.prepare_ttl),
             ("outbox.poll_interval", self.outbox.poll_interval),
             ("outbox.lease_duration", self.outbox.lease_duration),
             ("outbox.retry_initial", self.outbox.retry_initial),
@@ -628,6 +630,11 @@ pub struct BitcoinConfig {
     /// When false, new Bitcoin payment-request binds are refused while every
     /// existing invoice keeps being observed.
     pub creation_enabled: bool,
+    /// Lifetime of a `prepared` invoice awaiting activation (design §B.11.1):
+    /// `prepare_expires_at = created_at + prepare_ttl`, stamped from the
+    /// server clock at creation commit. The reaper voids a `prepared` invoice
+    /// once this elapses without activation.
+    pub prepare_ttl: Duration,
 }
 
 #[derive(Debug)]
@@ -957,10 +964,20 @@ struct RawBitcoinConfig {
     network: String,
     #[serde(default = "default_bitcoin_creation_enabled")]
     creation_enabled: bool,
+    #[serde(default = "default_bitcoin_prepare_ttl", with = "humantime_serde")]
+    prepare_ttl: Duration,
 }
 
 const fn default_bitcoin_creation_enabled() -> bool {
     true
+}
+
+/// §B.11.1: `prepare_expires_at = created_at + prepare_ttl`. Far longer than
+/// any plausible marketplace commit-plus-outbox latency and far shorter than
+/// the 1 h hold window, so a reaped prepare is always distinguishable from an
+/// expired order. A paykit-server config value, never marketplace-supplied.
+fn default_bitcoin_prepare_ttl() -> Duration {
+    Duration::from_secs(15 * 60)
 }
 
 #[derive(Deserialize)]
