@@ -229,6 +229,9 @@ fn private_payment_list_uses_derived_bech32_p2wpkh_address() {
 
 struct FakeStore {
     preflight: Mutex<InvoicePreflight>,
+    /// When non-empty, each `preflight` call pops the next scripted answer;
+    /// once the script is exhausted the static `preflight` value answers.
+    preflight_script: Mutex<VecDeque<InvoicePreflight>>,
     preflight_calls: AtomicUsize,
     create_calls: AtomicUsize,
     baseline_failures: AtomicUsize,
@@ -244,6 +247,7 @@ impl FakeStore {
     fn with_preflight(preflight: InvoicePreflight) -> Self {
         Self {
             preflight: Mutex::new(preflight),
+            preflight_script: Mutex::new(VecDeque::new()),
             preflight_calls: AtomicUsize::default(),
             create_calls: AtomicUsize::default(),
             baseline_failures: AtomicUsize::default(),
@@ -263,6 +267,9 @@ impl InvoicePersistence for FakeStore {
         _payment_binding: &[u8],
     ) -> Result<InvoicePreflight, PersistenceError> {
         self.preflight_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(scripted) = self.preflight_script.lock().unwrap().pop_front() {
+            return Ok(scripted);
+        }
         Ok(*self.preflight.lock().unwrap())
     }
 
@@ -860,7 +867,12 @@ async fn exact_replay_returns_without_validator_or_lock_fetch() {
 }
 
 #[tokio::test]
-async fn unresolved_baseline_is_in_progress_and_never_an_exact_replay() {
+async fn unresolved_baseline_wait_is_bounded_by_the_request_deadline() {
+    // §B.11.6: an exact replay landing on `awaiting_baseline` WAITS for
+    // the in-flight baseline — never an immediate in-progress refusal,
+    // never a replay of an unpublished invoice, never a second invoice,
+    // never downstream validation work — and an exhausted request budget
+    // answers the dependency timeout (503 `dependency_timeout`).
     let session = Arc::new(FakeSession {
         result: Ok(()),
         calls: AtomicUsize::default(),
@@ -873,16 +885,75 @@ async fn unresolved_baseline_is_in_progress_and_never_an_exact_replay() {
     let store = Arc::new(FakeStore::with_preflight(
         InvoicePreflight::BaselineInProgress,
     ));
+    // The baseline never resolves: the wait's remaining-budget read (the
+    // third clock read) is the first shifted one, so the request deadline
+    // has elapsed by the first poll interval.
+    let clock = Arc::new(ShiftClock {
+        calls: AtomicUsize::new(0),
+        start: Instant::now(),
+        shift_after: 2,
+        shift: Duration::from_secs(15),
+    });
+    let service = CreateInvoiceService::with_clock(
+        session.clone(),
+        locks.clone(),
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        store.clone(),
+        Arc::new(EmptyBaselineElectrum),
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+        clock,
+    );
 
     assert_eq!(
-        service(session.clone(), locks.clone(), store.clone())
-            .create(request())
-            .await,
-        Err(CreateInvoiceError::BaselineInProgress)
+        service.create(request()).await,
+        Err(CreateInvoiceError::DeadlineExceeded)
     );
     // The retry must not replay, must not create a second invoice, and
     // must not spend any downstream validation work.
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(session.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(locks.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn replay_during_baseline_wait_returns_the_stored_body_once_resolved() {
+    // §B.11.6: the waiting replay polls the side-effect-free preflight and,
+    // once the in-flight baseline lands `prepared`, is served the stored
+    // body through the ordinary replay path — one poll's delay, no second
+    // invoice, no validation work re-spent.
+    let session = Arc::new(FakeSession {
+        result: Ok(()),
+        calls: AtomicUsize::default(),
+        creators: Mutex::new(vec![]),
+    });
+    let locks = Arc::new(FakeLocks {
+        result: Ok(valid_lock()),
+        calls: AtomicUsize::default(),
+    });
+    let mut store = FakeStore::with_preflight(InvoicePreflight::ExactReplay);
+    store.preflight_script = Mutex::new(VecDeque::from([
+        InvoicePreflight::BaselineInProgress,
+        InvoicePreflight::BaselineInProgress,
+    ]));
+    let store = Arc::new(store);
+
+    let result = service(session.clone(), locks.clone(), store.clone())
+        .create(request())
+        .await
+        .unwrap();
+    assert_eq!(result.state, "prepared");
+    assert_eq!(store.preflight_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 1);
     assert_eq!(session.calls.load(Ordering::SeqCst), 0);
     assert_eq!(locks.calls.load(Ordering::SeqCst), 0);
 }
@@ -1744,12 +1815,22 @@ async fn replayed_create_atomic_returns_the_published_invoice_without_a_second_b
 }
 
 #[tokio::test]
-async fn raced_awaiting_baseline_row_is_in_progress_and_never_snapshotted_twice() {
+async fn raced_awaiting_baseline_row_waits_and_returns_the_stored_body() {
     // The FOR UPDATE loser receives the winner's still-unresolved
     // `awaiting_baseline` row: the store answers BaselineInProgress under
-    // the row lock (exactly like preflight), and the service must surface
-    // it without touching Electrum or the baseline lifecycle.
+    // the row lock (exactly like preflight), and §B.11.4 failure-matrix
+    // row 8 then serves the loser the winner's stored body once the
+    // baseline resolves — never a second snapshot sequence, never a
+    // second index.
     let mut store = FakeStore::with_preflight(InvoicePreflight::New);
+    store.preflight_script = Mutex::new(VecDeque::from([
+        // The loser's own preflight (before the winner commits)...
+        InvoicePreflight::New,
+        // ...then the wait after the row-lock answer: still unresolved
+        // once, resolved the second poll.
+        InvoicePreflight::BaselineInProgress,
+        InvoicePreflight::ExactReplay,
+    ]));
     store.create_error = Some(PersistenceError::BaselineInProgress);
     let store = Arc::new(store);
     let electrum = Arc::new(CountingBaselineElectrum(AtomicUsize::new(0)));
@@ -1779,10 +1860,8 @@ async fn raced_awaiting_baseline_row_is_in_progress_and_never_snapshotted_twice(
         Arc::new(PaykitIntentBuilder::default()),
     );
 
-    assert_eq!(
-        service.create(request()).await,
-        Err(CreateInvoiceError::BaselineInProgress)
-    );
+    let replayed = service.create(request()).await.unwrap();
+    assert_eq!(replayed.state, "prepared");
     assert_eq!(store.baseline_completions.load(Ordering::SeqCst), 0);
     assert_eq!(store.baseline_failures.load(Ordering::SeqCst), 0);
     assert_eq!(electrum.0.load(Ordering::SeqCst), 0);

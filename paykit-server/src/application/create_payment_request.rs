@@ -25,14 +25,17 @@ use crate::{
             DerivedNewReaderPayloads, InvoicePersistence, MarkerDiscovery,
             OFFER_AVAILABILITY_TIMEOUT, OfferAvailability, PaykitIntentBuilder,
             SessionValidationError, SessionValidator, SystemDeadlineClock,
-            complete_creation_baseline_within_deadline, draw_nonce_sats, map_store, remaining,
+            complete_creation_baseline_within_deadline, draw_nonce_sats, map_store,
+            preflight_after_baseline_resolution, remaining,
         },
         reader_marker::select_reader_marker,
         semantic_intent::DeliveryIntentV1,
     },
     config::ReceiverPathPriority,
     domain::locks::{BundleId, CreatorPubky, ReaderPubky},
-    persistence::{AtomicInvoiceInput, InvoicePreflight, NewReaderPayloadFactory},
+    persistence::{
+        AtomicInvoiceInput, InvoicePreflight, NewReaderPayloadFactory, PersistenceError,
+    },
     workers::observer::{ElectrumPort, RequestLimiter},
 };
 
@@ -191,36 +194,31 @@ impl MarketplacePaymentRequestService {
         let started = self.clock.now();
         let bundle_binding = request.reference.to_string().into_bytes();
         let payment_request_binding = request_binding(&request)?;
-        let preflight_remaining = elapsed_remaining(started, self.clock.now())?;
-        match tokio::time::timeout(
-            preflight_remaining,
-            self.store
-                .preflight(&request.creator, &bundle_binding, &payment_request_binding),
+        // §B.11.6: an exact replay whose invoice is still
+        // `awaiting_baseline` WAITS for the in-flight baseline to resolve —
+        // bounded by the request deadline, never a second snapshot, never a
+        // second index. The helper returns only a resolved preflight.
+        let preflight = preflight_after_baseline_resolution(
+            self.store.as_ref(),
+            self.clock.as_ref(),
+            started,
+            &request.creator,
+            &bundle_binding,
+            &payment_request_binding,
         )
-        .await
-        .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
-        .map_err(map_store)?
-        {
+        .await?;
+        match preflight {
             InvoicePreflight::ExactReplay => {
-                let replay_remaining = elapsed_remaining(started, self.clock.now())?;
-                let replayed = tokio::time::timeout(
-                    replay_remaining,
-                    self.store.exact_replay(
-                        &request.creator,
-                        &request.reader,
+                return self
+                    .exact_replay_outcome(
+                        started,
+                        &request,
                         &bundle_binding,
                         &payment_request_binding,
-                    ),
-                )
-                .await
-                .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
-                .map_err(map_store)?;
-                return self.phase_one_outcome(replayed.invoice_id()).await;
+                    )
+                    .await;
             }
             InvoicePreflight::Conflict => return Err(CreateInvoiceError::Conflict),
-            InvoicePreflight::BaselineInProgress => {
-                return Err(CreateInvoiceError::BaselineInProgress);
-            }
             // §B.11.6: a phase-1 replay against a void state is the named
             // refusal, never replay success and never a fresh allocation.
             InvoicePreflight::InvoiceFinalized => {
@@ -236,6 +234,10 @@ impl MarketplacePaymentRequestService {
                 return Err(CreateInvoiceError::BitcoinCreationDisabled);
             }
             InvoicePreflight::New => {}
+            // The wait helper above returns only resolved rows.
+            InvoicePreflight::BaselineInProgress => {
+                return Err(CreateInvoiceError::Unavailable);
+            }
         }
         // §B.11.3: `expires_at` is refused when past (missing is rejected by
         // the route's schema; "beyond the configured maximum" arrives with
@@ -311,7 +313,7 @@ impl MarketplacePaymentRequestService {
         // As in the Locks invoice path: once PostgreSQL mutation starts it is
         // awaited to a factual commit/rollback result rather than cancelled at
         // the HTTP deadline.
-        let created = self
+        let created = match self
             .store
             .create_atomic(AtomicInvoiceInput {
                 creator: &request.creator,
@@ -326,11 +328,49 @@ impl MarketplacePaymentRequestService {
                 expires_at: Some(request.expires_at),
             })
             .await
-            .map_err(map_store)?;
+        {
+            Ok(created) => created,
+            // §B.11.4 failure-matrix row 8 / §B.11.6: the `FOR UPDATE`
+            // loser found the winner's committed `awaiting_baseline` row
+            // under the row lock. It waits for the winner's baseline
+            // exactly like a preflight-visible replay — never a second
+            // snapshot, never a second index — then answers from the
+            // stored row.
+            Err(PersistenceError::BaselineInProgress) => {
+                return match preflight_after_baseline_resolution(
+                    self.store.as_ref(),
+                    self.clock.as_ref(),
+                    started,
+                    &request.creator,
+                    &bundle_binding,
+                    &payment_request_binding,
+                )
+                .await?
+                {
+                    InvoicePreflight::ExactReplay => {
+                        self.exact_replay_outcome(
+                            started,
+                            &request,
+                            &bundle_binding,
+                            &payment_request_binding,
+                        )
+                        .await
+                    }
+                    InvoicePreflight::Conflict => Err(CreateInvoiceError::Conflict),
+                    InvoicePreflight::InvoiceFinalized => Err(CreateInvoiceError::InvoiceFinalized),
+                    InvoicePreflight::PrepareExpired => Err(CreateInvoiceError::PrepareExpired),
+                    // The winner's row is committed, so `New` cannot
+                    // occur, and the wait helper never returns an
+                    // unresolved row.
+                    _ => Err(CreateInvoiceError::Unavailable),
+                };
+            }
+            Err(error) => return Err(map_store(error)),
+        };
         // As in the Locks invoice path: a replayed row won a creation race
         // and its baseline belongs to the winner. The winner's
-        // `awaiting_baseline` row is answered `BaselineInProgress` under the
-        // row lock, so a replay that returns here is the stored invoice.
+        // still-unresolved `awaiting_baseline` row is handled above (the
+        // wait arm), so a replay that returns here is the stored invoice.
         if created.replayed() {
             return self.phase_one_outcome(created.invoice_id()).await;
         }
@@ -352,6 +392,33 @@ impl MarketplacePaymentRequestService {
         )
         .await?;
         self.phase_one_outcome(created.invoice_id()).await
+    }
+
+    /// The §B.11.6 exact-replay path, identical to the Locks invoice
+    /// path: load the stored row (re-verifying the binding and the state
+    /// under the row lock) and build the phase-1 body from the stored
+    /// view.
+    async fn exact_replay_outcome(
+        &self,
+        started: Instant,
+        request: &MarketplacePaymentRequest,
+        bundle_binding: &[u8],
+        payment_request_binding: &[u8],
+    ) -> Result<crate::application::two_phase::PrepareBody, CreateInvoiceError> {
+        let replay_remaining = elapsed_remaining(started, self.clock.now())?;
+        let replayed = tokio::time::timeout(
+            replay_remaining,
+            self.store.exact_replay(
+                &request.creator,
+                &request.reader,
+                bundle_binding,
+                payment_request_binding,
+            ),
+        )
+        .await
+        .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
+        .map_err(map_store)?;
+        self.phase_one_outcome(replayed.invoice_id()).await
     }
 
     /// Builds the §B.11.3 phase-1 body from the stored view, identical to

@@ -299,10 +299,11 @@ unconfirmed baseline transaction whose inputs it fetches (bounded by
 maximal creation charges at most 55 tokens, and the 55-token worst case
 is charged at most once per invoice: a creation that loses the
 `FOR UPDATE` race to an identical in-flight bind receives the winner's
-`awaiting_baseline` row under the row lock and answers
-`invoice_baseline_in_progress` (exactly as preflight does) instead of
-running a second snapshot sequence, while a replay of the already
-published invoice returns its existing terms without touching the
+`awaiting_baseline` row under the row lock and, exactly like a
+preflight-visible replay (§B.11.6), waits for the winner's baseline —
+bounded by the request deadline — and is served the winner's stored body
+instead of running a second snapshot sequence, while a replay of the
+already published invoice returns its existing terms without touching the
 limiter. At the defaults (1000-token
 cap, 5 tokens/s refill, 10 s ±20 % poll) one 8 s tick window refills 40
 tokens, so once the initial 1000-token burst is spent a single maximal
@@ -477,6 +478,21 @@ Payment Request without a committed marketplace bind that polls it.*
   lookup, so a captured message replayed at the *wrong* stack after a
   repoint is refused `stack_identity_mismatch` and can never cancel or
   activate a live invoice that happens to share the id.
+- **A phase-1 replay against `awaiting_baseline` waits (§B.11.6).** An
+  exact replay whose invoice is still resolving its creation baseline
+  polls the stored row on a short cadence — bounded by the request
+  deadline, never a second snapshot, never a second index — and is then
+  answered from the stored row: the 200 body once the baseline lands
+  `prepared`, `invoice_finalized` (409) if it lands
+  `void_baseline_failed`, or `dependency_timeout` (503) when the request
+  budget elapses first. `activate`/`void` on `awaiting_baseline` keep the
+  immediate `invoice_baseline_in_progress` (409) refusal: the marketplace
+  only learns `invoice_id` from a 200 prepare, so a waiting phase-2 call
+  could only strand a handler. The final resolved states
+  (`resolved_paid_manually`, `resolved_closed`) answer both phase-2
+  operations with `invoice_finalized`, the same refusal §B.11.6 gives a
+  published invoice: a resolved invoice's money question is answered and
+  must never vanish or re-activate.
 - **The echoed `total_sats` is a guard, not an instruction.** A mismatch
   against the stored nonce'd total refuses activation with
   `activation_total_mismatch` — this is the R3-3 bug (a marketplace that

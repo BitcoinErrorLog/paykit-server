@@ -673,16 +673,46 @@ async fn exact_replay_returns_without_session_validation() {
 }
 
 #[tokio::test]
-async fn unresolved_baseline_is_in_progress_and_never_an_exact_replay() {
+async fn unresolved_baseline_wait_is_bounded_by_the_request_deadline() {
+    // §B.11.6: an exact replay landing on `awaiting_baseline` WAITS for
+    // the in-flight baseline — never an immediate in-progress refusal,
+    // never a replay of an unpublished invoice, never a second invoice,
+    // never downstream validation work — and an exhausted request budget
+    // answers the dependency timeout (503 `dependency_timeout`).
     let session = ok_session();
     let store = Arc::new(CapturingStore::with_preflight(
         InvoicePreflight::BaselineInProgress,
     ));
+    // The baseline never resolves: the wait's remaining-budget read (the
+    // third clock read) is the first shifted one, so the request deadline
+    // has elapsed by the first poll interval.
+    let clock = Arc::new(ShiftClock {
+        calls: AtomicUsize::new(0),
+        start: std::time::Instant::now(),
+        shift_after: 2,
+        shift: std::time::Duration::from_secs(15),
+    });
+    let service = MarketplacePaymentRequestService::with_clock(
+        session.clone(),
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        store.clone(),
+        Arc::new(EmptyBaselineElectrum),
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+        clock,
+    );
     assert_eq!(
-        service(session.clone(), store.clone(), BitcoinNetwork::Mainnet)
-            .create(request(50_000))
-            .await,
-        Err(CreateInvoiceError::BaselineInProgress)
+        service.create(request(50_000)).await,
+        Err(CreateInvoiceError::DeadlineExceeded)
     );
     // The retry must not replay, must not create a second invoice, and
     // must not spend any downstream validation work.

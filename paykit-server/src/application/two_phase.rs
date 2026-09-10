@@ -209,7 +209,14 @@ impl TwoPhaseService {
             "observing" | "expired_tail" => return Ok(activate_body(&view)),
             "prepared" => {}
             "void_prepare_expired" => return Err(TwoPhaseError::PrepareExpired),
-            "void_baseline_failed" | "void_cancelled" | "expired_final" => {
+            // §B.11.1: the void states, `expired_final` and the two
+            // resolved states are all final — activation against any of
+            // them is the named finalized refusal.
+            "void_baseline_failed"
+            | "void_cancelled"
+            | "expired_final"
+            | "resolved_paid_manually"
+            | "resolved_closed" => {
                 return Err(TwoPhaseError::InvoiceFinalized);
             }
             "awaiting_baseline" => return Err(TwoPhaseError::BaselineInProgress),
@@ -259,6 +266,18 @@ impl TwoPhaseService {
     pub async fn void(&self, request: VoidRequest) -> Result<VoidBody, TwoPhaseError> {
         if request.stack_id != self.stack_id {
             return Err(TwoPhaseError::StackIdentityMismatch);
+        }
+        // §B.11.1's resolved states are final: a resolved invoice was
+        // published and its money question answered, so voiding it would
+        // vanish a published request — the same `invoice_finalized`
+        // refusal §B.11.6 gives `observing`/`expired_tail`. The store's
+        // row lock below remains authoritative for every other state.
+        let view = self.load_view(request.invoice_id).await?;
+        if matches!(
+            view.baseline_state.as_str(),
+            "resolved_paid_manually" | "resolved_closed"
+        ) {
+            return Err(TwoPhaseError::InvoiceFinalized);
         }
         tracing::info!(reason = %request.reason, "voiding prepared invoice");
         match self.store.void_invoice(request.invoice_id).await {

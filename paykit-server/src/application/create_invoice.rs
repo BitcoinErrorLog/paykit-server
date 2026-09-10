@@ -614,36 +614,32 @@ impl CreateInvoiceService {
         let creator = request.lock_resource.creator().clone();
         let bundle_binding = request.bundle_id.to_string().into_bytes();
         let payment_request_binding = request_binding(&request)?;
-        let preflight_remaining = remaining(started, self.clock.now())?;
-        match tokio::time::timeout(
-            preflight_remaining,
-            self.store
-                .preflight(&creator, &bundle_binding, &payment_request_binding),
+        // §B.11.6: an exact replay whose invoice is still
+        // `awaiting_baseline` WAITS for the in-flight baseline to resolve —
+        // bounded by the request deadline, never a second snapshot, never a
+        // second index. The helper returns only a resolved preflight.
+        let preflight = preflight_after_baseline_resolution(
+            self.store.as_ref(),
+            self.clock.as_ref(),
+            started,
+            &creator,
+            &bundle_binding,
+            &payment_request_binding,
         )
-        .await
-        .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
-        .map_err(map_store)?
-        {
+        .await?;
+        match preflight {
             InvoicePreflight::ExactReplay => {
-                let replay_remaining = remaining(started, self.clock.now())?;
-                let replayed = tokio::time::timeout(
-                    replay_remaining,
-                    self.store.exact_replay(
+                return self
+                    .exact_replay_outcome(
+                        started,
                         &creator,
                         &request.reader,
                         &bundle_binding,
                         &payment_request_binding,
-                    ),
-                )
-                .await
-                .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
-                .map_err(map_store)?;
-                return self.phase_one_outcome(replayed.invoice_id()).await;
+                    )
+                    .await;
             }
             InvoicePreflight::Conflict => return Err(CreateInvoiceError::Conflict),
-            InvoicePreflight::BaselineInProgress => {
-                return Err(CreateInvoiceError::BaselineInProgress);
-            }
             // §B.11.6: a phase-1 replay against a void state is the named
             // refusal, never replay success and never a fresh allocation.
             InvoicePreflight::InvoiceFinalized => {
@@ -659,6 +655,10 @@ impl CreateInvoiceService {
                 return Err(CreateInvoiceError::BitcoinCreationDisabled);
             }
             InvoicePreflight::New => {}
+            // The wait helper above returns only resolved rows.
+            InvoicePreflight::BaselineInProgress => {
+                return Err(CreateInvoiceError::Unavailable);
+            }
         }
         // Runtime creation gate (ordering: static creation flag above →
         // live availability here → limiter charging in the baseline
@@ -736,7 +736,7 @@ impl CreateInvoiceService {
         // Once PostgreSQL mutation starts it must be awaited to a factual
         // commit/rollback result. Canceling this future at the HTTP deadline
         // could otherwise return failure while COMMIT succeeds concurrently.
-        let created = self
+        let created = match self
             .store
             .create_atomic(AtomicInvoiceInput {
                 creator: &creator,
@@ -751,14 +751,52 @@ impl CreateInvoiceService {
                 expires_at: None,
             })
             .await
-            .map_err(map_store)?;
+        {
+            Ok(created) => created,
+            // §B.11.4 failure-matrix row 8 / §B.11.6: the `FOR UPDATE`
+            // loser found the winner's committed `awaiting_baseline` row
+            // under the row lock. It waits for the winner's baseline
+            // exactly like a preflight-visible replay — never a second
+            // snapshot, never a second index — then answers from the
+            // stored row.
+            Err(PersistenceError::BaselineInProgress) => {
+                return match preflight_after_baseline_resolution(
+                    self.store.as_ref(),
+                    self.clock.as_ref(),
+                    started,
+                    &creator,
+                    &bundle_binding,
+                    &payment_request_binding,
+                )
+                .await?
+                {
+                    InvoicePreflight::ExactReplay => {
+                        self.exact_replay_outcome(
+                            started,
+                            &creator,
+                            &request.reader,
+                            &bundle_binding,
+                            &payment_request_binding,
+                        )
+                        .await
+                    }
+                    InvoicePreflight::Conflict => Err(CreateInvoiceError::Conflict),
+                    InvoicePreflight::InvoiceFinalized => Err(CreateInvoiceError::InvoiceFinalized),
+                    InvoicePreflight::PrepareExpired => Err(CreateInvoiceError::PrepareExpired),
+                    // The winner's row is committed, so `New` cannot
+                    // occur, and the wait helper never returns an
+                    // unresolved row.
+                    _ => Err(CreateInvoiceError::Unavailable),
+                };
+            }
+            Err(error) => return Err(map_store(error)),
+        };
         // A replayed row won a creation race (both preflights read `New`
         // before the winner committed). Its baseline belongs to the
         // winner: running the sequence here would double-charge the
         // shared limiter for one invoice and end in a Conflict. The
-        // winner's `awaiting_baseline` row never reaches this point —
-        // the store answers `BaselineInProgress` under the row lock,
-        // exactly like preflight — so a replay that returns here is the
+        // winner's still-unresolved `awaiting_baseline` row is handled
+        // above (the wait arm), so a replay that returns here is the
         // stored invoice, served with its existing terms.
         if created.replayed() {
             return self.phase_one_outcome(created.invoice_id()).await;
@@ -783,6 +821,29 @@ impl CreateInvoiceService {
         self.phase_one_outcome(created.invoice_id()).await
     }
 
+    /// The §B.11.6 exact-replay path: load the stored row (re-verifying
+    /// the binding and the state under the row lock) and build the
+    /// phase-1 body from the stored view.
+    async fn exact_replay_outcome(
+        &self,
+        started: Instant,
+        creator: &CreatorPubky,
+        reader: &ReaderPubky,
+        bundle_binding: &[u8],
+        payment_request_binding: &[u8],
+    ) -> Result<crate::application::two_phase::PrepareBody, CreateInvoiceError> {
+        let replay_remaining = remaining(started, self.clock.now())?;
+        let replayed = tokio::time::timeout(
+            replay_remaining,
+            self.store
+                .exact_replay(creator, reader, bundle_binding, payment_request_binding),
+        )
+        .await
+        .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
+        .map_err(map_store)?;
+        self.phase_one_outcome(replayed.invoice_id()).await
+    }
+
     /// Builds the §B.11.3 phase-1 body from the stored view — never from
     /// request-side state — so a fresh prepare and every replay report
     /// exactly what the database holds, and a replay landing on a void
@@ -798,6 +859,45 @@ impl CreateInvoiceService {
             .map_err(map_store)?
             .ok_or(CreateInvoiceError::Unavailable)?;
         crate::application::two_phase::prepare_outcome(&view, &self.stack_id)
+    }
+}
+
+/// Poll cadence of the §B.11.6 replay wait: an exact replay whose invoice
+/// is still `awaiting_baseline` re-reads the side-effect-free preflight at
+/// this interval until the in-flight baseline resolves.
+const BASELINE_REPLAY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// §B.11.6: an exact replay whose invoice is `awaiting_baseline` **waits**
+/// for the in-flight baseline to reach `prepared` or
+/// `void_baseline_failed` (or any later state), bounded by the request
+/// deadline — never a second snapshot, never a second index, nonce or
+/// outbox row. The budget check runs on the injected [`DeadlineClock`]
+/// (never `Instant::now()`), so an exhausted request budget answers
+/// `DeadlineExceeded` (503 `dependency_timeout`) rather than the
+/// in-progress refusal, and tests drive the deadline through the clock
+/// seam. Returns only a resolved preflight.
+pub(crate) async fn preflight_after_baseline_resolution(
+    store: &dyn InvoicePersistence,
+    clock: &dyn DeadlineClock,
+    started: Instant,
+    creator: &CreatorPubky,
+    bundle_binding: &[u8],
+    payment_request_binding: &[u8],
+) -> Result<InvoicePreflight, CreateInvoiceError> {
+    loop {
+        let preflight_remaining = remaining(started, clock.now())?;
+        let preflight = tokio::time::timeout(
+            preflight_remaining,
+            store.preflight(creator, bundle_binding, payment_request_binding),
+        )
+        .await
+        .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
+        .map_err(map_store)?;
+        if preflight != InvoicePreflight::BaselineInProgress {
+            return Ok(preflight);
+        }
+        let wait_remaining = remaining(started, clock.now())?;
+        tokio::time::sleep(BASELINE_REPLAY_POLL_INTERVAL.min(wait_remaining)).await;
     }
 }
 
