@@ -516,13 +516,97 @@ Payment Request without a committed marketplace bind that polls it.*
   runtime offer-availability verdict (§C.16): refusing them would strand
   exactly the `prepared` invoices a drain is trying to retire. Only
   phase-1 `InvoicePreflight::New` passes those gates.
-- **The marketplace-side hold-expiry rule for `preparing` orders is the
-  coordinator's delegated decision** (design §B.11.2 leaves the cell
-  undefined; `marketplace-service` W1.10 prompt §4, recorded there as
-  "coordinator decision; W9.3 reconcile"): on hold expiry with activation
-  still unconfirmed, the marketplace calls `void` with reason
-  `hold_expired` and treats `invoice_finalized` as a lost-2xx activation.
-  Paykit-server's side of that contract is exactly the state machine above:
-  `void` on `prepared` cancels, on a reaped invoice is an idempotent 200,
-  and on a published invoice is the named `invoice_finalized` refusal, so
-  the marketplace's ruling always terminates in a named, alertable outcome.
+ - **The marketplace-side hold-expiry rule for `preparing` orders is the
+   coordinator's delegated decision** (design §B.11.2 leaves the cell
+   undefined; `marketplace-service` W1.10 prompt §4, recorded there as
+   "coordinator decision; W9.3 reconcile"): on hold expiry with activation
+   still unconfirmed, the marketplace calls `void` with reason
+   `hold_expired` and treats `invoice_finalized` as a lost-2xx activation.
+   Paykit-server's side of that contract is exactly the state machine above:
+   `void` on `prepared` cancels, on a reaped invoice is an idempotent 200,
+   and on a published invoice is the named `invoice_finalized` refusal, so
+   the marketplace's ruling always terminates in a named, alertable outcome.
+
+## Expiry, the observation tail, and resolve (§B.9, W1.4b)
+
+Every delivered Payment Request carries an expiry, and the expiry is the
+observation TTL: it is what makes "the observer stops watching" a bounded,
+locally computable instant rather than a cross-service contract. The money
+properties this slice establishes: *a delivered request is unpayable after
+its expiry (enforced by the buyer's wallet), a late payment reaches a human
+rather than silence, and the marketplace's money-outcome record is one-way.*
+
+- **Expiry is fail-closed at creation.** Both prepare entrypoints require
+  `expires_at`; missing, past (server clock), or further out than
+  `bitcoin.max_request_expiry` (default 24 h) is refused before any
+  allocation, any cursor advance, or any Electrum charge — the same
+  fail-closed posture as the creation baseline. The value is persisted on
+  the invoice AND carried into the published request's
+  `proposal_expires_at` (both, always): both wallets parse and enforce
+  that field, so a buyer's wallet refuses to pay an expired request
+  without any wallet release. An exact phase-1 replay is exempt from the
+  freshness check precisely because §B.11.6 requires it to return the
+  stored body even after the moment has passed.
+- **The tail is timestamp-derived, never observer-derived.** The observer
+  tick's conditional UPDATEs move `observing → expired_tail` when
+  `now > expires_at` and `expired_tail → expired_final` when
+  `now > expires_at + bitcoin.expiry_tail` (default 24 h) — both from the
+  stored `expires_at` on the server clock, so the TTL is identical no
+  matter when or whether any observer notices, and a request handler can
+  never move an invoice. Through the tail the invoice is still observed
+  but ordered after every live target in the §B.7 budget (the budget
+  admits the plan's prefix, so ordering IS the deprioritisation);
+  `expired_final` leaves `observation_plan()` for good.
+- **A late settlement never settles.** Any eligible observation recorded
+  while the invoice is `expired_tail` is written with
+  `late_settlement = true` and can never drive `paid` — including for a
+  `shared_manual` creator and including at `confirmed` with the exact
+  amount: the flag takes precedence over the seller-confirmation edge
+  (§B.8.8, Kimi P2). The flag rides the `/transactions/status` payload the
+  marketplace polls, and the marketplace's existing late-settlement path
+  routes the order to `manual_review`: a buyer who pays late gets a
+  human, not silence. Nothing is silently dropped: the observation is
+  recorded factually (`confirmed`, `amount_matched`), and the flag — not
+  the absence of a record — is what blocks settlement.
+- **`resolve` is one-way and stack-pinned.** The endpoint records the
+  marketplace's money outcome: `paid_manually` finalizes
+  `observing`/`expired_tail` to `resolved_paid_manually`,
+  `refunded`/`abandoned` to `resolved_closed`, leaving
+  `observation_targets()` in the same transaction. It is idempotent on
+  `(invoice_id, resolution)` — a redelivered outbox row returns the
+  existing record with zero writes — and a different resolution after one
+  is recorded is the named `invoice_already_resolved` conflict, never a
+  last-writer-wins overwrite. The echoed `stack_id` (the W1.3
+  `stack_identity` row) is verified before any invoice lookup, so a
+  resolution queued before a repoint is refused
+  `stack_identity_mismatch` at the wrong stack rather than applied to
+  whatever invoice happens to share the id there. A `paid_manually`
+  resolution never creates or promotes an observation: it records a
+  decision made off-rail.
+- **`expired_final` is metadata-only.** A resolution against a final
+  invoice is recorded for audit (`resolution` + `resolved_at`) and the
+  state does not change: there is no un-final edge anywhere in this
+  design and observation does not resume. Funds arriving after
+  `expired_final` sit at the seller's own address and are the seller's;
+  the marketplace's record is authoritative for the money outcome and the
+  reconciliation is off-rail and human. The migration's CHECKs pin the
+  record's shape: `resolution`/`resolved_at` are both-NULL or both-set,
+  and each resolved state requires its matching resolution.
+- **The refusal split is transient-vs-permanent, and that is a liveness
+  property.** `awaiting_baseline` → `invoice_baseline_in_progress` is the
+  one transient refusal (retried under the marketplace's bounded delivery
+  deadline); `invoice_not_activated` (`prepared` — nothing was ever
+  published, so a `paid_manually` there means the caller has the wrong
+  invoice id), `invoice_already_resolved`, the three void refusals
+  (`prepare_expired`, `invoice_finalized` — the W1.1c names reused), and
+  `unknown_invoice` are all permanent: the marketplace's resolution
+  outbox terminates on each with an alert instead of retrying forever.
+  `resolved_at` is recorded as supplied but no state decision ever reads
+  it — every clock that matters is the server's.
+- **A phase-1 replay against a resolved invoice is `invoice_finalized`.**
+  With the resolved states reachable, preflight, the atomic-creation
+  replay arm, and `prepare_outcome` all classify
+  `resolved_paid_manually`/`resolved_closed` as finalized — mirroring the
+  activate/void treatment — so a replayed creation can neither resurrect
+  the prepared body of an invoice whose money question is answered nor
+  fall through to a 503.
