@@ -61,9 +61,7 @@ use paykit_server::{
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
     domain::payment::BitcoinOutpoint,
-    persistence::{
-        CreatorCredentials, CreatorStore, InvoiceStore, OutboxStore, run_migrations,
-    },
+    persistence::{CreatorCredentials, CreatorStore, InvoiceStore, OutboxStore, run_migrations},
     runtime::{ElectrumProbe, Runtime},
     startup::initialize_database,
     workers::observer::{
@@ -605,11 +603,7 @@ async fn activated_invoice(
         "activate body: {}",
         String::from_utf8_lossy(&response.body)
     );
-    (
-        invoice_id,
-        stack.invoice_address(child_index),
-        total_sats,
-    )
+    (invoice_id, stack.invoice_address(child_index), total_sats)
 }
 
 async fn send_http(address: SocketAddr, request: Request<Body>) -> HttpResponse {
@@ -834,7 +828,12 @@ async fn past_expires_at_is_refused_with_the_named_reason() {
     let marketplace = post(
         &stack,
         "/v0/payment-requests",
-        payment_request_body(&stack.creator.creator, &stack.reader, REFERENCE_A, Some(&past)),
+        payment_request_body(
+            &stack.creator.creator,
+            &stack.reader,
+            REFERENCE_A,
+            Some(&past),
+        ),
     )
     .await;
     assert_eq!(marketplace.status, StatusCode::BAD_REQUEST);
@@ -957,7 +956,10 @@ async fn observing_moves_to_expired_tail_at_the_boundary_and_not_before() {
     shift_expires_at(&stack.pool, &invoice_id, -1).await;
     let transitions = apply_transitions(&stack).await;
     assert_eq!(transitions.tailed, 1);
-    assert_eq!(baseline_state(&stack.pool, &invoice_id).await, "expired_tail");
+    assert_eq!(
+        baseline_state(&stack.pool, &invoice_id).await,
+        "expired_tail"
+    );
     assert!(
         sqlx::query_scalar::<_, bool>(
             "SELECT expired_tail_at IS NOT NULL FROM invoices WHERE id = $1"
@@ -986,13 +988,19 @@ async fn expired_tail_moves_to_expired_final_after_the_tail() {
     shift_expires_at(&stack.pool, &invoice_id, -60).await;
     let transitions = apply_transitions(&stack).await;
     assert_eq!(transitions.tailed, 1);
-    assert_eq!(baseline_state(&stack.pool, &invoice_id).await, "expired_tail");
+    assert_eq!(
+        baseline_state(&stack.pool, &invoice_id).await,
+        "expired_tail"
+    );
 
     // One minute short of the full tail: still expired_tail.
     shift_expires_at(&stack.pool, &invoice_id, -(23 * 3600 + 59 * 60)).await;
     let transitions = apply_transitions(&stack).await;
     assert_eq!(transitions.finalized, 0);
-    assert_eq!(baseline_state(&stack.pool, &invoice_id).await, "expired_tail");
+    assert_eq!(
+        baseline_state(&stack.pool, &invoice_id).await,
+        "expired_tail"
+    );
 
     // Past expires_at + 24 h: final, recorded, and out of the plan.
     shift_expires_at(&stack.pool, &invoice_id, -(24 * 3600 + 60)).await;
@@ -1042,10 +1050,7 @@ async fn observation_plan_orders_tail_after_live_and_excludes_final() {
     // Finalize the tail target: it leaves the plan; the live target stays.
     shift_expires_at(&stack.pool, &tail_id, -(24 * 3600 + 60)).await;
     apply_transitions(&stack).await;
-    assert_eq!(
-        baseline_state(&stack.pool, &tail_id).await,
-        "expired_final"
-    );
+    assert_eq!(baseline_state(&stack.pool, &tail_id).await, "expired_final");
     assert_eq!(plan_addresses(&stack).await, vec![live_address]);
     // And the live invoice is untouched.
     assert_eq!(baseline_state(&stack.pool, &live_id).await, "observing");

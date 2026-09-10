@@ -189,9 +189,7 @@ pub fn invoice_already_resolved(existing_resolution: &str) -> Response {
 /// a machine-readable `reason` so the marketplace can branch without
 /// string-matching prose. "Missing" is the route schema's plain
 /// `invalid_request`; past and over-maximum are named here.
-pub fn invalid_expiry(
-    reason: crate::application::create_invoice::ExpiryRefusal,
-) -> Response {
+pub fn invalid_expiry(reason: crate::application::create_invoice::ExpiryRefusal) -> Response {
     let message = match reason {
         crate::application::create_invoice::ExpiryRefusal::Past => {
             "expires_at is already in the past"

@@ -1062,7 +1062,9 @@ pub(crate) fn validate_expires_at(
         return Err(CreateInvoiceError::InvalidExpiry(ExpiryRefusal::Past));
     }
     if expires_at > now + max_request_expiry {
-        return Err(CreateInvoiceError::InvalidExpiry(ExpiryRefusal::OverMaximum));
+        return Err(CreateInvoiceError::InvalidExpiry(
+            ExpiryRefusal::OverMaximum,
+        ));
     }
     Ok(())
 }

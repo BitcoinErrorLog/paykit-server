@@ -987,7 +987,10 @@ struct RawBitcoinConfig {
     creation_enabled: bool,
     #[serde(default = "default_bitcoin_prepare_ttl", with = "humantime_serde")]
     prepare_ttl: Duration,
-    #[serde(default = "default_bitcoin_max_request_expiry", with = "humantime_serde")]
+    #[serde(
+        default = "default_bitcoin_max_request_expiry",
+        with = "humantime_serde"
+    )]
     max_request_expiry: Duration,
     #[serde(default = "default_bitcoin_expiry_tail", with = "humantime_serde")]
     expiry_tail: Duration,

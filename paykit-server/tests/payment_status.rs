@@ -143,10 +143,15 @@ async fn unknown_creator_or_bundle_returns_a_safe_404() {
 #[tokio::test]
 async fn known_unobserved_status_is_exactly_undetected() {
     let key = SigningKey::from_bytes(&[7; 32]);
-    let response = router(&key, Some(PersistedPaymentStatus::Undetected { late_settlement: false }))
-        .oneshot(signed_request(&key))
-        .await
-        .unwrap();
+    let response = router(
+        &key,
+        Some(PersistedPaymentStatus::Undetected {
+            late_settlement: false,
+        }),
+    )
+    .oneshot(signed_request(&key))
+    .await
+    .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -189,16 +194,26 @@ async fn known_observed_statuses_serialize_only_factual_fields() {
 #[tokio::test]
 async fn status_route_uses_task9_signed_authentication() {
     let key = SigningKey::from_bytes(&[7; 32]);
-    let valid = router(&key, Some(PersistedPaymentStatus::Undetected { late_settlement: false }))
-        .oneshot(signed_request(&key))
-        .await
-        .unwrap();
+    let valid = router(
+        &key,
+        Some(PersistedPaymentStatus::Undetected {
+            late_settlement: false,
+        }),
+    )
+    .oneshot(signed_request(&key))
+    .await
+    .unwrap();
     assert_eq!(valid.status(), StatusCode::OK);
 
-    let invalid = router(&key, Some(PersistedPaymentStatus::Undetected { late_settlement: false }))
-        .oneshot(signed_request(&SigningKey::from_bytes(&[8; 32])))
-        .await
-        .unwrap();
+    let invalid = router(
+        &key,
+        Some(PersistedPaymentStatus::Undetected {
+            late_settlement: false,
+        }),
+    )
+    .oneshot(signed_request(&SigningKey::from_bytes(&[8; 32])))
+    .await
+    .unwrap();
     assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
 }
 
@@ -210,17 +225,24 @@ async fn status_route_rejects_noncanonical_or_nonclosed_bodies() {
         format!(r#"{{"bundle_id":"{BUNDLE}","creator":"{CREATOR}","unexpected":true}}"#)
             .into_bytes(),
     ] {
-        let response = router(&key, Some(PersistedPaymentStatus::Undetected { late_settlement: false }))
-            .oneshot(signed_request_with_body(&key, body))
-            .await
-            .unwrap();
+        let response = router(
+            &key,
+            Some(PersistedPaymentStatus::Undetected {
+                late_settlement: false,
+            }),
+        )
+        .oneshot(signed_request_with_body(&key, body))
+        .await
+        .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
 
 #[tokio::test]
 async fn status_service_has_only_the_persisted_status_port() {
-    let (service, repository) = service(Some(PersistedPaymentStatus::Undetected { late_settlement: false }));
+    let (service, repository) = service(Some(PersistedPaymentStatus::Undetected {
+        late_settlement: false,
+    }));
     let creator = paykit_server::domain::locks::parse_creator(CREATOR).unwrap();
     let bundle_id = paykit_server::domain::locks::parse_bundle_id(BUNDLE).unwrap();
 

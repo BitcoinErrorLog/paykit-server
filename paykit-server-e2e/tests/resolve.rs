@@ -15,13 +15,7 @@
 //!   entrypoints → 409 `invoice_finalized` with zero writes (the W1.1c
 //!   round-2 classification hole, closed with the states now reachable).
 
-use std::{
-    collections::BTreeMap,
-    net::SocketAddr,
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::{
@@ -603,11 +597,7 @@ async fn activated_invoice(
         "activate body: {}",
         String::from_utf8_lossy(&response.body)
     );
-    (
-        invoice_id,
-        stack.invoice_address(child_index),
-        total_sats,
-    )
+    (invoice_id, stack.invoice_address(child_index), total_sats)
 }
 
 async fn send_http(address: SocketAddr, request: Request<Body>) -> HttpResponse {
@@ -1160,10 +1150,7 @@ async fn resolve_is_idempotent_one_way_and_path_checked() {
     for other in ["refunded", "abandoned"] {
         let conflict = resolve(&stack, &invoice_id, other).await;
         assert_eq!(conflict.status, StatusCode::CONFLICT);
-        assert_eq!(
-            conflict.json()["error"]["code"],
-            "invoice_already_resolved"
-        );
+        assert_eq!(conflict.json()["error"]["code"], "invoice_already_resolved");
         assert!(
             conflict.json()["error"]["message"]
                 .as_str()
@@ -1213,10 +1200,7 @@ async fn resolve_echoing_another_stacks_id_is_refused_with_zero_change() {
     )
     .await;
     assert_eq!(response.status, StatusCode::CONFLICT);
-    assert_eq!(
-        response.json()["error"]["code"],
-        "stack_identity_mismatch"
-    );
+    assert_eq!(response.json()["error"]["code"], "stack_identity_mismatch");
     assert_eq!(baseline_state(&stack.pool, &invoice_id).await, "observing");
     assert!(
         sqlx::query_scalar::<_, bool>("SELECT resolution IS NULL FROM invoices WHERE id = $1")
@@ -1265,8 +1249,7 @@ async fn phase_one_replay_against_resolved_states_is_invoice_finalized() {
         (BUNDLE_LOCKS_A, "paid_manually"),
         (BUNDLE_LOCKS_B, "abandoned"),
     ] {
-        let create_body =
-            locks_invoice_body(&stack.creator, &stack.reader, bundle, &expires_in(1));
+        let create_body = locks_invoice_body(&stack.creator, &stack.reader, bundle, &expires_in(1));
         let response = post(&stack, "/invoices", create_body.clone()).await;
         assert_eq!(
             response.status,
@@ -1286,12 +1269,11 @@ async fn phase_one_replay_against_resolved_states_is_invoice_finalized() {
     }
 
     for (create_body, uri, resolution) in cases {
-        let before: (i64, i64) = sqlx::query_as(
-            "SELECT (SELECT COUNT(*) FROM invoices), (SELECT COUNT(*) FROM outbox)",
-        )
-        .fetch_one(&stack.pool)
-        .await
-        .unwrap();
+        let before: (i64, i64) =
+            sqlx::query_as("SELECT (SELECT COUNT(*) FROM invoices), (SELECT COUNT(*) FROM outbox)")
+                .fetch_one(&stack.pool)
+                .await
+                .unwrap();
         let replay = post(&stack, uri, create_body).await;
         assert_eq!(
             replay.status,
@@ -1300,13 +1282,15 @@ async fn phase_one_replay_against_resolved_states_is_invoice_finalized() {
             String::from_utf8_lossy(&replay.body)
         );
         assert_eq!(replay.json()["error"]["code"], "invoice_finalized");
-        let after: (i64, i64) = sqlx::query_as(
-            "SELECT (SELECT COUNT(*) FROM invoices), (SELECT COUNT(*) FROM outbox)",
-        )
-        .fetch_one(&stack.pool)
-        .await
-        .unwrap();
-        assert_eq!(after, before, "{uri} replay after {resolution}: zero writes");
+        let after: (i64, i64) =
+            sqlx::query_as("SELECT (SELECT COUNT(*) FROM invoices), (SELECT COUNT(*) FROM outbox)")
+                .fetch_one(&stack.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            after, before,
+            "{uri} replay after {resolution}: zero writes"
+        );
     }
 
     stack.shutdown().await;

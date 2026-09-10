@@ -376,7 +376,11 @@ impl TwoPhaseService {
         }
         match self
             .store
-            .resolve_invoice(request.invoice_id, request.resolution.as_str(), request.resolved_at)
+            .resolve_invoice(
+                request.invoice_id,
+                request.resolution.as_str(),
+                request.resolved_at,
+            )
             .await
         {
             Ok(Some(_write)) => {}

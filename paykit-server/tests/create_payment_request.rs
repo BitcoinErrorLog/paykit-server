@@ -476,7 +476,10 @@ async fn persists_exact_terms_bindings_and_derived_address_without_a_lock() {
             assert_eq!(reference.get_version_num(), 4);
             // §B.9: the expiry is carried into the published request so the
             // buyer's wallet enforces it.
-            assert_eq!(terms.proposal_expires_at.as_deref(), Some(expires_at.as_str()));
+            assert_eq!(
+                terms.proposal_expires_at.as_deref(),
+                Some(expires_at.as_str())
+            );
             assert_eq!(terms.accepted_endpoint_identifiers, ["btc-bitcoin-p2wpkh"]);
             assert_eq!(
                 serde_json::Value::Object(terms.metadata.clone()),

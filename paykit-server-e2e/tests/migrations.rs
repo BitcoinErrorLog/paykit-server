@@ -774,12 +774,10 @@ async fn payment_request_expiry_migration_backfills_and_constrains() {
     let observing = insert_legacy("observing", false).await;
     let prepared = insert_legacy("prepared", false).await;
     let already_set = insert_legacy("observing", true).await;
-    let nilled: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM invoices WHERE expires_at IS NULL",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap();
+    let nilled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE expires_at IS NULL")
+        .fetch_one(pool)
+        .await
+        .unwrap();
     assert_eq!(nilled, 2, "two legacy NULL-expiry rows staged");
 
     sqlx::raw_sql(include_str!(
@@ -837,7 +835,11 @@ async fn payment_request_expiry_migration_backfills_and_constrains() {
     .await
     .expect_err("an INSERT without expires_at must violate NOT NULL");
     assert_eq!(
-        not_null_error.as_database_error().unwrap().code().as_deref(),
+        not_null_error
+            .as_database_error()
+            .unwrap()
+            .code()
+            .as_deref(),
         Some("23502")
     );
 
@@ -901,12 +903,13 @@ async fn payment_request_expiry_migration_backfills_and_constrains() {
     .execute(pool)
     .await
     .unwrap();
-    let late: bool =
-        sqlx::query_scalar("SELECT late_settlement FROM bitcoin_observations WHERE invoice_id = $1")
-            .bind(observing)
-            .fetch_one(pool)
-            .await
-            .unwrap();
+    let late: bool = sqlx::query_scalar(
+        "SELECT late_settlement FROM bitcoin_observations WHERE invoice_id = $1",
+    )
+    .bind(observing)
+    .fetch_one(pool)
+    .await
+    .unwrap();
     assert!(!late, "late_settlement must default false");
 
     database.cleanup().await;
