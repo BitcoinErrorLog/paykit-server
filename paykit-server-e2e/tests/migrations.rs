@@ -68,7 +68,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .unwrap();
     assert_eq!(
         applied_versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
     );
 
     let retired_observation_budget_columns: Vec<String> = sqlx::query_scalar(
@@ -559,6 +559,130 @@ async fn enum_like_status_columns_allow_unexpected_text_for_read_time_validation
         .unwrap()
         .get("payment_status");
     assert_eq!(status, "unexpected_corrupt_status");
+
+    database.cleanup().await;
+}
+
+/// Migration 0014 (two-phase activation, §B.11): the `baseline_state` CHECK
+/// is total over the §B.11.1 table, the new columns exist, the outbox status
+/// CHECK admits `prepared`, and the baseline-outpoint kind CHECK admits
+/// `pre_existing` — each verified by acceptance AND by rejection of an
+/// unknown value.
+#[tokio::test]
+async fn two_phase_activation_migration_applies_and_constrains_states() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    run_migrations(pool).await.unwrap();
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(pool, creator_id, b"bundle-2p", b"request-2p").await;
+
+    // Every state in the §B.11.1 table (plus the two pre-existing live
+    // values) is admitted; an unknown state is rejected.
+    for state in [
+        "legacy_unbaselined",
+        "awaiting_baseline",
+        "prepared",
+        "observing",
+        "expired_tail",
+        "expired_final",
+        "void_baseline_failed",
+        "void_prepare_expired",
+        "void_cancelled",
+        "resolved_paid_manually",
+        "resolved_closed",
+        "manual_review",
+    ] {
+        sqlx::query("UPDATE invoices SET baseline_state = $1 WHERE creator_id = $2")
+            .bind(state)
+            .bind(creator_id)
+            .execute(pool)
+            .await
+            .unwrap_or_else(|error| panic!("baseline_state {state} rejected: {error}"));
+    }
+    assert_check_violation(
+        sqlx::query("UPDATE invoices SET baseline_state = 'mystery' WHERE creator_id = $1")
+            .bind(creator_id)
+            .execute(pool)
+            .await,
+    );
+
+    // The new columns exist and accept timestamps.
+    sqlx::query(
+        "UPDATE invoices SET expires_at = NOW(), prepare_expires_at = NOW(), activated_at = NOW()
+         WHERE creator_id = $1",
+    )
+    .bind(creator_id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // The outbox status CHECK admits the full closed set including
+    // 'prepared', and rejects anything else.
+    for status in [
+        "prepared",
+        "queued",
+        "leased",
+        "retryable",
+        "handed_off",
+        "delivered",
+        "permanently_failed",
+    ] {
+        let mut insert = sqlx::query(
+            "INSERT INTO outbox (creator_id, intent_envelope, status, sdk_outbound_message_id)
+             VALUES ($1, $2, $3, $4)",
+        );
+        insert = insert
+            .bind(creator_id)
+            .bind(b"encrypted-intent".as_slice())
+            .bind(status);
+        // Terminal attributable states require an outbound id (0001's
+        // attributable-terminal CHECK); non-terminal states forbid nothing.
+        let result = if matches!(status, "handed_off" | "delivered") {
+            insert.bind(Some("7")).execute(pool).await
+        } else {
+            insert.bind(None::<&str>).execute(pool).await
+        };
+        result.unwrap_or_else(|error| panic!("outbox status {status} rejected: {error}"));
+    }
+    assert_check_violation(
+        sqlx::query(
+            "INSERT INTO outbox (creator_id, intent_envelope, status)
+             VALUES ($1, $2, 'mystery')",
+        )
+        .bind(creator_id)
+        .bind(b"encrypted-intent".as_slice())
+        .execute(pool)
+        .await,
+    );
+
+    // The baseline-outpoint kind CHECK admits 'pre_existing' (§B.4.6) and
+    // rejects an unknown kind.
+    let invoice_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM invoices WHERE creator_id = $1 LIMIT 1")
+            .bind(creator_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    sqlx::query(
+        "INSERT INTO invoice_baseline_outpoints (invoice_id, txid, vout, kind)
+         VALUES ($1, $2, 0, 'pre_existing')",
+    )
+    .bind(invoice_id)
+    .bind("ab".repeat(32))
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_check_violation(
+        sqlx::query(
+            "INSERT INTO invoice_baseline_outpoints (invoice_id, txid, vout, kind)
+             VALUES ($1, $2, 1, 'mystery')",
+        )
+        .bind(invoice_id)
+        .bind("ab".repeat(32))
+        .execute(pool)
+        .await,
+    );
 
     database.cleanup().await;
 }

@@ -109,6 +109,8 @@ async fn invoice_for(
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
             nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
         .await
         .unwrap();
@@ -160,6 +162,8 @@ async fn other_creator_invoice(
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
             nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
         .await
         .unwrap()
@@ -210,6 +214,8 @@ async fn awaiting_invoice(
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
             nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
         .await
         .unwrap()
@@ -232,6 +238,8 @@ async fn awaiting_other_creator_invoice(
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
             nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
         .await
         .unwrap()
@@ -255,6 +263,9 @@ async fn new_1_baseline_unconfirmed_later_confirmed_above_floor_never_binds() {
         .complete_creation_baseline(invoice_id, 100, &[baseline], &[])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(invoice_id, &[], &[]).await.unwrap();
 
     store
         .apply_bitcoin_observation_at_height(
@@ -289,6 +300,9 @@ async fn baseline_input_replacement_never_binds_but_unrelated_input_does() {
         .complete_creation_baseline(blocked_id, 100, &[], &[baseline_input])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(blocked_id, &[], &[]).await.unwrap();
     let blocked = provider_outpoint(203);
     store
         .apply_bitcoin_observation_at_height(
@@ -331,6 +345,9 @@ async fn baseline_input_replacement_never_binds_but_unrelated_input_does() {
         .complete_creation_baseline(allowed_id, 100, &[], &[baseline_input])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(allowed_id, &[], &[]).await.unwrap();
     let allowed = provider_outpoint(204);
     store
         .apply_bitcoin_observation_at_height(
@@ -376,6 +393,9 @@ async fn post_baseline_output_binds_after_one_candidate_fetch_decision() {
         .complete_creation_baseline(invoice_id, 100, &[], &[])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(invoice_id, &[], &[]).await.unwrap();
     let output = provider_outpoint(206);
     for _ in 0..2 {
         store
@@ -410,6 +430,9 @@ async fn output_at_or_below_creation_floor_writes_no_observation() {
         .complete_creation_baseline(invoice_id, 100, &[], &[])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(invoice_id, &[], &[]).await.unwrap();
     store
         .apply_bitcoin_observation_at_height(
             REGTEST_ADDRESS,
@@ -436,6 +459,9 @@ async fn confirmed_height_uses_chain_height_instead_of_confirmation_count() {
         .complete_creation_baseline(invoice_id, 850_000, &[], &[])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(invoice_id, &[], &[]).await.unwrap();
     let below = provider_outpoint(208);
     store
         .apply_bitcoin_observation_at_height(
@@ -487,6 +513,9 @@ async fn overpaying_replacement_inherits_baseline_and_reports_mismatch() {
         .complete_creation_baseline(invoice_id, 100, &[], &[baseline_input])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(invoice_id, &[], &[]).await.unwrap();
     let replacement = provider_outpoint(211);
     store
         .apply_bitcoin_observation_at_height(
@@ -547,6 +576,9 @@ async fn candidate_backoff_skips_a_then_exhaustion_routes_it_to_manual_review() 
         .complete_creation_baseline(invoice_a, 100, &[], &[])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(invoice_a, &[], &[]).await.unwrap();
     let outpoint_a = provider_outpoint(212);
     store
         .apply_bitcoin_observation_at_height(
@@ -587,6 +619,9 @@ async fn candidate_backoff_skips_a_then_exhaustion_routes_it_to_manual_review() 
         .complete_creation_baseline(invoice_b, 100, &[], &[])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(invoice_b, &[], &[]).await.unwrap();
     let outpoint_b = provider_outpoint(213);
     store
         .apply_bitcoin_observation_at_height(
@@ -657,6 +692,9 @@ async fn persistence_failures_never_consume_the_candidate_fetch_retry_budget() {
         .complete_creation_baseline(invoice_id, 100, &[], &[])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(invoice_id, &[], &[]).await.unwrap();
     let outpoint = provider_outpoint(216);
     store
         .apply_bitcoin_observation_at_height(
@@ -735,6 +773,9 @@ async fn oversized_candidate_transaction_moves_to_manual_review_after_one_attemp
         .complete_creation_baseline(invoice_id, 100, &[], &[])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(invoice_id, &[], &[]).await.unwrap();
     let outpoint = provider_outpoint(217);
     store
         .apply_bitcoin_observation_at_height(
@@ -810,6 +851,9 @@ async fn baseline_hash_recomputation_matches_under_a_non_c_database_collation() 
         )
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(invoice_id, &[], &[]).await.unwrap();
 
     // Binding recomputes the baseline-set hash from SQL-ordered rows;
     // under this database's non-C default collation only the explicit
@@ -949,6 +993,9 @@ async fn corrupt_invoice_is_isolated_while_other_observation_commits() {
         .complete_creation_baseline(bad_id, 100, &[], &[])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(bad_id, &[], &[]).await.unwrap();
     let good_id = awaiting_other_creator_invoice(
         &store,
         b"good-integrity-bundle",
@@ -960,6 +1007,9 @@ async fn corrupt_invoice_is_isolated_while_other_observation_commits() {
         .complete_creation_baseline(good_id, 100, &[], &[])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(good_id, &[], &[]).await.unwrap();
     let targets = observation_targets(&store).await;
     sqlx::query("UPDATE invoices SET payment_record_envelope = $1 WHERE id = $2")
         .bind(b"corrupt-v1".as_slice())
@@ -1041,6 +1091,8 @@ async fn batch_invoice(database: &TestDatabase) -> (InvoiceStore, uuid::Uuid) {
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
             nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
         .await
         .unwrap()
@@ -2191,6 +2243,8 @@ async fn observation_plan_orders_oldest_observed_first_and_stamp_rotates_the_pla
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
             nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
         .await
         .unwrap();
@@ -2233,6 +2287,8 @@ async fn a_failed_observation_attempt_rotates_the_plan_without_marking_the_targe
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 100,
             nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
         .await
         .unwrap();
@@ -2347,6 +2403,9 @@ async fn first_bind_candidate_gate_uses_the_exact_required_amount() {
         .complete_creation_baseline(invoice_id, 100, &[], &[])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(invoice_id, &[], &[]).await.unwrap();
 
     // required - 1 is never a first-bind candidate (behaviour unchanged).
     store
@@ -2402,6 +2461,9 @@ async fn first_bind_candidate_gate_uses_the_exact_required_amount() {
         .complete_creation_baseline(overpaid_id, 100, &[], &[])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(overpaid_id, &[], &[]).await.unwrap();
     store
         .apply_bitcoin_observation_at_height(
             "bcrt1q6rz28mcfaxtmdy5rme7l2ae6f4h0d2sgzvv5u0",
@@ -2475,6 +2537,8 @@ async fn invoice_payment_record_seals_nonce_and_nonce_d_total() {
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: price_sats + nonce_sats,
             nonce_sats,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
         .await
         .unwrap()
@@ -2510,6 +2574,8 @@ async fn invoice_payment_record_seals_nonce_and_nonce_d_total() {
                 payment_request_intent: common::payment_intent(&reader()),
                 required_sats: 100,
                 nonce_sats: bad_nonce,
+                prepare_ttl: std::time::Duration::from_secs(900),
+                expires_at: None,
             })
             .await
             .unwrap_err();
@@ -2567,6 +2633,8 @@ async fn replay_by_state_returns_the_same_nonce_total_and_address() {
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 108,
             nonce_sats: 8,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
         .await
         .unwrap();
@@ -2586,6 +2654,8 @@ async fn replay_by_state_returns_the_same_nonce_total_and_address() {
             payment_request_intent: common::payment_intent(&reader()),
             required_sats: 999_999,
             nonce_sats: 999,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
         .await
         .unwrap();
@@ -2707,6 +2777,9 @@ async fn pre_nonce_v2_invoice_binds_exactly_at_its_stored_required_amount() {
         .complete_creation_baseline(awaiting_id, 100, &[], &[])
         .await
         .unwrap();
+    // W1.1c: the baseline now lands in `prepared`; activate (empty tick-1
+    // snapshot) to reach `observing`, the state these tests exercise.
+    store.activate_invoice(awaiting_id, &[], &[]).await.unwrap();
     let row = payment_record_row(&database, awaiting_id).await;
     let plaintext = crypto
         .decrypt(

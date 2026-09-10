@@ -163,6 +163,7 @@ impl ElectrumPort for DeterministicElectrum {
             tip_height: 300,
             baseline_outputs: Vec::new(),
             unconfirmed_inputs: Vec::new(),
+            unconfirmed_outputs: Vec::new(),
         })
     }
 
@@ -539,6 +540,25 @@ fn invoice_request(
         format!(
             r#"{{"bundle_id":"{bundle}","lock_resource":"{}","reader":"{reader}"}}"#,
             fixture.lock_resource
+        ),
+    )
+}
+
+/// §B.11 phase 2: the signed activation of a prepared invoice, echoing the
+/// stack identity and the nonce'd total phase 1 returned.
+fn activate_request(
+    signing_key: &SigningKey,
+    invoice_id: &str,
+    stack_id: &str,
+    total_sats: u64,
+) -> Request<Body> {
+    signed_request(
+        signing_key,
+        Method::POST,
+        &format!("/invoices/{invoice_id}/activate"),
+        // The signed-body middleware requires canonical JSON (sorted keys).
+        format!(
+            r#"{{"activation_attempt":1,"invoice_id":"{invoice_id}","stack_id":"{stack_id}","total_sats":{total_sats}}}"#
         ),
     )
 }
@@ -1055,16 +1075,56 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     );
     assert_eq!(
         invoice_a.status,
-        StatusCode::NO_CONTENT,
+        StatusCode::OK,
         "Creator A invoice body: {}",
         String::from_utf8_lossy(&invoice_a.body)
     );
     assert_eq!(
         invoice_b.status,
-        StatusCode::NO_CONTENT,
+        StatusCode::OK,
         "Creator B invoice body: {}",
         String::from_utf8_lossy(&invoice_b.body)
     );
+    let prepare_a: serde_json::Value = serde_json::from_slice(&invoice_a.body).unwrap();
+    let prepare_b: serde_json::Value = serde_json::from_slice(&invoice_b.body).unwrap();
+    for prepare in [&prepare_a, &prepare_b] {
+        assert_eq!(prepare["state"], "prepared");
+        assert_eq!(
+            prepare["stack_id"],
+            first_initialized.stack_identity.stack_id()
+        );
+    }
+    // Phase 1 publishes nothing: all four outbox rows are 'prepared' and
+    // therefore invisible to the delivery worker (§B.11.5).
+    let prepared_rows: Vec<String> = sqlx::query_scalar("SELECT status FROM outbox ORDER BY id")
+        .fetch_all(&first_pool)
+        .await
+        .unwrap();
+    assert_eq!(prepared_rows.len(), 4);
+    assert!(prepared_rows.iter().all(|status| status == "prepared"));
+    // Phase 2: the signed activation flips each invoice to `observing` and
+    // releases both of its outbox rows in one transaction.
+    let stack_id = first_initialized.stack_identity.stack_id();
+    for prepare in [&prepare_a, &prepare_b] {
+        let activation = send_http(
+            first_address,
+            activate_request(
+                &signing_key,
+                prepare["invoice_id"].as_str().unwrap(),
+                &stack_id,
+                prepare["total_sats"].as_u64().unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            activation.status,
+            StatusCode::OK,
+            "activation body: {}",
+            String::from_utf8_lossy(&activation.body)
+        );
+        let activated: serde_json::Value = serde_json::from_slice(&activation.body).unwrap();
+        assert_eq!(activated["state"], "observing");
+    }
     let totals = assert_persisted_workflow_inputs(
         &first_pool,
         &crypto,
@@ -1155,7 +1215,9 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         .filter(|(_, request)| request.as_str() == "script_get_history cap=50")
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    assert_eq!(creation_starts.len(), 2, "request log: {requests:?}");
+    // Two creation baselines plus two §B.4.6 tick-1 snapshots (one inside
+    // each activation): same bounded request shape, same configured caps.
+    assert_eq!(creation_starts.len(), 4, "request log: {requests:?}");
     for start in creation_starts {
         assert_eq!(requests[start + 1], "script_list_unspent");
         assert_eq!(
@@ -1327,6 +1389,7 @@ impl ElectrumPort for GatedSnapshotElectrum {
             tip_height: 300,
             baseline_outputs: Vec::new(),
             unconfirmed_inputs: Vec::new(),
+            unconfirmed_outputs: Vec::new(),
         })
     }
 
@@ -1492,8 +1555,9 @@ async fn a_creation_cancelled_after_commit_is_in_progress_on_retry_and_voided_by
         .unwrap();
     assert_eq!(queued, 0, "a voided orphan's outbox is never queued");
 
-    // The voided binding is spent: a further retry is a conflict, still
-    // never replay success for an invoice that never published.
+    // The voided binding is spent: §B.11.6 answers a further retry with the
+    // named `invoice_finalized` refusal, still never replay success for an
+    // invoice that never published.
     let after_void = send_http(
         address,
         invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
@@ -1501,7 +1565,7 @@ async fn a_creation_cancelled_after_commit_is_in_progress_on_retry_and_voided_by
     .await;
     assert_eq!(after_void.status, StatusCode::CONFLICT);
     let after_void_body: serde_json::Value = serde_json::from_slice(&after_void.body).unwrap();
-    assert_eq!(after_void_body["error"]["code"], "invoice_conflict");
+    assert_eq!(after_void_body["error"]["code"], "invoice_finalized");
 
     electrum.release.notify_waiters();
     let _ = shutdown_tx.send(());
@@ -1641,7 +1705,7 @@ async fn concurrent_identical_creations_run_exactly_one_baseline_snapshot() {
     let winner = winner.await.unwrap();
     assert_eq!(
         winner.status,
-        StatusCode::NO_CONTENT,
+        StatusCode::OK,
         "winner body: {}",
         String::from_utf8_lossy(&winner.body)
     );
@@ -1668,7 +1732,7 @@ async fn concurrent_identical_creations_run_exactly_one_baseline_snapshot() {
         invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
     )
     .await;
-    assert_eq!(replay.status, StatusCode::NO_CONTENT);
+    assert_eq!(replay.status, StatusCode::OK);
 
     let _ = shutdown_tx.send(());
     running.await.unwrap().unwrap();

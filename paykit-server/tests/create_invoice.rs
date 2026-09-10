@@ -60,6 +60,7 @@ impl ElectrumPort for EmptyBaselineElectrum {
             tip_height: 100,
             baseline_outputs: Vec::new(),
             unconfirmed_inputs: Vec::new(),
+            unconfirmed_outputs: Vec::new(),
         })
     }
 
@@ -96,6 +97,7 @@ impl ElectrumPort for CountingBaselineElectrum {
             tip_height: 100,
             baseline_outputs: Vec::new(),
             unconfirmed_inputs: Vec::new(),
+            unconfirmed_outputs: Vec::new(),
         })
     }
 
@@ -315,6 +317,13 @@ impl InvoicePersistence for FakeStore {
     ) -> Result<(), PersistenceError> {
         self.baseline_completions.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    async fn prepare_view(
+        &self,
+        invoice_id: uuid::Uuid,
+    ) -> Result<Option<paykit_server::persistence::InvoicePhaseView>, PersistenceError> {
+        Ok(fake_phase_view(invoice_id))
     }
 }
 
@@ -558,6 +567,7 @@ impl ElectrumPort for GatedSnapshotElectrum {
                 tip_height: 100,
                 baseline_outputs: Vec::new(),
                 unconfirmed_inputs: Vec::new(),
+                unconfirmed_outputs: Vec::new(),
             })
         })
         .await
@@ -843,7 +853,7 @@ async fn exact_replay_returns_without_validator_or_lock_fetch() {
         .create(request())
         .await
         .unwrap();
-    assert!(result.replayed());
+    assert_eq!(result.state, "prepared");
     assert_eq!(session.calls.load(Ordering::SeqCst), 0);
     assert_eq!(locks.calls.load(Ordering::SeqCst), 0);
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 1);
@@ -930,7 +940,7 @@ async fn disabled_creation_refuses_new_locks_invoice_binds_but_replays_exact_req
         .create(request())
         .await
         .unwrap();
-    assert!(replayed.replayed());
+    assert_eq!(replayed.state, "prepared");
 }
 
 #[tokio::test]
@@ -1194,7 +1204,7 @@ async fn signed_router_parses_canonical_invoice_and_derives_creator_from_lock_re
         .oneshot(signed_invoice_request(&key, body))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(session.creators.lock().unwrap().as_slice(), [CREATOR]);
 }
 
@@ -1285,6 +1295,22 @@ struct CapturingIntentStore {
     captured: Mutex<Vec<DeliveryIntentV1>>,
 }
 
+fn fake_phase_view(invoice_id: uuid::Uuid) -> Option<paykit_server::persistence::InvoicePhaseView> {
+    Some(paykit_server::persistence::InvoicePhaseView {
+        invoice_id,
+        baseline_state: "prepared".into(),
+        nonce_sats: 437,
+        total_sats: 50_437,
+        expires_at: None,
+        prepare_expires_at: Some(time::OffsetDateTime::now_utc()),
+        activated_at: None,
+        updated_at: time::OffsetDateTime::now_utc(),
+        allocation_mode: "shared_manual".into(),
+        derived_address_fingerprint: "3f7a1c9e5b204d86".into(),
+        bitcoin_address: "test-address".into(),
+    })
+}
+
 #[async_trait]
 impl InvoicePersistence for CapturingIntentStore {
     async fn preflight(
@@ -1323,6 +1349,13 @@ impl InvoicePersistence for CapturingIntentStore {
             0,
             false,
         ))
+    }
+
+    async fn prepare_view(
+        &self,
+        invoice_id: uuid::Uuid,
+    ) -> Result<Option<paykit_server::persistence::InvoicePhaseView>, PersistenceError> {
+        Ok(fake_phase_view(invoice_id))
     }
 }
 
@@ -1598,7 +1631,7 @@ async fn three_failed_probes_refuse_then_three_successes_permit_a_first_time_bin
     }
     assert!(runtime.readiness().await.bitcoin_offer_available);
     let created = service.create(request()).await.unwrap();
-    assert!(!created.replayed());
+    assert_eq!(created.state, "prepared");
     assert_eq!(electrum.0.load(Ordering::SeqCst), 2);
 }
 
@@ -1622,7 +1655,7 @@ async fn exact_replay_is_served_while_the_offer_is_hidden() {
     .await
     .unwrap();
     // An exact replay binds nothing new: the gate must not see it.
-    assert!(replayed.replayed());
+    assert_eq!(replayed.state, "prepared");
 }
 
 #[tokio::test]
@@ -1704,7 +1737,7 @@ async fn replayed_create_atomic_returns_the_published_invoice_without_a_second_b
     );
 
     let replayed = service.create(request()).await.unwrap();
-    assert!(replayed.replayed());
+    assert_eq!(replayed.state, "prepared");
     assert_eq!(store.baseline_completions.load(Ordering::SeqCst), 0);
     assert_eq!(store.baseline_failures.load(Ordering::SeqCst), 0);
     assert_eq!(electrum.0.load(Ordering::SeqCst), 0);
@@ -1862,6 +1895,13 @@ impl InvoicePersistence for CapturingAmountsStore {
             0,
             false,
         ))
+    }
+
+    async fn prepare_view(
+        &self,
+        invoice_id: uuid::Uuid,
+    ) -> Result<Option<paykit_server::persistence::InvoicePhaseView>, PersistenceError> {
+        Ok(fake_phase_view(invoice_id))
     }
 }
 

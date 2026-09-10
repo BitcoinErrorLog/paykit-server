@@ -24,7 +24,10 @@ use paykit_server::{
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     domain::locks::{CreatorPubky, parse_bundle_id, parse_creator, parse_reader},
     http::{auth::SignedLocksAuth, payment_requests::payment_requests_router},
-    persistence::{AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, PersistenceError},
+    persistence::{
+        AtomicInvoiceInput, AtomicInvoiceResult, InvoicePhaseView, InvoicePreflight,
+        PersistenceError,
+    },
     workers::observer::{
         CreationSnapshot, ElectrumPort, ObservationReport, ObserverError, RequestLimiter, TipProbe,
     },
@@ -50,6 +53,7 @@ impl ElectrumPort for EmptyBaselineElectrum {
             tip_height: 100,
             baseline_outputs: Vec::new(),
             unconfirmed_inputs: Vec::new(),
+            unconfirmed_outputs: Vec::new(),
         })
     }
 
@@ -113,6 +117,7 @@ impl ElectrumPort for StaleBaselineElectrum {
             tip_height: 96,
             baseline_outputs: Vec::new(),
             unconfirmed_inputs: Vec::new(),
+            unconfirmed_outputs: Vec::new(),
         })
     }
 
@@ -149,6 +154,12 @@ fn request(amount_sats: u64) -> MarketplacePaymentRequest {
         reader: parse_reader(&reader()).unwrap(),
         reference: parse_bundle_id(REFERENCE).unwrap(),
         amount_sats,
+        expires_at: time::OffsetDateTime::parse(
+            "2099-01-01T00:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap(),
+        idempotency_key: format!("{REFERENCE}:1"),
     }
 }
 
@@ -332,6 +343,32 @@ impl InvoicePersistence for CapturingStore {
         self.baseline_failures.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
+
+    async fn prepare_view(
+        &self,
+        invoice_id: uuid::Uuid,
+    ) -> Result<Option<InvoicePhaseView>, PersistenceError> {
+        let (nonce_sats, total_sats) = self
+            .captured
+            .lock()
+            .unwrap()
+            .last()
+            .map(|input| (input.nonce_sats, input.required_sats))
+            .unwrap_or((437, 50_437));
+        Ok(Some(InvoicePhaseView {
+            invoice_id,
+            baseline_state: "prepared".into(),
+            nonce_sats,
+            total_sats,
+            expires_at: None,
+            prepare_expires_at: Some(time::OffsetDateTime::now_utc()),
+            activated_at: None,
+            updated_at: time::OffsetDateTime::now_utc(),
+            allocation_mode: "shared_manual".into(),
+            derived_address_fingerprint: "3f7a1c9e5b204d86".into(),
+            bitcoin_address: "test-address".into(),
+        }))
+    }
 }
 
 fn service(
@@ -397,7 +434,9 @@ async fn persists_exact_terms_bindings_and_derived_address_without_a_lock() {
         .create(request(50_000))
         .await
         .unwrap();
-    assert!(!result.replayed());
+    // §B.11.3: the phase-1 body reports the stored nonce'd total.
+    assert_eq!(result.state, "prepared");
+    assert_eq!(result.total_sats, 50_000 + result.nonce_sats);
 
     let captured = store.captured.lock().unwrap();
     let input = &captured[0];
@@ -412,6 +451,8 @@ async fn persists_exact_terms_bindings_and_derived_address_without_a_lock() {
             "creator": CREATOR,
             "reader": reader(),
             "reference": REFERENCE,
+            "expires_at": "2099-01-01T00:00:00Z",
+            "idempotency_key": format!("{REFERENCE}:1"),
         }))
         .unwrap()
     );
@@ -625,7 +666,7 @@ async fn exact_replay_returns_without_session_validation() {
         .create(request(50_000))
         .await
         .unwrap();
-    assert!(result.replayed());
+    assert_eq!(result.state, "prepared");
     assert_eq!(session.calls.load(Ordering::SeqCst), 0);
     assert_eq!(store.replay_calls.load(Ordering::SeqCst), 1);
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
@@ -788,6 +829,8 @@ fn canonical_body() -> String {
             "creator": CREATOR,
             "reader": reader(),
             "reference": REFERENCE,
+            "expires_at": "2099-01-01T00:00:00Z",
+            "idempotency_key": format!("{REFERENCE}:1"),
         }))
         .unwrap(),
     )
@@ -820,8 +863,8 @@ async fn signed_route_accepts_locks_and_marketplace_keys_and_refuses_others() {
     .layer(Extension(auth));
 
     for (key, expected) in [
-        (&locks_key, StatusCode::NO_CONTENT),
-        (&marketplace_key, StatusCode::NO_CONTENT),
+        (&locks_key, StatusCode::OK),
+        (&marketplace_key, StatusCode::OK),
         (&stranger_key, StatusCode::UNAUTHORIZED),
     ] {
         let response = router
@@ -861,9 +904,9 @@ async fn marketplace_key_list_accepts_every_listed_key_and_refuses_others() {
 
     // The second listed key verifies exactly like the first.
     for (key, expected) in [
-        (&staging_key, StatusCode::NO_CONTENT),
-        (&production_key, StatusCode::NO_CONTENT),
-        (&locks_key, StatusCode::NO_CONTENT),
+        (&staging_key, StatusCode::OK),
+        (&production_key, StatusCode::OK),
+        (&locks_key, StatusCode::OK),
         (&stranger_key, StatusCode::UNAUTHORIZED),
     ] {
         let response = router
@@ -899,7 +942,7 @@ async fn without_a_marketplace_key_only_the_locks_key_is_trusted() {
         .oneshot(signed_request(&locks_key, canonical_body()))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -921,6 +964,8 @@ async fn malformed_identifiers_are_invalid_requests() {
             "creator": CREATOR,
             "reader": reader(),
             "reference": "not-a-reference",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "idempotency_key": "not-a-reference:1",
         }))
         .unwrap(),
     )
@@ -953,7 +998,7 @@ async fn disabled_creation_refuses_new_binds_but_replays_exact_requests() {
             .create(request(50_000))
             .await
             .unwrap();
-    assert!(replayed.replayed());
+    assert_eq!(replayed.state, "prepared");
 }
 
 #[tokio::test]
@@ -1131,7 +1176,7 @@ async fn exact_replay_is_served_while_the_offer_is_hidden() {
         .await
         .unwrap();
     // An exact replay binds nothing new: the gate must not see it.
-    assert!(replayed.replayed());
+    assert_eq!(replayed.state, "prepared");
 }
 
 #[tokio::test]
@@ -1171,7 +1216,7 @@ async fn replayed_create_atomic_returns_the_published_invoice_without_a_second_b
         .create(request(50_000))
         .await
         .unwrap();
-    assert!(replayed.replayed());
+    assert_eq!(replayed.state, "prepared");
     assert_eq!(store.baseline_completions.load(Ordering::SeqCst), 0);
     assert_eq!(store.baseline_failures.load(Ordering::SeqCst), 0);
 }

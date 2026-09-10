@@ -217,6 +217,8 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             payment_request_intent: common::payment_intent(&reader),
             required_sats: 100,
             nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
         .await
         .unwrap();
@@ -700,6 +702,8 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             payment_request_intent: common::payment_intent(&reader),
             required_sats: 100,
             nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
         .await
         .unwrap();

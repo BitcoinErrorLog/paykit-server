@@ -174,6 +174,8 @@ fn input<'a>(
         payment_request_intent: payment_intent(),
         required_sats: 100,
         nonce_sats: 1,
+        prepare_ttl: std::time::Duration::from_secs(900),
+        expires_at: None,
     }
 }
 
@@ -602,8 +604,9 @@ async fn preflight_never_replays_an_unpublished_baseline_row() {
         InvoicePreflight::Conflict
     );
 
-    // The sweeper's void is terminal: the spent binding maps to Conflict,
-    // still never ExactReplay, so the client mints a fresh payment request.
+    // The sweeper's void is terminal: §B.11.6 answers a phase-1 replay
+    // against it with the named `invoice_finalized` refusal, still never
+    // ExactReplay.
     store
         .fail_creation_baseline(created.invoice_id())
         .await
@@ -617,7 +620,7 @@ async fn preflight_never_replays_an_unpublished_baseline_row() {
             )
             .await
             .unwrap(),
-        InvoicePreflight::Conflict
+        InvoicePreflight::InvoiceFinalized
     );
 
     // A published invoice (baseline completed, outbox queued) replays.
@@ -698,8 +701,9 @@ async fn create_atomic_replay_branch_mirrors_preflight_for_every_baseline_state(
     assert!(replay.replayed());
     assert_eq!(replay.invoice_id(), created.invoice_id());
 
-    // A terminally voided binding is spent: Conflict, exactly as preflight
-    // reports it, so the client mints a fresh payment request.
+    // A terminally voided binding is spent: the replay branch mirrors
+    // preflight's named `invoice_finalized` refusal (§B.11.6) under the row
+    // lock.
     let voided = store
         .create_awaiting_baseline(input(
             &creator,
@@ -722,7 +726,7 @@ async fn create_atomic_replay_branch_mirrors_preflight_for_every_baseline_state(
                 b"replay-voided-request",
             ))
             .await,
-        Err(PersistenceError::Conflict)
+        Err(PersistenceError::InvoiceFinalized)
     );
     database.cleanup().await;
 }
@@ -977,6 +981,8 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             payment_request_intent: payment_intent(),
             required_sats: 100,
             nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         }),
         second_store.create_atomic(AtomicInvoiceInput {
             creator: &second_creator,
@@ -987,6 +993,8 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             payment_request_intent: payment_intent(),
             required_sats: 100,
             nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
     );
     let first = first.unwrap();

@@ -353,6 +353,8 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             payment_request_intent: payment_intent(&reader, &marker),
             required_sats: 100,
             nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
         .await
         .unwrap();
@@ -370,6 +372,8 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             payment_request_intent: payment_intent(&reader, &marker),
             required_sats: 200,
             nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
         .await
         .unwrap();
@@ -389,6 +393,8 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             payment_request_intent: payment_intent(&unreachable_reader, &marker),
             required_sats: 300,
             nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: None,
         })
         .await
         .unwrap();
