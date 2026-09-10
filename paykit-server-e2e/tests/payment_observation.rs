@@ -487,19 +487,34 @@ async fn overpaying_replacement_inherits_baseline_and_requires_manual_review() {
         )
         .await
         .unwrap();
-    let candidate = store.pending_candidates().await.unwrap().remove(0);
-    store
-        .resolve_candidate(&candidate, &[baseline_input])
-        .await
-        .unwrap();
 
+    // §B.8.2: an overpay is never a first-bind candidate (the candidate gate
+    // matches the exact nonce'd total). It binds directly as a confirmed
+    // amount mismatch — the marketplace manual-review path — and the
+    // creation baseline is inherited untouched: no candidate rows, no
+    // ineligible markings, baseline_state stays observing.
+    assert!(store.pending_candidates().await.unwrap().is_empty());
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 1, false)
+    );
     let state: String = sqlx::query_scalar("SELECT baseline_state FROM invoices WHERE id = $1")
         .bind(invoice_id)
         .fetch_one(database.pool())
         .await
         .unwrap();
-    assert_eq!(state, "manual_review");
-    assert_invoice_has_no_observation_writes(&database, invoice_id).await;
+    assert_eq!(state, "observing");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM invoice_baseline_outpoints WHERE invoice_id = $1",
+        )
+        .bind(invoice_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        1,
+        "only the original replaced_input baseline row may exist"
+    );
     database.cleanup().await;
 }
 
