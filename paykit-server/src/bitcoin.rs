@@ -114,9 +114,12 @@ impl ObservedOutput {
 
 /// The exact-amount settlement predicate (design §B.8.2): an observed output
 /// settles an invoice only when it pays exactly the required amount. An
-/// overpayment is a mismatch and takes the same manual-review path as an
-/// underpayment; the per-invoice amount nonce is absorbed in the price and
-/// is never refunded on chain.
+/// overpayment is a mismatch: the invoice stays `observing`, and the
+/// marketplace service (marketplace-service `crates/service/src/workers.rs`)
+/// routes the order to its `manual_review` state — paykit-server's own
+/// `baseline_state = 'manual_review'` is a different thing (an unfetchable
+/// baseline). The per-invoice amount nonce is absorbed in the price and is
+/// never refunded on chain.
 pub fn amount_matches(present: bool, observed_sats: u64, required_sats: u64) -> bool {
     present && observed_sats == required_sats
 }

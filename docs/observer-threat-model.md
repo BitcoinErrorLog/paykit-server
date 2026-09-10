@@ -152,8 +152,13 @@ never a transaction fetch — so the request *count* is bounded by the
   (default 5s). The blocking socket read cannot be cancelled, so on
   expiry the wait is abandoned, the scan fails the window
   `claim_scan_unavailable`, the stale connection is dropped and never
-  reused, and the abandoned read exits at latest when
-  `electrum.request_timeout` elapses on the wire.
+  reused, and the abandoned read exits when the socket read returns.
+  That return is not bounded by one `electrum.request_timeout`: the
+  timeout is PER READ, so the true wire bound is retries ×
+  request_timeout + reconnect backoff (client-side retries are pinned
+  at zero in this composition, collapsing the formula) plus, for a
+  drip-feeding endpoint, up to one request_timeout per delivered byte
+  until the `electrum.max_response_bytes` + 1 line cap trips.
 - **Concurrency bound.** At most `electrum.max_concurrent_claim_scans`
   window fetches run at once process-wide (default 2, config-validated
   non-zero, a semaphore owned by the claim adapter); over the bound a
@@ -162,8 +167,11 @@ never a transaction fetch — so the request *count* is bounded by the
   owned by the blocking call it admits, not by the awaiting side: it is
   released only when that call's blocking socket read actually returns.
   A read orphaned past its window deadline therefore keeps its slot
-  occupied until the read ends — bounded at latest by
-  `electrum.request_timeout` on the wire — so the bound holds in live
+  occupied until the read ends — with the true wire bound named above
+  (retries × request_timeout + reconnect backoff, retries pinned at
+  zero here, plus the per-read drip-feed extension to the
+  `electrum.max_response_bytes` + 1 line cap), not by one
+  `electrum.request_timeout` — so the bound holds in live
   blocking threads and sockets, not merely in awaited windows.
 
 **Residual risk:** the request *count* is O(1) per window, but the
@@ -184,8 +192,13 @@ both bounded:
    how long the scan *waits*, but the blocking socket read behind it
    cannot be cancelled: an over-deadline response keeps one
    blocking-pool thread, its socket, and its semaphore permit occupied
-   until the read returns — bounded at latest by
-   `electrum.request_timeout` on the wire, and bounded in count by the
+   until the read returns — not bounded by one
+   `electrum.request_timeout`: the timeout is per socket read, so the
+   true bound is retries × request_timeout + reconnect backoff
+   (client-side retries are pinned at zero in this composition) plus,
+   for a drip-feeding endpoint, up to one request_timeout per delivered
+   byte until the `electrum.max_response_bytes` + 1 line cap trips —
+   and bounded in count by the
    `electrum.max_concurrent_claim_scans` semaphore (the permit outlives
    the abandoned wait by construction) — so the residual is never
    unbounded claim latency and never unbounded blocking-pool growth.

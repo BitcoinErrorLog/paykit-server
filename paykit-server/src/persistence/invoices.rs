@@ -1641,8 +1641,13 @@ impl InvoiceStore {
             return Err(PersistenceError::Conflict);
         }
         // §B.8.2: the match is exact. An overpayment reports confirmed with
-        // amount_matched = false and takes the same manual-review path as an
-        // underpayment; the nonce is absorbed in the price, never refunded.
+        // amount_matched = false; the invoice stays `observing`, and the
+        // marketplace service (marketplace-service
+        // `crates/service/src/workers.rs`) routes the order to its
+        // `manual_review` state — paykit-server's own
+        // `baseline_state = 'manual_review'` is a different thing (an
+        // unfetchable baseline). The nonce is absorbed in the price, never
+        // refunded.
         let amount_matched = crate::bitcoin::amount_matches(present, observed_sats, required);
         let reported_confirmations = if amount_matched {
             incoming_confirmations.min(6)

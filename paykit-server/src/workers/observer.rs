@@ -23,7 +23,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bitcoin::{Address, Network, OutPoint, ScriptBuf, Txid, consensus::deserialize, hex::DisplayHex};
+use bitcoin::{
+    Address, Network, OutPoint, ScriptBuf, Txid, consensus::deserialize, hex::DisplayHex,
+};
 use electrum_client::{
     Batch, ElectrumApi, Error as ElectrumError, ListUnspentRes, Param, ToElectrumScriptHash,
 };
@@ -1619,16 +1621,26 @@ impl ElectrumPort for ElectrumAdapter {
 ///   finish within `claim_scan_window_deadline`. The blocking socket read
 ///   cannot be cancelled, so on expiry the join handle is abandoned: the
 ///   window fails `Unavailable`, the connection is never reused, and the
-///   detached task exits when the socket read returns (bounded at latest
-///   by `electrum.request_timeout` on the wire).
+///   detached task exits when the socket read returns. That return is not
+///   bounded by one `electrum.request_timeout`: the timeout is PER READ,
+///   so the true wire bound is retries × request_timeout + reconnect
+///   backoff (client-side retries are pinned at zero in this composition,
+///   collapsing the formula) plus, for a drip-feeding endpoint, up to one
+///   request_timeout per delivered byte until the
+///   `electrum.max_response_bytes` + 1 line cap trips. Occupancy is
+///   therefore bounded in count by the concurrency permit, not in time by
+///   request_timeout.
 /// - **Concurrency bound.** At most `max_concurrent_claim_scans` window
 ///   fetches run at once across the process; over the bound the window
 ///   fails `Unavailable` immediately (no queueing, no Electrum call).
 ///   The permit is owned by the blocking call itself, not by the awaiting
 ///   side: it is released only when the blocking socket read actually
 ///   returns, so a read orphaned past its window deadline still occupies
-///   its slot (bounded at latest by `electrum.request_timeout` on the
-///   wire) and the bound holds in live blocking threads and sockets.
+///   its slot (with the true wire bound named above: retries ×
+///   request_timeout + reconnect backoff, retries pinned at zero here,
+///   plus the per-read drip-feed extension to the
+///   `electrum.max_response_bytes` + 1 line cap) and the bound holds in
+///   live blocking threads and sockets.
 #[async_trait]
 impl ChainHistoryPort for ElectrumAdapter {
     async fn history_presence_batch(
@@ -1651,10 +1663,15 @@ impl ChainHistoryPort for ElectrumAdapter {
             // when the call returns — never when the awaiting side gives
             // up on the per-window deadline. A window whose socket read
             // outlives its deadline therefore keeps its slot occupied
-            // until the read ends (bounded at latest by the client
-            // `electrum.request_timeout` on the wire), so the semaphore
-            // bounds live blocking threads and sockets, not just awaited
-            // windows.
+            // until the read ends — not bounded by one
+            // `electrum.request_timeout`: the timeout is per read, so the
+            // true wire bound is retries × request_timeout + reconnect
+            // backoff (client-side retries are pinned at zero in this
+            // composition) plus, for a drip-feeding endpoint, up to one
+            // request_timeout per delivered byte until the
+            // `electrum.max_response_bytes` + 1 line cap trips — so the
+            // semaphore bounds live blocking threads and sockets, not
+            // just awaited windows.
             let _permit = permit;
             let client = adapter
                 .raw_client_blocking()
@@ -1699,8 +1716,13 @@ impl ChainHistoryPort for ElectrumAdapter {
         // blocking socket read cannot be cancelled, so on expiry the join
         // handle is abandoned: the scan fails the window Unavailable, the
         // connection is never reused, and the detached task exits when the
-        // socket read returns (bounded at latest by
-        // `electrum.request_timeout` on the wire). The semaphore permit
+        // socket read returns — not bounded by one
+        // `electrum.request_timeout`: the timeout is per read, so the true
+        // wire bound is retries × request_timeout + reconnect backoff
+        // (client-side retries are pinned at zero in this composition)
+        // plus, for a drip-feeding endpoint, up to one request_timeout per
+        // delivered byte until the `electrum.max_response_bytes` + 1 line
+        // cap trips. The semaphore permit
         // moved into the blocking closure above stays held for exactly that
         // long too: the slot frees only when the read actually ends, not
         // when the deadline fires.
