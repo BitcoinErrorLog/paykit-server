@@ -299,8 +299,15 @@ shared endpoint's request rate stays inside the configured sustained
 budget, and `bitcoin_offer_available` never degrades because of
 per-address failures. Payment semantics (outpoint/value/presence,
 the exact `observed_sats == required` match of W1.1b / §B.8.2 —
-overpayment is a mismatch routed to manual review — six-confirmation
-finality) are unchanged.
+overpayment and underpayment are mismatches: the observation is stored
+`confirmed` with `amount_matched = false`, the invoice stays `observing`
+until resolve (§B.9) or expiry (W1.4b), and the marketplace service — not
+paykit-server — routes the order to `manual_review` — six-confirmation
+finality) are unchanged. After such a mismatch, observation of the
+address continues (budgeted per-address `listunspent`, no extra per-tick
+transaction fetch for an already-verified output) until resolve or
+expiry, and `baseline_state = 'manual_review'` is reserved for
+unfetchable/baseline anomalies.
 
 ## Cluster-single observer
 

@@ -99,8 +99,14 @@ struct InvoicePaymentRecordV3 {
 /// so their exact-amount predicate runs against their stored required
 /// amount. That is a behaviour change for exactly one in-flight case: a
 /// version-2 overpayment at fewer than six confirmations, which had
-/// `amount_matched = true` under the old `>=` predicate, flips to false and
-/// takes the `manual_review` path — seller-recoverable, not stranded.
+/// `amount_matched = true` under the old `>=` predicate, flips to false.
+/// The invoice stays `observing`, the observation is stored `confirmed`
+/// with `amount_matched = false`, and the status endpoint reports that
+/// flag; the marketplace service routes the order to its own
+/// `manual_review` state (design §B.8.2, `workers.rs:827-859`). This is
+/// not paykit-server's `baseline_state = 'manual_review'`, which marks
+/// unfetchable-transaction and baseline anomalies. Seller-recoverable,
+/// not stranded.
 /// Finalized version-2 rows are frozen by the finalization guard (six
 /// confirmations and `amount_matched` short-circuit before the predicate is
 /// re-evaluated) and never flip.

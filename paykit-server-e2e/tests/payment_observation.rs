@@ -460,7 +460,7 @@ async fn confirmed_height_uses_chain_height_instead_of_confirmation_count() {
 }
 
 #[tokio::test]
-async fn overpaying_replacement_inherits_baseline_and_requires_manual_review() {
+async fn overpaying_replacement_inherits_baseline_and_reports_mismatch() {
     let database = TestDatabase::create().await;
     let store = store(&database).await;
     let invoice_id = awaiting_invoice(
@@ -503,6 +503,8 @@ async fn overpaying_replacement_inherits_baseline_and_requires_manual_review() {
         .fetch_one(database.pool())
         .await
         .unwrap();
+    // Correct per §B.9: the invoice stays observing; the marketplace
+    // routes the order to manual_review.
     assert_eq!(state, "observing");
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
