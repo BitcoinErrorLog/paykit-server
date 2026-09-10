@@ -527,6 +527,21 @@ fn signed_request(
         .unwrap()
 }
 
+/// §B.9: prepare calls on `/invoices` must carry an `expires_at` within
+/// `max_request_expiry` (default 24 h) of the server clock. The value is
+/// stable per test process because it rides in the exact-replay binding:
+/// two calls that must replay byte-identically share one timestamp.
+fn expires_at() -> String {
+    static VALUE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VALUE
+        .get_or_init(|| {
+            (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        })
+        .clone()
+}
+
 fn invoice_request(
     signing_key: &SigningKey,
     fixture: &CreatorFixture,
@@ -538,7 +553,8 @@ fn invoice_request(
         Method::POST,
         "/invoices",
         format!(
-            r#"{{"bundle_id":"{bundle}","lock_resource":"{}","reader":"{reader}"}}"#,
+            r#"{{"bundle_id":"{bundle}","expires_at":"{}","lock_resource":"{}","reader":"{reader}"}}"#,
+            expires_at(),
             fixture.lock_resource
         ),
     )
@@ -702,7 +718,8 @@ async fn wait_for_completion(
                 == serde_json::json!({
                     "status": "confirmed",
                     "confirmations": 6,
-                    "amount_matched": true
+                    "amount_matched": true,
+                    "late_settlement": false
                 });
         }
         if delivered == 4 && statuses_confirmed {
@@ -959,7 +976,7 @@ async fn assert_persisted_workflow_inputs(
                         .is_ok_and(|reference| reference.get_version_num() == 4
                             && reference.get_variant() == uuid::Variant::RFC4122
                             && terms.payment_reference == reference.hyphenated().to_string())
-                    && terms.proposal_expires_at.is_none()
+                    && terms.proposal_expires_at.is_some()
                     && terms.accepted_endpoint_identifiers == ["btc-testnet-p2wpkh"]
                     && terms.metadata.get("bundle_id") == Some(&serde_json::json!(bundle))
                     && terms.metadata.get("lock_resource")

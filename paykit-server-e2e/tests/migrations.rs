@@ -68,7 +68,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .unwrap();
     assert_eq!(
         applied_versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
     );
 
     let retired_observation_budget_columns: Vec<String> = sqlx::query_scalar(
@@ -578,7 +578,10 @@ async fn two_phase_activation_migration_applies_and_constrains_states() {
     insert_invoice(pool, creator_id, b"bundle-2p", b"request-2p").await;
 
     // Every state in the §B.11.1 table (plus the two pre-existing live
-    // values) is admitted; an unknown state is rejected.
+    // values) is admitted; an unknown state is rejected. The 0015
+    // resolution CHECKs tie the resolved states to their resolution
+    // columns, so those two rows set the pair and every other state
+    // clears it.
     for state in [
         "legacy_unbaselined",
         "awaiting_baseline",
@@ -593,12 +596,25 @@ async fn two_phase_activation_migration_applies_and_constrains_states() {
         "resolved_closed",
         "manual_review",
     ] {
-        sqlx::query("UPDATE invoices SET baseline_state = $1 WHERE creator_id = $2")
-            .bind(state)
-            .bind(creator_id)
-            .execute(pool)
-            .await
-            .unwrap_or_else(|error| panic!("baseline_state {state} rejected: {error}"));
+        match state {
+            "resolved_paid_manually" => sqlx::query(
+                "UPDATE invoices SET baseline_state = $1, resolution = 'paid_manually',
+                 resolved_at = NOW() WHERE creator_id = $2",
+            ),
+            "resolved_closed" => sqlx::query(
+                "UPDATE invoices SET baseline_state = $1, resolution = 'refunded',
+                 resolved_at = NOW() WHERE creator_id = $2",
+            ),
+            _ => sqlx::query(
+                "UPDATE invoices SET baseline_state = $1, resolution = NULL,
+                 resolved_at = NULL WHERE creator_id = $2",
+            ),
+        }
+        .bind(state)
+        .bind(creator_id)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|error| panic!("baseline_state {state} rejected: {error}"));
     }
     assert_check_violation(
         sqlx::query("UPDATE invoices SET baseline_state = 'mystery' WHERE creator_id = $1")
@@ -687,6 +703,215 @@ async fn two_phase_activation_migration_applies_and_constrains_states() {
     database.cleanup().await;
 }
 
+/// Migration 0015 (§B.9 expiry/resolve): legacy NULL `expires_at` rows are
+/// backfilled to `created_at + 24 hours` and the column closes to NOT NULL;
+/// the resolution CHECKs reject every invalid combination (23514);
+/// `bitcoin_observations.late_settlement` defaults false.
+#[tokio::test]
+async fn payment_request_expiry_migration_backfills_and_constrains() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    for migration in [
+        include_str!("../../paykit-server/migrations/0001_initial.sql"),
+        include_str!("../../paykit-server/migrations/0002_deployment_stack_role.sql"),
+        include_str!("../../paykit-server/migrations/0003_invoice_observation_budget.sql"),
+        include_str!("../../paykit-server/migrations/0004_observation_request_count.sql"),
+        include_str!("../../paykit-server/migrations/0005_observation_overrun.sql"),
+        include_str!("../../paykit-server/migrations/0006_drop_observation_budget_columns.sql"),
+        include_str!("../../paykit-server/migrations/0007_invoice_observation_attempts.sql"),
+        include_str!("../../paykit-server/migrations/0008_invoice_creation_baseline.sql"),
+        include_str!("../../paykit-server/migrations/0009_observation_failure_isolation.sql"),
+        include_str!("../../paykit-server/migrations/0010_invoice_amount_nonce.sql"),
+        include_str!("../../paykit-server/migrations/0011_stack_identity.sql"),
+        include_str!("../../paykit-server/migrations/0012_claimed_key_fingerprints.sql"),
+        include_str!("../../paykit-server/migrations/0013_creator_allocation_mode.sql"),
+        include_str!("../../paykit-server/migrations/0014_two_phase_activation.sql"),
+    ] {
+        sqlx::raw_sql(migration).execute(pool).await.unwrap();
+    }
+    let creator_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO creators (creator_lookup_hash, credential_envelope, first_child_index)
+         VALUES ($1, $2, 0) RETURNING id",
+    )
+    .bind(b"expiry-legacy-creator".as_slice())
+    .bind(b"expiry-legacy-credential".as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    // Legacy rows as the Locks /invoices path wrote them between 0014 and
+    // 0015: `expires_at` NULL. One `observing`, one `prepared`, plus one
+    // row that already carries an expiry and must be left untouched.
+    let insert_legacy = |state: &str, expires: bool| {
+        let pool = pool.clone();
+        let state = state.to_owned();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO invoices
+                 (creator_id, reader_lookup_hash, bundle_lookup_hash,
+                  payment_request_lookup_hash, invoice_envelope, payment_record_envelope,
+                  bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status,
+                  baseline_state, expires_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'undetected', $9,
+                         CASE WHEN $10 THEN NOW() + INTERVAL '3 hours' ELSE NULL END)
+                 RETURNING id",
+            )
+            .bind(creator_id)
+            .bind(format!("legacy-reader-{state}").into_bytes())
+            .bind(format!("legacy-bundle-{state}-{expires}").into_bytes())
+            .bind(format!("legacy-request-{state}-{expires}").into_bytes())
+            .bind(b"legacy-invoice".as_slice())
+            .bind(b"legacy-payment-record".as_slice())
+            .bind(Uuid::new_v4().as_bytes().as_slice())
+            .bind(Uuid::new_v4().as_bytes().as_slice())
+            .bind(state)
+            .bind(expires)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let observing = insert_legacy("observing", false).await;
+    let prepared = insert_legacy("prepared", false).await;
+    let already_set = insert_legacy("observing", true).await;
+    let nilled: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM invoices WHERE expires_at IS NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(nilled, 2, "two legacy NULL-expiry rows staged");
+
+    sqlx::raw_sql(include_str!(
+        "../../paykit-server/migrations/0015_payment_request_expiry.sql"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // The backfill count this migration saw: exactly the two staged NULL
+    // rows, each now `created_at + 24 hours`; the pre-set row is untouched.
+    let backfilled: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM invoices
+         WHERE expires_at = created_at + INTERVAL '24 hours'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(backfilled, 2, "legacy backfill count seen by 0015");
+    let untouched: bool = sqlx::query_scalar(
+        "SELECT expires_at <> created_at + INTERVAL '24 hours' FROM invoices WHERE id = $1",
+    )
+    .bind(already_set)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(untouched, "a pre-set expires_at must survive the backfill");
+    for id in [observing, prepared] {
+        let state: String = sqlx::query_scalar(
+            "SELECT baseline_state FROM invoices WHERE id = $1 AND expires_at IS NOT NULL",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert!(!state.is_empty());
+    }
+    // NOT NULL is closed.
+    let not_null_error = sqlx::query(
+        "INSERT INTO invoices
+         (creator_id, reader_lookup_hash, bundle_lookup_hash,
+          payment_request_lookup_hash, invoice_envelope, payment_record_envelope,
+          bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'undetected')",
+    )
+    .bind(creator_id)
+    .bind(b"null-expiry-reader".as_slice())
+    .bind(b"null-expiry-bundle".as_slice())
+    .bind(b"null-expiry-request".as_slice())
+    .bind(b"legacy-invoice".as_slice())
+    .bind(b"legacy-payment-record".as_slice())
+    .bind(Uuid::new_v4().as_bytes().as_slice())
+    .bind(Uuid::new_v4().as_bytes().as_slice())
+    .execute(pool)
+    .await
+    .expect_err("an INSERT without expires_at must violate NOT NULL");
+    assert_eq!(
+        not_null_error.as_database_error().unwrap().code().as_deref(),
+        Some("23502")
+    );
+
+    // Every invalid resolution combination is a CHECK violation (23514).
+    for (resolution, resolved_at, state) in [
+        // Unknown resolution text.
+        (Some("'bogus'"), Some("NOW()"), "observing"),
+        // The pair must be both-NULL or both-set.
+        (Some("'paid_manually'"), None, "observing"),
+        (None, Some("NOW()"), "observing"),
+        // The resolved states require their matching resolution.
+        (Some("'refunded'"), Some("NOW()"), "resolved_paid_manually"),
+        (Some("'paid_manually'"), Some("NOW()"), "resolved_closed"),
+        (None, None, "resolved_paid_manually"),
+        (None, None, "resolved_closed"),
+    ] {
+        let statement = format!(
+            "UPDATE invoices SET baseline_state = '{state}',
+             resolution = {}, resolved_at = {} WHERE id = $1",
+            resolution.unwrap_or("NULL"),
+            resolved_at.unwrap_or("NULL"),
+        );
+        assert_check_violation(sqlx::query(&statement).bind(observing).execute(pool).await);
+    }
+    // The valid combinations are admitted: metadata-only on expired_final
+    // and the two resolved states with their matching resolutions.
+    for (resolution, state) in [
+        ("'paid_manually'", "expired_final"),
+        ("'paid_manually'", "resolved_paid_manually"),
+        ("'refunded'", "resolved_closed"),
+        ("'abandoned'", "resolved_closed"),
+    ] {
+        sqlx::query(&format!(
+            "UPDATE invoices SET baseline_state = '{state}',
+             resolution = {resolution}, resolved_at = NOW() WHERE id = $1"
+        ))
+        .bind(observing)
+        .execute(pool)
+        .await
+        .unwrap_or_else(|error| panic!("{state}/{resolution} rejected: {error}"));
+        sqlx::query(
+            "UPDATE invoices SET baseline_state = 'observing',
+             resolution = NULL, resolved_at = NULL WHERE id = $1",
+        )
+        .bind(observing)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // `late_settlement` defaults false on observation rows.
+    sqlx::query(
+        "INSERT INTO bitcoin_observations
+         (invoice_id, observation_envelope, outpoint_lookup_hash, active,
+          confirmations, present)
+         VALUES ($1, $2, $3, TRUE, 0, TRUE)",
+    )
+    .bind(observing)
+    .bind(b"legacy-observation".as_slice())
+    .bind(Uuid::new_v4().as_bytes().as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+    let late: bool =
+        sqlx::query_scalar("SELECT late_settlement FROM bitcoin_observations WHERE invoice_id = $1")
+            .bind(observing)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(!late, "late_settlement must default false");
+
+    database.cleanup().await;
+}
+
 async fn insert_creator(pool: &PgPool) -> Uuid {
     sqlx::query_scalar(
         "INSERT INTO creators (creator_lookup_hash, credential_envelope, first_child_index) VALUES ($1, $2, 0) RETURNING id",
@@ -726,8 +951,8 @@ async fn insert_invoice_result_with_reader(
         "INSERT INTO invoices \
          (creator_id, reader_lookup_hash, bundle_lookup_hash, payment_request_lookup_hash, \
           invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash,
-          derivation_index_lookup_hash, payment_status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+          derivation_index_lookup_hash, payment_status, expires_at) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW() + INTERVAL '1 hour')",
     )
     .bind(creator_id)
     .bind(reader_hash)

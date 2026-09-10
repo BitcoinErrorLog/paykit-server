@@ -110,7 +110,7 @@ async fn invoice_for(
             required_sats: 100,
             nonce_sats: 1,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();
@@ -163,7 +163,7 @@ async fn other_creator_invoice(
             required_sats: 100,
             nonce_sats: 1,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap()
@@ -215,7 +215,7 @@ async fn awaiting_invoice(
             required_sats: 100,
             nonce_sats: 1,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap()
@@ -239,7 +239,7 @@ async fn awaiting_other_creator_invoice(
             required_sats: 100,
             nonce_sats: 1,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap()
@@ -1092,7 +1092,7 @@ async fn batch_invoice(database: &TestDatabase) -> (InvoiceStore, uuid::Uuid) {
             required_sats: 100,
             nonce_sats: 1,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap()
@@ -2244,7 +2244,7 @@ async fn observation_plan_orders_oldest_observed_first_and_stamp_rotates_the_pla
             required_sats: 100,
             nonce_sats: 1,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();
@@ -2288,7 +2288,7 @@ async fn a_failed_observation_attempt_rotates_the_plan_without_marking_the_targe
             required_sats: 100,
             nonce_sats: 1,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();
@@ -2538,7 +2538,7 @@ async fn invoice_payment_record_seals_nonce_and_nonce_d_total() {
             required_sats: price_sats + nonce_sats,
             nonce_sats,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap()
@@ -2575,7 +2575,7 @@ async fn invoice_payment_record_seals_nonce_and_nonce_d_total() {
                 required_sats: 100,
                 nonce_sats: bad_nonce,
                 prepare_ttl: std::time::Duration::from_secs(900),
-                expires_at: None,
+                expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
             })
             .await
             .unwrap_err();
@@ -2634,7 +2634,7 @@ async fn replay_by_state_returns_the_same_nonce_total_and_address() {
             required_sats: 108,
             nonce_sats: 8,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();
@@ -2655,7 +2655,7 @@ async fn replay_by_state_returns_the_same_nonce_total_and_address() {
             required_sats: 999_999,
             nonce_sats: 999,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();

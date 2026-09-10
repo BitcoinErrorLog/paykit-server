@@ -96,7 +96,19 @@ const REFERENCE_A: &str = "000G40R40M30E209185GR38E1W";
 const REFERENCE_B: &str = "000G40R40M30E209185GR38E2W";
 const REFERENCE_C: &str = "000G40R40M30E209185GR38E3W";
 const BUNDLE_LOCKS: &str = "000G40R40M30E209185GR38E4W";
-const EXPIRES_AT: &str = "2030-01-01T00:00:00Z";
+/// §B.9: prepare calls must carry an `expires_at` within
+/// `max_request_expiry` (default 24 h) of the server clock. One value per
+/// test process is enough: every assertion compares against what was sent.
+fn expires_at() -> &'static str {
+    static VALUE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VALUE
+        .get_or_init(|| {
+            (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        })
+        .as_str()
+}
 static PUBKY_TESTNET_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Electrum fake: a fundable UTXO map for observations, plus a scriptable
@@ -535,7 +547,7 @@ fn payment_request_body(creator: &CreatorPubky, reader: &ReaderPubky, reference:
         "creator": creator.to_string(),
         "reader": reader.to_string(),
         "reference": reference,
-        "expires_at": EXPIRES_AT,
+        "expires_at": expires_at(),
         "idempotency_key": format!("{reference}:1"),
     }))
     .unwrap()
@@ -547,6 +559,7 @@ fn payment_request_body(creator: &CreatorPubky, reader: &ReaderPubky, reference:
 fn locks_invoice_body(fixture: &CreatorFixture, reader: &ReaderPubky, bundle: &str) -> String {
     serde_json_canonicalizer::to_vec(&serde_json::json!({
         "bundle_id": bundle,
+        "expires_at": expires_at(),
         "lock_resource": fixture.lock_resource,
         "reader": reader.to_string(),
     }))
@@ -718,7 +731,7 @@ fn assert_b11_prepare_body(body: &serde_json::Value, stack_id: &str, amount_sats
     let nonce = body["nonce_sats"].as_u64().unwrap();
     assert!((1..=999).contains(&nonce), "nonce {nonce} outside [1, 999]");
     assert_eq!(body["total_sats"].as_u64().unwrap(), amount_sats + nonce);
-    assert_eq!(body["expires_at"], EXPIRES_AT);
+    assert_eq!(body["expires_at"], expires_at());
     assert!(
         body["prepare_expires_at"].as_str().is_some(),
         "prepare_expires_at must be set: {body}"
@@ -759,9 +772,9 @@ async fn prepare_returns_the_b11_body_and_zero_claims_on_both_entrypoints() {
     // And the invoice is not an observation target while prepared.
     assert!(stack.store.observation_plan().await.unwrap().is_empty());
 
-    // Locks entrypoint: same body shape (expires_at is null until the §B.9
-    // expiry edges land for this path), same prepared landing, same
-    // zero-claims.
+    // Locks entrypoint: same body shape (§B.9: `expires_at` is required
+    // here exactly as on the marketplace entrypoint and echoes what was
+    // sent), same prepared landing, same zero-claims.
     let locks_response = post(
         &stack,
         "/invoices",
@@ -783,7 +796,7 @@ async fn prepare_returns_the_b11_body_and_zero_claims_on_both_entrypoints() {
         locks_body["total_sats"].as_u64().unwrap(),
         50_000 + locks_nonce
     );
-    assert!(locks_body["expires_at"].is_null());
+    assert_eq!(locks_body["expires_at"], expires_at());
     let locks_invoice_id = locks_body["invoice_id"].as_str().unwrap().to_owned();
     assert_eq!(
         baseline_state(&stack.pool, &locks_invoice_id).await,
@@ -986,7 +999,7 @@ async fn activate_flips_persists_the_tick1_snapshot_and_replays_without_writes()
     assert_eq!(activated["state"], "observing");
     assert_eq!(activated["invoice_id"], invoice_id);
     assert_eq!(activated["total_sats"], total_sats);
-    assert_eq!(activated["expires_at"], EXPIRES_AT);
+    assert_eq!(activated["expires_at"], expires_at());
     assert!(activated["activated_at"].as_str().is_some());
 
     assert_eq!(baseline_state(&stack.pool, &invoice_id).await, "observing");
@@ -1200,12 +1213,28 @@ async fn drive_to_state(stack: &BootedStack, invoice_id: &str, total_sats: u64, 
 }
 
 async fn set_baseline_state(stack: &BootedStack, invoice_id: &str, state: &str) {
-    sqlx::query("UPDATE invoices SET baseline_state = $1 WHERE id = $2")
-        .bind(state)
-        .bind(uuid::Uuid::parse_str(invoice_id).unwrap())
-        .execute(&stack.pool)
-        .await
-        .unwrap();
+    // The 0015 resolution CHECKs tie the resolved states to their
+    // resolution columns: driving a row into one sets the matching pair,
+    // and driving it anywhere else clears both.
+    match state {
+        "resolved_paid_manually" => sqlx::query(
+            "UPDATE invoices SET baseline_state = $1, resolution = 'paid_manually',
+             resolved_at = NOW() WHERE id = $2",
+        ),
+        "resolved_closed" => sqlx::query(
+            "UPDATE invoices SET baseline_state = $1, resolution = 'abandoned',
+             resolved_at = NOW() WHERE id = $2",
+        ),
+        _ => sqlx::query(
+            "UPDATE invoices SET baseline_state = $1, resolution = NULL,
+             resolved_at = NULL WHERE id = $2",
+        ),
+    }
+    .bind(state)
+    .bind(uuid::Uuid::parse_str(invoice_id).unwrap())
+    .execute(&stack.pool)
+    .await
+    .unwrap();
 }
 
 /// void and activate across the TOTAL §B.11.1 state set: the named result
@@ -1545,7 +1574,7 @@ async fn reaper_voids_expired_prepares_and_nothing_else() {
             required_sats: 101,
             nonce_sats: 1,
             prepare_ttl: Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         }
     }
 
@@ -1910,7 +1939,7 @@ impl ReplayFixture {
             reference: parse_bundle_id(reference).unwrap(),
             amount_sats: 50_000,
             expires_at: time::OffsetDateTime::parse(
-                EXPIRES_AT,
+                expires_at(),
                 &time::format_description::well_known::Rfc3339,
             )
             .unwrap(),

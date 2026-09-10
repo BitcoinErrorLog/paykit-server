@@ -175,7 +175,7 @@ fn input<'a>(
         required_sats: 100,
         nonce_sats: 1,
         prepare_ttl: std::time::Duration::from_secs(900),
-        expires_at: None,
+        expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
     }
 }
 
@@ -982,7 +982,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             required_sats: 100,
             nonce_sats: 1,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         }),
         second_store.create_atomic(AtomicInvoiceInput {
             creator: &second_creator,
@@ -994,7 +994,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             required_sats: 100,
             nonce_sats: 1,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
     );
     let first = first.unwrap();

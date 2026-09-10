@@ -354,7 +354,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             required_sats: 100,
             nonce_sats: 1,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();
@@ -373,7 +373,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             required_sats: 200,
             nonce_sats: 1,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();
@@ -394,7 +394,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             required_sats: 300,
             nonce_sats: 1,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();

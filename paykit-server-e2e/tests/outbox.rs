@@ -218,7 +218,7 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             required_sats: 100,
             nonce_sats: 1,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();
@@ -703,7 +703,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             required_sats: 100,
             nonce_sats: 1,
             prepare_ttl: std::time::Duration::from_secs(900),
-            expires_at: None,
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();
