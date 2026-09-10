@@ -258,4 +258,17 @@ pub enum PersistenceError {
     /// The caller must not run a second baseline for the same invoice.
     #[error("invoice creation baseline is still resolving")]
     BaselineInProgress,
+    /// The invoice reached a final state that admits neither activation nor
+    /// a replayed prepare: `void_baseline_failed`, `void_cancelled`, or
+    /// `expired_final` (design §B.11.6 — reported as `invoice_finalized`).
+    /// On `void`, a published invoice (`observing` / `expired_tail`) is the
+    /// same refusal: a published request must expire through the tail rather
+    /// than vanish.
+    #[error("invoice is finalized")]
+    InvoiceFinalized,
+    /// The invoice was reaped at `prepare_expires_at` without activation
+    /// (design §B.11.1) or a prepare replay arrived after that reap
+    /// (§B.11.6 — reported as `prepare_expired`).
+    #[error("invoice prepare window expired")]
+    PrepareExpired,
 }

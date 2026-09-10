@@ -128,6 +128,12 @@ pub struct CreationSnapshot {
     pub tip_height: u32,
     pub baseline_outputs: Vec<OutPoint>,
     pub unconfirmed_inputs: Vec<OutPoint>,
+    /// The subset of `baseline_outputs` paying the address with zero
+    /// confirmations at snapshot time. The creation baseline ignores this
+    /// distinction (every output becomes a baseline `'output'`); the §B.4.6
+    /// tick-1 snapshot inside activation classifies exactly these as
+    /// `pre_existing`.
+    pub unconfirmed_outputs: Vec<OutPoint>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -287,6 +293,11 @@ pub trait ObservationBackend: Send + Sync {
     ) -> Result<u64, ObserverError> {
         Ok(0)
     }
+    /// The §B.11.1 prepare reaper: one query per tick voiding every
+    /// `prepared` invoice whose `prepare_expires_at` has elapsed.
+    async fn reap_expired_prepares(&self) -> Result<u64, ObserverError> {
+        Ok(0)
+    }
 }
 
 #[async_trait]
@@ -355,6 +366,12 @@ impl ObservationBackend for InvoiceStore {
         timeout: Duration,
     ) -> Result<u64, ObserverError> {
         InvoiceStore::sweep_stale_creation_baselines(self, timeout)
+            .await
+            .map_err(map_persistence)
+    }
+
+    async fn reap_expired_prepares(&self) -> Result<u64, ObserverError> {
+        InvoiceStore::reap_expired_prepares(self)
             .await
             .map_err(map_persistence)
     }
@@ -915,6 +932,11 @@ pub async fn observe_tick(
     {
         return ObserverTickOutcome::ObservationFailed(error);
     }
+    // §B.11.1: one reaper query per tick. A reaped prepare is final and
+    // never enters the plan this tick or any later one.
+    if let Err(error) = backend.reap_expired_prepares().await {
+        return ObserverTickOutcome::ObservationFailed(error);
+    }
     let tip = match port.probe().await {
         Ok(tip) => {
             runtime.record_electrum_probe(ElectrumProbe::success(tip.height, tip.time_unix));
@@ -1414,16 +1436,18 @@ impl ElectrumPort for ElectrumAdapter {
             let unspent = client
                 .script_list_unspent(address.script_pubkey().as_script())
                 .map_err(map_electrum)?;
-            let mut baseline_outputs = unspent
-                .into_iter()
-                .map(|item| {
-                    Ok(OutPoint::new(
-                        item.tx_hash,
-                        u32::try_from(item.tx_pos)
-                            .map_err(|_| ObserverError::InvalidObservation)?,
-                    ))
-                })
-                .collect::<Result<Vec<_>, ObserverError>>()?;
+            let mut baseline_outputs = Vec::with_capacity(unspent.len());
+            let mut unconfirmed_outputs = Vec::new();
+            for item in unspent {
+                let outpoint = OutPoint::new(
+                    item.tx_hash,
+                    u32::try_from(item.tx_pos).map_err(|_| ObserverError::InvalidObservation)?,
+                );
+                if item.height == 0 {
+                    unconfirmed_outputs.push(outpoint);
+                }
+                baseline_outputs.push(outpoint);
+            }
             let mut unconfirmed_inputs = Vec::new();
             for entry in history.into_iter().filter(|entry| entry.height <= 0) {
                 request_limiter
@@ -1442,12 +1466,15 @@ impl ElectrumPort for ElectrumAdapter {
             baseline_outputs.dedup();
             unconfirmed_inputs.sort_unstable();
             unconfirmed_inputs.dedup();
+            unconfirmed_outputs.sort_unstable();
+            unconfirmed_outputs.dedup();
             let notification = client.block_headers_subscribe().map_err(map_electrum)?;
             Ok(CreationSnapshot {
                 tip_height: u32::try_from(notification.height)
                     .map_err(|_| ObserverError::InvalidObservation)?,
                 baseline_outputs,
                 unconfirmed_inputs,
+                unconfirmed_outputs,
             })
         })
         .await

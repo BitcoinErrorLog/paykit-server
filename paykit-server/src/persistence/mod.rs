@@ -14,9 +14,9 @@ pub use creators::{
 pub use deployment::{DeploymentStore, PersistenceError, StackIdentity};
 pub(crate) use invoices::BitcoinObservationInput;
 pub use invoices::{
-    AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, InvoiceStore,
-    NewReaderPayloadFactory, NewReaderPayloads, OBSERVER_LEADERSHIP_LOCK_KEY, PendingCandidate,
-    PgObserverLeadership,
+    ActivationWrite, AtomicInvoiceInput, AtomicInvoiceResult, InvoicePhaseView, InvoicePreflight,
+    InvoiceStore, NewReaderPayloadFactory, NewReaderPayloads, OBSERVER_LEADERSHIP_LOCK_KEY,
+    PendingCandidate, PgObserverLeadership, VoidWrite,
 };
 pub use migrations::{MIGRATION_ADVISORY_LOCK_KEY, MigrationLock, run_migrations};
 pub use outbox::{ClaimedHandoff, ClaimedOutbox, HandoffResult, OutboxRetryClass, OutboxStore};
