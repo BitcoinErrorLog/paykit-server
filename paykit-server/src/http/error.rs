@@ -21,6 +21,11 @@ pub enum ApiError {
     LockNotFound,
     BitcoinCreationDisabled,
     BitcoinOfferUnavailable,
+    PrepareExpired,
+    InvoiceFinalized,
+    ActivationTotalMismatch,
+    UnknownInvoice,
+    StackIdentityMismatch,
 }
 
 #[derive(Serialize)]
@@ -106,6 +111,33 @@ impl ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "bitcoin_offer_unavailable",
                 "bitcoin offer is temporarily unavailable; retry later",
+            ),
+            // §B.11.3's named two-phase errors, with distinct codes so the
+            // marketplace can branch without string-matching prose.
+            Self::PrepareExpired => (
+                StatusCode::CONFLICT,
+                "prepare_expired",
+                "invoice prepare window expired without activation",
+            ),
+            Self::InvoiceFinalized => (
+                StatusCode::CONFLICT,
+                "invoice_finalized",
+                "invoice is finalized",
+            ),
+            Self::ActivationTotalMismatch => (
+                StatusCode::CONFLICT,
+                "activation_total_mismatch",
+                "echoed total does not match the stored invoice total",
+            ),
+            Self::UnknownInvoice => (
+                StatusCode::NOT_FOUND,
+                "unknown_invoice",
+                "no such invoice on this stack",
+            ),
+            Self::StackIdentityMismatch => (
+                StatusCode::CONFLICT,
+                "stack_identity_mismatch",
+                "echoed stack_id is not this stack's identity",
             ),
         }
     }

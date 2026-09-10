@@ -231,7 +231,9 @@ impl Server {
                 electrum_request_limiter.clone(),
                 creation_snapshot_slots.clone(),
             )
-            .with_offer_availability(runtime.clone()),
+            .with_offer_availability(runtime.clone())
+            .with_stack_identity(stack_identity.stack_id())
+            .with_prepare_ttl(config.bitcoin.prepare_ttl),
         );
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
         let payment_request_service = Arc::new(
@@ -258,9 +260,30 @@ impl Server {
                     &config.deployment_invariants().bitcoin_network,
                 )),
             )
-            .with_electrum_controls(electrum_request_limiter.clone(), creation_snapshot_slots)
-            .with_offer_availability(runtime.clone()),
+            .with_electrum_controls(
+                electrum_request_limiter.clone(),
+                creation_snapshot_slots.clone(),
+            )
+            .with_offer_availability(runtime.clone())
+            .with_stack_identity(stack_identity.stack_id())
+            .with_prepare_ttl(config.bitcoin.prepare_ttl),
         );
+        // §B.11 phase 2: the signed activate/void service. It reuses the
+        // same Electrum adapter, request limiter and snapshot slots as
+        // creation (the tick-1 snapshot is one bounded round inside the
+        // §B.7 budget), and the same signed-body authentication as the
+        // create routes — no new auth path.
+        let two_phase_service = Arc::new(crate::application::two_phase::TwoPhaseService::new(
+            Arc::new(invoices.clone()),
+            electrum.clone(),
+            electrum_request_limiter.clone(),
+            creation_snapshot_slots,
+            usize::try_from(config.electrum.max_creation_history_entries)
+                .expect("validated history cap fits usize"),
+            usize::try_from(config.electrum.max_transaction_bytes)
+                .expect("validated transaction cap fits usize"),
+            stack_identity.stack_id(),
+        ));
         // The claim-time history scan (design §B.5) reuses the observer's
         // Electrum adapter type and timeout configuration; each scan batch
         // opens its own bounded connection, so no second client type is
@@ -314,6 +337,7 @@ impl Server {
                     .merge(http::payment_requests::payment_requests_router(
                         payment_request_service,
                     ))
+                    .merge(http::two_phase::two_phase_router(two_phase_service))
                     .layer(Extension(signed_auth)),
             );
 

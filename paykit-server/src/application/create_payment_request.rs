@@ -32,9 +32,7 @@ use crate::{
     },
     config::ReceiverPathPriority,
     domain::locks::{BundleId, CreatorPubky, ReaderPubky},
-    persistence::{
-        AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, NewReaderPayloadFactory,
-    },
+    persistence::{AtomicInvoiceInput, InvoicePreflight, NewReaderPayloadFactory},
     workers::observer::{ElectrumPort, RequestLimiter},
 };
 
@@ -47,6 +45,16 @@ pub struct MarketplacePaymentRequest {
     pub reader: ReaderPubky,
     pub reference: BundleId,
     pub amount_sats: u64,
+    /// The order's hold deadline (design §B.11.3): required, must be in the
+    /// future, and is echoed on the phase-1/phase-2 bodies. The §B.9 expiry
+    /// edges land with the expiry work; this slice persists and echoes the
+    /// value.
+    pub expires_at: time::OffsetDateTime,
+    /// `{order_reference}:{bind_attempt}` (design §B.11.3). It rides in the
+    /// payment-request binding, so an identical retry replays the stored
+    /// invoice while any changed term against the same bundle stays
+    /// `Conflict` (§B.11.6).
+    pub idempotency_key: String,
 }
 
 pub struct MarketplacePaymentRequestService {
@@ -66,6 +74,8 @@ pub struct MarketplacePaymentRequestService {
     creation_snapshot_slots: Arc<tokio::sync::Semaphore>,
     intents: Arc<PaykitIntentBuilder>,
     clock: Arc<dyn DeadlineClock>,
+    stack_id: String,
+    prepare_ttl: Duration,
 }
 
 impl MarketplacePaymentRequestService {
@@ -134,6 +144,8 @@ impl MarketplacePaymentRequestService {
             creation_snapshot_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             intents,
             clock,
+            stack_id: crate::application::create_invoice::UNSPECIFIED_STACK_ID.to_owned(),
+            prepare_ttl: crate::application::create_invoice::DEFAULT_PREPARE_TTL,
         }
     }
 
@@ -155,10 +167,24 @@ impl MarketplacePaymentRequestService {
         self
     }
 
+    /// Installs this stack's minted identity (`{stack_role}:{instance_uuid}`)
+    /// for the phase-1 response body, exactly as on the Locks invoice path.
+    pub fn with_stack_identity(mut self, stack_id: String) -> Self {
+        self.stack_id = stack_id;
+        self
+    }
+
+    /// Installs the configured `bitcoin.prepare_ttl` stamped into
+    /// `prepare_expires_at` at creation commit (§B.11.1).
+    pub fn with_prepare_ttl(mut self, prepare_ttl: Duration) -> Self {
+        self.prepare_ttl = prepare_ttl;
+        self
+    }
+
     pub async fn create(
         &self,
         request: MarketplacePaymentRequest,
-    ) -> Result<AtomicInvoiceResult, CreateInvoiceError> {
+    ) -> Result<crate::application::two_phase::PrepareBody, CreateInvoiceError> {
         if request.amount_sats == 0 {
             return Err(CreateInvoiceError::InvalidRequest);
         }
@@ -177,7 +203,7 @@ impl MarketplacePaymentRequestService {
         {
             InvoicePreflight::ExactReplay => {
                 let replay_remaining = elapsed_remaining(started, self.clock.now())?;
-                return tokio::time::timeout(
+                let replayed = tokio::time::timeout(
                     replay_remaining,
                     self.store.exact_replay(
                         &request.creator,
@@ -188,11 +214,20 @@ impl MarketplacePaymentRequestService {
                 )
                 .await
                 .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
-                .map_err(map_store);
+                .map_err(map_store)?;
+                return self.phase_one_outcome(replayed.invoice_id()).await;
             }
             InvoicePreflight::Conflict => return Err(CreateInvoiceError::Conflict),
             InvoicePreflight::BaselineInProgress => {
                 return Err(CreateInvoiceError::BaselineInProgress);
+            }
+            // §B.11.6: a phase-1 replay against a void state is the named
+            // refusal, never replay success and never a fresh allocation.
+            InvoicePreflight::InvoiceFinalized => {
+                return Err(CreateInvoiceError::InvoiceFinalized);
+            }
+            InvoicePreflight::PrepareExpired => {
+                return Err(CreateInvoiceError::PrepareExpired);
             }
             // An exact replay above binds nothing new; only first-time binds
             // are gated — by the creation kill switch first, then by the
@@ -201,6 +236,14 @@ impl MarketplacePaymentRequestService {
                 return Err(CreateInvoiceError::BitcoinCreationDisabled);
             }
             InvoicePreflight::New => {}
+        }
+        // §B.11.3: `expires_at` is refused when past (missing is rejected by
+        // the route's schema; "beyond the configured maximum" arrives with
+        // the §B.9 expiry edges). The check runs only for a New bind: an
+        // exact replay must return the stored body even after the deadline
+        // has passed (§B.11.6 — `observing` and `expired_tail` replay 200).
+        if request.expires_at <= time::OffsetDateTime::now_utc() {
+            return Err(CreateInvoiceError::InvalidRequest);
         }
         // Runtime creation gate, identical to the Locks invoice path
         // (static flag → live availability → limiter charging). Refusing
@@ -279,15 +322,17 @@ impl MarketplacePaymentRequestService {
                 payment_request_intent,
                 required_sats: total_sats,
                 nonce_sats,
+                prepare_ttl: self.prepare_ttl,
+                expires_at: Some(request.expires_at),
             })
             .await
             .map_err(map_store)?;
         // As in the Locks invoice path: a replayed row won a creation race
         // and its baseline belongs to the winner. The winner's
         // `awaiting_baseline` row is answered `BaselineInProgress` under the
-        // row lock, so a replay that returns here is the published invoice.
+        // row lock, so a replay that returns here is the stored invoice.
         if created.replayed() {
-            return Ok(created);
+            return self.phase_one_outcome(created.invoice_id()).await;
         }
         let address = new_reader_payloads
             .for_child_index(created.reader_child_index())
@@ -306,7 +351,24 @@ impl MarketplacePaymentRequestService {
             &address,
         )
         .await?;
-        Ok(created)
+        self.phase_one_outcome(created.invoice_id()).await
+    }
+
+    /// Builds the §B.11.3 phase-1 body from the stored view, identical to
+    /// the Locks invoice path: a fresh prepare and every replay report
+    /// exactly what the database holds, and a replay landing on a void
+    /// state yields the §B.11.6 named refusal instead of a stale success.
+    async fn phase_one_outcome(
+        &self,
+        invoice_id: uuid::Uuid,
+    ) -> Result<crate::application::two_phase::PrepareBody, CreateInvoiceError> {
+        let view = self
+            .store
+            .prepare_view(invoice_id)
+            .await
+            .map_err(map_store)?
+            .ok_or(CreateInvoiceError::Unavailable)?;
+        crate::application::two_phase::prepare_outcome(&view, &self.stack_id)
     }
 
     /// The amount on the terms is the nonce'd total (`amount_sats` +
@@ -360,6 +422,11 @@ fn request_binding(request: &MarketplacePaymentRequest) -> Result<Vec<u8>, Creat
         "creator": request.creator.to_string(),
         "reader": request.reader.to_string(),
         "reference": request.reference.to_string(),
+        "expires_at": request
+            .expires_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|_| CreateInvoiceError::InvalidRequest)?,
+        "idempotency_key": request.idempotency_key,
     }))
     .map_err(|_| CreateInvoiceError::InvalidRequest)
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::{
-    Router,
+    Json, Router,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -37,7 +37,9 @@ async fn create(
         Err(error) => return error.into_response(),
     };
     match service.create(request).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        // §B.11 phase 1 returns 200 with the prepare body (the r3 204 was
+        // the B.11.0 defect: the caller learned nothing it could bind to).
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
         Err(error) => invoice_error(error),
     }
 }
@@ -72,5 +74,7 @@ fn invoice_error(error: CreateInvoiceError) -> Response {
         CreateInvoiceError::BitcoinOfferUnavailable => {
             ApiError::BitcoinOfferUnavailable.into_response()
         }
+        CreateInvoiceError::InvoiceFinalized => ApiError::InvoiceFinalized.into_response(),
+        CreateInvoiceError::PrepareExpired => ApiError::PrepareExpired.into_response(),
     }
 }

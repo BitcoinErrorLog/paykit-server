@@ -39,6 +39,17 @@ use crate::{
 
 const REQUEST_DEADLINE: Duration = Duration::from_secs(15);
 
+/// Stack identity reported on phase-1 bodies when none was installed —
+/// test compositions only. Production always installs the minted
+/// `stack_identity` via [`CreateInvoiceService::with_stack_identity`]; a
+/// body carrying this value can never pass an activation's identity check
+/// on any real stack.
+pub const UNSPECIFIED_STACK_ID: &str = "unspecified:00000000-0000-0000-0000-000000000000";
+
+/// §B.11.1's `prepare_ttl` when none is installed — test compositions
+/// only; production wires `bitcoin.prepare_ttl` from configuration.
+pub const DEFAULT_PREPARE_TTL: Duration = Duration::from_secs(15 * 60);
+
 /// Draws one invoice's amount nonce from the operating system's CSPRNG
 /// (design §B.8.2): `nonce_sats ∈ [1, 999]`, never derived from the order
 /// id, the price, a counter, or time, because a predictable nonce is not a
@@ -91,6 +102,14 @@ pub enum CreateInvoiceError {
     /// address is allocated, any cursor advances, or any Electrum request
     /// is charged. Exact replays are never gated.
     BitcoinOfferUnavailable,
+    /// A phase-1 replay matched an invoice in a final void state
+    /// (`void_baseline_failed`, `void_cancelled`, or `expired_final`):
+    /// §B.11.6 answers with the named `invoice_finalized` refusal, never
+    /// replay success.
+    InvoiceFinalized,
+    /// A phase-1 replay matched an invoice reaped at `prepare_expires_at`:
+    /// §B.11.6 answers with the named `prepare_expired` refusal.
+    PrepareExpired,
 }
 
 /// Live read of the runtime's `bitcoin_offer_available` verdict. This is
@@ -174,6 +193,16 @@ pub trait InvoicePersistence: Send + Sync {
     ) -> Result<(), PersistenceError> {
         Ok(())
     }
+    /// Loads the §B.11.3 body facts for one invoice. The phase-1 response
+    /// is built from this view — after baseline completion for a fresh
+    /// prepare, and directly for a replay — so a response never reports
+    /// anything the database does not.
+    async fn prepare_view(
+        &self,
+        _invoice_id: uuid::Uuid,
+    ) -> Result<Option<crate::persistence::InvoicePhaseView>, PersistenceError> {
+        Ok(None)
+    }
 }
 #[async_trait]
 impl InvoicePersistence for InvoiceStore {
@@ -216,6 +245,12 @@ impl InvoicePersistence for InvoiceStore {
     }
     async fn fail_creation_baseline(&self, invoice_id: uuid::Uuid) -> Result<(), PersistenceError> {
         InvoiceStore::fail_creation_baseline(self, invoice_id).await
+    }
+    async fn prepare_view(
+        &self,
+        invoice_id: uuid::Uuid,
+    ) -> Result<Option<crate::persistence::InvoicePhaseView>, PersistenceError> {
+        InvoiceStore::prepare_view(self, invoice_id).await
     }
 }
 
@@ -427,6 +462,8 @@ pub struct CreateInvoiceService {
     creation_snapshot_slots: Arc<tokio::sync::Semaphore>,
     intents: Arc<dyn IntentBuilder>,
     clock: Arc<dyn DeadlineClock>,
+    stack_id: String,
+    prepare_ttl: Duration,
 }
 impl CreateInvoiceService {
     #[allow(clippy::too_many_arguments)]
@@ -498,6 +535,8 @@ impl CreateInvoiceService {
             creation_snapshot_slots: Arc::new(tokio::sync::Semaphore::new(4)),
             intents,
             clock,
+            stack_id: UNSPECIFIED_STACK_ID.to_owned(),
+            prepare_ttl: DEFAULT_PREPARE_TTL,
         }
     }
 
@@ -552,10 +591,25 @@ impl CreateInvoiceService {
         self
     }
 
+    /// Installs this stack's minted identity (`{stack_role}:{instance_uuid}`)
+    /// for the phase-1 response body. The marketplace persists it at bind
+    /// time and echoes it on `activate`/`void` (§B.11.3).
+    pub fn with_stack_identity(mut self, stack_id: String) -> Self {
+        self.stack_id = stack_id;
+        self
+    }
+
+    /// Installs the configured `bitcoin.prepare_ttl` stamped into
+    /// `prepare_expires_at` at creation commit (§B.11.1).
+    pub fn with_prepare_ttl(mut self, prepare_ttl: Duration) -> Self {
+        self.prepare_ttl = prepare_ttl;
+        self
+    }
+
     pub async fn create(
         &self,
         request: CreateInvoiceRequest,
-    ) -> Result<AtomicInvoiceResult, CreateInvoiceError> {
+    ) -> Result<crate::application::two_phase::PrepareBody, CreateInvoiceError> {
         let started = self.clock.now();
         let creator = request.lock_resource.creator().clone();
         let bundle_binding = request.bundle_id.to_string().into_bytes();
@@ -572,7 +626,7 @@ impl CreateInvoiceService {
         {
             InvoicePreflight::ExactReplay => {
                 let replay_remaining = remaining(started, self.clock.now())?;
-                return tokio::time::timeout(
+                let replayed = tokio::time::timeout(
                     replay_remaining,
                     self.store.exact_replay(
                         &creator,
@@ -583,11 +637,20 @@ impl CreateInvoiceService {
                 )
                 .await
                 .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
-                .map_err(map_store);
+                .map_err(map_store)?;
+                return self.phase_one_outcome(replayed.invoice_id()).await;
             }
             InvoicePreflight::Conflict => return Err(CreateInvoiceError::Conflict),
             InvoicePreflight::BaselineInProgress => {
                 return Err(CreateInvoiceError::BaselineInProgress);
+            }
+            // §B.11.6: a phase-1 replay against a void state is the named
+            // refusal, never replay success and never a fresh allocation.
+            InvoicePreflight::InvoiceFinalized => {
+                return Err(CreateInvoiceError::InvoiceFinalized);
+            }
+            InvoicePreflight::PrepareExpired => {
+                return Err(CreateInvoiceError::PrepareExpired);
             }
             // An exact replay above binds nothing new; only first-time binds
             // are gated — by the creation kill switch first, then by the
@@ -684,6 +747,8 @@ impl CreateInvoiceService {
                 payment_request_intent,
                 required_sats: total_sats,
                 nonce_sats,
+                prepare_ttl: self.prepare_ttl,
+                expires_at: None,
             })
             .await
             .map_err(map_store)?;
@@ -694,9 +759,9 @@ impl CreateInvoiceService {
         // winner's `awaiting_baseline` row never reaches this point —
         // the store answers `BaselineInProgress` under the row lock,
         // exactly like preflight — so a replay that returns here is the
-        // published invoice, served with its existing terms.
+        // stored invoice, served with its existing terms.
         if created.replayed() {
-            return Ok(created);
+            return self.phase_one_outcome(created.invoice_id()).await;
         }
         let address = new_reader_payloads
             .for_child_index(created.reader_child_index())
@@ -715,7 +780,24 @@ impl CreateInvoiceService {
             &address,
         )
         .await?;
-        Ok(created)
+        self.phase_one_outcome(created.invoice_id()).await
+    }
+
+    /// Builds the §B.11.3 phase-1 body from the stored view — never from
+    /// request-side state — so a fresh prepare and every replay report
+    /// exactly what the database holds, and a replay landing on a void
+    /// state yields the §B.11.6 named refusal instead of a stale success.
+    async fn phase_one_outcome(
+        &self,
+        invoice_id: uuid::Uuid,
+    ) -> Result<crate::application::two_phase::PrepareBody, CreateInvoiceError> {
+        let view = self
+            .store
+            .prepare_view(invoice_id)
+            .await
+            .map_err(map_store)?
+            .ok_or(CreateInvoiceError::Unavailable)?;
+        crate::application::two_phase::prepare_outcome(&view, &self.stack_id)
     }
 }
 
@@ -824,6 +906,8 @@ pub(crate) fn map_store(error: PersistenceError) -> CreateInvoiceError {
     match error {
         PersistenceError::Conflict => CreateInvoiceError::Conflict,
         PersistenceError::BaselineInProgress => CreateInvoiceError::BaselineInProgress,
+        PersistenceError::InvoiceFinalized => CreateInvoiceError::InvoiceFinalized,
+        PersistenceError::PrepareExpired => CreateInvoiceError::PrepareExpired,
         PersistenceError::Unavailable => CreateInvoiceError::Unavailable,
         _ => CreateInvoiceError::Unavailable,
     }
