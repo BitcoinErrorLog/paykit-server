@@ -23,7 +23,10 @@ use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -55,15 +58,22 @@ use paykit_sdk::{
 use paykit_server::{
     Server,
     allocation::ClaimAllocation,
-    application::create_invoice::derive_bip84_p2wpkh_address,
+    application::create_invoice::{
+        CreateInvoiceError, DeadlineClock, InvoicePersistence, MarkerDiscovery,
+        PaykitIntentBuilder, SessionValidationError, SessionValidator, derive_bip84_p2wpkh_address,
+    },
+    application::create_payment_request::{
+        MarketplacePaymentRequest, MarketplacePaymentRequestService,
+    },
     bitcoin::ObservationTarget,
-    config::{BitcoinNetwork, Config, ConfigEnvironment},
+    config::{BitcoinNetwork, Config, ConfigEnvironment, ReceiverPathPriority},
     crypto::Crypto,
-    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
     domain::payment::BitcoinOutpoint,
     persistence::{
-        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
-        NewReaderPayloadFactory, NewReaderPayloads, OutboxStore, PersistenceError, run_migrations,
+        AtomicInvoiceInput, AtomicInvoiceResult, CreatorCredentials, CreatorStore,
+        InvoicePhaseView, InvoicePreflight, InvoiceStore, NewReaderPayloadFactory,
+        NewReaderPayloads, OutboxStore, PersistenceError, run_migrations,
     },
     runtime::{ElectrumProbe, Runtime},
     startup::initialize_database,
@@ -1083,104 +1093,297 @@ async fn activate_flips_persists_the_tick1_snapshot_and_replays_without_writes()
     stack.shutdown().await;
 }
 
-/// void: `prepared → void_cancelled`, an idempotent replay, and the named
-/// errors of §B.11.3/§B.11.6 for every other state.
+/// What one phase-2 operation must do against one §B.11.1 state.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase2Outcome {
+    /// 200 echoing the stored state — an idempotent replay or an
+    /// already-satisfied intent; zero writes (§B.11.6).
+    Replay,
+    /// The operation's own transition (`prepared` only): it writes.
+    Transition,
+    /// The named refusal; zero writes (§B.11.3/§B.11.6).
+    Refused(StatusCode, &'static str),
+}
+
+/// A distinct, canonical marketplace reference per table row (Crockford
+/// base32, 26 chars): the last two characters encode the row index.
+fn table_reference(index: usize) -> String {
+    const CROCKFORD: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut reference = REFERENCE_A[..24].to_owned();
+    reference.push(CROCKFORD[(index / 8) % 32] as char);
+    // The final symbol of a 16-byte Crockford encoding carries only its
+    // top three bits; keep the low two zero or the id is non-canonical.
+    reference.push(CROCKFORD[(index % 8) * 4] as char);
+    reference
+}
+
+/// Everything a refused or replayed phase-2 operation must NOT move: the
+/// invoice's `updated_at`, its outbox rows, and the observation targets.
+struct WritesSnapshot {
+    baseline_state: String,
+    updated_at: String,
+    outbox: Vec<(String, String, String)>,
+    observation_targets: Vec<String>,
+}
+
+async fn writes_snapshot(stack: &BootedStack, invoice_id: &str) -> WritesSnapshot {
+    let id = uuid::Uuid::parse_str(invoice_id).unwrap();
+    let (baseline_state, updated_at): (String, String) =
+        sqlx::query_as("SELECT baseline_state, updated_at::text FROM invoices WHERE id = $1")
+            .bind(id)
+            .fetch_one(&stack.pool)
+            .await
+            .unwrap();
+    let outbox: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id::text, status, updated_at::text FROM outbox \
+         WHERE invoice_id = $1 ORDER BY created_at, id",
+    )
+    .bind(id)
+    .fetch_all(&stack.pool)
+    .await
+    .unwrap();
+    let mut observation_targets: Vec<String> = stack
+        .store
+        .observation_plan()
+        .await
+        .unwrap()
+        .iter()
+        .map(|planned| planned.target().address().to_owned())
+        .collect();
+    observation_targets.sort();
+    WritesSnapshot {
+        baseline_state,
+        updated_at,
+        outbox,
+        observation_targets,
+    }
+}
+
+fn assert_zero_writes(before: &WritesSnapshot, after: &WritesSnapshot, op: &str, state: &str) {
+    assert_eq!(
+        after.baseline_state, before.baseline_state,
+        "{op} on {state} must not move the state"
+    );
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "{op} on {state} must not touch updated_at"
+    );
+    assert_eq!(
+        after.outbox, before.outbox,
+        "{op} on {state} must not touch outbox rows"
+    );
+    assert_eq!(
+        after.observation_targets, before.observation_targets,
+        "{op} on {state} must not move observation targets"
+    );
+}
+
+/// Drives a freshly prepared invoice into the row's §B.11.1 state.
+async fn drive_to_state(stack: &BootedStack, invoice_id: &str, total_sats: u64, state: &str) {
+    match state {
+        "prepared" => {}
+        "observing" | "expired_tail" => {
+            let response = activate(stack, invoice_id, total_sats).await;
+            assert_eq!(
+                response.status,
+                StatusCode::OK,
+                "setup activation for {state}: {}",
+                String::from_utf8_lossy(&response.body)
+            );
+            if state == "expired_tail" {
+                set_baseline_state(stack, invoice_id, state).await;
+            }
+        }
+        other => set_baseline_state(stack, invoice_id, other).await,
+    }
+    assert_eq!(baseline_state(&stack.pool, invoice_id).await, state);
+}
+
+async fn set_baseline_state(stack: &BootedStack, invoice_id: &str, state: &str) {
+    sqlx::query("UPDATE invoices SET baseline_state = $1 WHERE id = $2")
+        .bind(state)
+        .bind(uuid::Uuid::parse_str(invoice_id).unwrap())
+        .execute(&stack.pool)
+        .await
+        .unwrap();
+}
+
+/// void and activate across the TOTAL §B.11.1 state set: the named result
+/// of each operation for every state, zero writes for every refusal and
+/// every replay, and the one transitioning pair (`prepared`) asserting
+/// exactly its designed writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn void_and_activate_named_errors_for_every_state() {
     let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
     let stack = boot(65).await;
 
-    // prepared → void_cancelled; the replay returns the same body.
-    let body = prepare(&stack, REFERENCE_A).await;
-    let voided_id = body["invoice_id"].as_str().unwrap().to_owned();
-    let response = void(&stack, &voided_id).await;
+    const FINALIZED: Phase2Outcome =
+        Phase2Outcome::Refused(StatusCode::CONFLICT, "invoice_finalized");
+    // (state, activate outcome, void outcome) — every §B.11.1 state.
+    let table: [(&str, Phase2Outcome, Phase2Outcome); 10] = [
+        (
+            "awaiting_baseline",
+            Phase2Outcome::Refused(StatusCode::CONFLICT, "invoice_baseline_in_progress"),
+            Phase2Outcome::Refused(StatusCode::CONFLICT, "invoice_baseline_in_progress"),
+        ),
+        (
+            "prepared",
+            Phase2Outcome::Transition,
+            Phase2Outcome::Transition,
+        ),
+        ("observing", Phase2Outcome::Replay, FINALIZED),
+        ("expired_tail", Phase2Outcome::Replay, FINALIZED),
+        ("expired_final", FINALIZED, FINALIZED),
+        ("void_baseline_failed", FINALIZED, FINALIZED),
+        (
+            "void_prepare_expired",
+            Phase2Outcome::Refused(StatusCode::CONFLICT, "prepare_expired"),
+            Phase2Outcome::Replay,
+        ),
+        ("void_cancelled", FINALIZED, Phase2Outcome::Replay),
+        ("resolved_paid_manually", FINALIZED, FINALIZED),
+        ("resolved_closed", FINALIZED, FINALIZED),
+    ];
+
+    // The references that drove each state, for the phase-1 replay rows
+    // asserted after the table.
+    let mut reference_of: HashMap<&str, String> = HashMap::new();
+    for (index, (state, activate_outcome, void_outcome)) in table.iter().enumerate() {
+        let reference = table_reference(index);
+        reference_of.insert(*state, reference.clone());
+
+        // `prepared` is the one state whose operations write, and each
+        // operation consumes the state — so each gets its own invoice.
+        let invoices: Vec<(String, u64)> = if *state == "prepared" {
+            let mut pair = Vec::new();
+            for attempt in 0..2 {
+                let body = prepare(&stack, &table_reference(20 + 2 * index + attempt)).await;
+                pair.push((
+                    body["invoice_id"].as_str().unwrap().to_owned(),
+                    body["total_sats"].as_u64().unwrap(),
+                ));
+            }
+            pair
+        } else {
+            let body = prepare(&stack, &reference).await;
+            vec![(
+                body["invoice_id"].as_str().unwrap().to_owned(),
+                body["total_sats"].as_u64().unwrap(),
+            )]
+        };
+
+        let void_invoice = if *state == "prepared" {
+            &invoices[1]
+        } else {
+            &invoices[0]
+        };
+        for (op, outcome, (invoice_id, total_sats)) in [
+            ("activate", activate_outcome, &invoices[0]),
+            ("void", void_outcome, void_invoice),
+        ] {
+            drive_to_state(&stack, invoice_id, *total_sats, state).await;
+            let before = writes_snapshot(&stack, invoice_id).await;
+            let response = match op {
+                "activate" => activate(&stack, invoice_id, *total_sats).await,
+                _ => void(&stack, invoice_id).await,
+            };
+            match outcome {
+                Phase2Outcome::Replay => {
+                    assert_eq!(
+                        response.status,
+                        StatusCode::OK,
+                        "{op} on {state}: {}",
+                        String::from_utf8_lossy(&response.body)
+                    );
+                    let body = response.json();
+                    assert_eq!(body["state"], *state, "{op} replay on {state}");
+                    assert_eq!(body["invoice_id"], invoice_id.as_str());
+                    assert_zero_writes(
+                        &before,
+                        &writes_snapshot(&stack, invoice_id).await,
+                        op,
+                        state,
+                    );
+                }
+                Phase2Outcome::Refused(status, code) => {
+                    assert_eq!(
+                        response.status,
+                        *status,
+                        "{op} on {state}: {}",
+                        String::from_utf8_lossy(&response.body)
+                    );
+                    assert_eq!(response.json()["error"]["code"], *code, "{op} on {state}");
+                    assert_zero_writes(
+                        &before,
+                        &writes_snapshot(&stack, invoice_id).await,
+                        op,
+                        state,
+                    );
+                }
+                Phase2Outcome::Transition => {
+                    assert_eq!(
+                        response.status,
+                        StatusCode::OK,
+                        "{op} on {state}: {}",
+                        String::from_utf8_lossy(&response.body)
+                    );
+                    let body = response.json();
+                    let landed = baseline_state(&stack.pool, invoice_id).await;
+                    match op {
+                        // The designed writes and only they: state flip,
+                        // both outbox rows queued, nothing else.
+                        "activate" => {
+                            assert_eq!(body["state"], "observing");
+                            assert_eq!(landed, "observing");
+                            assert_eq!(
+                                outbox_statuses(&stack.pool, invoice_id).await,
+                                vec!["queued".to_owned(), "queued".to_owned()]
+                            );
+                        }
+                        _ => {
+                            assert_eq!(body["state"], "void_cancelled");
+                            assert!(body["voided_at"].as_str().is_some());
+                            assert_eq!(landed, "void_cancelled");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // A void replay is byte-identical (§B.11.6 idempotence).
+    let voided_reference = reference_of["void_cancelled"].clone();
+    let voided_body = post(
+        &stack,
+        "/v0/payment-requests",
+        payment_request_body(&stack.creator.creator, &stack.reader, &voided_reference),
+    )
+    .await;
+    assert_eq!(voided_body.status, StatusCode::CONFLICT);
+    assert_eq!(voided_body.json()["error"]["code"], "invoice_finalized");
+
+    // Phase-1 replays against the same bindings (§B.11.6): `observing`
+    // returns the stored body; the reaped and voided states answer their
+    // named refusals.
+    let observing_reference = reference_of["observing"].clone();
+    let response = post(
+        &stack,
+        "/v0/payment-requests",
+        payment_request_body(&stack.creator.creator, &stack.reader, &observing_reference),
+    )
+    .await;
     assert_eq!(
         response.status,
         StatusCode::OK,
-        "void body: {}",
+        "observing replay: {}",
         String::from_utf8_lossy(&response.body)
     );
-    let voided = response.json();
-    assert_eq!(voided["state"], "void_cancelled");
-    assert_eq!(voided["invoice_id"], voided_id);
-    assert!(voided["voided_at"].as_str().is_some());
-    assert_eq!(
-        baseline_state(&stack.pool, &voided_id).await,
-        "void_cancelled"
-    );
-    let replay = void(&stack, &voided_id).await;
-    assert_eq!(replay.status, StatusCode::OK);
-    assert_eq!(
-        replay.body, response.body,
-        "void replay must be byte-identical"
-    );
-    // activate on a voided invoice is the named finalized refusal.
-    let response = activate(&stack, &voided_id, body["total_sats"].as_u64().unwrap()).await;
-    assert_eq!(response.status, StatusCode::CONFLICT);
-    assert_eq!(response.json()["error"]["code"], "invoice_finalized");
-    // A phase-1 replay against the voided binding is the same named error.
+    assert_eq!(response.json()["state"], "observing");
+    let reaped_reference = reference_of["void_prepare_expired"].clone();
     let response = post(
         &stack,
         "/v0/payment-requests",
-        payment_request_body(&stack.creator.creator, &stack.reader, REFERENCE_A),
-    )
-    .await;
-    assert_eq!(response.status, StatusCode::CONFLICT);
-    assert_eq!(response.json()["error"]["code"], "invoice_finalized");
-
-    // void on `observing` is refused: a published request expires through
-    // the tail, it never vanishes.
-    let body = prepare(&stack, REFERENCE_B).await;
-    let observing_id = body["invoice_id"].as_str().unwrap().to_owned();
-    let total_b = body["total_sats"].as_u64().unwrap();
-    let response = activate(&stack, &observing_id, total_b).await;
-    assert_eq!(response.status, StatusCode::OK);
-    let response = void(&stack, &observing_id).await;
-    assert_eq!(response.status, StatusCode::CONFLICT);
-    assert_eq!(response.json()["error"]["code"], "invoice_finalized");
-    assert_eq!(
-        baseline_state(&stack.pool, &observing_id).await,
-        "observing"
-    );
-    // A phase-1 replay on `observing` returns the stored body (B.11.6).
-    let response = post(
-        &stack,
-        "/v0/payment-requests",
-        payment_request_body(&stack.creator.creator, &stack.reader, REFERENCE_B),
-    )
-    .await;
-    assert_eq!(response.status, StatusCode::OK);
-    let replayed = response.json();
-    assert_eq!(replayed["state"], "observing");
-    assert_eq!(replayed["invoice_id"], observing_id);
-    assert_eq!(replayed["total_sats"], total_b);
-
-    // Reaped at prepare_expires_at: activate is `prepare_expired`, void is
-    // the already-satisfied 200, and a phase-1 replay is `prepare_expired`.
-    let body = prepare(&stack, REFERENCE_C).await;
-    let reaped_id = body["invoice_id"].as_str().unwrap().to_owned();
-    sqlx::query(
-        "UPDATE invoices SET prepare_expires_at = NOW() - INTERVAL '1 minute' WHERE id = $1",
-    )
-    .bind(uuid::Uuid::parse_str(&reaped_id).unwrap())
-    .execute(&stack.pool)
-    .await
-    .unwrap();
-    assert_eq!(stack.store.reap_expired_prepares().await.unwrap(), 1);
-    assert_eq!(
-        baseline_state(&stack.pool, &reaped_id).await,
-        "void_prepare_expired"
-    );
-    let response = activate(&stack, &reaped_id, body["total_sats"].as_u64().unwrap()).await;
-    assert_eq!(response.status, StatusCode::CONFLICT);
-    assert_eq!(response.json()["error"]["code"], "prepare_expired");
-    let response = void(&stack, &reaped_id).await;
-    assert_eq!(response.status, StatusCode::OK);
-    assert_eq!(response.json()["state"], "void_prepare_expired");
-    let response = post(
-        &stack,
-        "/v0/payment-requests",
-        payment_request_body(&stack.creator.creator, &stack.reader, REFERENCE_C),
+        payment_request_body(&stack.creator.creator, &stack.reader, &reaped_reference),
     )
     .await;
     assert_eq!(response.status, StatusCode::CONFLICT);
@@ -1197,6 +1400,15 @@ async fn void_and_activate_named_errors_for_every_state() {
     assert_eq!(response.json()["error"]["code"], "unknown_invoice");
 
     // void naming another stack is refused before touching anything.
+    let observing_id = {
+        let mut rows: Vec<String> =
+            sqlx::query_scalar("SELECT id::text FROM invoices WHERE baseline_state = 'observing'")
+                .fetch_all(&stack.pool)
+                .await
+                .unwrap();
+        rows.pop().unwrap()
+    };
+    let before = writes_snapshot(&stack, &observing_id).await;
     let response = post(
         &stack,
         &format!("/v0/payment-requests/{observing_id}/void"),
@@ -1208,9 +1420,11 @@ async fn void_and_activate_named_errors_for_every_state() {
     .await;
     assert_eq!(response.status, StatusCode::CONFLICT);
     assert_eq!(response.json()["error"]["code"], "stack_identity_mismatch");
-    assert_eq!(
-        baseline_state(&stack.pool, &observing_id).await,
-        "observing"
+    assert_zero_writes(
+        &before,
+        &writes_snapshot(&stack, &observing_id).await,
+        "void",
+        "observing (foreign stack_id)",
     );
 
     stack.shutdown().await;
@@ -1482,4 +1696,473 @@ async fn hidden_offer_gates_prepare_but_never_activate_or_void() {
     );
 
     stack.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// §B.11.6 replay-wait (phase 1 against `awaiting_baseline`), proven at the
+// application-service level over a REAL Postgres store: the deadline is
+// driven through the `DeadlineClock` seam, never through wall-clock sleeps.
+// ---------------------------------------------------------------------------
+
+/// A deadline clock the test advances by hand: the replay's request budget
+/// elapses exactly when the test says so, with no sleeping.
+struct ManualClock {
+    now: Mutex<std::time::Instant>,
+}
+
+impl ManualClock {
+    fn new() -> Self {
+        Self {
+            now: Mutex::new(std::time::Instant::now()),
+        }
+    }
+
+    fn advance(&self, duration: Duration) {
+        let mut now = self.now.lock().unwrap();
+        *now += duration;
+    }
+}
+
+impl DeadlineClock for ManualClock {
+    fn now(&self) -> std::time::Instant {
+        *self.now.lock().unwrap()
+    }
+}
+
+/// The real Postgres [`InvoiceStore`] behind the `InvoicePersistence`
+/// port, with a preflight counter so the test can synchronize on the
+/// replay having entered its §B.11.6 wait loop.
+struct CountingStore {
+    inner: InvoiceStore,
+    preflight_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl InvoicePersistence for CountingStore {
+    async fn preflight(
+        &self,
+        creator: &CreatorPubky,
+        bundle_binding: &[u8],
+        payment_binding: &[u8],
+    ) -> Result<InvoicePreflight, PersistenceError> {
+        self.preflight_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .preflight(creator, bundle_binding, payment_binding)
+            .await
+    }
+
+    async fn exact_replay(
+        &self,
+        creator: &CreatorPubky,
+        reader: &ReaderPubky,
+        bundle_binding: &[u8],
+        payment_binding: &[u8],
+    ) -> Result<AtomicInvoiceResult, PersistenceError> {
+        self.inner
+            .exact_replay(creator, reader, bundle_binding, payment_binding)
+            .await
+    }
+
+    async fn create_atomic(
+        &self,
+        input: AtomicInvoiceInput<'_>,
+    ) -> Result<AtomicInvoiceResult, PersistenceError> {
+        self.inner.create_awaiting_baseline(input).await
+    }
+
+    async fn complete_creation_baseline(
+        &self,
+        invoice_id: uuid::Uuid,
+        snapshot: &CreationSnapshot,
+    ) -> Result<(), PersistenceError> {
+        self.inner
+            .complete_creation_baseline(
+                invoice_id,
+                snapshot.tip_height,
+                &snapshot.baseline_outputs,
+                &snapshot.unconfirmed_inputs,
+            )
+            .await
+    }
+
+    async fn fail_creation_baseline(&self, invoice_id: uuid::Uuid) -> Result<(), PersistenceError> {
+        self.inner.fail_creation_baseline(invoice_id).await
+    }
+
+    async fn prepare_view(
+        &self,
+        invoice_id: uuid::Uuid,
+    ) -> Result<Option<InvoicePhaseView>, PersistenceError> {
+        self.inner.prepare_view(invoice_id).await
+    }
+}
+
+/// An Electrum fake whose creation snapshot parks until the test releases
+/// it (a watch channel: no missed wakeups), then either completes or fails
+/// the baseline as the test scripted.
+struct GatedBaselineElectrum {
+    snapshot_starts: AtomicUsize,
+    release: tokio::sync::watch::Receiver<bool>,
+    fail_on_release: AtomicBool,
+}
+
+#[async_trait]
+impl ElectrumPort for GatedBaselineElectrum {
+    async fn creation_snapshot(
+        &self,
+        _address: &str,
+        _max_history_entries: usize,
+        _max_transaction_bytes: usize,
+        _request_limiter: &RequestLimiter,
+        _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<CreationSnapshot, ObserverError> {
+        self.snapshot_starts.fetch_add(1, Ordering::SeqCst);
+        let mut release = self.release.clone();
+        while !*release.borrow_and_update() {
+            release
+                .changed()
+                .await
+                .map_err(|_| ObserverError::Unavailable)?;
+        }
+        if self.fail_on_release.load(Ordering::SeqCst) {
+            return Err(ObserverError::Unavailable);
+        }
+        Ok(CreationSnapshot {
+            tip_height: 300,
+            baseline_outputs: Vec::new(),
+            unconfirmed_inputs: Vec::new(),
+            unconfirmed_outputs: Vec::new(),
+        })
+    }
+
+    async fn observations(
+        &self,
+        _tip_height: u32,
+        _targets: &[ObservationTarget],
+    ) -> Result<ObservationReport, ObserverError> {
+        Ok(ObservationReport::default())
+    }
+
+    async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        Ok(TipProbe {
+            height: 300,
+            time_unix: fresh_tip_time(),
+        })
+    }
+}
+
+struct OkSession;
+#[async_trait]
+impl SessionValidator for OkSession {
+    async fn validate(&self, _creator: &CreatorPubky) -> Result<(), SessionValidationError> {
+        Ok(())
+    }
+}
+
+struct StaticMarkers;
+#[async_trait]
+impl MarkerDiscovery for StaticMarkers {
+    async fn discover(
+        &self,
+        _reader: &ReaderPubky,
+    ) -> Result<Vec<paykit_lib::PaykitReceiverMarker>, CreateInvoiceError> {
+        Ok(vec![test_marker()])
+    }
+}
+
+/// One creator in a real database, one gated Electrum, and the shared
+/// counting store — everything two marketplace services (creation with a
+/// frozen clock, replay with the test-advanced clock) need.
+struct ReplayFixture {
+    pool: PgPool,
+    store: Arc<CountingStore>,
+    electrum: Arc<GatedBaselineElectrum>,
+    release: tokio::sync::watch::Sender<bool>,
+    creators: CreatorStore,
+    creator: CreatorPubky,
+    reader: ReaderPubky,
+    database: TestDatabase,
+}
+
+impl ReplayFixture {
+    fn service(&self, clock: Arc<dyn DeadlineClock>) -> MarketplacePaymentRequestService {
+        MarketplacePaymentRequestService::with_clock(
+            Arc::new(OkSession),
+            Arc::new(StaticMarkers),
+            vec![ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+            PaykitReceiverPath::new("paykit/server").unwrap(),
+            Arc::new(self.creators.clone()),
+            BitcoinNetwork::Testnet,
+            true,
+            self.store.clone(),
+            self.electrum.clone(),
+            50,
+            400_000,
+            Arc::new(PaykitIntentBuilder::for_network(&BitcoinNetwork::Testnet)),
+            clock,
+        )
+    }
+
+    fn request(&self, reference: &str) -> MarketplacePaymentRequest {
+        MarketplacePaymentRequest {
+            creator: self.creator.clone(),
+            reader: self.reader.clone(),
+            reference: parse_bundle_id(reference).unwrap(),
+            amount_sats: 50_000,
+            expires_at: time::OffsetDateTime::parse(
+                EXPIRES_AT,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap(),
+            idempotency_key: format!("{reference}:1"),
+        }
+    }
+
+    /// Waits until the creation's `awaiting_baseline` row is committed and
+    /// its snapshot is parked on the gate. Only then may the replay be
+    /// spawned: its preflight must read the committed row (never `New`),
+    /// so it always takes the §B.11.6 wait path.
+    async fn wait_until_baseline_parked(&self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let awaiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM invoices WHERE baseline_state = 'awaiting_baseline'",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+            if awaiting == 1 && self.electrum.snapshot_starts.load(Ordering::SeqCst) == 1 {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the creation never reached the parked snapshot"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Waits until the replay has polled at least once inside the §B.11.6
+    /// wait loop (one creation preflight, one replay preflight, one
+    /// wait-loop poll).
+    async fn wait_until_replay_is_waiting(&self) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while self.store.preflight_calls.load(Ordering::SeqCst) < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the replay never entered the §B.11.6 wait"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The replay minted nothing: one invoice, one derivation index, the
+    /// original two outbox rows.
+    async fn assert_single_allocation(&self) {
+        let invoices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+        assert_eq!(invoices, 1, "no second invoice may exist");
+        let next_index: i64 = sqlx::query_scalar("SELECT next_child_index FROM creators")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+        assert_eq!(next_index, 1, "no second derivation index may be burned");
+        let outbox_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbox")
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+        assert_eq!(outbox_rows, 2, "no second outbox row may be minted");
+        assert_eq!(
+            self.electrum.snapshot_starts.load(Ordering::SeqCst),
+            1,
+            "no second baseline snapshot may run"
+        );
+    }
+
+    async fn cleanup(self) {
+        self.pool.close().await;
+        self.database.cleanup().await;
+    }
+}
+
+async fn replay_fixture(seed: u8) -> ReplayFixture {
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    run_migrations(pool).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[seed; 32]).unwrap());
+    let creator = parse_creator(REAPER_CREATOR).unwrap();
+    let creators = CreatorStore::new(pool, crypto.clone());
+    creators
+        .create(
+            &CreatorCredentials::new(
+                creator.clone(),
+                "session".into(),
+                ReceiverNoiseSecretKey::new([seed; 32]),
+                account_xpub(seed, 0),
+                0,
+            ),
+            &Default::default(),
+            &key_tail(seed),
+            &ClaimAllocation::shared_manual_default(),
+            0,
+        )
+        .await
+        .unwrap();
+    let (release, release_rx) = tokio::sync::watch::channel(false);
+    ReplayFixture {
+        pool: pool.clone(),
+        store: Arc::new(CountingStore {
+            inner: InvoiceStore::new(pool, crypto),
+            preflight_calls: AtomicUsize::new(0),
+        }),
+        electrum: Arc::new(GatedBaselineElectrum {
+            snapshot_starts: AtomicUsize::new(0),
+            release: release_rx,
+            fail_on_release: AtomicBool::new(false),
+        }),
+        release,
+        creators,
+        creator,
+        reader: reaper_reader(),
+        database,
+    }
+}
+
+/// §B.11.6: an exact replay that lands on `awaiting_baseline` waits for
+/// the in-flight baseline and is then served the stored body — identical
+/// to the original caller's — with exactly one index, one nonce and the
+/// original two outbox rows in existence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prepare_replay_during_baseline_waits_and_returns_the_stored_body() {
+    let fixture = replay_fixture(70).await;
+    let reference = table_reference(30);
+    let creation = tokio::spawn({
+        let service = fixture.service(Arc::new(ManualClock::new()));
+        let request = fixture.request(&reference);
+        async move { service.create(request).await }
+    });
+    fixture.wait_until_baseline_parked().await;
+    let replay = tokio::spawn({
+        let service = fixture.service(Arc::new(ManualClock::new()));
+        let request = fixture.request(&reference);
+        async move { service.create(request).await }
+    });
+    fixture.wait_until_replay_is_waiting().await;
+
+    // The in-flight baseline completes inside the replay's request budget.
+    fixture.release.send(true).unwrap();
+    let replayed = replay
+        .await
+        .unwrap()
+        .expect("the waiting replay is served the stored body");
+    let created = creation
+        .await
+        .unwrap()
+        .expect("the held-open creation completes once released");
+    assert_eq!(
+        replayed, created,
+        "the replay body is identical to the original response"
+    );
+    fixture.assert_single_allocation().await;
+    fixture.cleanup().await;
+}
+
+/// §B.11.6: the wait is bounded by the request deadline. With the deadline
+/// elapsed before the baseline completes, the replay answers
+/// `DeadlineExceeded` (503 `dependency_timeout`) — never the in-progress
+/// refusal — and the in-flight baseline still completes afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prepare_replay_during_baseline_times_out_as_dependency_timeout() {
+    let fixture = replay_fixture(71).await;
+    let reference = table_reference(31);
+    // The creation's clock stays frozen: its own request deadline can
+    // never fire while the baseline is parked — only the replay's budget
+    // elapses, driven through the clock seam.
+    let creation = tokio::spawn({
+        let service = fixture.service(Arc::new(ManualClock::new()));
+        let request = fixture.request(&reference);
+        async move { service.create(request).await }
+    });
+    fixture.wait_until_baseline_parked().await;
+    let replay_clock = Arc::new(ManualClock::new());
+    let replay = tokio::spawn({
+        let service = fixture.service(replay_clock.clone());
+        let request = fixture.request(&reference);
+        async move { service.create(request).await }
+    });
+    fixture.wait_until_replay_is_waiting().await;
+
+    // The deadline/clock seam: the replay's whole request budget elapses
+    // while the baseline is still parked.
+    replay_clock.advance(Duration::from_secs(16));
+    let outcome = replay.await.unwrap();
+    assert_eq!(
+        outcome,
+        Err(CreateInvoiceError::DeadlineExceeded),
+        "the wait is bounded by the request deadline"
+    );
+    fixture.assert_single_allocation().await;
+
+    // The in-flight baseline is unaffected: it completes to `prepared`.
+    fixture.release.send(true).unwrap();
+    creation
+        .await
+        .unwrap()
+        .expect("the held-open creation completes once released");
+    let state: String = sqlx::query_scalar("SELECT baseline_state FROM invoices")
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "prepared");
+    fixture.cleanup().await;
+}
+
+/// §B.11.6: when the in-flight baseline fails during the wait, the replay
+/// lands on `void_baseline_failed` and answers the named
+/// `invoice_finalized` refusal — never replay success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prepare_replay_during_failed_baseline_returns_invoice_finalized() {
+    let fixture = replay_fixture(72).await;
+    let reference = table_reference(32);
+    let creation = tokio::spawn({
+        let service = fixture.service(Arc::new(ManualClock::new()));
+        let request = fixture.request(&reference);
+        async move { service.create(request).await }
+    });
+    fixture.wait_until_baseline_parked().await;
+    let replay = tokio::spawn({
+        let service = fixture.service(Arc::new(ManualClock::new()));
+        let request = fixture.request(&reference);
+        async move { service.create(request).await }
+    });
+    fixture.wait_until_replay_is_waiting().await;
+
+    // The baseline fails during the wait: the replay must land on
+    // `void_baseline_failed` and answer `invoice_finalized`.
+    fixture
+        .electrum
+        .fail_on_release
+        .store(true, Ordering::SeqCst);
+    fixture.release.send(true).unwrap();
+    let created = creation.await.unwrap();
+    assert_eq!(
+        created,
+        Err(CreateInvoiceError::Unavailable),
+        "the failed baseline refuses the original caller"
+    );
+    let replayed = replay.await.unwrap();
+    assert_eq!(
+        replayed,
+        Err(CreateInvoiceError::InvoiceFinalized),
+        "a baseline that fails during the wait is the finalized refusal"
+    );
+    let state: String = sqlx::query_scalar("SELECT baseline_state FROM invoices")
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "void_baseline_failed");
+    fixture.assert_single_allocation().await;
+    fixture.cleanup().await;
 }

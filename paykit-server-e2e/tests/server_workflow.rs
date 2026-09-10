@@ -1511,8 +1511,12 @@ async fn a_creation_cancelled_after_commit_is_in_progress_on_retry_and_voided_by
     request_task.abort();
     let _ = request_task.await;
 
-    // The identical retry must NEVER be an exact replay of an unpublished
-    // invoice: it is told the baseline is still resolving.
+    // §B.11.6: the identical retry WAITS for the orphaned baseline to
+    // resolve — it is never an exact replay of an unpublished invoice and
+    // it never starts a second snapshot. The orphan never resolves (the
+    // snapshot gate stays parked), so the server's own request-deadline
+    // clock is what bounds the wait and answers 503 dependency_timeout;
+    // nothing in the test sleeps to drive it.
     let retry = send_http(
         address,
         invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
@@ -1520,12 +1524,12 @@ async fn a_creation_cancelled_after_commit_is_in_progress_on_retry_and_voided_by
     .await;
     assert_eq!(
         retry.status,
-        StatusCode::CONFLICT,
+        StatusCode::SERVICE_UNAVAILABLE,
         "retry body: {}",
         String::from_utf8_lossy(&retry.body)
     );
     let retry_body: serde_json::Value = serde_json::from_slice(&retry.body).unwrap();
-    assert_eq!(retry_body["error"]["code"], "invoice_baseline_in_progress");
+    assert_eq!(retry_body["error"]["code"], "dependency_timeout");
 
     // Nothing published: both outbox intents stay `prepared`.
     let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM outbox ORDER BY id")
@@ -1585,8 +1589,9 @@ fn key_tail(seed: u64) -> [u8; 65] {
 /// Two byte-identical concurrent creations whose preflights can both read
 /// `New` (TOCTOU before the first commits): exactly one creation_snapshot
 /// runs, exactly one address is allocated, the winner publishes, and the
-/// loser is told the baseline is still resolving — never voided, never
-/// double-charged, never a second snapshot for the same invoice.
+/// loser waits for that baseline and is served the same stored body —
+/// never voided, never double-charged, never a second snapshot for the
+/// same invoice (§B.11.4 failure-matrix row 8, §B.11.6).
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn concurrent_identical_creations_run_exactly_one_baseline_snapshot() {
     parse_bundle_id(BUNDLE_A).unwrap();
@@ -1678,36 +1683,40 @@ async fn concurrent_identical_creations_run_exactly_one_baseline_snapshot() {
     }
 
     // The loser: byte-identical, issued while the winner's baseline is
-    // unresolved. Whether its preflight reads the awaiting row or its
-    // create_atomic serializes behind the winner's row lock, it must be
-    // told the baseline is still resolving — and it must NEVER start a
-    // second snapshot sequence for the same invoice.
-    let loser = send_http(
+    // unresolved. §B.11.6 / §B.11.4 failure-matrix row 8: it WAITS for the
+    // winner's baseline — whether its preflight reads the awaiting row or
+    // its create_atomic serializes behind the winner's row lock — and it
+    // must NEVER start a second snapshot sequence for the same invoice.
+    let loser = tokio::spawn(send_http(
         address,
         invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
-    )
-    .await;
-    assert_eq!(
-        loser.status,
-        StatusCode::CONFLICT,
-        "loser body: {}",
-        String::from_utf8_lossy(&loser.body)
-    );
-    let loser_body: serde_json::Value = serde_json::from_slice(&loser.body).unwrap();
-    assert_eq!(loser_body["error"]["code"], "invoice_baseline_in_progress");
-    assert_eq!(
-        electrum.snapshot_starts.load(Ordering::SeqCst),
-        1,
-        "a replayed creation must never run a second baseline snapshot"
-    );
+    ));
 
+    // Release the winner's parked baseline: the loser's wait ends on the
+    // stored `prepared` row and both callers receive the same body.
     electrum.release.notify_waiters();
     let winner = winner.await.unwrap();
+    let loser = loser.await.unwrap();
     assert_eq!(
         winner.status,
         StatusCode::OK,
         "winner body: {}",
         String::from_utf8_lossy(&winner.body)
+    );
+    assert_eq!(
+        loser.status,
+        StatusCode::OK,
+        "loser body: {}",
+        String::from_utf8_lossy(&loser.body)
+    );
+    assert_eq!(
+        loser.body, winner.body,
+        "the waiting replay returns the winner's stored body byte-identically"
+    );
+    assert_eq!(
+        electrum.snapshot_starts.load(Ordering::SeqCst),
+        1,
+        "a replayed creation must never run a second baseline snapshot"
     );
 
     // Exactly one address was allocated across both creations.
