@@ -70,10 +70,13 @@ Business routes:
 
 - `GET /setup`
 - `POST /setup/{flow_id}/complete`
-- signed `POST /invoices`
+- signed `POST /invoices` — two-phase prepare (design §B.11): `200` with the prepare body; the invoice lands `prepared`, nothing is published
+- signed `POST /v0/payment-requests` — the marketplace entrypoint, same two-phase prepare and body
+- signed `POST /invoices/{invoice_id}/activate` and `POST /v0/payment-requests/{invoice_id}/activate` — phase 2: verifies the echoed `stack_id`/`total_sats`, takes the §B.4.6 tick-1 snapshot, flips `prepared → observing` and releases the outbox in one transaction; idempotent
+- signed `POST /invoices/{invoice_id}/void` and `POST /v0/payment-requests/{invoice_id}/void` — cancels a `prepared` invoice; idempotent, with the §B.11.3 named errors (`prepare_expired`, `invoice_finalized`, `unknown_invoice`, `stack_identity_mismatch`, `activation_total_mismatch`)
 - signed `POST /transactions/status`
 
-Invoice/status signatures use the configured trusted Locks Ed25519 key. Setup uses the Bitkit Pubky Auth companion-claim flow and an exact configured browser origin.
+Invoice/status signatures use the configured trusted Locks Ed25519 key; the activate/void routes use the same signed-body authentication as the create routes. Setup uses the Bitkit Pubky Auth companion-claim flow and an exact configured browser origin. A `prepared` invoice is never observed and never published (§B.11.5); the reaper voids it at `bitcoin.prepare_ttl` (default 15 min) without activation.
 
 ### Setup iframe
 

@@ -442,3 +442,71 @@ leadership, and a failed leadership check idles the replica. No per-row
 database lock is ever held across network I/O. With the current single
 Railway instance this is operationally a no-op; it exists so a second
 replica can never double-stamp a tick.
+
+## Two-phase creation and activation (§B.11, W1.1c)
+
+Invoice creation is split into a signed **prepare** (phase 1) and a signed
+**activate** (phase 2), with a signed **void** for cancellation. The money
+property the split establishes: *no state of the protocol has a payable
+Payment Request without a committed marketplace bind that polls it.*
+
+- **A `prepared` invoice is unreachable by a buyer (§B.11.5).** Phase 1
+  commits the allocation, the nonce'd total and the creation baseline, and
+  inserts both outbox intents with `status = 'prepared'`.
+  `OutboxStore::claim` selects only `queued`/`leased`/`retryable`, so a
+  `'prepared'` row is invisible to the delivery worker with no new
+  predicate; the derived address — which lives only in the
+  endpoint-publication intent's sealed payload — has never left the
+  database in any form a buyer can read, and the phase-1 response carries
+  only its SHA-256 fingerprint. `observation_plan()` selects only
+  `observing` (forward-compatibly `expired_tail`), so even a buyer who
+  somehow obtained and funded the address is never observed: the payment
+  would sit at the seller's own address, off-rail, exactly like a payment
+  after `expired_final`. This is proven by test, not inspection
+  (`a_funded_prepared_address_is_never_observed_published_or_payable`).
+- **Captured activate/void replays are idempotent, never re-applied.** Both
+  routes reuse the signed-body middleware of the create routes, and the
+  signed body repeats the `invoice_id` (the signature covers the body, not
+  the path). A replayed `activate` on `observing` returns the same 200 body
+  and writes nothing — the outbox flip is `UPDATE … WHERE status =
+  'prepared'`, so a concurrent second activation affects zero rows and
+  cannot double-enqueue. A replayed `void` on `void_cancelled` or
+  `void_prepare_expired` returns the stored body, because the caller's
+  intent is already satisfied. The echoed `stack_id` (the `stack_identity`
+  row minted once per database, W1.3) is verified before any invoice
+  lookup, so a captured message replayed at the *wrong* stack after a
+  repoint is refused `stack_identity_mismatch` and can never cancel or
+  activate a live invoice that happens to share the id.
+- **The echoed `total_sats` is a guard, not an instruction.** A mismatch
+  against the stored nonce'd total refuses activation with
+  `activation_total_mismatch` — this is the R3-3 bug (a marketplace that
+  persisted the pre-nonce amount) caught at runtime rather than published.
+- **The tick-1 snapshot (§B.4.6) runs inside activation**, before the state
+  transaction and outside any row lock: any output unconfirmed at that
+  moment and absent from the creation baseline is written with
+  `kind = 'pre_existing'` (permanently ineligible, exactly like a baseline
+  member) and the sealed `baseline_set_hash` is recomputed over the full
+  set in the same transaction. Because the buyer cannot have the address
+  before activation, rule 2's false-negative window is empty by
+  construction.
+- **The reaper is bounded.** One query per observer tick voids `prepared`
+  invoices whose `prepare_expires_at` has elapsed
+  (`prepare_ttl`, config `bitcoin.prepare_ttl`, default 15 min — far longer
+  than any plausible marketplace commit-plus-outbox latency, far shorter
+  than the 1 h hold window). `void_prepare_expired` is final and never
+  enters `observation_plan()`; a reaped prepare costs one burned derivation
+  index and nothing else.
+- **`activate`/`void` are never gated** by the creation kill switch or the
+  runtime offer-availability verdict (§C.16): refusing them would strand
+  exactly the `prepared` invoices a drain is trying to retire. Only
+  phase-1 `InvoicePreflight::New` passes those gates.
+- **The marketplace-side hold-expiry rule for `preparing` orders is the
+  coordinator's delegated decision** (design §B.11.2 leaves the cell
+  undefined; `marketplace-service` W1.10 prompt §4, recorded there as
+  "coordinator decision; W9.3 reconcile"): on hold expiry with activation
+  still unconfirmed, the marketplace calls `void` with reason
+  `hold_expired` and treats `invoice_finalized` as a lost-2xx activation.
+  Paykit-server's side of that contract is exactly the state machine above:
+  `void` on `prepared` cancels, on a reaped invoice is an idempotent 200,
+  and on a published invoice is the named `invoice_finalized` refusal, so
+  the marketplace's ruling always terminates in a named, alertable outcome.
