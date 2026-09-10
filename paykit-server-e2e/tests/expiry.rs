@@ -61,7 +61,7 @@ use paykit_server::{
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
     domain::payment::BitcoinOutpoint,
-    persistence::{CreatorCredentials, CreatorStore, InvoiceStore, OutboxStore, run_migrations},
+    persistence::{CreatorCredentials, CreatorStore, InvoiceStore, OutboxStore},
     runtime::{ElectrumProbe, Runtime},
     startup::initialize_database,
     workers::observer::{
@@ -268,6 +268,7 @@ fn content_lock(creator: &CreatorPubky, amount_sats: u64) -> ContentLock {
 struct BootedStack {
     address: SocketAddr,
     pool: PgPool,
+    #[allow(dead_code)]
     runtime: Arc<Runtime>,
     stack_id: String,
     store: InvoiceStore,

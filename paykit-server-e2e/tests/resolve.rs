@@ -847,10 +847,7 @@ async fn resolve_table_covers_all_twelve_b9_rows() {
     for (row_index, row) in rows.iter().enumerate() {
         let label = format!(
             "row {} {} {:?} {}",
-            row_index,
-            row.state,
-            row.observation.map(|(delta, conf)| (delta, conf)),
-            row.resolution
+            row_index, row.state, row.observation, row.resolution
         );
         // --- Drive a fresh invoice into the row's state.
         let (invoice_id, address) = match row.state {
