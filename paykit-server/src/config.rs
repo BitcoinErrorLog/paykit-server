@@ -100,6 +100,8 @@ impl Config {
             bitcoin: BitcoinConfig {
                 creation_enabled: raw.bitcoin.creation_enabled,
                 prepare_ttl: raw.bitcoin.prepare_ttl,
+                max_request_expiry: raw.bitcoin.max_request_expiry,
+                expiry_tail: raw.bitcoin.expiry_tail,
             },
             electrum: ElectrumConfig {
                 endpoint: raw.electrum.endpoint,
@@ -163,6 +165,11 @@ impl Config {
                 self.electrum.baseline_completion_timeout,
             ),
             ("bitcoin.prepare_ttl", self.bitcoin.prepare_ttl),
+            (
+                "bitcoin.max_request_expiry",
+                self.bitcoin.max_request_expiry,
+            ),
+            ("bitcoin.expiry_tail", self.bitcoin.expiry_tail),
             ("outbox.poll_interval", self.outbox.poll_interval),
             ("outbox.lease_duration", self.outbox.lease_duration),
             ("outbox.retry_initial", self.outbox.retry_initial),
@@ -635,6 +642,19 @@ pub struct BitcoinConfig {
     /// server clock at creation commit. The reaper voids a `prepared` invoice
     /// once this elapses without activation.
     pub prepare_ttl: Duration,
+    /// Furthest future Payment Request expiry a prepare call may carry
+    /// (design §B.9): `expires_at` further out than
+    /// `server clock + max_request_expiry` is refused fail-closed, so a
+    /// delivered request can never be payable (and observed) effectively
+    /// forever. The buyer's wallet enforces the carried expiry.
+    pub max_request_expiry: Duration,
+    /// Length of the observation tail after `expires_at` (design §B.9): the
+    /// observer tick moves `observing → expired_tail` at `expires_at` and
+    /// `expired_tail → expired_final` at `expires_at + expiry_tail`, both
+    /// timestamp-derived from `expires_at` on the server clock. Through the
+    /// tail the invoice is still observed, deprioritized behind live
+    /// targets; observations recorded there carry `late_settlement`.
+    pub expiry_tail: Duration,
 }
 
 #[derive(Debug)]
@@ -966,6 +986,10 @@ struct RawBitcoinConfig {
     creation_enabled: bool,
     #[serde(default = "default_bitcoin_prepare_ttl", with = "humantime_serde")]
     prepare_ttl: Duration,
+    #[serde(default = "default_bitcoin_max_request_expiry", with = "humantime_serde")]
+    max_request_expiry: Duration,
+    #[serde(default = "default_bitcoin_expiry_tail", with = "humantime_serde")]
+    expiry_tail: Duration,
 }
 
 const fn default_bitcoin_creation_enabled() -> bool {
@@ -978,6 +1002,21 @@ const fn default_bitcoin_creation_enabled() -> bool {
 /// expired order. A paykit-server config value, never marketplace-supplied.
 fn default_bitcoin_prepare_ttl() -> Duration {
     Duration::from_secs(15 * 60)
+}
+
+/// §B.9: a prepare carrying `expires_at` further out than this is refused.
+/// Bounded so every delivered Payment Request expires on a horizon the
+/// observer tail and the marketplace hold window can actually cover.
+fn default_bitcoin_max_request_expiry() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
+}
+
+/// §B.9: `expired_tail → expired_final` at `expires_at + expiry_tail`. The
+/// tail is the window in which a late payment still reaches a human
+/// (`manual_review`) rather than silence; aligned with the marketplace's
+/// 24-hour seller-confirmation window (§B.8.8).
+fn default_bitcoin_expiry_tail() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
 }
 
 #[derive(Deserialize)]

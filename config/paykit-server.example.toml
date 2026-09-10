@@ -47,6 +47,19 @@ network = "testnet"
 # plausible marketplace commit-plus-outbox latency, far shorter than the
 # marketplace's 1 h hold window. Defaults to 15 minutes.
 # prepare_ttl = "15min"
+# Furthest future Payment Request expiry a prepare call may carry (design
+# §B.9): expires_at is required on both prepare entrypoints, and a value
+# already in the past or further out than server clock + max_request_expiry
+# is refused fail-closed. The expiry is carried in the published request and
+# enforced by the buyer's wallet. Defaults to 24 hours.
+# max_request_expiry = "24h"
+# Observation tail after expires_at (design §B.9): at expires_at the invoice
+# moves observing -> expired_tail (still observed, deprioritized behind live
+# targets; observations carry late_settlement and can never drive paid), and
+# at expires_at + expiry_tail it moves to expired_final and leaves the
+# observation target set. Timestamp-derived from expires_at, server clock.
+# Defaults to 24 hours.
+# expiry_tail = "24h"
 
 [deployment]
 # Required, no default. "production" serves real-money traffic; "proof" marks
