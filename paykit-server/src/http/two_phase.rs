@@ -1,5 +1,6 @@
 //! Signed two-phase routes (design §B.11.3): `activate` and `void` for both
-//! creation entrypoint families.
+//! creation entrypoint families, plus the §B.9 `resolve` route on the same
+//! two families (and nowhere else — no `/v0/invoices` alias).
 //!
 //! Authenticated exactly like the create routes (canonical JSON body, single
 //! `x-paykit-signature` header verified against the configured trusted
@@ -25,7 +26,10 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
-    application::two_phase::{ActivateRequest, TwoPhaseError, TwoPhaseService, VoidRequest},
+    application::two_phase::{
+        ActivateRequest, Resolution, ResolveError, ResolveRequest, TwoPhaseError, TwoPhaseService,
+        VoidRequest,
+    },
     http::{auth::AuthenticatedJson, error::ApiError},
 };
 
@@ -44,12 +48,22 @@ struct VoidBody {
     reason: String,
 }
 
+#[derive(Deserialize)]
+struct ResolveHttpBody {
+    invoice_id: Uuid,
+    stack_id: String,
+    resolution: String,
+    resolved_at: String,
+}
+
 pub fn two_phase_router(service: Arc<TwoPhaseService>) -> Router {
     Router::new()
         .route("/invoices/{invoice_id}/activate", post(activate))
         .route("/invoices/{invoice_id}/void", post(void_invoice))
+        .route("/invoices/{invoice_id}/resolve", post(resolve))
         .route("/v0/payment-requests/{invoice_id}/activate", post(activate))
         .route("/v0/payment-requests/{invoice_id}/void", post(void_invoice))
+        .route("/v0/payment-requests/{invoice_id}/resolve", post(resolve))
         .with_state(service)
 }
 
@@ -93,6 +107,58 @@ async fn void_invoice(
     {
         Ok(body) => (StatusCode::OK, Json(body)).into_response(),
         Err(error) => two_phase_error(error),
+    }
+}
+
+/// §B.9: the marketplace's one-way money-outcome record. `resolved_at` is
+/// recorded as supplied; every state decision uses the server clock.
+async fn resolve(
+    State(service): State<Arc<TwoPhaseService>>,
+    Path(invoice_id): Path<Uuid>,
+    AuthenticatedJson(body): AuthenticatedJson<ResolveHttpBody>,
+) -> Response {
+    if body.invoice_id != invoice_id {
+        return ApiError::InvalidRequest.into_response();
+    }
+    let resolution = match body.resolution.as_str() {
+        "paid_manually" => Resolution::PaidManually,
+        "refunded" => Resolution::Refunded,
+        "abandoned" => Resolution::Abandoned,
+        _ => return ApiError::InvalidRequest.into_response(),
+    };
+    let resolved_at = match time::OffsetDateTime::parse(
+        &body.resolved_at,
+        &time::format_description::well_known::Rfc3339,
+    ) {
+        Ok(resolved_at) => resolved_at,
+        Err(_) => return ApiError::InvalidRequest.into_response(),
+    };
+    match service
+        .resolve(ResolveRequest {
+            invoice_id,
+            stack_id: body.stack_id,
+            resolution,
+            resolved_at,
+        })
+        .await
+    {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Err(error) => resolve_error(error),
+    }
+}
+
+fn resolve_error(error: ResolveError) -> Response {
+    match error {
+        ResolveError::UnknownInvoice => ApiError::UnknownInvoice.into_response(),
+        ResolveError::StackIdentityMismatch => ApiError::StackIdentityMismatch.into_response(),
+        ResolveError::InvoiceNotActivated => ApiError::InvoiceNotActivated.into_response(),
+        ResolveError::InvoiceAlreadyResolved(existing) => {
+            crate::http::error::invoice_already_resolved(&existing)
+        }
+        ResolveError::PrepareExpired => ApiError::PrepareExpired.into_response(),
+        ResolveError::InvoiceFinalized => ApiError::InvoiceFinalized.into_response(),
+        ResolveError::BaselineInProgress => ApiError::InvoiceBaselineInProgress.into_response(),
+        ResolveError::Unavailable => ApiError::CreatorSessionUnavailable.into_response(),
     }
 }
 

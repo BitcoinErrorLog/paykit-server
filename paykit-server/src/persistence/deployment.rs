@@ -271,4 +271,15 @@ pub enum PersistenceError {
     /// (§B.11.6 — reported as `prepare_expired`).
     #[error("invoice prepare window expired")]
     PrepareExpired,
+    /// A `resolve` named a `prepared` invoice (design §B.9): nothing was
+    /// ever published, so no buyer could have paid it — reported as
+    /// `invoice_not_activated`.
+    #[error("invoice was never activated")]
+    InvoiceNotActivated,
+    /// A `resolve` named an invoice already resolved with a DIFFERENT
+    /// resolution (design §B.9): one-way, and the conflict is surfaced —
+    /// reported as `invoice_already_resolved` naming the existing
+    /// resolution. A replay of the SAME resolution is not an error.
+    #[error("invoice is already resolved with a different resolution")]
+    InvoiceAlreadyResolved,
 }

@@ -1407,6 +1407,8 @@ fn fake_phase_view(invoice_id: uuid::Uuid) -> Option<paykit_server::persistence:
         allocation_mode: "shared_manual".into(),
         derived_address_fingerprint: "3f7a1c9e5b204d86".into(),
         bitcoin_address: "test-address".into(),
+        resolution: None,
+        resolved_at: None,
     })
 }
 

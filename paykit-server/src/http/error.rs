@@ -26,6 +26,7 @@ pub enum ApiError {
     ActivationTotalMismatch,
     UnknownInvoice,
     StackIdentityMismatch,
+    InvoiceNotActivated,
 }
 
 #[derive(Serialize)]
@@ -139,6 +140,12 @@ impl ApiError {
                 "stack_identity_mismatch",
                 "echoed stack_id is not this stack's identity",
             ),
+            // §B.9's named resolve errors not already covered above.
+            Self::InvoiceNotActivated => (
+                StatusCode::CONFLICT,
+                "invoice_not_activated",
+                "invoice was never activated; nothing was ever published",
+            ),
         }
     }
 }
@@ -161,6 +168,21 @@ impl IntoResponse for ApiError {
         }
         response
     }
+}
+
+/// §B.9's one-way resolution conflict: 409 `invoice_already_resolved`
+/// naming the resolution already recorded on the invoice.
+pub fn invoice_already_resolved(existing_resolution: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": {
+                "code": "invoice_already_resolved",
+                "message": format!("invoice is already resolved as {existing_resolution}"),
+            }
+        })),
+    )
+        .into_response()
 }
 
 /// §B.9's fail-closed `expires_at` refusal: one `invalid_request` code with

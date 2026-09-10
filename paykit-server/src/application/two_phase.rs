@@ -86,6 +86,76 @@ pub struct VoidRequest {
     pub reason: String,
 }
 
+/// The §B.9 marketplace money-outcome record: one-way, stack-pinned,
+/// idempotent on `(invoice_id, resolution)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resolution {
+    /// The seller confirmed the payment off-rail: finalizes
+    /// `observing`/`expired_tail` to `resolved_paid_manually`. Never
+    /// creates or promotes an observation.
+    PaidManually,
+    /// The marketplace refunded the buyer off-rail: `resolved_closed`.
+    Refunded,
+    /// The marketplace gave up on the order: `resolved_closed`.
+    Abandoned,
+}
+
+impl Resolution {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PaidManually => "paid_manually",
+            Self::Refunded => "refunded",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolveRequest {
+    pub invoice_id: Uuid,
+    /// Echo of the `stack_id` phase 1 returned — the remote half of the
+    /// stack pin (§B.9, §B.8.8).
+    pub stack_id: String,
+    pub resolution: Resolution,
+    /// RECORDED only: every state decision uses the server clock.
+    pub resolved_at: time::OffsetDateTime,
+}
+
+/// The resolve response body: the invoice's state and recorded resolution
+/// after the call — identical on an idempotent replay.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ResolveBody {
+    pub invoice_id: Uuid,
+    pub state: String,
+    pub resolution: String,
+    pub resolved_at: Option<String>,
+}
+
+/// Named refusals of the §B.9 resolve table, mapped one-to-one at the
+/// HTTP boundary. Every refusing row except `awaiting_baseline` is
+/// permanent (the marketplace's resolution outbox terminates on it);
+/// `BaselineInProgress` is the one transient refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolveError {
+    UnknownInvoice,
+    StackIdentityMismatch,
+    /// `prepared`: nothing was ever published, so no buyer could have
+    /// paid it (`invoice_not_activated`).
+    InvoiceNotActivated,
+    /// A different resolution is already recorded; the existing one is
+    /// named (`invoice_already_resolved`).
+    InvoiceAlreadyResolved(String),
+    /// `void_prepare_expired`, reusing the W1.1c name (`prepare_expired`).
+    PrepareExpired,
+    /// `void_baseline_failed` / `void_cancelled`, reusing the W1.1c name
+    /// (`invoice_finalized`).
+    InvoiceFinalized,
+    /// `awaiting_baseline`: the one transient refusal
+    /// (`invoice_baseline_in_progress`).
+    BaselineInProgress,
+    Unavailable,
+}
+
 /// Named refusals of the two-phase state machine, mapped one-to-one onto
 /// the §B.11.3 error table at the HTTP boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,9 +191,11 @@ pub fn prepare_outcome(
             derived_address_fingerprint: view.derived_address_fingerprint.clone(),
         }),
         "void_prepare_expired" => Err(CreateInvoiceError::PrepareExpired),
-        "void_baseline_failed" | "void_cancelled" | "expired_final" => {
-            Err(CreateInvoiceError::InvoiceFinalized)
-        }
+        "void_baseline_failed"
+        | "void_cancelled"
+        | "expired_final"
+        | "resolved_paid_manually"
+        | "resolved_closed" => Err(CreateInvoiceError::InvoiceFinalized),
         "awaiting_baseline" => Err(CreateInvoiceError::BaselineInProgress),
         _ => Err(CreateInvoiceError::Unavailable),
     }
@@ -290,6 +362,60 @@ impl TwoPhaseService {
             Err(PersistenceError::BaselineInProgress) => Err(TwoPhaseError::BaselineInProgress),
             Err(_) => Err(TwoPhaseError::Unavailable),
         }
+    }
+
+    /// The §B.9 resolution write (the marketplace's one-way money-outcome
+    /// record). The echoed stack identity is verified before any invoice
+    /// lookup, exactly like `activate`/`void`; the twelve-row table is
+    /// enforced by the store under the row lock, and the body is read back
+    /// from the stored view so an idempotent replay reports exactly what
+    /// the database holds — and writes nothing (`updated_at` untouched).
+    pub async fn resolve(&self, request: ResolveRequest) -> Result<ResolveBody, ResolveError> {
+        if request.stack_id != self.stack_id {
+            return Err(ResolveError::StackIdentityMismatch);
+        }
+        match self
+            .store
+            .resolve_invoice(request.invoice_id, request.resolution.as_str(), request.resolved_at)
+            .await
+        {
+            Ok(Some(_write)) => {}
+            Ok(None) => return Err(ResolveError::UnknownInvoice),
+            Err(PersistenceError::InvoiceNotActivated) => {
+                return Err(ResolveError::InvoiceNotActivated);
+            }
+            Err(PersistenceError::InvoiceAlreadyResolved) => {
+                // Name the existing resolution from the stored record —
+                // the write above changed nothing.
+                let view = self
+                    .store
+                    .prepare_view(request.invoice_id)
+                    .await
+                    .map_err(|_| ResolveError::Unavailable)?
+                    .ok_or(ResolveError::UnknownInvoice)?;
+                return Err(ResolveError::InvoiceAlreadyResolved(
+                    view.resolution.unwrap_or_default(),
+                ));
+            }
+            Err(PersistenceError::PrepareExpired) => return Err(ResolveError::PrepareExpired),
+            Err(PersistenceError::InvoiceFinalized) => return Err(ResolveError::InvoiceFinalized),
+            Err(PersistenceError::BaselineInProgress) => {
+                return Err(ResolveError::BaselineInProgress);
+            }
+            Err(_) => return Err(ResolveError::Unavailable),
+        }
+        let view = self
+            .store
+            .prepare_view(request.invoice_id)
+            .await
+            .map_err(|_| ResolveError::Unavailable)?
+            .ok_or(ResolveError::UnknownInvoice)?;
+        Ok(ResolveBody {
+            invoice_id: view.invoice_id,
+            state: view.baseline_state.clone(),
+            resolution: view.resolution.unwrap_or_default(),
+            resolved_at: rfc3339(view.resolved_at),
+        })
     }
 
     async fn load_view(&self, invoice_id: Uuid) -> Result<InvoicePhaseView, TwoPhaseError> {

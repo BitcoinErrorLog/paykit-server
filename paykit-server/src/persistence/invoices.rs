@@ -279,10 +279,11 @@ pub enum InvoicePreflight {
     /// the client retries until the row resolves (a completed baseline
     /// replays exactly; the sweeper's void is the terminal fallback).
     BaselineInProgress,
-    /// The idempotent payload matches an invoice in a final void state
-    /// (`void_baseline_failed`, `void_cancelled`, or `expired_final`):
-    /// §B.11.6 answers a phase-1 replay against it with the named
-    /// `invoice_finalized` refusal, never with replay success.
+    /// The idempotent payload matches an invoice in a final state
+    /// (`void_baseline_failed`, `void_cancelled`, `expired_final`, or
+    /// either resolved state): §B.11.6 answers a phase-1 replay against
+    /// it with the named `invoice_finalized` refusal, never with replay
+    /// success.
     InvoiceFinalized,
     /// The idempotent payload matches an invoice reaped at
     /// `prepare_expires_at` (`void_prepare_expired`): §B.11.6 answers a
@@ -361,6 +362,12 @@ pub struct InvoicePhaseView {
     /// hex-encoded — deliberately not the address (§B.11.3).
     pub derived_address_fingerprint: String,
     pub bitcoin_address: String,
+    /// The §B.9 marketplace resolution recorded by `resolve`, when any
+    /// (`paid_manually` | `refunded` | `abandoned`).
+    pub resolution: Option<String>,
+    /// The caller-supplied `resolved_at` recorded with it (recorded only;
+    /// every state decision uses the server clock).
+    pub resolved_at: Option<time::OffsetDateTime>,
 }
 
 /// Row counts of one tick's §B.9 expiry transitions.
@@ -390,6 +397,19 @@ pub enum VoidWrite {
     /// Idempotent replay on `void_cancelled`/`void_prepare_expired`:
     /// nothing was written (§B.11.6).
     AlreadyVoid,
+}
+
+/// Outcome of [`InvoiceStore::resolve_invoice`] on a known invoice (§B.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveWrite {
+    /// `observing`/`expired_tail` finalized to the matching resolved
+    /// state and left `observation_plan()` in the same transaction.
+    Finalized,
+    /// `expired_final`: `resolution` + `resolved_at` recorded for audit;
+    /// the state is unchanged and observation does not resume.
+    MetadataOnly,
+    /// Idempotent replay of the already-recorded resolution: zero writes.
+    Replayed,
 }
 
 /// First 8 bytes of SHA-256 over the derived address string, hex-encoded
@@ -818,7 +838,11 @@ impl InvoiceStore {
             Some((_, baseline_state))
                 if matches!(
                     baseline_state.as_str(),
-                    "void_baseline_failed" | "void_cancelled" | "expired_final"
+                    "void_baseline_failed"
+                        | "void_cancelled"
+                        | "expired_final"
+                        | "resolved_paid_manually"
+                        | "resolved_closed"
                 ) =>
             {
                 InvoicePreflight::InvoiceFinalized
@@ -876,7 +900,11 @@ impl InvoiceStore {
         match existing.baseline_state.as_str() {
             "awaiting_baseline" => return Err(PersistenceError::BaselineInProgress),
             "void_prepare_expired" => return Err(PersistenceError::PrepareExpired),
-            "void_baseline_failed" | "void_cancelled" | "expired_final" => {
+            "void_baseline_failed"
+            | "void_cancelled"
+            | "expired_final"
+            | "resolved_paid_manually"
+            | "resolved_closed" => {
                 return Err(PersistenceError::InvoiceFinalized);
             }
             _ => {}
@@ -1071,6 +1099,7 @@ impl InvoiceStore {
         let row = sqlx::query_as::<_, PhaseViewRow>(
             "SELECT invoices.baseline_state, invoices.expires_at, invoices.prepare_expires_at,
                     invoices.activated_at, invoices.updated_at, invoices.payment_record_envelope,
+                    invoices.resolution, invoices.resolved_at,
                     creators.creator_lookup_hash, creators.allocation_mode
              FROM invoices JOIN creators ON creators.id = invoices.creator_id
              WHERE invoices.id = $1",
@@ -1107,6 +1136,8 @@ impl InvoiceStore {
             allocation_mode: row.allocation_mode,
             derived_address_fingerprint: derived_address_fingerprint(record.bitcoin_address()),
             bitcoin_address: record.bitcoin_address().to_owned(),
+            resolution: row.resolution,
+            resolved_at: row.resolved_at,
         }))
     }
 
@@ -1297,6 +1328,121 @@ impl InvoiceStore {
                 return Err(PersistenceError::InvoiceFinalized);
             }
             "awaiting_baseline" => return Err(PersistenceError::BaselineInProgress),
+            _ => return Err(PersistenceError::CorruptOrMissing),
+        };
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(Some(write))
+    }
+
+    /// The §B.9 marketplace resolution write: one row of the twelve-row
+    /// table, in one transaction, guarded by the state read under the row
+    /// lock. `paid_manually` finalizes `observing`/`expired_tail` to
+    /// `resolved_paid_manually`; `refunded`/`abandoned` to
+    /// `resolved_closed`; either leaves `observation_plan()` with the
+    /// state flip. On `expired_final` the resolution is metadata-only:
+    /// recorded for audit, the state unchanged, observation never
+    /// resuming — there is no un-final edge. Idempotent on
+    /// `(invoice_id, resolution)`: the same resolution again writes
+    /// nothing and reports [`ResolveWrite::Replayed`]; a different one is
+    /// [`PersistenceError::InvoiceAlreadyResolved`]. A `paid_manually`
+    /// resolution never creates or promotes an observation.
+    ///
+    /// Returns `Ok(None)` for an unknown invoice id. `resolved_at` is
+    /// recorded as supplied; every state decision here reads the stored
+    /// state, never the caller's clock.
+    pub async fn resolve_invoice(
+        &self,
+        invoice_id: Uuid,
+        resolution: &str,
+        resolved_at: time::OffsetDateTime,
+    ) -> Result<Option<ResolveWrite>, PersistenceError> {
+        if !matches!(resolution, "paid_manually" | "refunded" | "abandoned") {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let row = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT baseline_state, resolution FROM invoices WHERE id = $1 FOR UPDATE",
+        )
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some((baseline_state, existing_resolution)) = row else {
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(None);
+        };
+        // Idempotency on (invoice_id, resolution), covering both resolved
+        // states and a metadata-only `expired_final` record: the same
+        // resolution returns the existing record with zero writes; a
+        // different one is the named one-way conflict.
+        if let Some(existing) = existing_resolution {
+            if existing == resolution {
+                tx.commit()
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)?;
+                return Ok(Some(ResolveWrite::Replayed));
+            }
+            return Err(PersistenceError::InvoiceAlreadyResolved);
+        }
+        let write = match baseline_state.as_str() {
+            "observing" | "expired_tail" => {
+                let new_state = if resolution == "paid_manually" {
+                    "resolved_paid_manually"
+                } else {
+                    "resolved_closed"
+                };
+                let flipped = sqlx::query(
+                    "UPDATE invoices
+                     SET baseline_state = $2, resolution = $3, resolved_at = $4,
+                         updated_at = NOW()
+                     WHERE id = $1 AND baseline_state = $5",
+                )
+                .bind(invoice_id)
+                .bind(new_state)
+                .bind(resolution)
+                .bind(resolved_at)
+                .bind(&baseline_state)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                if flipped.rows_affected() != 1 {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                ResolveWrite::Finalized
+            }
+            "expired_final" => {
+                let recorded = sqlx::query(
+                    "UPDATE invoices
+                     SET resolution = $2, resolved_at = $3, updated_at = NOW()
+                     WHERE id = $1 AND baseline_state = 'expired_final'",
+                )
+                .bind(invoice_id)
+                .bind(resolution)
+                .bind(resolved_at)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                if recorded.rows_affected() != 1 {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                ResolveWrite::MetadataOnly
+            }
+            "prepared" => return Err(PersistenceError::InvoiceNotActivated),
+            "awaiting_baseline" => return Err(PersistenceError::BaselineInProgress),
+            "void_prepare_expired" => return Err(PersistenceError::PrepareExpired),
+            "void_baseline_failed" | "void_cancelled" => {
+                return Err(PersistenceError::InvoiceFinalized);
+            }
+            // `manual_review` and `legacy_unbaselined` have no resolve row
+            // in §B.9's table: safe refusal, zero writes.
             _ => return Err(PersistenceError::CorruptOrMissing),
         };
         tx.commit()
@@ -2177,7 +2323,11 @@ impl InvoiceStore {
             match existing.baseline_state.as_str() {
                 "awaiting_baseline" => return Err(PersistenceError::BaselineInProgress),
                 "void_prepare_expired" => return Err(PersistenceError::PrepareExpired),
-                "void_baseline_failed" | "void_cancelled" | "expired_final" => {
+                "void_baseline_failed"
+                | "void_cancelled"
+                | "expired_final"
+                | "resolved_paid_manually"
+                | "resolved_closed" => {
                     return Err(PersistenceError::InvoiceFinalized);
                 }
                 _ => {}
@@ -2598,6 +2748,8 @@ struct PhaseViewRow {
     activated_at: Option<time::OffsetDateTime>,
     updated_at: time::OffsetDateTime,
     payment_record_envelope: Vec<u8>,
+    resolution: Option<String>,
+    resolved_at: Option<time::OffsetDateTime>,
     creator_lookup_hash: Vec<u8>,
     allocation_mode: String,
 }
