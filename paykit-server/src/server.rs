@@ -233,7 +233,8 @@ impl Server {
             )
             .with_offer_availability(runtime.clone())
             .with_stack_identity(stack_identity.stack_id())
-            .with_prepare_ttl(config.bitcoin.prepare_ttl),
+            .with_prepare_ttl(config.bitcoin.prepare_ttl)
+            .with_max_request_expiry(config.bitcoin.max_request_expiry),
         );
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
         let payment_request_service = Arc::new(
@@ -266,7 +267,8 @@ impl Server {
             )
             .with_offer_availability(runtime.clone())
             .with_stack_identity(stack_identity.stack_id())
-            .with_prepare_ttl(config.bitcoin.prepare_ttl),
+            .with_prepare_ttl(config.bitcoin.prepare_ttl)
+            .with_max_request_expiry(config.bitcoin.max_request_expiry),
         );
         // §B.11 phase 2: the signed activate/void service. It reuses the
         // same Electrum adapter, request limiter and snapshot slots as
@@ -379,6 +381,7 @@ impl Server {
                 max_transaction_bytes: usize::try_from(config.electrum.max_transaction_bytes)
                     .expect("validated transaction cap fits usize"),
                 baseline_completion_timeout: config.electrum.baseline_completion_timeout,
+                expiry_tail: config.bitcoin.expiry_tail,
             },
         };
 

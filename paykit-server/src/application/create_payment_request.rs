@@ -48,10 +48,11 @@ pub struct MarketplacePaymentRequest {
     pub reader: ReaderPubky,
     pub reference: BundleId,
     pub amount_sats: u64,
-    /// The order's hold deadline (design §B.11.3): required, must be in the
-    /// future, and is echoed on the phase-1/phase-2 bodies. The §B.9 expiry
-    /// edges land with the expiry work; this slice persists and echoes the
-    /// value.
+    /// The order's hold deadline (design §B.9/§B.11.3): required, refused
+    /// when past or further out than `max_request_expiry`, persisted on the
+    /// invoice, echoed on the phase-1/phase-2 bodies, and carried into the
+    /// published request's `proposal_expires_at` so the buyer's wallet
+    /// enforces it.
     pub expires_at: time::OffsetDateTime,
     /// `{order_reference}:{bind_attempt}` (design §B.11.3). It rides in the
     /// payment-request binding, so an identical retry replays the stored
@@ -79,6 +80,7 @@ pub struct MarketplacePaymentRequestService {
     clock: Arc<dyn DeadlineClock>,
     stack_id: String,
     prepare_ttl: Duration,
+    max_request_expiry: Duration,
 }
 
 impl MarketplacePaymentRequestService {
@@ -149,6 +151,7 @@ impl MarketplacePaymentRequestService {
             clock,
             stack_id: crate::application::create_invoice::UNSPECIFIED_STACK_ID.to_owned(),
             prepare_ttl: crate::application::create_invoice::DEFAULT_PREPARE_TTL,
+            max_request_expiry: crate::application::create_invoice::DEFAULT_MAX_REQUEST_EXPIRY,
         }
     }
 
@@ -181,6 +184,13 @@ impl MarketplacePaymentRequestService {
     /// `prepare_expires_at` at creation commit (§B.11.1).
     pub fn with_prepare_ttl(mut self, prepare_ttl: Duration) -> Self {
         self.prepare_ttl = prepare_ttl;
+        self
+    }
+
+    /// Installs the configured `bitcoin.max_request_expiry` bounding how
+    /// far out a prepare's `expires_at` may lie (§B.9, fail closed).
+    pub fn with_max_request_expiry(mut self, max_request_expiry: Duration) -> Self {
+        self.max_request_expiry = max_request_expiry;
         self
     }
 
@@ -239,14 +249,15 @@ impl MarketplacePaymentRequestService {
                 return Err(CreateInvoiceError::Unavailable);
             }
         }
-        // §B.11.3: `expires_at` is refused when past (missing is rejected by
-        // the route's schema; "beyond the configured maximum" arrives with
-        // the §B.9 expiry edges). The check runs only for a New bind: an
-        // exact replay must return the stored body even after the deadline
-        // has passed (§B.11.6 — `observing` and `expired_tail` replay 200).
-        if request.expires_at <= time::OffsetDateTime::now_utc() {
-            return Err(CreateInvoiceError::InvalidRequest);
-        }
+        // §B.9: `expires_at` is refused when past or beyond the configured
+        // maximum (missing is rejected by the route's schema). The check
+        // runs only for a New bind: an exact replay must return the stored
+        // body even after the deadline has passed (§B.11.6 — `observing`
+        // and `expired_tail` replay 200).
+        crate::application::create_invoice::validate_expires_at(
+            request.expires_at,
+            self.max_request_expiry,
+        )?;
         // Runtime creation gate, identical to the Locks invoice path
         // (static flag → live availability → limiter charging). Refusing
         // here consumes no address, advances no cursor, and charges no
@@ -325,7 +336,7 @@ impl MarketplacePaymentRequestService {
                 required_sats: total_sats,
                 nonce_sats,
                 prepare_ttl: self.prepare_ttl,
-                expires_at: Some(request.expires_at),
+                expires_at: request.expires_at,
             })
             .await
         {
@@ -468,7 +479,14 @@ impl MarketplacePaymentRequestService {
             // rides in `metadata.order_reference`.
             payment_reference: PaymentReference::new(uuid::Uuid::new_v4().hyphenated().to_string())
                 .map_err(|_| CreateInvoiceError::InvalidRequest)?,
-            proposal_expires_at: None,
+            // §B.9: the expiry rides in the published request so the
+            // buyer's wallet refuses to pay it once expired.
+            proposal_expires_at: Some(
+                request
+                    .expires_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .map_err(|_| CreateInvoiceError::InvalidRequest)?,
+            ),
             recurrence: None,
             accepted_payment_endpoint_identifiers: vec![
                 PaymentEndpointIdentifier::new(self.intents.onchain_endpoint_identifier())

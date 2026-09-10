@@ -20,6 +20,10 @@ struct InvoiceBody {
     bundle_id: String,
     lock_resource: String,
     reader: String,
+    /// §B.9: required exactly as on `/v0/payment-requests`; a missing field
+    /// is the schema's plain `invalid_request`, past/over-maximum are named
+    /// by the service.
+    expires_at: String,
 }
 
 pub fn invoices_router(service: Arc<CreateInvoiceService>) -> Router {
@@ -50,6 +54,11 @@ fn parse(body: InvoiceBody) -> Result<CreateInvoiceRequest, ApiError> {
         lock_resource: parse_addressed_lock_resource(&body.lock_resource)
             .map_err(|_| ApiError::InvalidRequest)?,
         reader: parse_reader(&body.reader).map_err(|_| ApiError::InvalidRequest)?,
+        expires_at: time::OffsetDateTime::parse(
+            &body.expires_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .map_err(|_| ApiError::InvalidRequest)?,
     })
 }
 
@@ -76,5 +85,8 @@ fn invoice_error(error: CreateInvoiceError) -> Response {
         }
         CreateInvoiceError::InvoiceFinalized => ApiError::InvoiceFinalized.into_response(),
         CreateInvoiceError::PrepareExpired => ApiError::PrepareExpired.into_response(),
+        CreateInvoiceError::InvalidExpiry(reason) => {
+            crate::http::error::invalid_expiry(reason)
+        }
     }
 }

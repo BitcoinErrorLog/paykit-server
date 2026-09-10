@@ -298,6 +298,16 @@ pub trait ObservationBackend: Send + Sync {
     async fn reap_expired_prepares(&self) -> Result<u64, ObserverError> {
         Ok(0)
     }
+    /// The §B.9 expiry transitions: one pair of conditional UPDATEs per
+    /// tick moving `observing → expired_tail` at `expires_at` and
+    /// `expired_tail → expired_final` at `expires_at + tail`, both
+    /// timestamp-derived from `expires_at` on the server clock.
+    async fn apply_expiry_transitions(
+        &self,
+        _tail: Duration,
+    ) -> Result<crate::persistence::ExpiryTransitions, ObserverError> {
+        Ok(crate::persistence::ExpiryTransitions::default())
+    }
 }
 
 #[async_trait]
@@ -375,6 +385,15 @@ impl ObservationBackend for InvoiceStore {
             .await
             .map_err(map_persistence)
     }
+
+    async fn apply_expiry_transitions(
+        &self,
+        tail: Duration,
+    ) -> Result<crate::persistence::ExpiryTransitions, ObserverError> {
+        InvoiceStore::apply_expiry_transitions(self, tail)
+            .await
+            .map_err(map_persistence)
+    }
 }
 
 /// Cluster-wide observer leadership boundary. Exactly one replica may run
@@ -414,6 +433,10 @@ pub struct ObserverPolicy {
     pub max_requests_per_second: u32,
     pub max_transaction_bytes: usize,
     pub baseline_completion_timeout: Duration,
+    /// §B.9 observation tail: `expired_tail → expired_final` at
+    /// `expires_at + expiry_tail`, applied by one pair of conditional
+    /// UPDATEs per tick.
+    pub expiry_tail: Duration,
 }
 
 impl ObserverPolicy {
@@ -738,6 +761,7 @@ pub struct ObserverTickState {
     zero_success_logged: bool,
     max_transaction_bytes: usize,
     baseline_completion_timeout: Duration,
+    expiry_tail: Duration,
 }
 
 impl ObserverTickState {
@@ -751,6 +775,7 @@ impl ObserverTickState {
             policy.max_transaction_bytes,
         );
         state.baseline_completion_timeout = policy.baseline_completion_timeout;
+        state.expiry_tail = policy.expiry_tail;
         state
     }
 
@@ -771,6 +796,7 @@ impl ObserverTickState {
             zero_success_logged: false,
             max_transaction_bytes,
             baseline_completion_timeout: Duration::from_secs(60),
+            expiry_tail: Duration::from_secs(24 * 60 * 60),
         }
     }
 
@@ -935,6 +961,13 @@ pub async fn observe_tick(
     // §B.11.1: one reaper query per tick. A reaped prepare is final and
     // never enters the plan this tick or any later one.
     if let Err(error) = backend.reap_expired_prepares().await {
+        return ObserverTickOutcome::ObservationFailed(error);
+    }
+    // §B.9: one expiry-transition pair per tick, ordered before the plan
+    // load so a newly-tailed invoice is deprioritized and a newly-final
+    // invoice absent already this tick. Both guards are conditional
+    // UPDATEs on the server clock, timestamp-derived from `expires_at`.
+    if let Err(error) = backend.apply_expiry_transitions(state.expiry_tail).await {
         return ObserverTickOutcome::ObservationFailed(error);
     }
     let tip = match port.probe().await {
@@ -1180,6 +1213,7 @@ pub async fn observation_loop(
         policy.max_transaction_bytes,
     );
     state.baseline_completion_timeout = policy.baseline_completion_timeout;
+    state.expiry_tail = policy.expiry_tail;
     let mut first_tick = true;
     let mut was_leader = true;
     loop {
@@ -2217,6 +2251,7 @@ mod tests {
             max_requests_per_second: 5,
             max_transaction_bytes: 400_000,
             baseline_completion_timeout: Duration::from_secs(60),
+            expiry_tail: Duration::from_secs(24 * 60 * 60),
         };
         assert_eq!(policy.per_tick_budget(), 50);
         let capped = ObserverPolicy {

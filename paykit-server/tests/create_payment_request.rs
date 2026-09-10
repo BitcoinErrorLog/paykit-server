@@ -154,11 +154,7 @@ fn request(amount_sats: u64) -> MarketplacePaymentRequest {
         reader: parse_reader(&reader()).unwrap(),
         reference: parse_bundle_id(REFERENCE).unwrap(),
         amount_sats,
-        expires_at: time::OffsetDateTime::parse(
-            "2099-01-01T00:00:00Z",
-            &time::format_description::well_known::Rfc3339,
-        )
-        .unwrap(),
+        expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         idempotency_key: format!("{REFERENCE}:1"),
     }
 }
@@ -430,8 +426,13 @@ fn ok_session() -> Arc<FakeSession> {
 #[tokio::test]
 async fn persists_exact_terms_bindings_and_derived_address_without_a_lock() {
     let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    let request = request(50_000);
+    let expires_at = request
+        .expires_at
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
     let result = service(ok_session(), store.clone(), BitcoinNetwork::Mainnet)
-        .create(request(50_000))
+        .create(request)
         .await
         .unwrap();
     // §B.11.3: the phase-1 body reports the stored nonce'd total.
@@ -451,7 +452,7 @@ async fn persists_exact_terms_bindings_and_derived_address_without_a_lock() {
             "creator": CREATOR,
             "reader": reader(),
             "reference": REFERENCE,
-            "expires_at": "2099-01-01T00:00:00Z",
+            "expires_at": expires_at,
             "idempotency_key": format!("{REFERENCE}:1"),
         }))
         .unwrap()
@@ -471,7 +472,9 @@ async fn persists_exact_terms_bindings_and_derived_address_without_a_lock() {
             assert_eq!(terms.asset, "btc");
             let reference = uuid::Uuid::parse_str(&terms.payment_reference).unwrap();
             assert_eq!(reference.get_version_num(), 4);
-            assert_eq!(terms.proposal_expires_at, None);
+            // §B.9: the expiry is carried into the published request so the
+            // buyer's wallet enforces it.
+            assert_eq!(terms.proposal_expires_at.as_deref(), Some(expires_at.as_str()));
             assert_eq!(terms.accepted_endpoint_identifiers, ["btc-bitcoin-p2wpkh"]);
             assert_eq!(
                 serde_json::Value::Object(terms.metadata.clone()),
@@ -859,7 +862,9 @@ fn canonical_body() -> String {
             "creator": CREATOR,
             "reader": reader(),
             "reference": REFERENCE,
-            "expires_at": "2099-01-01T00:00:00Z",
+            "expires_at": (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
             "idempotency_key": format!("{REFERENCE}:1"),
         }))
         .unwrap(),
@@ -1152,6 +1157,7 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
             max_requests_per_second: 5,
             max_transaction_bytes: 400_000,
             baseline_completion_timeout: std::time::Duration::from_secs(60),
+            expiry_tail: std::time::Duration::from_secs(24 * 60 * 60),
         }),
     )
     .await;

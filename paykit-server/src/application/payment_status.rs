@@ -12,14 +12,18 @@ use crate::{
 /// Validated payment facts read from one persisted invoice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistedPaymentStatus {
-    Undetected,
+    Undetected {
+        late_settlement: bool,
+    },
     Detected {
         confirmations: u32,
         amount_matched: bool,
+        late_settlement: bool,
     },
     Confirmed {
         confirmations: u32,
         amount_matched: bool,
+        late_settlement: bool,
     },
 }
 
@@ -44,28 +48,31 @@ impl StatusRepository for InvoiceStore {
     }
 }
 
-/// The exact, secret-free Locks-facing status response.
+/// The exact, secret-free Locks-facing status response. `late_settlement`
+/// marks an observation recorded in the §B.9 expiry tail: it is a factual
+/// observation, never a settlement — the marketplace routes it to
+/// `manual_review` and it can never drive `paid`, even when it reports
+/// `confirmed` with an exact amount (§B.9, §B.8.8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaymentStatusResponse {
     status: &'static str,
     confirmations: u32,
     amount_matched: bool,
+    late_settlement: bool,
 }
 
 impl PaymentStatusResponse {
-    fn undetected() -> Self {
-        Self {
-            status: "undetected",
-            confirmations: 0,
-            amount_matched: false,
-        }
-    }
-
-    fn observed(status: &'static str, confirmations: u32, amount_matched: bool) -> Self {
+    fn new(
+        status: &'static str,
+        confirmations: u32,
+        amount_matched: bool,
+        late_settlement: bool,
+    ) -> Self {
         Self {
             status,
             confirmations,
             amount_matched,
+            late_settlement,
         }
     }
 
@@ -79,6 +86,10 @@ impl PaymentStatusResponse {
 
     pub fn amount_matched(&self) -> bool {
         self.amount_matched
+    }
+
+    pub fn late_settlement(&self) -> bool {
+        self.late_settlement
     }
 }
 
@@ -111,15 +122,29 @@ impl PaymentStatusService {
             .map_err(|_| PaymentStatusError::Unavailable)?
             .ok_or(PaymentStatusError::NotFound)?;
         Ok(match persisted {
-            PersistedPaymentStatus::Undetected => PaymentStatusResponse::undetected(),
+            PersistedPaymentStatus::Undetected { late_settlement } => {
+                PaymentStatusResponse::new("undetected", 0, false, late_settlement)
+            }
             PersistedPaymentStatus::Detected {
                 confirmations,
                 amount_matched,
-            } => PaymentStatusResponse::observed("detected", confirmations, amount_matched),
+                late_settlement,
+            } => PaymentStatusResponse::new(
+                "detected",
+                confirmations,
+                amount_matched,
+                late_settlement,
+            ),
             PersistedPaymentStatus::Confirmed {
                 confirmations,
                 amount_matched,
-            } => PaymentStatusResponse::observed("confirmed", confirmations, amount_matched),
+                late_settlement,
+            } => PaymentStatusResponse::new(
+                "confirmed",
+                confirmations,
+                amount_matched,
+                late_settlement,
+            ),
         })
     }
 }

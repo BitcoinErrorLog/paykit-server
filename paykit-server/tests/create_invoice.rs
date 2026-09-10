@@ -129,11 +129,16 @@ fn reader() -> String {
     panic!("valid reader fixture")
 }
 
+fn expires_at() -> time::OffsetDateTime {
+    time::OffsetDateTime::now_utc() + time::Duration::hours(1)
+}
+
 fn request() -> CreateInvoiceRequest {
     CreateInvoiceRequest {
         bundle_id: parse_bundle_id(BUNDLE).unwrap(),
         lock_resource: parse_addressed_lock_resource(LOCK_RESOURCE).unwrap(),
         reader: parse_reader(&reader()).unwrap(),
+        expires_at: expires_at(),
     }
 }
 
@@ -177,12 +182,23 @@ fn capable_marker() -> paykit_lib::PaykitReceiverMarker {
 fn library_payment_request_has_exact_terms_amount_and_metadata() {
     let request = request();
     let terms = PaykitIntentBuilder::default()
-        .payment_request_terms(&request, &valid_lock(), 500)
+        .payment_request_terms(&request, &valid_lock(), 500, request.expires_at)
         .unwrap();
     // The terms amount is the nonce'd total: lock price 50000 + nonce 500.
     assert_eq!(terms.amount.value, "0.00050500");
     assert_eq!(terms.amount.asset, "btc");
-    assert_eq!(terms.proposal_expires_at, None);
+    // §B.9: the expiry is carried into the published request so the
+    // buyer's wallet enforces it.
+    assert_eq!(
+        terms.proposal_expires_at.as_deref(),
+        Some(
+            request
+                .expires_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+                .as_str()
+        )
+    );
     assert_eq!(terms.recurrence, None);
     assert_eq!(
         terms.accepted_payment_endpoint_identifiers[0].as_str(),
@@ -1033,6 +1049,9 @@ async fn disabled_creation_maps_to_the_stable_http_code_on_the_locks_route() {
     .layer(Extension(signed_auth(&key)));
     let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
         "bundle_id": BUNDLE,
+        "expires_at": expires_at()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
         "lock_resource": LOCK_RESOURCE,
         "reader": reader()
     }))
@@ -1177,6 +1196,9 @@ async fn signed_router_maps_deadline_exhaustion_to_dependency_timeout() {
     let router = invoices_router(Arc::new(service)).layer(Extension(signed_auth(&key)));
     let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
         "bundle_id": BUNDLE,
+        "expires_at": expires_at()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
         "lock_resource": LOCK_RESOURCE,
         "reader": reader()
     }))
@@ -1266,6 +1288,9 @@ async fn signed_router_parses_canonical_invoice_and_derives_creator_from_lock_re
         .layer(Extension(signed_auth(&key)));
     let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
         "bundle_id": BUNDLE,
+        "expires_at": expires_at()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
         "lock_resource": LOCK_RESOURCE,
         "reader": reader()
     }))
@@ -1303,6 +1328,9 @@ async fn signed_router_maps_session_invalid_and_unavailable_and_rejects_bad_iden
             .layer(Extension(signed_auth(&key)));
         let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
             "bundle_id": BUNDLE,
+            "expires_at": expires_at()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
             "lock_resource": LOCK_RESOURCE,
             "reader": reader()
         }))
@@ -1751,6 +1779,9 @@ async fn hidden_offer_maps_to_503_bitcoin_offer_unavailable_on_the_locks_route()
     .layer(Extension(signed_auth(&key)));
     let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
         "bundle_id": BUNDLE,
+        "expires_at": expires_at()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
         "lock_resource": LOCK_RESOURCE,
         "reader": reader()
     }))

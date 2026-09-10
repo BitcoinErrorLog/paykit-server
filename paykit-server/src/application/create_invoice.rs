@@ -50,6 +50,10 @@ pub const UNSPECIFIED_STACK_ID: &str = "unspecified:00000000-0000-0000-0000-0000
 /// only; production wires `bitcoin.prepare_ttl` from configuration.
 pub const DEFAULT_PREPARE_TTL: Duration = Duration::from_secs(15 * 60);
 
+/// §B.9's `max_request_expiry` when none is installed — test compositions
+/// only; production wires `bitcoin.max_request_expiry` from configuration.
+pub const DEFAULT_MAX_REQUEST_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Draws one invoice's amount nonce from the operating system's CSPRNG
 /// (design §B.8.2): `nonce_sats ∈ [1, 999]`, never derived from the order
 /// id, the price, a counter, or time, because a predictable nonce is not a
@@ -66,6 +70,12 @@ pub struct CreateInvoiceRequest {
     pub bundle_id: BundleId,
     pub lock_resource: PubkyLockResource,
     pub reader: ReaderPubky,
+    /// The Payment Request expiry (design §B.9): required on this
+    /// entrypoint exactly as on `/v0/payment-requests`, refused when past
+    /// or further out than `max_request_expiry`, persisted on the invoice,
+    /// and carried into the published request's `proposal_expires_at` so
+    /// the buyer's wallet enforces it.
+    pub expires_at: time::OffsetDateTime,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,6 +120,30 @@ pub enum CreateInvoiceError {
     /// A phase-1 replay matched an invoice reaped at `prepare_expires_at`:
     /// §B.11.6 answers with the named `prepare_expired` refusal.
     PrepareExpired,
+    /// §B.9: `expires_at` failed the fail-closed creation check — past the
+    /// server clock or beyond `max_request_expiry`. Reported as
+    /// `invalid_request` with the named reason at the HTTP boundary.
+    InvalidExpiry(ExpiryRefusal),
+}
+
+/// Why an `expires_at` was refused at creation (§B.9). "Missing" never
+/// reaches the service: the route schema rejects it as `invalid_request`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpiryRefusal {
+    /// Already in the past on the server clock.
+    Past,
+    /// Further out than the configured `max_request_expiry`.
+    OverMaximum,
+}
+
+impl ExpiryRefusal {
+    /// Stable machine-readable reason carried on the 400 body.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Past => "expires_at_past",
+            Self::OverMaximum => "expires_at_over_maximum",
+        }
+    }
 }
 
 /// Live read of the runtime's `bitcoin_offer_available` verdict. This is
@@ -259,11 +293,14 @@ pub trait IntentBuilder: Send + Sync {
     /// Builds the Payment Request terms. The amount is the nonce'd total
     /// (`lock price + nonce_sats`, design §B.8.2): the buyer's checkout
     /// figure, the Payment Request amount and the recorded total all agree.
+    /// `expires_at` is carried as `proposal_expires_at` so the buyer's
+    /// wallet enforces the expiry (design §B.9).
     fn payment_request_terms(
         &self,
         request: &CreateInvoiceRequest,
         lock: &ContentLock,
         nonce_sats: u64,
+        expires_at: time::OffsetDateTime,
     ) -> Result<PaymentRequestTerms, CreateInvoiceError>;
     fn receiving_details(
         &self,
@@ -310,6 +347,7 @@ impl IntentBuilder for PaykitIntentBuilder {
         request: &CreateInvoiceRequest,
         lock: &ContentLock,
         nonce_sats: u64,
+        expires_at: time::OffsetDateTime,
     ) -> Result<PaymentRequestTerms, CreateInvoiceError> {
         let amount = extract_terms(lock)?;
         let sats = amount
@@ -337,7 +375,13 @@ impl IntentBuilder for PaykitIntentBuilder {
             .map_err(|_| CreateInvoiceError::InvalidRequest)?,
             payment_reference: PaymentReference::new(uuid::Uuid::new_v4().hyphenated().to_string())
                 .map_err(|_| CreateInvoiceError::InvalidRequest)?,
-            proposal_expires_at: None,
+            // §B.9: the expiry rides in the published request so the
+            // buyer's wallet refuses to pay it once expired.
+            proposal_expires_at: Some(
+                expires_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .map_err(|_| CreateInvoiceError::InvalidRequest)?,
+            ),
             recurrence: None,
             accepted_payment_endpoint_identifiers: vec![
                 PaymentEndpointIdentifier::new(self.onchain_endpoint_identifier)
@@ -464,6 +508,7 @@ pub struct CreateInvoiceService {
     clock: Arc<dyn DeadlineClock>,
     stack_id: String,
     prepare_ttl: Duration,
+    max_request_expiry: Duration,
 }
 impl CreateInvoiceService {
     #[allow(clippy::too_many_arguments)]
@@ -537,6 +582,7 @@ impl CreateInvoiceService {
             clock,
             stack_id: UNSPECIFIED_STACK_ID.to_owned(),
             prepare_ttl: DEFAULT_PREPARE_TTL,
+            max_request_expiry: DEFAULT_MAX_REQUEST_EXPIRY,
         }
     }
 
@@ -606,6 +652,13 @@ impl CreateInvoiceService {
         self
     }
 
+    /// Installs the configured `bitcoin.max_request_expiry` bounding how
+    /// far out a prepare's `expires_at` may lie (§B.9, fail closed).
+    pub fn with_max_request_expiry(mut self, max_request_expiry: Duration) -> Self {
+        self.max_request_expiry = max_request_expiry;
+        self
+    }
+
     pub async fn create(
         &self,
         request: CreateInvoiceRequest,
@@ -660,6 +713,12 @@ impl CreateInvoiceService {
                 return Err(CreateInvoiceError::Unavailable);
             }
         }
+        // §B.9: `expires_at` is refused when past or beyond the configured
+        // maximum (missing is rejected by the route's schema). The check
+        // runs only for a New bind: an exact replay must return the stored
+        // body even after the deadline has passed (§B.11.6 — `observing`
+        // and `expired_tail` replay 200).
+        validate_expires_at(request.expires_at, self.max_request_expiry)?;
         // Runtime creation gate (ordering: static creation flag above →
         // live availability here → limiter charging in the baseline
         // sequence below). Refusing here consumes no address, advances no
@@ -713,9 +772,9 @@ impl CreateInvoiceService {
         let total_sats = price_sats
             .checked_add(nonce_sats)
             .ok_or(CreateInvoiceError::InvalidRequest)?;
-        let terms = self
-            .intents
-            .payment_request_terms(&request, &lock, nonce_sats)?;
+        let terms =
+            self.intents
+                .payment_request_terms(&request, &lock, nonce_sats, request.expires_at)?;
         let payment_request_intent = DeliveryIntentV1::payment_request(
             request.reader.to_string(),
             &selected.marker,
@@ -748,7 +807,7 @@ impl CreateInvoiceService {
                 required_sats: total_sats,
                 nonce_sats,
                 prepare_ttl: self.prepare_ttl,
-                expires_at: None,
+                expires_at: request.expires_at,
             })
             .await
         {
@@ -990,8 +1049,35 @@ pub(crate) async fn complete_creation_baseline_within_deadline(
     }
 }
 
+/// §B.9's fail-closed `expires_at` validation, shared by both prepare
+/// entrypoints: past (server clock) or further out than
+/// `max_request_expiry` is `invalid_request`; "missing" never reaches
+/// here — the route schema rejects it with the same refusal class.
+pub(crate) fn validate_expires_at(
+    expires_at: time::OffsetDateTime,
+    max_request_expiry: Duration,
+) -> Result<(), CreateInvoiceError> {
+    let now = time::OffsetDateTime::now_utc();
+    if expires_at <= now {
+        return Err(CreateInvoiceError::InvalidExpiry(ExpiryRefusal::Past));
+    }
+    if expires_at > now + max_request_expiry {
+        return Err(CreateInvoiceError::InvalidExpiry(ExpiryRefusal::OverMaximum));
+    }
+    Ok(())
+}
+
 fn request_binding(request: &CreateInvoiceRequest) -> Result<Vec<u8>, CreateInvoiceError> {
-    serde_json_canonicalizer::to_vec(&serde_json::json!({"bundle_id":request.bundle_id.to_string(),"lock_resource":request.lock_resource.to_string(),"reader":request.reader.to_string()})).map_err(|_| CreateInvoiceError::InvalidRequest)
+    serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "bundle_id": request.bundle_id.to_string(),
+        "lock_resource": request.lock_resource.to_string(),
+        "reader": request.reader.to_string(),
+        "expires_at": request
+            .expires_at
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|_| CreateInvoiceError::InvalidRequest)?,
+    }))
+    .map_err(|_| CreateInvoiceError::InvalidRequest)
 }
 pub(crate) fn remaining(start: Instant, now: Instant) -> Result<Duration, CreateInvoiceError> {
     let remaining = REQUEST_DEADLINE

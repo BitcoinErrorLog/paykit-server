@@ -68,10 +68,13 @@ pub struct AtomicInvoiceInput<'a> {
     /// server clock. Carried here so the config value reaches the INSERT
     /// without a plaintext config column.
     pub prepare_ttl: std::time::Duration,
-    /// Caller-supplied Payment Request expiry (design §B.11.3), echoed on the
-    /// prepare/activate bodies. `None` on the Locks `/invoices` path until
-    /// the expiry edges land (§B.9).
-    pub expires_at: Option<time::OffsetDateTime>,
+    /// Caller-supplied Payment Request expiry (design §B.9/§B.11.3), echoed
+    /// on the prepare/activate bodies and carried into the published
+    /// request's `proposal_expires_at`. Required on both prepare
+    /// entrypoints and validated (future, within `max_request_expiry`) by
+    /// the application before allocation; the column is NOT NULL since
+    /// migration 0015.
+    pub expires_at: time::OffsetDateTime,
 }
 
 /// Private payloads for a newly allocated `(creator, reader)` assignment.
@@ -360,6 +363,15 @@ pub struct InvoicePhaseView {
     pub bitcoin_address: String,
 }
 
+/// Row counts of one tick's §B.9 expiry transitions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExpiryTransitions {
+    /// `observing → expired_tail` at `expires_at`.
+    pub tailed: u64,
+    /// `expired_tail → expired_final` at `expires_at + tail`.
+    pub finalized: u64,
+}
+
 /// Outcome of [`InvoiceStore::activate_invoice`] on a known invoice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActivationWrite {
@@ -567,10 +579,13 @@ impl InvoiceStore {
     }
 
     /// Loads every observable invoice as an authenticated observation plan
-    /// entry. Only `observing` (and, forward-compatibly, `expired_tail`)
-    /// rows are planned: `awaiting_baseline`, `prepared`, and every void or
+    /// entry. Only `observing` and `expired_tail` rows are planned:
+    /// `awaiting_baseline`, `prepared`, `expired_final`, and every void or
     /// resolved state is unreachable here, which is the §B.11.5 guarantee
-    /// that a `prepared` invoice is never observed. Ordered oldest ATTEMPT
+    /// that a `prepared` invoice is never observed. Ordered with every live
+    /// (`observing`) target BEFORE every `expired_tail` target (§B.9: the
+    /// tail is deprioritized in the §B.7 budget, which admits the plan's
+    /// prefix), then oldest ATTEMPT
     /// first (`last_attempted_at`, falling
     /// back to `last_observed_at` and then `created_at` for rows that
     /// predate attempt stamping) so budget exhaustion defers the most
@@ -595,7 +610,8 @@ impl InvoiceStore {
                 AND NOT invoices.integrity_failed
                 AND NOT (invoices.payment_status = 'confirmed' \
                          AND invoices.confirmation_count = 6 AND invoices.amount_matched) \
-               ORDER BY COALESCE(invoices.last_attempted_at, invoices.last_observed_at, \
+               ORDER BY CASE WHEN invoices.baseline_state = 'observing' THEN 0 ELSE 1 END, \
+                        COALESCE(invoices.last_attempted_at, invoices.last_observed_at, \
                                  invoices.created_at), invoices.id",
         )
         .fetch_all(&self.pool)
@@ -656,13 +672,15 @@ impl InvoiceStore {
                 sqlx::query(
                     "UPDATE invoices \
                      SET last_observed_at = NOW(), last_attempted_at = NOW(), updated_at = NOW() \
-                     WHERE bitcoin_address_lookup_hash = $1 AND baseline_state = 'observing'",
+                     WHERE bitcoin_address_lookup_hash = $1 \
+                       AND baseline_state IN ('observing', 'expired_tail')",
                 )
             } else {
                 sqlx::query(
                     "UPDATE invoices \
                      SET last_attempted_at = NOW(), updated_at = NOW() \
-                     WHERE bitcoin_address_lookup_hash = $1 AND baseline_state = 'observing'",
+                     WHERE bitcoin_address_lookup_hash = $1 \
+                       AND baseline_state IN ('observing', 'expired_tail')",
                 )
             }
             .bind(address_lookup_hash.as_bytes().as_slice())
@@ -902,8 +920,11 @@ impl InvoiceStore {
         let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
         let bundle_hash = self.crypto.lookup_hash(bundle_id.to_string().as_bytes());
         let row = sqlx::query_as::<_, PaymentStatusRow>(
-            "SELECT invoices.payment_status, invoices.confirmation_count, invoices.amount_matched \
+            "SELECT invoices.payment_status, invoices.confirmation_count, invoices.amount_matched, \
+                    COALESCE(observations.late_settlement, FALSE) AS late_settlement \
              FROM invoices JOIN creators ON creators.id = invoices.creator_id \
+             LEFT JOIN bitcoin_observations AS observations \
+               ON observations.invoice_id = invoices.id AND observations.active \
              WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
         )
         .bind(creator_hash.as_bytes().as_slice())
@@ -1299,6 +1320,45 @@ impl InvoiceStore {
         Ok(reaped.rows_affected())
     }
 
+    /// The §B.9 expiry transitions, two conditional UPDATEs per observer
+    /// tick, never performed by a request handler. Both guards are
+    /// timestamp-derived from `expires_at` on the server clock: at
+    /// `expires_at` an `observing` invoice moves to `expired_tail` (still
+    /// observed, deprioritized behind live targets; observations there
+    /// carry `late_settlement`), and at `expires_at + tail` it moves to
+    /// `expired_final` and leaves `observation_plan()` for good. Exactly at
+    /// `expires_at` the invoice is still `observing` (`now > expires_at`
+    /// is the guard, not `>=`).
+    pub async fn apply_expiry_transitions(
+        &self,
+        tail: std::time::Duration,
+    ) -> Result<ExpiryTransitions, PersistenceError> {
+        let tail_seconds =
+            i64::try_from(tail.as_secs()).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let tailed = sqlx::query(
+            "UPDATE invoices
+             SET baseline_state = 'expired_tail', expired_tail_at = NOW(), updated_at = NOW()
+             WHERE baseline_state = 'observing' AND expires_at < NOW()",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let finalized = sqlx::query(
+            "UPDATE invoices
+             SET baseline_state = 'expired_final', expired_final_at = NOW(), updated_at = NOW()
+             WHERE baseline_state = 'expired_tail'
+               AND expires_at + make_interval(secs => $1) < NOW()",
+        )
+        .bind(tail_seconds)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(ExpiryTransitions {
+            tailed: tailed.rows_affected(),
+            finalized: finalized.rows_affected(),
+        })
+    }
+
     pub async fn sweep_stale_creation_baselines(
         &self,
         timeout: std::time::Duration,
@@ -1341,10 +1401,10 @@ impl InvoiceStore {
             "SELECT candidates.invoice_id, candidates.txid, candidates.vout
              FROM bitcoin_observation_candidates AS candidates
              JOIN invoices ON invoices.id = candidates.invoice_id
-             WHERE NOT candidates.approved
-               AND candidates.state = 'pending'
-               AND candidates.next_attempt_at <= NOW()
-               AND invoices.baseline_state = 'observing'
+              WHERE NOT candidates.approved
+                AND candidates.state = 'pending'
+                AND candidates.next_attempt_at <= NOW()
+                AND invoices.baseline_state IN ('observing', 'expired_tail')
                AND NOT invoices.integrity_failed
                AND NOT (invoices.payment_status = 'confirmed'
                         AND invoices.confirmation_count = 6 AND invoices.amount_matched)
@@ -1780,9 +1840,15 @@ impl InvoiceStore {
         let Some(invoice) = invoice else {
             return Ok(false);
         };
-        if invoice.baseline_state != "observing" {
+        // §B.9: observation does not stop at expiry. An `expired_tail`
+        // invoice is still observed; anything recorded there is a late
+        // settlement and can never drive `paid` — the marketplace routes it
+        // to `manual_review` on the flag. Every other state (prepared,
+        // final, void, resolved) no-ops exactly as before.
+        if invoice.baseline_state != "observing" && invoice.baseline_state != "expired_tail" {
             return Ok(true);
         }
+        let late_settlement = invoice.baseline_state == "expired_tail";
         let creator_hash = lookup_hash_from_storage(&invoice.creator_lookup_hash)?;
         let payment_record_plaintext = self
             .crypto
@@ -1989,11 +2055,12 @@ impl InvoiceStore {
         let observation_write = sqlx::query(
             "INSERT INTO bitcoin_observations \
             (id, invoice_id, observation_envelope, outpoint_lookup_hash,
-            confirmations, present, active) \
-            VALUES ($1, $2, $3, $4, $5, $6, TRUE) \
+            confirmations, present, active, late_settlement) \
+            VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7) \
             ON CONFLICT (outpoint_lookup_hash) DO UPDATE SET
             observation_envelope = EXCLUDED.observation_envelope,
             confirmations = EXCLUDED.confirmations, present = EXCLUDED.present, active = TRUE, \
+            late_settlement = EXCLUDED.late_settlement, \
             updated_at = NOW() WHERE bitcoin_observations.invoice_id = EXCLUDED.invoice_id",
         )
         .bind(observation_id)
@@ -2002,6 +2069,7 @@ impl InvoiceStore {
         .bind(outpoint_lookup_hash.as_bytes().as_slice())
         .bind(confirmations)
         .bind(present)
+        .bind(late_settlement)
         .execute(&mut **tx)
         .await
         .map_err(|_| PersistenceError::Conflict)?;
@@ -2539,6 +2607,7 @@ struct PaymentStatusRow {
     payment_status: String,
     confirmation_count: i32,
     amount_matched: bool,
+    late_settlement: bool,
 }
 
 impl TryFrom<PaymentStatusRow> for PersistedPaymentStatus {
@@ -2548,14 +2617,18 @@ impl TryFrom<PaymentStatusRow> for PersistedPaymentStatus {
         let confirmations = u32::try_from(row.confirmation_count)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         match row.payment_status.as_str() {
-            "undetected" => Ok(Self::Undetected),
+            "undetected" => Ok(Self::Undetected {
+                late_settlement: row.late_settlement,
+            }),
             "detected" => Ok(Self::Detected {
                 confirmations,
                 amount_matched: row.amount_matched,
+                late_settlement: row.late_settlement,
             }),
             "confirmed" => Ok(Self::Confirmed {
                 confirmations,
                 amount_matched: row.amount_matched,
+                late_settlement: row.late_settlement,
             }),
             _ => Err(PersistenceError::CorruptOrMissing),
         }
@@ -2653,11 +2726,13 @@ mod tests {
                 payment_status: "unexpected".into(),
                 confirmation_count: 0,
                 amount_matched: false,
+                late_settlement: false,
             },
             PaymentStatusRow {
                 payment_status: "confirmed".into(),
                 confirmation_count: -1,
                 amount_matched: true,
+                late_settlement: false,
             },
         ] {
             assert_eq!(

@@ -162,3 +162,31 @@ impl IntoResponse for ApiError {
         response
     }
 }
+
+/// §B.9's fail-closed `expires_at` refusal: one `invalid_request` code with
+/// a machine-readable `reason` so the marketplace can branch without
+/// string-matching prose. "Missing" is the route schema's plain
+/// `invalid_request`; past and over-maximum are named here.
+pub fn invalid_expiry(
+    reason: crate::application::create_invoice::ExpiryRefusal,
+) -> Response {
+    let message = match reason {
+        crate::application::create_invoice::ExpiryRefusal::Past => {
+            "expires_at is already in the past"
+        }
+        crate::application::create_invoice::ExpiryRefusal::OverMaximum => {
+            "expires_at exceeds the configured maximum request expiry"
+        }
+    };
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({
+            "error": {
+                "code": "invalid_request",
+                "message": message,
+                "reason": reason.as_str(),
+            }
+        })),
+    )
+        .into_response()
+}

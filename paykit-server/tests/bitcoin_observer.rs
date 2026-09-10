@@ -189,6 +189,7 @@ mod tick {
             max_requests_per_second: 100,
             max_transaction_bytes: 400_000,
             baseline_completion_timeout: Duration::from_secs(60),
+            expiry_tail: Duration::from_secs(24 * 60 * 60),
         }
     }
 
@@ -1880,6 +1881,7 @@ mod tick {
             max_requests_per_second: 1,
             max_transaction_bytes: 400_000,
             baseline_completion_timeout: Duration::from_secs(60),
+            expiry_tail: Duration::from_secs(24 * 60 * 60),
         });
 
         let outcome = observe_tick(

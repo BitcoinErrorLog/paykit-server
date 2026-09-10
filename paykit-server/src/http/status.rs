@@ -27,6 +27,7 @@ struct StatusResponse {
     status: &'static str,
     confirmations: u32,
     amount_matched: bool,
+    late_settlement: bool,
 }
 
 pub fn status_router(service: Arc<PaymentStatusService>) -> Router {
@@ -60,6 +61,7 @@ impl From<PaymentStatusResponse> for StatusResponse {
             status: value.status(),
             confirmations: value.confirmations(),
             amount_matched: value.amount_matched(),
+            late_settlement: value.late_settlement(),
         }
     }
 }

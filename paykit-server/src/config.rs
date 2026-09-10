@@ -281,6 +281,7 @@ impl Config {
             max_transaction_bytes: usize::try_from(self.electrum.max_transaction_bytes)
                 .unwrap_or(usize::MAX),
             baseline_completion_timeout: self.electrum.baseline_completion_timeout,
+            expiry_tail: self.bitcoin.expiry_tail,
         }
         .per_tick_budget();
         if effective_per_tick <= PROBE_REQUESTS_PER_TICK {
