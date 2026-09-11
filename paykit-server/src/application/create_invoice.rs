@@ -1053,6 +1053,13 @@ pub(crate) async fn complete_creation_baseline_within_deadline(
 /// entrypoints: past (server clock) or further out than
 /// `max_request_expiry` is `invalid_request`; "missing" never reaches
 /// here — the route schema rejects it with the same refusal class.
+///
+/// The maximum is bounded by `Duration`, not by the calendar: startup
+/// validation accepts up to `i64::MAX` seconds, far outside the range
+/// `OffsetDateTime` can represent, so the bound is evaluated with
+/// checked conversion and addition. A maximum that cannot be
+/// represented from `now` admits nothing — the bind is refused as
+/// over-maximum rather than panic.
 pub(crate) fn validate_expires_at(
     expires_at: time::OffsetDateTime,
     max_request_expiry: Duration,
@@ -1061,12 +1068,15 @@ pub(crate) fn validate_expires_at(
     if expires_at <= now {
         return Err(CreateInvoiceError::InvalidExpiry(ExpiryRefusal::Past));
     }
-    if expires_at > now + max_request_expiry {
-        return Err(CreateInvoiceError::InvalidExpiry(
+    let maximum = time::Duration::try_from(max_request_expiry)
+        .ok()
+        .and_then(|duration| now.checked_add(duration));
+    match maximum {
+        Some(maximum) if expires_at <= maximum => Ok(()),
+        _ => Err(CreateInvoiceError::InvalidExpiry(
             ExpiryRefusal::OverMaximum,
-        ));
+        )),
     }
-    Ok(())
 }
 
 fn request_binding(request: &CreateInvoiceRequest) -> Result<Vec<u8>, CreateInvoiceError> {
@@ -1156,4 +1166,47 @@ fn extract_terms(lock: &ContentLock) -> Result<CriterionAmount, CreateInvoiceErr
             .ok_or(CreateInvoiceError::InvalidRequest)?,
     )
     .map_err(|_| CreateInvoiceError::InvalidRequest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// §B.9 regression: startup validation accepts a
+    /// `bitcoin.max_request_expiry` of exactly `i64::MAX` seconds
+    /// (humantime parses `"9223372036854775807s"`; the typed config test
+    /// proves the acceptance), but that many seconds lands far outside
+    /// the calendar range `OffsetDateTime` can represent from `now`.
+    /// Evaluating `now + max_request_expiry` unchecked would panic on a
+    /// valid configuration; the checked bound must fail closed as
+    /// `OverMaximum` instead.
+    #[test]
+    fn unrepresentable_maximum_fails_closed_as_over_maximum_instead_of_panicking() {
+        let max_request_expiry = Duration::from_secs(i64::MAX as u64);
+        let expires_at = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let result = validate_expires_at(expires_at, max_request_expiry);
+        assert_eq!(
+            result,
+            Err(CreateInvoiceError::InvalidExpiry(
+                ExpiryRefusal::OverMaximum
+            )),
+        );
+    }
+
+    /// The representable bound keeps its exact boundary semantics:
+    /// `expires_at` at `now + max_request_expiry` is admitted, one
+    /// second further out is refused.
+    #[test]
+    fn representable_maximum_keeps_its_boundary() {
+        let max_request_expiry = Duration::from_secs(60);
+        let boundary = time::OffsetDateTime::now_utc() + time::Duration::seconds(59);
+        assert_eq!(validate_expires_at(boundary, max_request_expiry), Ok(()));
+        let beyond = time::OffsetDateTime::now_utc() + time::Duration::seconds(61);
+        assert_eq!(
+            validate_expires_at(beyond, max_request_expiry),
+            Err(CreateInvoiceError::InvalidExpiry(
+                ExpiryRefusal::OverMaximum
+            )),
+        );
+    }
 }

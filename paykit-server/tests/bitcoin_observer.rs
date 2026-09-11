@@ -354,6 +354,7 @@ mod tick {
     struct FakeBackend {
         entries: Mutex<Vec<FakeEntry>>,
         applied: Mutex<Vec<Vec<String>>>,
+        events: Mutex<Vec<String>>,
         /// Success-stamped addresses per tick (`last_observed_at` +
         /// `last_attempted_at` in the store).
         stamped: Mutex<Vec<Vec<String>>>,
@@ -367,6 +368,7 @@ mod tick {
     #[async_trait]
     impl ObservationBackend for FakeBackend {
         async fn observation_plan(&self) -> Result<Vec<PlannedObservation>, ObserverError> {
+            self.events.lock().unwrap().push("plan".to_owned());
             let entries = self.entries.lock().unwrap();
             let mut ordered: Vec<&FakeEntry> = entries.iter().collect();
             // Mirrors the store's ORDER BY COALESCE(last_attempted_at,
@@ -405,6 +407,14 @@ mod tick {
                     .collect(),
             );
             Ok(0)
+        }
+
+        async fn apply_expiry_transitions(
+            &self,
+            tail: Duration,
+        ) -> Result<paykit_server::persistence::ExpiryTransitions, ObserverError> {
+            self.events.lock().unwrap().push(format!("expiry:{tail:?}"));
+            Ok(Default::default())
         }
 
         async fn record_observation_tick(
@@ -465,6 +475,36 @@ mod tick {
             self.recorded_failures.lock().unwrap().push(kind);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn observer_applies_expiry_transitions_before_loading_the_plan() {
+        let port = FakeElectrum::healthy();
+        let backend = FakeBackend::default();
+        backend
+            .entries
+            .lock()
+            .unwrap()
+            .push(FakeEntry::new("expiry-order", 30));
+        let runtime = runtime();
+        let policy = policy(4);
+        let expected_tail = policy.expiry_tail;
+        let mut observer_state = state(&policy);
+
+        let outcome = observe_tick(
+            &port,
+            &backend,
+            &BitcoinNetwork::Regtest,
+            &runtime,
+            &mut observer_state,
+        )
+        .await;
+
+        assert!(matches!(outcome, ObserverTickOutcome::Observed { .. }));
+        assert_eq!(
+            backend.events.lock().unwrap().as_slice(),
+            &[format!("expiry:{expected_tail:?}"), "plan".to_owned(),]
+        );
     }
 
     #[tokio::test]
@@ -852,6 +892,7 @@ mod tick {
                 FakeEntry::new("freshest", 60),
             ]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -948,6 +989,7 @@ mod tick {
                 FakeEntry::new("extra", 300),
             ]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1000,6 +1042,7 @@ mod tick {
                     .collect(),
             ),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1053,6 +1096,7 @@ mod tick {
                 FakeEntry::new("cheap-b", 120),
             ]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1149,6 +1193,7 @@ mod tick {
         let backend = FakeBackend {
             entries: Mutex::new(vec![FakeEntry::new("dusted", 600)]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1201,6 +1246,7 @@ mod tick {
                 FakeEntry::new("d", 60),
             ]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1269,6 +1315,7 @@ mod tick {
         let backend = FakeBackend {
             entries: Mutex::new(vec![FakeEntry::new("a", 600), FakeEntry::new("b", 300)]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1337,6 +1384,7 @@ mod tick {
         let backend = FakeBackend {
             entries: Mutex::new(entries),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1390,6 +1438,7 @@ mod tick {
         let backend = FakeBackend {
             entries: Mutex::new(vec![FakeEntry::new("known", 300)]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1427,6 +1476,7 @@ mod tick {
         let backend = FakeBackend {
             entries: Mutex::new(vec![FakeEntry::new("known", 300)]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1471,6 +1521,7 @@ mod tick {
                 FakeEntry::new("fresh", 120),
             ]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1504,6 +1555,7 @@ mod tick {
                 FakeEntry::new("cheap", 300),
             ]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1543,6 +1595,7 @@ mod tick {
                 FakeEntry::new("third", 120),
             ]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1616,6 +1669,7 @@ mod tick {
                 FakeEntry::new("second", 300),
             ]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1684,6 +1738,7 @@ mod tick {
                 FakeEntry::new("second", 300),
             ]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1729,6 +1784,7 @@ mod tick {
                 FakeEntry::new("stuck-b", 300),
             ]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1780,6 +1836,7 @@ mod tick {
                 FakeEntry::new("cheap", 300),
             ]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),
@@ -1866,6 +1923,7 @@ mod tick {
                 FakeEntry::new("third", 120),
             ]),
             applied: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             stamped: Mutex::new(Vec::new()),
             stamped_failed: Mutex::new(Vec::new()),
             attempt_clock: Mutex::new(0),

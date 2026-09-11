@@ -21,6 +21,7 @@ use crate::workers::{
 /// (`{"jsonrpc":"2.0","id":<u64>,"result":[…]}` plus separators): well
 /// under 1 KiB. Used only by the item-cap/byte-cap coupling rule.
 pub const LISTUNSPENT_RESPONSE_ENVELOPE_BYTES: u64 = 1024;
+const MAX_POSTGRES_INTERVAL_SECONDS: u64 = i64::MAX as u64;
 
 #[derive(Debug)]
 pub struct Config {
@@ -184,6 +185,18 @@ impl Config {
             if value.is_zero() {
                 return Err(ConfigError::ZeroDuration(name));
             }
+        }
+        // Only `bitcoin.expiry_tail` flows to
+        // `make_interval(secs => i64)` in the expiry transitions, so only
+        // it needs the PostgreSQL interval bound at startup.
+        // `bitcoin.max_request_expiry` never reaches PostgreSQL: it
+        // bounds `expires_at` at request time with checked calendar
+        // arithmetic that fails closed (see
+        // `application::create_invoice::validate_expires_at`).
+        if self.bitcoin.expiry_tail.as_secs() > MAX_POSTGRES_INTERVAL_SECONDS {
+            return Err(ConfigError::DurationExceedsPostgresInterval(
+                "bitcoin.expiry_tail",
+            ));
         }
         for (name, value) in [
             ("outbox.batch_size", u64::from(self.outbox.batch_size)),
@@ -847,6 +860,8 @@ pub enum ConfigError {
     ZeroValue(&'static str),
     #[error("{0} must be at least one second")]
     SubsecondPersistenceDuration(&'static str),
+    #[error("{0} must fit PostgreSQL make_interval(secs => i64)")]
+    DurationExceedsPostgresInterval(&'static str),
     #[error("{0}.retry_initial must not exceed {0}.retry_max")]
     InconsistentRetries(&'static str),
     #[error(

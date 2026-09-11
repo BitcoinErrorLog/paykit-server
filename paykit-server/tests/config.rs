@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use paykit_server::config::{
-    Config, ConfigEnvironment, LISTUNSPENT_RESPONSE_ENVELOPE_BYTES, PaykitNetwork,
+    Config, ConfigEnvironment, ConfigError, LISTUNSPENT_RESPONSE_ENVELOPE_BYTES, PaykitNetwork,
 };
 use paykit_server::workers::electrum::{
     LISTUNSPENT_ITEM_BYTES_UPPER_BOUND, MAX_MAX_RESPONSE_BYTES, MIN_MAX_RESPONSE_BYTES,
@@ -745,6 +745,48 @@ fn rejects_zero_electrum_max_utxos_per_address_and_address_deadline() {
             "{extra} should be rejected"
         );
     }
+}
+
+/// §B.9's `expiry_tail` feeds integer seconds to
+/// `make_interval(secs => i64)`, so a value whose whole seconds exceed
+/// `i64::MAX` is refused at startup — before any runtime conversion.
+/// The input below is 2562047788015216 h = 9223372036854777600 s,
+/// strictly greater than `i64::MAX` = 9223372036854775807 s yet inside
+/// `Duration`'s `u64` range, so it parses cleanly and only the bound
+/// can reject it.
+#[test]
+fn rejects_expiry_tail_that_does_not_fit_postgres_make_interval_seconds() {
+    let input = valid_toml().replace(
+        "[bitcoin]\nnetwork = \"testnet\"",
+        "[bitcoin]\nnetwork = \"testnet\"\nexpiry_tail = \"2562047788015216h\"",
+    );
+    let error = Config::from_toml_and_environment(&input, environment()).expect_err("expiry_tail");
+    match error {
+        ConfigError::DurationExceedsPostgresInterval(name) => {
+            assert_eq!(name, "bitcoin.expiry_tail");
+        }
+        other => panic!("expiry_tail: expected DurationExceedsPostgresInterval, got {other}"),
+    }
+}
+
+/// `max_request_expiry` carries no interval bound: it never reaches
+/// `make_interval` — it bounds `expires_at` at request time with
+/// checked calendar arithmetic that fails closed as
+/// `expires_at_over_maximum` (see the `validate_expires_at` unit
+/// tests). Exactly `i64::MAX` seconds therefore parses and is accepted
+/// at startup; a prepare under it can never panic.
+#[test]
+fn accepts_max_request_expiry_at_i64_max_seconds() {
+    let input = valid_toml().replace(
+        "[bitcoin]\nnetwork = \"testnet\"",
+        "[bitcoin]\nnetwork = \"testnet\"\nmax_request_expiry = \"9223372036854775807s\"",
+    );
+    let config = Config::from_toml_and_environment(&input, environment())
+        .expect("max_request_expiry is bounded at request time, not at startup");
+    assert_eq!(
+        config.bitcoin.max_request_expiry,
+        Duration::from_secs(i64::MAX as u64)
+    );
 }
 
 fn marketplace_toml(section: &str) -> String {

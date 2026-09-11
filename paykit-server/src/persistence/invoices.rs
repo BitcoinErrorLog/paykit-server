@@ -1481,12 +1481,17 @@ impl InvoiceStore {
     ) -> Result<ExpiryTransitions, PersistenceError> {
         let tail_seconds =
             i64::try_from(tail.as_secs()).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         let tailed = sqlx::query(
             "UPDATE invoices
              SET baseline_state = 'expired_tail', expired_tail_at = NOW(), updated_at = NOW()
              WHERE baseline_state = 'observing' AND expires_at < NOW()",
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         let finalized = sqlx::query(
@@ -1496,9 +1501,13 @@ impl InvoiceStore {
                AND expires_at + make_interval(secs => $1) < NOW()",
         )
         .bind(tail_seconds)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         Ok(ExpiryTransitions {
             tailed: tailed.rows_affected(),
             finalized: finalized.rows_affected(),

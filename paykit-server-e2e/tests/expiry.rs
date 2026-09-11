@@ -13,6 +13,10 @@
 //!   `apply_expiry_transitions` calls), never by sleeping;
 //! - `observation_plan()` order: tail targets after every live target,
 //!   `expired_final` absent;
+//! - the long-outage case through the real observer seam: one production
+//!   `observe_tick` over the real `InvoiceStore` leaves a long-overdue
+//!   `observing` invoice `expired_final` and absent from the plan, never
+//!   observed and never a late settlement;
 //! - an eligible observation in the tail is recorded with
 //!   `late_settlement = true` and can never drive settlement — for an
 //!   `exclusive` creator and for a `shared_manual` creator at the exact
@@ -22,7 +26,10 @@ use std::{
     collections::{BTreeMap, HashMap},
     net::SocketAddr,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -65,7 +72,8 @@ use paykit_server::{
     runtime::{ElectrumProbe, Runtime},
     startup::initialize_database,
     workers::observer::{
-        CreationSnapshot, ElectrumPort, ObservationReport, ObserverError, RequestLimiter, TipProbe,
+        CreationSnapshot, ElectrumPort, ObservationReport, ObserverError, ObserverPolicy,
+        ObserverTickOutcome, ObserverTickState, RequestLimiter, TipProbe, observe_tick,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -95,13 +103,31 @@ fn expires_in(hours: i64) -> String {
 
 struct ScriptedElectrum {
     outputs: Mutex<HashMap<String, (u64, OutPoint)>>,
+    probes: AtomicUsize,
+    probe_completed: tokio::sync::Notify,
 }
 
 impl ScriptedElectrum {
     fn new() -> Self {
         Self {
             outputs: Mutex::new(HashMap::new()),
+            probes: AtomicUsize::new(0),
+            probe_completed: tokio::sync::Notify::new(),
         }
+    }
+
+    fn probe_count(&self) -> usize {
+        self.probes.load(Ordering::Acquire)
+    }
+
+    /// Completes once at least one `probe` call has finished — at boot
+    /// that is the background observer's initial zero-delay tick.
+    /// `notify_one` stores a permit when no waiter is registered yet, so
+    /// this is lost-wakeup-safe in both orders: a probe that finished
+    /// before the await still releases it, and a later probe wakes an
+    /// already-registered waiter.
+    async fn first_probe_completed(&self) {
+        self.probe_completed.notified().await
     }
 }
 
@@ -155,10 +181,13 @@ impl ElectrumPort for ScriptedElectrum {
     }
 
     async fn probe(&self) -> Result<TipProbe, ObserverError> {
-        Ok(TipProbe {
+        let tip = TipProbe {
             height: 300,
             time_unix: fresh_tip_time(),
-        })
+        };
+        self.probes.fetch_add(1, Ordering::AcqRel);
+        self.probe_completed.notify_one();
+        Ok(tip)
     }
 }
 
@@ -195,7 +224,7 @@ network = "testnet"
 stack_role = "proof"
 [electrum]
 endpoint = "tcp://127.0.0.1:1"
-poll_interval = "1s"
+poll_interval = "1h"
 request_timeout = "1s"
 max_concurrent_creation_snapshots = 1
 [outbox]
@@ -268,7 +297,6 @@ fn content_lock(creator: &CreatorPubky, amount_sats: u64) -> ContentLock {
 struct BootedStack {
     address: SocketAddr,
     pool: PgPool,
-    #[allow(dead_code)]
     runtime: Arc<Runtime>,
     stack_id: String,
     store: InvoiceStore,
@@ -277,7 +305,6 @@ struct BootedStack {
     signing_key: SigningKey,
     creator: CreatorFixture,
     reader: ReaderPubky,
-    #[allow(dead_code)]
     electrum: Arc<ScriptedElectrum>,
     _testnet: EphemeralTestnet,
     database: TestDatabase,
@@ -307,7 +334,11 @@ impl BootedStack {
 /// Boots the production server over a real database and an ephemeral pubky
 /// testnet, with one creator (credentials stored, content lock published)
 /// and one reader (marker published). The outbox worker is configured at a
-/// 1 h poll so NOTHING delivers unless a test drives the store directly.
+/// 1 h poll so NOTHING delivers unless a test drives the store directly,
+/// and the observer at a 1 h poll so its only background tick runs at boot
+/// — before any invoice exists — and every expiry transition in this file
+/// is driven explicitly by the test (directly, or through one
+/// `observe_tick` call), never stolen by a background tick mid-assertion.
 async fn boot(seed: u8) -> BootedStack {
     let database = TestDatabase::create().await;
     let signing_key = SigningKey::from_bytes(&[seed; 32]);
@@ -420,6 +451,14 @@ async fn boot(seed: u8) -> BootedStack {
     }));
     wait_until_listening(address).await;
     wait_until_ready(address).await;
+    // `observation_loop`'s first tick runs at zero delay regardless of
+    // the configured 1 h poll interval, so boot must not return before
+    // that initial background probe completed: a test invoice created
+    // right after boot would otherwise be visible to a still-running
+    // first tick. The `Notify` permit makes this await race-free even
+    // when the probe finished before we got here; the 1 h poll keeps
+    // the next background tick outside every test's lifetime.
+    electrum.first_probe_completed().await;
     for _ in 0..3 {
         runtime.record_electrum_probe(ElectrumProbe::success(300, fresh_tip_time()));
     }
@@ -1023,6 +1062,161 @@ async fn expired_tail_moves_to_expired_final_after_the_tail() {
     assert!(
         plan_addresses(&stack).await.is_empty(),
         "expired_final leaves observation_targets (was {address})"
+    );
+    stack.shutdown().await;
+}
+
+/// A long outage must not leave an observing invoice in `expired_tail` for
+/// one extra observer tick: the same transition call must finalize it before
+/// the plan is loaded. The primary proof is the production transaction in
+/// `apply_expiry_transitions` — both UPDATEs commit atomically, so the row
+/// is never externally visible in the intermediate tail state. The
+/// timestamps are supporting regression evidence: PostgreSQL `NOW()` is
+/// transaction-stable, so one transaction stamps `expired_tail_at`,
+/// `expired_final_at`, and `updated_at` with one clock value, while two
+/// autocommitted statements read the clock independently and would
+/// diverge on any clock tick between them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn long_overdue_observing_invoice_finalizes_in_one_transition_call() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(160).await;
+    let (invoice_id, _address, _total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+
+    shift_expires_at(&stack.pool, &invoice_id, -(24 * 3600 + 60)).await;
+    let transitions = apply_transitions(&stack).await;
+
+    assert_eq!(transitions.tailed, 1);
+    assert_eq!(transitions.finalized, 1);
+    assert_eq!(
+        baseline_state(&stack.pool, &invoice_id).await,
+        "expired_final"
+    );
+    let (tail_at, final_at, touched_at): (
+        time::OffsetDateTime,
+        time::OffsetDateTime,
+        time::OffsetDateTime,
+    ) = sqlx::query_as(
+        "SELECT expired_tail_at, expired_final_at, updated_at FROM invoices WHERE id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&invoice_id).unwrap())
+    .fetch_one(&stack.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        tail_at, final_at,
+        "both transitions stamped one NOW() value, consistent with the single transaction"
+    );
+    assert_eq!(final_at, touched_at);
+    assert!(plan_addresses(&stack).await.is_empty());
+    stack.shutdown().await;
+}
+
+/// The same long-outage case through the REAL observer seam: the exact
+/// `observe_tick` entry point `observation_loop` invokes (server wiring
+/// passes the `InvoiceStore` as its `ObservationBackend` and this stack's
+/// Electrum port), driven here once over the booted stack's real store,
+/// runtime, and port. A long-overdue `observing` invoice must be
+/// `expired_final` BEFORE the plan loads inside that same tick: the tick
+/// admits zero targets, records zero observations (no late settlement can
+/// appear), and never stamps the invoice. The boot's 1 h observer poll
+/// guarantees this explicit tick is the only one that sees the invoice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn long_overdue_observing_invoice_is_final_before_the_plan_inside_one_observer_tick() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(161).await;
+    assert_eq!(
+        stack.electrum.probe_count(),
+        1,
+        "exactly the boot-time background probe has run: no background tick can see \
+         the invoice created below, and the 1 h poll keeps the next one out of this test"
+    );
+    let (invoice_id, address, _total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    assert_eq!(
+        stack.electrum.probe_count(),
+        2,
+        "the prepare's creation-baseline probe is the only probe since boot"
+    );
+
+    shift_expires_at(&stack.pool, &invoice_id, -(24 * 3600 + 60)).await;
+    assert_eq!(
+        baseline_state(&stack.pool, &invoice_id).await,
+        "observing",
+        "no background tick may touch the invoice before the explicit one"
+    );
+
+    let policy = ObserverPolicy {
+        poll_interval: Duration::from_secs(10),
+        max_requests_per_tick: 100,
+        max_requests_per_second: 100,
+        max_transaction_bytes: 400_000,
+        baseline_completion_timeout: Duration::from_secs(60),
+        expiry_tail: TAIL,
+    };
+    let mut tick_state = ObserverTickState::new(&policy);
+    let outcome = observe_tick(
+        stack.electrum.as_ref(),
+        &stack.store,
+        &BitcoinNetwork::Testnet,
+        &stack.runtime,
+        &mut tick_state,
+    )
+    .await;
+
+    assert_eq!(
+        outcome,
+        ObserverTickOutcome::Observed {
+            processed: 0,
+            deferred: 0,
+            failed: 0,
+        },
+        "the invoice must be out of the plan already this tick: {address} observed zero times"
+    );
+    assert_eq!(
+        stack.electrum.probe_count(),
+        3,
+        "the explicit tick's probe is the third and last: the background loop cannot tick again for 1 h"
+    );
+    assert_eq!(
+        baseline_state(&stack.pool, &invoice_id).await,
+        "expired_final"
+    );
+    assert!(plan_addresses(&stack).await.is_empty());
+    let observations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM bitcoin_observations WHERE invoice_id = $1")
+            .bind(uuid::Uuid::parse_str(&invoice_id).unwrap())
+            .fetch_one(&stack.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        observations, 0,
+        "never observed, so never a late settlement"
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT last_attempted_at IS NULL AND last_observed_at IS NULL
+             FROM invoices WHERE id = $1"
+        )
+        .bind(uuid::Uuid::parse_str(&invoice_id).unwrap())
+        .fetch_one(&stack.pool)
+        .await
+        .unwrap(),
+        "a finalized invoice must not carry an observation stamp"
+    );
+    stack.shutdown().await;
+}
+
+/// `boot()` must return only after the background observer's initial
+/// (zero-delay) tick has completed at least one probe: the first tick
+/// already ran before any test invoice exists, and the 1 h poll
+/// interval keeps the next background tick outside the test's lifetime,
+/// so no background tick can ever see a test invoice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn boot_returns_only_after_the_background_observers_initial_probe() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(162).await;
+    assert!(
+        stack.electrum.probe_count() >= 1,
+        "boot() returned before the background observer's initial probe completed"
     );
     stack.shutdown().await;
 }
