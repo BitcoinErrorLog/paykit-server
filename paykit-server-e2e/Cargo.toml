@@ -30,5 +30,6 @@ pubky-testnet.workspace = true
 postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_json_canonicalizer.workspace = true
 time.workspace = true
 tower = { version = "0.5", features = ["util"] }

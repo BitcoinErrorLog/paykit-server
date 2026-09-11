@@ -916,6 +916,9 @@ async fn status_first_address_is_stable_across_invoice_allocation() {
             },
             payment_request_intent: payment_request_intent(&reader),
             required_sats: 100,
+            nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();

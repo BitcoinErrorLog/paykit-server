@@ -3,17 +3,28 @@
 use std::sync::Mutex;
 
 use prometheus_client::{
-    encoding::text::encode,
+    encoding::{EncodeLabelSet, text::encode},
     metrics::{
         counter::Counter,
+        family::Family,
         gauge::Gauge,
         histogram::{Histogram, exponential_buckets},
     },
     registry::Registry,
 };
 
-/// Metrics intentionally have no labels: routes, identifiers, and caller input
-/// must never become metric cardinality or data-exposure boundaries.
+/// Label set for per-address observation lookup failures. The value set is
+/// a closed code-owned enum (`error`, `response_too_large`, `deadline`) —
+/// never caller input — so cardinality is bounded at three series.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AddressFailureLabels {
+    reason: &'static str,
+}
+
+/// Metrics intentionally carry no route, identifier, or caller-input
+/// labels: the only label anywhere is the closed failure-reason enum above,
+/// so caller input can never become metric cardinality or a data-exposure
+/// boundary.
 pub struct Metrics {
     registry: Mutex<Registry>,
     http_requests: Counter,
@@ -25,7 +36,9 @@ pub struct Metrics {
     electrum_last_success_age_seconds: Gauge,
     electrum_backlog_oldest_age_seconds: Gauge,
     electrum_observation_stamp_misses: Counter,
-    electrum_observation_address_failures: Counter,
+    electrum_observation_address_failures: Family<AddressFailureLabels, Counter>,
+    electrum_zero_success_ticks: Counter,
+    electrum_budget_exhausted_ticks: Counter,
     payment_states: Gauge,
     runtime_active: Gauge,
     session_validation_results: Counter,
@@ -43,7 +56,9 @@ impl Metrics {
         let electrum_last_success_age_seconds = Gauge::default();
         let electrum_backlog_oldest_age_seconds = Gauge::default();
         let electrum_observation_stamp_misses = Counter::default();
-        let electrum_observation_address_failures = Counter::default();
+        let electrum_observation_address_failures = Family::default();
+        let electrum_zero_success_ticks = Counter::default();
+        let electrum_budget_exhausted_ticks = Counter::default();
         let payment_states = Gauge::default();
         let runtime_active = Gauge::default();
         let session_validation_results = Counter::default();
@@ -94,8 +109,20 @@ impl Metrics {
         );
         registry.register(
             "paykit_electrum_observation_address_failures",
-            "Isolated per-address Electrum lookup failures (timeout, oversize, or error).",
+            "Isolated per-address Electrum lookup failures by closed reason label \
+             (error, response_too_large, or deadline).",
             electrum_observation_address_failures.clone(),
+        );
+        registry.register(
+            "paykit_electrum_zero_success_ticks",
+            "Observer ticks that attempted lookups and succeeded at none.",
+            electrum_zero_success_ticks.clone(),
+        );
+        registry.register(
+            "paykit_electrum_budget_exhausted_ticks",
+            "Observer ticks deferred because the shared request budget could not \
+             cover the probe reservation; the tick sent no Electrum requests.",
+            electrum_budget_exhausted_ticks.clone(),
         );
         registry.register(
             "paykit_payment_states",
@@ -124,6 +151,8 @@ impl Metrics {
             electrum_backlog_oldest_age_seconds,
             electrum_observation_stamp_misses,
             electrum_observation_address_failures,
+            electrum_zero_success_ticks,
+            electrum_budget_exhausted_ticks,
             payment_states,
             runtime_active,
             session_validation_results,
@@ -155,8 +184,16 @@ impl Metrics {
     pub fn electrum_observation_stamp_misses(&self, misses: u64) {
         self.electrum_observation_stamp_misses.inc_by(misses);
     }
-    pub fn electrum_observation_address_failures(&self, failures: u64) {
-        self.electrum_observation_address_failures.inc_by(failures);
+    pub fn electrum_observation_address_failures(&self, reason: &'static str, failures: u64) {
+        self.electrum_observation_address_failures
+            .get_or_create(&AddressFailureLabels { reason })
+            .inc_by(failures);
+    }
+    pub fn electrum_zero_success_tick(&self) {
+        self.electrum_zero_success_ticks.inc();
+    }
+    pub fn electrum_budget_exhausted_tick(&self) {
+        self.electrum_budget_exhausted_ticks.inc();
     }
     pub fn set_payment_states(&self, value: i64) {
         self.payment_states.set(value);

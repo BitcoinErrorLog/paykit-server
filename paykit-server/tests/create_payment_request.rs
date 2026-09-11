@@ -14,7 +14,8 @@ use ed25519_dalek::{Signer, SigningKey};
 use paykit_server::{
     application::create_invoice::{
         CreateInvoiceError, CreatorXpubProvider, InvoicePersistence, MarkerDiscovery,
-        PaykitIntentBuilder, SessionValidationError, SessionValidator, derive_bip84_p2wpkh_address,
+        OfferAvailability, PaykitIntentBuilder, SessionValidationError, SessionValidator,
+        derive_bip84_p2wpkh_address,
     },
     application::create_payment_request::{
         MarketplacePaymentRequest, MarketplacePaymentRequestService,
@@ -23,9 +24,12 @@ use paykit_server::{
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     domain::locks::{CreatorPubky, parse_bundle_id, parse_creator, parse_reader},
     http::{auth::SignedLocksAuth, payment_requests::payment_requests_router},
-    persistence::{AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, PersistenceError},
+    persistence::{
+        AtomicInvoiceInput, AtomicInvoiceResult, InvoicePhaseView, InvoicePreflight,
+        PersistenceError,
+    },
     workers::observer::{
-        CreationSnapshot, ElectrumPort, ObservationReport, ObserverError, TipProbe,
+        CreationSnapshot, ElectrumPort, ObservationReport, ObserverError, RequestLimiter, TipProbe,
     },
 };
 use tower::ServiceExt;
@@ -42,11 +46,14 @@ impl ElectrumPort for EmptyBaselineElectrum {
         _address: &str,
         _max_history_entries: usize,
         _max_transaction_bytes: usize,
+        _request_limiter: &RequestLimiter,
+        _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<CreationSnapshot, ObserverError> {
         Ok(CreationSnapshot {
             tip_height: 100,
             baseline_outputs: Vec::new(),
             unconfirmed_inputs: Vec::new(),
+            unconfirmed_outputs: Vec::new(),
         })
     }
 
@@ -75,6 +82,8 @@ impl ElectrumPort for FailingBaselineElectrum {
         _address: &str,
         _max_history_entries: usize,
         _max_transaction_bytes: usize,
+        _request_limiter: &RequestLimiter,
+        _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<CreationSnapshot, ObserverError> {
         Err(ObserverError::Unavailable)
     }
@@ -101,11 +110,14 @@ impl ElectrumPort for StaleBaselineElectrum {
         _address: &str,
         _max_history_entries: usize,
         _max_transaction_bytes: usize,
+        _request_limiter: &RequestLimiter,
+        _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<CreationSnapshot, ObserverError> {
         Ok(CreationSnapshot {
             tip_height: 96,
             baseline_outputs: Vec::new(),
             unconfirmed_inputs: Vec::new(),
+            unconfirmed_outputs: Vec::new(),
         })
     }
 
@@ -142,6 +154,8 @@ fn request(amount_sats: u64) -> MarketplacePaymentRequest {
         reader: parse_reader(&reader()).unwrap(),
         reference: parse_bundle_id(REFERENCE).unwrap(),
         amount_sats,
+        expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        idempotency_key: format!("{REFERENCE}:1"),
     }
 }
 
@@ -222,6 +236,7 @@ struct CapturedInput {
     bundle_binding: Vec<u8>,
     payment_request_binding: Vec<u8>,
     required_sats: u64,
+    nonce_sats: u64,
     payment_request_intent: DeliveryIntentV1,
     new_reader_bitcoin_address: String,
 }
@@ -231,7 +246,12 @@ struct CapturingStore {
     preflight_calls: AtomicUsize,
     replay_calls: AtomicUsize,
     create_calls: AtomicUsize,
+    baseline_failures: AtomicUsize,
+    baseline_completions: AtomicUsize,
     captured: Mutex<Vec<CapturedInput>>,
+    /// What `create_atomic` reports: a fresh allocation (`false`) or a
+    /// race-losing replay of the winner's published row (`true`).
+    create_replayed: bool,
 }
 
 impl CapturingStore {
@@ -241,7 +261,10 @@ impl CapturingStore {
             preflight_calls: AtomicUsize::default(),
             replay_calls: AtomicUsize::default(),
             create_calls: AtomicUsize::default(),
+            baseline_failures: AtomicUsize::default(),
+            baseline_completions: AtomicUsize::default(),
             captured: Mutex::new(vec![]),
+            create_replayed: false,
         }
     }
 }
@@ -286,6 +309,7 @@ impl InvoicePersistence for CapturingStore {
             bundle_binding: input.bundle_binding.to_vec(),
             payment_request_binding: input.payment_request_binding.to_vec(),
             required_sats: input.required_sats,
+            nonce_sats: input.nonce_sats,
             payment_request_intent: input.payment_request_intent.clone(),
             new_reader_bitcoin_address: payloads.bitcoin_address,
         });
@@ -295,8 +319,53 @@ impl InvoicePersistence for CapturingStore {
             Some(uuid::Uuid::new_v4()),
             uuid::Uuid::new_v4(),
             0,
-            false,
+            self.create_replayed,
         ))
+    }
+
+    async fn complete_creation_baseline(
+        &self,
+        _invoice_id: uuid::Uuid,
+        _snapshot: &CreationSnapshot,
+    ) -> Result<(), PersistenceError> {
+        self.baseline_completions.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn fail_creation_baseline(
+        &self,
+        _invoice_id: uuid::Uuid,
+    ) -> Result<(), PersistenceError> {
+        self.baseline_failures.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn prepare_view(
+        &self,
+        invoice_id: uuid::Uuid,
+    ) -> Result<Option<InvoicePhaseView>, PersistenceError> {
+        let (nonce_sats, total_sats) = self
+            .captured
+            .lock()
+            .unwrap()
+            .last()
+            .map(|input| (input.nonce_sats, input.required_sats))
+            .unwrap_or((437, 50_437));
+        Ok(Some(InvoicePhaseView {
+            invoice_id,
+            baseline_state: "prepared".into(),
+            nonce_sats,
+            total_sats,
+            expires_at: None,
+            prepare_expires_at: Some(time::OffsetDateTime::now_utc()),
+            activated_at: None,
+            updated_at: time::OffsetDateTime::now_utc(),
+            allocation_mode: "shared_manual".into(),
+            derived_address_fingerprint: "3f7a1c9e5b204d86".into(),
+            bitcoin_address: "test-address".into(),
+            resolution: None,
+            resolved_at: None,
+        }))
     }
 }
 
@@ -359,16 +428,25 @@ fn ok_session() -> Arc<FakeSession> {
 #[tokio::test]
 async fn persists_exact_terms_bindings_and_derived_address_without_a_lock() {
     let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    let request = request(50_000);
+    let expires_at = request
+        .expires_at
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
     let result = service(ok_session(), store.clone(), BitcoinNetwork::Mainnet)
-        .create(request(50_000))
+        .create(request)
         .await
         .unwrap();
-    assert!(!result.replayed());
+    // §B.11.3: the phase-1 body reports the stored nonce'd total.
+    assert_eq!(result.state, "prepared");
+    assert_eq!(result.total_sats, 50_000 + result.nonce_sats);
 
     let captured = store.captured.lock().unwrap();
     let input = &captured[0];
     assert_eq!(input.bundle_binding, REFERENCE.as_bytes());
-    assert_eq!(input.required_sats, 50_000);
+    // §B.8.2: the invoice binds at exactly the nonce'd total.
+    assert!((1..=999).contains(&input.nonce_sats));
+    assert_eq!(input.required_sats, 50_000 + input.nonce_sats);
     assert_eq!(
         input.payment_request_binding,
         serde_json_canonicalizer::to_vec(&serde_json::json!({
@@ -376,6 +454,8 @@ async fn persists_exact_terms_bindings_and_derived_address_without_a_lock() {
             "creator": CREATOR,
             "reader": reader(),
             "reference": REFERENCE,
+            "expires_at": expires_at,
+            "idempotency_key": format!("{REFERENCE}:1"),
         }))
         .unwrap()
     );
@@ -385,11 +465,21 @@ async fn persists_exact_terms_bindings_and_derived_address_without_a_lock() {
     );
     match input.payment_request_intent.operation() {
         DeliveryOperationV1::PaymentRequestProposal { terms } => {
-            assert_eq!(terms.amount, "0.00050000");
+            // The buyer-facing Payment Request amount is the same total.
+            let total = 50_000 + input.nonce_sats;
+            assert_eq!(
+                terms.amount,
+                format!("{}.{:08}", total / 100_000_000, total % 100_000_000)
+            );
             assert_eq!(terms.asset, "btc");
             let reference = uuid::Uuid::parse_str(&terms.payment_reference).unwrap();
             assert_eq!(reference.get_version_num(), 4);
-            assert_eq!(terms.proposal_expires_at, None);
+            // §B.9: the expiry is carried into the published request so the
+            // buyer's wallet enforces it.
+            assert_eq!(
+                terms.proposal_expires_at.as_deref(),
+                Some(expires_at.as_str())
+            );
             assert_eq!(terms.accepted_endpoint_identifiers, ["btc-bitcoin-p2wpkh"]);
             assert_eq!(
                 serde_json::Value::Object(terms.metadata.clone()),
@@ -507,6 +597,73 @@ async fn snapshot_tip_more_than_three_blocks_stale_refuses_creation() {
     );
 }
 
+/// A deadline clock that returns `start` for the first `shift_after` calls
+/// and `start + shift` afterwards, so one chosen step's remaining budget
+/// shrinks to `REQUEST_DEADLINE - shift` while every earlier step sees the
+/// full budget.
+struct ShiftClock {
+    calls: AtomicUsize,
+    start: std::time::Instant,
+    shift_after: usize,
+    shift: std::time::Duration,
+}
+
+impl paykit_server::application::create_invoice::DeadlineClock for ShiftClock {
+    fn now(&self) -> std::time::Instant {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if call < self.shift_after {
+            self.start
+        } else {
+            self.start + self.shift
+        }
+    }
+}
+
+#[tokio::test]
+async fn snapshot_slot_acquisition_is_bounded_by_the_request_deadline() {
+    // The only snapshot slot is already taken, so acquisition can only
+    // complete within the remaining request-deadline budget.
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let _held = slots.clone().acquire_owned().await.unwrap();
+    let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    // The eighth clock read (the slot step) is the first shifted one, so
+    // the acquisition has 300ms of budget left.
+    let clock = Arc::new(ShiftClock {
+        calls: AtomicUsize::new(0),
+        start: std::time::Instant::now(),
+        shift_after: 7,
+        shift: std::time::Duration::from_millis(14_700),
+    });
+    let service = MarketplacePaymentRequestService::with_clock(
+        ok_session(),
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        store.clone(),
+        Arc::new(EmptyBaselineElectrum),
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+        clock,
+    )
+    .with_electrum_controls(RequestLimiter::new(100, 100), slots);
+
+    let created = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        service.create(request(50_000)),
+    )
+    .await
+    .expect("the creation returns within the request-deadline bound");
+    assert_eq!(created, Err(CreateInvoiceError::DeadlineExceeded));
+    assert_eq!(store.baseline_failures.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test]
 async fn exact_replay_returns_without_session_validation() {
     let session = ok_session();
@@ -517,10 +674,59 @@ async fn exact_replay_returns_without_session_validation() {
         .create(request(50_000))
         .await
         .unwrap();
-    assert!(result.replayed());
+    assert_eq!(result.state, "prepared");
     assert_eq!(session.calls.load(Ordering::SeqCst), 0);
     assert_eq!(store.replay_calls.load(Ordering::SeqCst), 1);
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn unresolved_baseline_wait_is_bounded_by_the_request_deadline() {
+    // §B.11.6: an exact replay landing on `awaiting_baseline` WAITS for
+    // the in-flight baseline — never an immediate in-progress refusal,
+    // never a replay of an unpublished invoice, never a second invoice,
+    // never downstream validation work — and an exhausted request budget
+    // answers the dependency timeout (503 `dependency_timeout`).
+    let session = ok_session();
+    let store = Arc::new(CapturingStore::with_preflight(
+        InvoicePreflight::BaselineInProgress,
+    ));
+    // The baseline never resolves: the wait's remaining-budget read (the
+    // third clock read) is the first shifted one, so the request deadline
+    // has elapsed by the first poll interval.
+    let clock = Arc::new(ShiftClock {
+        calls: AtomicUsize::new(0),
+        start: std::time::Instant::now(),
+        shift_after: 2,
+        shift: std::time::Duration::from_secs(15),
+    });
+    let service = MarketplacePaymentRequestService::with_clock(
+        session.clone(),
+        Arc::new(FakeMarkers {
+            markers: vec![capable_marker()],
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        store.clone(),
+        Arc::new(EmptyBaselineElectrum),
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+        clock,
+    );
+    assert_eq!(
+        service.create(request(50_000)).await,
+        Err(CreateInvoiceError::DeadlineExceeded)
+    );
+    // The retry must not replay, must not create a second invoice, and
+    // must not spend any downstream validation work.
+    assert_eq!(store.replay_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(session.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -661,6 +867,10 @@ fn canonical_body() -> String {
             "creator": CREATOR,
             "reader": reader(),
             "reference": REFERENCE,
+            "expires_at": (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            "idempotency_key": format!("{REFERENCE}:1"),
         }))
         .unwrap(),
     )
@@ -693,8 +903,8 @@ async fn signed_route_accepts_locks_and_marketplace_keys_and_refuses_others() {
     .layer(Extension(auth));
 
     for (key, expected) in [
-        (&locks_key, StatusCode::NO_CONTENT),
-        (&marketplace_key, StatusCode::NO_CONTENT),
+        (&locks_key, StatusCode::OK),
+        (&marketplace_key, StatusCode::OK),
         (&stranger_key, StatusCode::UNAUTHORIZED),
     ] {
         let response = router
@@ -734,9 +944,9 @@ async fn marketplace_key_list_accepts_every_listed_key_and_refuses_others() {
 
     // The second listed key verifies exactly like the first.
     for (key, expected) in [
-        (&staging_key, StatusCode::NO_CONTENT),
-        (&production_key, StatusCode::NO_CONTENT),
-        (&locks_key, StatusCode::NO_CONTENT),
+        (&staging_key, StatusCode::OK),
+        (&production_key, StatusCode::OK),
+        (&locks_key, StatusCode::OK),
         (&stranger_key, StatusCode::UNAUTHORIZED),
     ] {
         let response = router
@@ -772,7 +982,7 @@ async fn without_a_marketplace_key_only_the_locks_key_is_trusted() {
         .oneshot(signed_request(&locks_key, canonical_body()))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -794,6 +1004,8 @@ async fn malformed_identifiers_are_invalid_requests() {
             "creator": CREATOR,
             "reader": reader(),
             "reference": "not-a-reference",
+            "expires_at": "2099-01-01T00:00:00Z",
+            "idempotency_key": "not-a-reference:1",
         }))
         .unwrap(),
     )
@@ -826,7 +1038,7 @@ async fn disabled_creation_refuses_new_binds_but_replays_exact_requests() {
             .create(request(50_000))
             .await
             .unwrap();
-    assert!(replayed.replayed());
+    assert_eq!(replayed.state, "prepared");
 }
 
 #[tokio::test]
@@ -861,8 +1073,8 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
         bitcoin::{ObservationTarget, PlannedObservation},
         runtime::{DependencyCheck, Runtime},
         workers::observer::{
-            AddressFailureGate, ElectrumPort, ObservationBackend, ObservationReport, ObserverError,
-            ObserverPolicy, ObserverTickOutcome, TipProbe, observe_tick,
+            ElectrumPort, ObservationBackend, ObservationReport, ObserverError, ObserverPolicy,
+            ObserverTickOutcome, ObserverTickState, TipProbe, observe_tick,
         },
     };
 
@@ -921,7 +1133,8 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
 
         async fn record_observation_tick(
             &self,
-            _addresses: &[String],
+            _observed: &[String],
+            _failed: &[String],
         ) -> Result<u64, ObserverError> {
             Ok(0)
         }
@@ -942,14 +1155,15 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
         &HealthyPort,
         &ExistingInvoice,
         &BitcoinNetwork::Mainnet,
-        &ObserverPolicy {
+        &runtime,
+        &mut ObserverTickState::new(&ObserverPolicy {
             poll_interval: std::time::Duration::from_secs(10),
             max_requests_per_tick: 100,
             max_requests_per_second: 5,
             max_transaction_bytes: 400_000,
-        },
-        &runtime,
-        &mut AddressFailureGate::new(),
+            baseline_completion_timeout: std::time::Duration::from_secs(60),
+            expiry_tail: std::time::Duration::from_secs(24 * 60 * 60),
+        }),
     )
     .await;
     assert_eq!(
@@ -961,4 +1175,89 @@ async fn disabled_creation_keeps_observing_existing_invoices() {
         }
     );
     assert!(!runtime.readiness().await.bitcoin_creation_enabled);
+}
+
+struct FixedAvailability(bool);
+
+#[async_trait]
+impl OfferAvailability for FixedAvailability {
+    async fn bitcoin_offer_available(&self) -> bool {
+        self.0
+    }
+}
+
+#[tokio::test]
+async fn hidden_offer_refuses_first_time_payment_request_binds_without_consuming_anything() {
+    let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    let session = ok_session();
+    // Calibration: the static creation flag is ON, so the refusing
+    // predicate here is the runtime gate and nothing else.
+    let service = service_with_creation(ok_session(), store.clone(), BitcoinNetwork::Mainnet, true)
+        .with_offer_availability(Arc::new(FixedAvailability(false)));
+
+    assert_eq!(
+        service.create(request(50_000)).await,
+        Err(CreateInvoiceError::BitcoinOfferUnavailable)
+    );
+    assert_eq!(store.preflight_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(store.baseline_completions.load(Ordering::SeqCst), 0);
+    assert_eq!(store.baseline_failures.load(Ordering::SeqCst), 0);
+    assert_eq!(session.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn exact_replay_is_served_while_the_offer_is_hidden() {
+    let store = Arc::new(CapturingStore::with_preflight(
+        InvoicePreflight::ExactReplay,
+    ));
+    let replayed = service(ok_session(), store, BitcoinNetwork::Mainnet)
+        .with_offer_availability(Arc::new(FixedAvailability(false)))
+        .create(request(50_000))
+        .await
+        .unwrap();
+    // An exact replay binds nothing new: the gate must not see it.
+    assert_eq!(replayed.state, "prepared");
+}
+
+#[tokio::test]
+async fn hidden_offer_maps_to_503_bitcoin_offer_unavailable_on_the_marketplace_route() {
+    let locks_key = SigningKey::from_bytes(&[3; 32]);
+    let config = auth_config(&locks_key, None);
+    let auth = Arc::new(SignedLocksAuth::from_config(&config));
+    let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    let router = payment_requests_router(Arc::new(
+        service(ok_session(), store, BitcoinNetwork::Mainnet)
+            .with_offer_availability(Arc::new(FixedAvailability(false))),
+    ))
+    .layer(Extension(auth));
+
+    let response = router
+        .oneshot(signed_request(&locks_key, canonical_body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["error"]["code"], "bitcoin_offer_unavailable");
+}
+
+#[tokio::test]
+async fn replayed_create_atomic_returns_the_published_invoice_without_a_second_baseline() {
+    // Both preflights read `New`, the winner committed AND published
+    // before the loser's create_atomic took the row lock: the replayed row
+    // is served as-is and the baseline sequence never runs twice for one
+    // invoice (no double charge against the shared limiter).
+    let mut store = CapturingStore::with_preflight(InvoicePreflight::New);
+    store.create_replayed = true;
+    let store = Arc::new(store);
+    let replayed = service(ok_session(), store.clone(), BitcoinNetwork::Mainnet)
+        .create(request(50_000))
+        .await
+        .unwrap();
+    assert_eq!(replayed.state, "prepared");
+    assert_eq!(store.baseline_completions.load(Ordering::SeqCst), 0);
+    assert_eq!(store.baseline_failures.load(Ordering::SeqCst), 0);
 }

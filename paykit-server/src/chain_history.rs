@@ -11,6 +11,16 @@
 //! claim is refused and the seller must use a fresh account. Any Electrum
 //! failure refuses the claim rather than defaulting to index 0: an unscanned
 //! claim is exactly the P1-A condition the design forbids.
+//!
+//! The response work is bounded too (see the `ChainHistoryPort`
+//! implementation on the Electrum adapter): the window's raw history-item
+//! count is capped before any domain value is materialised, an over-cap
+//! window is treated as USED (presence = true for the whole window, never
+//! attributed to individual addresses — conservative: it only advances the
+//! start index, and the window bound above still yields
+//! `account_history_too_deep`), each window runs under a wall-clock
+//! deadline, and concurrent scans are bounded process-wide (over the bound
+//! the claim fails `claim_scan_unavailable` immediately).
 
 use std::str::FromStr;
 

@@ -251,4 +251,35 @@ pub enum PersistenceError {
     /// A requested idempotent binding conflicts with a durable record.
     #[error("persisted state conflicts with the request")]
     Conflict,
+    /// The idempotent payload matches an invoice whose creation baseline
+    /// is still unresolved: the atomic allocation's replay branch found
+    /// the winner's `awaiting_baseline` row, exactly what `preflight`
+    /// reports as [`crate::persistence::InvoicePreflight::BaselineInProgress`].
+    /// The caller must not run a second baseline for the same invoice.
+    #[error("invoice creation baseline is still resolving")]
+    BaselineInProgress,
+    /// The invoice reached a final state that admits neither activation nor
+    /// a replayed prepare: `void_baseline_failed`, `void_cancelled`, or
+    /// `expired_final` (design §B.11.6 — reported as `invoice_finalized`).
+    /// On `void`, a published invoice (`observing` / `expired_tail`) is the
+    /// same refusal: a published request must expire through the tail rather
+    /// than vanish.
+    #[error("invoice is finalized")]
+    InvoiceFinalized,
+    /// The invoice was reaped at `prepare_expires_at` without activation
+    /// (design §B.11.1) or a prepare replay arrived after that reap
+    /// (§B.11.6 — reported as `prepare_expired`).
+    #[error("invoice prepare window expired")]
+    PrepareExpired,
+    /// A `resolve` named a `prepared` invoice (design §B.9): nothing was
+    /// ever published, so no buyer could have paid it — reported as
+    /// `invoice_not_activated`.
+    #[error("invoice was never activated")]
+    InvoiceNotActivated,
+    /// A `resolve` named an invoice already resolved with a DIFFERENT
+    /// resolution (design §B.9): one-way, and the conflict is surfaced —
+    /// reported as `invoice_already_resolved` naming the existing
+    /// resolution. A replay of the SAME resolution is not an error.
+    #[error("invoice is already resolved with a different resolution")]
+    InvoiceAlreadyResolved,
 }

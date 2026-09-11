@@ -206,9 +206,20 @@ impl DeliveryIntentV1 {
                 if reference.get_version_num() != 4
                     || reference.get_variant() != uuid::Variant::RFC4122
                     || terms.payment_reference != reference.hyphenated().to_string()
-                    || terms.proposal_expires_at.is_some()
                 {
                     return Err(DeliveryIntentError::Invalid);
+                }
+                // §B.9: the proposal expiry is carried so the buyer's wallet
+                // enforces it; when present it must be a well-formed RFC3339
+                // timestamp (freshness is a creation-time check, not a
+                // decode-time one — a replayed intent must still validate
+                // after the moment has passed).
+                if let Some(expires_at) = &terms.proposal_expires_at {
+                    time::OffsetDateTime::parse(
+                        expires_at,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .map_err(|_| DeliveryIntentError::Invalid)?;
                 }
             }
         }

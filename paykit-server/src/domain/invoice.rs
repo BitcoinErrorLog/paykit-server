@@ -58,6 +58,15 @@ impl InvoiceIdentity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct CriterionAsset;
 
+/// Inclusive bounds of the per-invoice CSPRNG amount nonce (design §B.8.2).
+/// Every invoice created from W1.1b on draws `nonce_sats` inside this range
+/// and binds at exactly `price + nonce_sats`; at most 999 satoshis keeps the
+/// nonce far below a typical mainnet fee. Invoices created before W1.1b carry
+/// no nonce and read as `nonce_sats = 0`.
+pub const NONCE_SATS_MIN: u64 = 1;
+/// Inclusive upper bound of the per-invoice amount nonce; see [`NONCE_SATS_MIN`].
+pub const NONCE_SATS_MAX: u64 = 999;
+
 impl CriterionAsset {
     /// Parses the exact accepted asset spelling, `BTC`.
     pub fn parse(value: &str) -> Result<Self, CriterionAssetError> {

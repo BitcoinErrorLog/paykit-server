@@ -9,22 +9,28 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
     str::FromStr,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
     time::Duration,
 };
 
-use bdk_electrum::electrum_client::{ScriptHash, ToElectrumScriptHash};
 use bitcoin::{
     Address, CompressedPublicKey, Network, OutPoint, ScriptBuf, Transaction, Txid,
-    absolute::LockTime, consensus::encode, transaction::Version,
+    absolute::LockTime, consensus::encode, hashes::Hash, transaction::Version,
 };
+use electrum_client::{ScriptHash, ToElectrumScriptHash};
 use paykit_server::{
     bitcoin::{ObservationTarget, TrackedOutput},
     config::BitcoinNetwork,
-    workers::observer::{ElectrumAdapter, ElectrumPort, ObserverError},
+    workers::{
+        electrum::DEFAULT_MAX_RESPONSE_BYTES,
+        observer::{
+            AddressFailureReason, ElectrumAdapter, ElectrumPort, FailedObservation, ObserverError,
+            RequestLimiter,
+        },
+    },
 };
 
 const TIP_HEIGHT: usize = 120;
@@ -47,16 +53,55 @@ fn unspent_entry(label: u64, value_sats: u64, height: usize) -> serde_json::Valu
     })
 }
 
+/// A syntactically valid JSON result item whose `tx_hash` cannot decode
+/// into `ListUnspentRes`: any code path that converts items before
+/// checking the item-count cap fails with a decode error instead.
+fn undecodable_entry(label: u64) -> serde_json::Value {
+    serde_json::json!({
+        "tx_hash": format!("not-a-txid-{label}"),
+        "tx_pos": 0,
+        "value": 546,
+        "height": TIP_HEIGHT,
+    })
+}
+
 fn outpoint(label: u64) -> OutPoint {
     OutPoint::new(Txid::from_str(&format!("{label:064x}")).unwrap(), 0)
 }
 
+fn failed(address: &Address, reason: AddressFailureReason) -> FailedObservation {
+    FailedObservation {
+        address: address.to_string(),
+        reason,
+    }
+}
+
+/// Test adapter matching the production defaults: the configured UTXO cap
+/// (200), a generous 5s per-address deadline, and the default 1 MiB
+/// response-line cap.
 async fn connect(server: &ProtocolServer) -> ElectrumAdapter {
+    connect_bounded(
+        server,
+        200,
+        Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .await
+}
+
+async fn connect_bounded(
+    server: &ProtocolServer,
+    max_utxos_per_address: usize,
+    address_deadline: Duration,
+    max_response_bytes: u64,
+) -> ElectrumAdapter {
     ElectrumAdapter::connect(
         server.endpoint(),
         BitcoinNetwork::Regtest,
         Duration::from_secs(1),
-        1,
+        max_utxos_per_address,
+        address_deadline,
+        max_response_bytes,
     )
     .await
     .unwrap()
@@ -214,6 +259,33 @@ async fn candidate_fetch_uses_exactly_one_distinct_transaction_request() {
 }
 
 #[tokio::test]
+async fn candidate_fetch_rejects_a_transaction_over_the_byte_cap() {
+    let transaction = Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: Vec::new(),
+        output: Vec::new(),
+    };
+    let txid = transaction.compute_txid();
+    let server = ProtocolServer::start_with_transaction(
+        Network::Regtest,
+        encode::serialize_hex(&transaction),
+    )
+    .await;
+    let adapter = connect(&server).await;
+
+    // The over-cap response is rejected with a named deterministic kind:
+    // refetching the same transaction can never succeed under the byte
+    // cap, so the candidate path routes it to manual review after one
+    // attempt instead of burning the bounded fetch retries.
+    assert_eq!(
+        adapter.candidate_transaction(txid, 0).await,
+        Err(ObserverError::TransactionTooLarge)
+    );
+    server.assert_rpc_counts(0, 0, 1);
+}
+
+#[tokio::test]
 async fn a_spent_tracked_outpoint_observes_absence() {
     let address = fixture_address();
     let tracked = outpoint(77);
@@ -283,7 +355,10 @@ async fn a_utxo_height_above_the_tip_fails_only_that_address() {
         .await
         .unwrap();
 
-    assert_eq!(report.failed, vec![address.to_string()]);
+    assert_eq!(
+        report.failed,
+        vec![failed(&address, AddressFailureReason::Error)]
+    );
     assert_eq!(report.observed, vec![other.to_string()]);
     assert_eq!(report.outputs.len(), 1);
     assert_eq!(report.outputs[0].sats, 50_000);
@@ -338,13 +413,210 @@ async fn a_per_address_timeout_isolates_the_failed_address_and_the_rest_are_obse
         .await
         .unwrap();
 
-    assert_eq!(report.failed, vec![stalled.to_string()]);
+    assert_eq!(
+        report.failed,
+        vec![failed(&stalled, AddressFailureReason::Error)]
+    );
     assert_eq!(
         report.observed,
         vec![healthy_a.to_string(), healthy_b.to_string()],
         "the timed-out address must not discard the other addresses' observations"
     );
     assert_eq!(report.outputs.len(), 2);
+    // Retry-path evidence: exactly one list_unspent per admitted target —
+    // the timed-out lookup is NOT reissued (client retries are pinned at
+    // zero; the observer's own next tick is the retry).
+    server.assert_rpc_counts(3, 0, 0);
+}
+
+#[tokio::test]
+async fn an_oversized_listunspent_response_fails_only_that_address_before_materialising_records() {
+    let dusted = fixture_address();
+    let healthy = Address::p2wpkh(
+        &CompressedPublicKey::from_str(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap(),
+        Network::Regtest,
+    );
+    // Literal fixtures: the dusted address answers with a 10k-item
+    // listunspent response whose items cannot even decode into
+    // ListUnspentRes; the healthy address answers normally. The cap (200)
+    // must fire BEFORE any per-item conversion: a convert-first code path
+    // would fail with AddressFailureReason::Error instead.
+    const DUST: u64 = 10_000;
+    let server = ProtocolServer::start_multi(
+        Network::Regtest,
+        vec![
+            (
+                dusted.script_pubkey(),
+                serde_json::Value::Array((1..=DUST).map(undecodable_entry).collect()),
+            ),
+            (
+                healthy.script_pubkey(),
+                serde_json::json!([unspent_entry(7, 30_000, TIP_HEIGHT)]),
+            ),
+        ],
+    )
+    .await;
+    let adapter = connect(&server).await;
+
+    let started = std::time::Instant::now();
+    let report = adapter
+        .observations(
+            TIP_HEIGHT as u32,
+            &[
+                ObservationTarget::new(dusted.to_string(), None),
+                ObservationTarget::new(healthy.to_string(), None),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.failed,
+        vec![failed(&dusted, AddressFailureReason::ResponseTooLarge)],
+        "the over-cap response is rejected by the item-count cap, not by a \
+         per-item decode — no 10k-element record vector is ever built"
+    );
+    assert_eq!(
+        report.observed,
+        vec![healthy.to_string()],
+        "the next seller is observed in the same tick"
+    );
+    assert_eq!(report.outputs.len(), 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the rejection happens well within the per-address deadline"
+    );
+    server.assert_rpc_counts(2, 0, 0);
+}
+
+#[tokio::test]
+async fn an_over_cap_response_line_fails_the_read_before_decode_and_the_next_address_reconnects() {
+    let capped = fixture_address();
+    let healthy = Address::p2wpkh(
+        &CompressedPublicKey::from_str(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap(),
+        Network::Regtest,
+    );
+    // Literal fixtures: the capped address's listunspent response is a
+    // single JSON line far above a 4 KiB transport cap (100 items at
+    // ~100 bytes each); the healthy address answers a small line. The
+    // item-count cap (200) would NOT fire for the capped address: the
+    // failure must come from the transport cap, surfacing as an isolated
+    // per-address `error` — the read fails before the client buffers or
+    // JSON-decodes the line.
+    let server = ProtocolServer::start_multi(
+        Network::Regtest,
+        vec![
+            (
+                capped.script_pubkey(),
+                serde_json::Value::Array(
+                    (1..=100)
+                        .map(|label| unspent_entry(label, 546, TIP_HEIGHT))
+                        .collect(),
+                ),
+            ),
+            (
+                healthy.script_pubkey(),
+                serde_json::json!([unspent_entry(7, 30_000, TIP_HEIGHT)]),
+            ),
+        ],
+    )
+    .await;
+    let adapter = connect_bounded(&server, 200, Duration::from_secs(5), 4 * 1024).await;
+
+    let report = adapter
+        .observations(
+            TIP_HEIGHT as u32,
+            &[
+                ObservationTarget::new(capped.to_string(), None),
+                ObservationTarget::new(healthy.to_string(), None),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.failed,
+        vec![failed(&capped, AddressFailureReason::Error)],
+        "the over-cap line fails the read (transport cap), isolated to \
+         that address"
+    );
+    assert_eq!(
+        report.observed,
+        vec![healthy.to_string()],
+        "the poisoned connection is torn down and the next seller is \
+         observed over a fresh capped connection"
+    );
+    assert_eq!(report.outputs.len(), 1);
+    // One lookup per target; the capped lookup is NOT reissued.
+    server.assert_rpc_counts(2, 0, 0);
+}
+
+#[tokio::test]
+async fn a_trickling_response_exceeding_the_address_deadline_fails_only_that_address() {
+    let trickled = fixture_address();
+    let healthy = Address::p2wpkh(
+        &CompressedPublicKey::from_str(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap(),
+        Network::Regtest,
+    );
+    // The trickled address's response arrives after 10s — well past the
+    // 300ms per-address deadline and past the 1s client socket timeout, so
+    // only the wall-clock deadline can bound it; the healthy address
+    // answers immediately.
+    let server = ProtocolServer::start_multi_with_stall(
+        Network::Regtest,
+        trickled.script_pubkey(),
+        Duration::from_secs(10),
+        vec![(
+            healthy.script_pubkey(),
+            serde_json::json!([unspent_entry(8, 40_000, TIP_HEIGHT)]),
+        )],
+    )
+    .await;
+    let adapter = connect_bounded(
+        &server,
+        200,
+        Duration::from_millis(300),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    let report = adapter
+        .observations(
+            TIP_HEIGHT as u32,
+            &[
+                ObservationTarget::new(trickled.to_string(), None),
+                ObservationTarget::new(healthy.to_string(), None),
+            ],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.failed,
+        vec![failed(&trickled, AddressFailureReason::Deadline)]
+    );
+    assert_eq!(
+        report.observed,
+        vec![healthy.to_string()],
+        "the deadline returns to the tick and the next seller is observed \
+         over a fresh connection"
+    );
+    assert_eq!(report.outputs.len(), 1);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the 300ms deadline bounds the wait; the 10s trickle never completes"
+    );
+    server.assert_rpc_counts(2, 0, 0);
 }
 
 #[tokio::test]
@@ -385,11 +657,59 @@ async fn classifies_endpoint_outage_as_retryable_unavailable() {
         endpoint,
         BitcoinNetwork::Regtest,
         Duration::from_millis(50),
-        0,
+        200,
+        Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
     )
     .await;
 
     assert_eq!(result.err(), Some(ObserverError::Unavailable));
+}
+
+#[tokio::test]
+async fn a_trickling_probe_response_exceeding_the_deadline_fails_the_probe_as_unavailable() {
+    // The fake server answers blockchain.headers.subscribe one byte
+    // every 20ms: every socket read returns well inside the 1s per-read
+    // socket timeout, so only the wall-clock deadline can bound the
+    // probe. The full subscribe reply is over 200 bytes — about five
+    // seconds of drip — and without the deadline the tick would wedge
+    // here: no backoff, no availability change, no failover.
+    let server =
+        ProtocolServer::start_probe_drip(Network::Regtest, Duration::from_millis(20)).await;
+    let adapter = connect_bounded(
+        &server,
+        200,
+        Duration::from_millis(300),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .await;
+
+    let started = std::time::Instant::now();
+    // Test-level outer bound: without the probe's wall-clock deadline
+    // this await would hang for the whole ~5s drip; the deadline must
+    // cut it to ~300ms with the endpoint-level Unavailable outcome, so
+    // the existing backoff/metrics/availability path applies.
+    let result = tokio::time::timeout(Duration::from_secs(2), adapter.probe())
+        .await
+        .expect("the probe deadline must return well before the drip completes");
+    assert_eq!(result, Err(ObserverError::Unavailable));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the 300ms deadline bounds the probe; the 5s drip never completes"
+    );
+
+    // The tick is not wedged: a subsequent probe against a healthy
+    // endpoint succeeds immediately.
+    let healthy =
+        ProtocolServer::start(
+            Network::Regtest,
+            ScriptBuf::new(),
+            |_| serde_json::json!([]),
+        )
+        .await;
+    let adapter = connect(&healthy).await;
+    let tip = adapter.probe().await.unwrap();
+    assert_eq!(tip.height, TIP_HEIGHT as u32);
 }
 
 #[tokio::test]
@@ -426,11 +746,249 @@ async fn probe_classifies_endpoint_outage_as_retryable_unavailable() {
         endpoint,
         BitcoinNetwork::Regtest,
         Duration::from_millis(50),
-        0,
+        200,
+        Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
     )
     .unwrap();
 
     assert_eq!(adapter.probe().await, Err(ObserverError::Unavailable));
+}
+
+#[tokio::test]
+async fn creation_snapshot_reads_tip_after_history_and_unspent() {
+    let address = fixture_address();
+    let server =
+        ProtocolServer::start_creation_snapshot(Network::Regtest, address.script_pubkey()).await;
+    let adapter = ElectrumAdapter::configured(
+        server.endpoint(),
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(1),
+        200,
+        Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .unwrap();
+
+    let snapshot = adapter
+        .creation_snapshot(
+            &address.to_string(),
+            50,
+            400_000,
+            &RequestLimiter::new(100, 0),
+            Arc::new(tokio::sync::Semaphore::new(1))
+                .acquire_owned()
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(snapshot.tip_height, u32::try_from(TIP_HEIGHT).unwrap());
+    let requests = server.fixture.request_log.lock().unwrap();
+    let ordered = requests
+        .iter()
+        .filter(|request| {
+            matches!(
+                request.as_str(),
+                "blockchain.scripthash.get_history"
+                    | "blockchain.scripthash.listunspent"
+                    | "blockchain.headers.subscribe"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        ordered,
+        vec![
+            "blockchain.scripthash.get_history",
+            "blockchain.scripthash.listunspent",
+            "blockchain.headers.subscribe",
+        ],
+        "a transaction mined while history is read is either captured by the snapshot or at/below the later floor"
+    );
+}
+
+#[tokio::test]
+async fn creation_snapshot_rejects_history_over_the_entry_cap_before_transaction_fetches() {
+    let address = fixture_address();
+    let server = ProtocolServer::start_with_fixture(
+        Network::Regtest,
+        vec![(address.script_pubkey(), serde_json::json!([]))],
+        51,
+        true,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+    )
+    .await;
+    let adapter = ElectrumAdapter::configured(
+        server.endpoint(),
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(1),
+        200,
+        Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .unwrap();
+
+    assert_eq!(
+        adapter
+            .creation_snapshot(
+                &address.to_string(),
+                50,
+                400_000,
+                &RequestLimiter::new(100, 0),
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+            )
+            .await,
+        Err(ObserverError::Unavailable)
+    );
+    server.assert_rpc_counts(0, 1, 0);
+}
+
+#[tokio::test]
+async fn creation_snapshot_permit_outlives_an_abandoned_await() {
+    let address = fixture_address();
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let server = ProtocolServer::start_with_fixture(
+        Network::Regtest,
+        vec![(address.script_pubkey(), serde_json::json!([]))],
+        0,
+        true,
+        None,
+        None,
+        false,
+        None,
+        Some(gate.clone()),
+        None,
+    )
+    .await;
+    // The client wire timeout (30s) far exceeds the test window, so the
+    // gated read stays parked until the gate is released.
+    let adapter = ElectrumAdapter::configured(
+        server.endpoint(),
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(30),
+        200,
+        Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .unwrap();
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = slots.clone().acquire_owned().await.unwrap();
+    let snapshot = {
+        let adapter = adapter.clone();
+        let address = address.to_string();
+        tokio::spawn(async move {
+            adapter
+                .creation_snapshot(&address, 50, 400_000, &RequestLimiter::new(100, 0), permit)
+                .await
+        })
+    };
+    for _ in 0..200 {
+        let parked = server
+            .fixture
+            .request_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|method| method == "blockchain.scripthash.get_history");
+        if parked {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The awaiting side gives up (the request deadline passed); the
+    // blocking read is orphaned on the gated history response.
+    snapshot.abort();
+    let _ = snapshot.await;
+    assert_eq!(
+        slots.available_permits(),
+        0,
+        "the orphaned blocking read must retain its slot until the read returns"
+    );
+    assert!(slots.clone().try_acquire_owned().is_err());
+
+    *gate.0.lock().unwrap() = true;
+    gate.1.notify_all();
+    for _ in 0..500 {
+        if slots.available_permits() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        slots.available_permits(),
+        1,
+        "the slot is released only when the detached blocking read exits"
+    );
+}
+
+#[tokio::test]
+async fn a_transaction_answered_under_the_wrong_txid_fails_both_fetch_paths() {
+    let address = fixture_address();
+    // The server holds valid raw bytes of transaction A; every request
+    // below asks for a different txid B.
+    let transaction_a = Transaction {
+        version: Version::ONE,
+        lock_time: LockTime::ZERO,
+        input: Vec::new(),
+        output: Vec::new(),
+    };
+    let requested_txid = Txid::from_byte_array([7; 32]);
+    assert_ne!(transaction_a.compute_txid(), requested_txid);
+    let server = ProtocolServer::start_with_fixture(
+        Network::Regtest,
+        vec![(address.script_pubkey(), serde_json::json!([]))],
+        0,
+        false,
+        None,
+        None,
+        false,
+        Some(encode::serialize_hex(&transaction_a)),
+        None,
+        Some(requested_txid.to_string()),
+    )
+    .await;
+    let adapter = connect(&server).await;
+
+    // First-bind candidate path: valid raw bytes of a different
+    // transaction are a fetch failure, never resolution input — no
+    // candidate approval can follow.
+    assert_eq!(
+        adapter.candidate_transaction(requested_txid, 400_000).await,
+        Err(ObserverError::Unavailable)
+    );
+
+    // Creation-snapshot path: the unconfirmed baseline entry's input
+    // capture fails the same way, so no baseline-input row can be built
+    // from foreign bytes.
+    assert_eq!(
+        adapter
+            .creation_snapshot(
+                &address.to_string(),
+                50,
+                400_000,
+                &RequestLimiter::new(100, 0),
+                Arc::new(tokio::sync::Semaphore::new(1))
+                    .acquire_owned()
+                    .await
+                    .unwrap(),
+            )
+            .await,
+        Err(ObserverError::Unavailable)
+    );
+    // One listunspent and one get_history for the snapshot, and exactly
+    // one transaction.get per fetch path; the snapshot failed before
+    // headers.subscribe and no observation ever happened.
+    server.assert_rpc_counts(1, 1, 2);
 }
 
 struct ProtocolServer {
@@ -449,11 +1007,23 @@ struct ProtocolFixture {
     unspent_by_script: Vec<(ScriptBuf, serde_json::Value)>,
     /// History length served if the adapter ever calls get_history.
     history_len: usize,
+    serve_history: bool,
     /// Script whose list_unspent response is delayed, and the delay.
     stall: Option<(ScriptBuf, Duration)>,
+    /// Per-byte write delay for the `blockchain.headers.subscribe`
+    /// response (probe drip-feed): every socket read stays well inside
+    /// the per-read socket timeout, so only a wall-clock deadline can
+    /// bound the probe.
+    probe_drip: Option<Duration>,
     /// Close each connection after its first list_unspent response.
     disconnect_after_unspent: bool,
     transaction_raw: Option<String>,
+    /// When set, every `get_history` response parks on this gate until it
+    /// is released, modelling a blocking read that outlives its caller.
+    gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+    /// When set, `get_history` answers with this single unconfirmed entry
+    /// (height 0), driving the snapshot's unconfirmed-input fetch.
+    unconfirmed_history_txid: Option<String>,
     request_log: Mutex<Vec<String>>,
 }
 
@@ -470,7 +1040,10 @@ impl ProtocolServer {
     }
 
     async fn start_multi(network: Network, unspent: Vec<(ScriptBuf, serde_json::Value)>) -> Self {
-        Self::start_with_fixture(network, unspent, 0, None, false, None).await
+        Self::start_with_fixture(
+            network, unspent, 0, false, None, None, false, None, None, None,
+        )
+        .await
     }
 
     /// Starts a server that would answer get_history with `history_len`
@@ -482,8 +1055,12 @@ impl ProtocolServer {
             network,
             vec![(script, unspent)],
             history_len,
+            false,
+            None,
             None,
             false,
+            None,
+            None,
             None,
         )
         .await
@@ -499,8 +1076,12 @@ impl ProtocolServer {
             network,
             healthy,
             0,
-            Some((stalled_script, stall)),
             false,
+            Some((stalled_script, stall)),
+            None,
+            false,
+            None,
+            None,
             None,
         )
         .await
@@ -508,20 +1089,84 @@ impl ProtocolServer {
 
     async fn start_disconnecting(network: Network, script: ScriptBuf) -> Self {
         let unspent = serde_json::json!([unspent_entry(11, 125_000, TIP_HEIGHT)]);
-        Self::start_with_fixture(network, vec![(script, unspent)], 0, None, true, None).await
+        Self::start_with_fixture(
+            network,
+            vec![(script, unspent)],
+            0,
+            false,
+            None,
+            None,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Starts a server that answers `blockchain.headers.subscribe` one
+    /// byte per `per_byte` interval — a drip-feeding endpoint whose every
+    /// socket read completes inside the per-read socket timeout.
+    async fn start_probe_drip(network: Network, per_byte: Duration) -> Self {
+        Self::start_with_fixture(
+            network,
+            vec![],
+            0,
+            false,
+            None,
+            Some(per_byte),
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     async fn start_with_transaction(network: Network, transaction_raw: String) -> Self {
-        Self::start_with_fixture(network, Vec::new(), 0, None, false, Some(transaction_raw)).await
+        Self::start_with_fixture(
+            network,
+            Vec::new(),
+            0,
+            false,
+            None,
+            None,
+            false,
+            Some(transaction_raw),
+            None,
+            None,
+        )
+        .await
     }
 
+    async fn start_creation_snapshot(network: Network, script: ScriptBuf) -> Self {
+        Self::start_with_fixture(
+            network,
+            vec![(script, serde_json::json!([]))],
+            0,
+            true,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn start_with_fixture(
         network: Network,
         unspent_by_script: Vec<(ScriptBuf, serde_json::Value)>,
         history_len: usize,
+        serve_history: bool,
         stall: Option<(ScriptBuf, Duration)>,
+        probe_drip: Option<Duration>,
         disconnect_after_unspent: bool,
         transaction_raw: Option<String>,
+        gate: Option<Arc<(Mutex<bool>, Condvar)>>,
+        unconfirmed_history_txid: Option<String>,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let wake_address = listener.local_addr().unwrap();
@@ -533,9 +1178,13 @@ impl ProtocolServer {
             tip_height: TIP_HEIGHT,
             unspent_by_script,
             history_len,
+            serve_history,
             stall,
+            probe_drip,
             disconnect_after_unspent,
             transaction_raw,
+            gate,
+            unconfirmed_history_txid,
             request_log: Mutex::new(Vec::new()),
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -633,8 +1282,30 @@ fn serve_connection(mut stream: TcpStream, fixture: Arc<ProtocolFixture>) {
             // The adapter must never call these; if it ever does, fail the
             // test loudly instead of silently serving a fanout.
             "blockchain.scripthash.get_history" => {
-                let _ = fixture.history_len;
-                panic!("adapter called blockchain.scripthash.get_history");
+                if let Some(gate) = &fixture.gate {
+                    let (released, condvar) = &**gate;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = condvar.wait(released).unwrap();
+                    }
+                }
+                if let Some(txid) = &fixture.unconfirmed_history_txid {
+                    serde_json::json!([{"tx_hash": txid, "height": 0}])
+                } else if fixture.serve_history {
+                    serde_json::Value::Array(
+                        (0..fixture.history_len)
+                            .map(|index| {
+                                serde_json::json!({
+                                    "tx_hash": format!("{:064x}", index + 1),
+                                    "height": 1
+                                })
+                            })
+                            .collect(),
+                    )
+                } else {
+                    let _ = fixture.history_len;
+                    panic!("adapter called blockchain.scripthash.get_history");
+                }
             }
             "blockchain.transaction.get" => serde_json::Value::String(
                 fixture
@@ -645,6 +1316,20 @@ fn serve_connection(mut stream: TcpStream, fixture: Arc<ProtocolFixture>) {
             method => panic!("unexpected Electrum method: {method}"),
         };
         let response = serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result});
+        // Probe drip-feed: write the subscribe reply one byte at a time
+        // so every socket read completes inside the per-read socket
+        // timeout and only a wall-clock deadline can bound the probe.
+        if method == "blockchain.headers.subscribe"
+            && let Some(per_byte) = fixture.probe_drip
+        {
+            for byte in format!("{response}\n").into_bytes() {
+                if stream.write_all(&[byte]).is_err() || stream.flush().is_err() {
+                    return;
+                }
+                thread::sleep(per_byte);
+            }
+            continue;
+        }
         if writeln!(stream, "{response}").is_err() {
             break;
         }

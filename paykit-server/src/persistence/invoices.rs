@@ -24,6 +24,18 @@ use crate::{
     persistence::PersistenceError,
 };
 
+/// Baseline-set recomputation must order rows byte-exactly the way the
+/// creation path hashed them. The text columns' collation is pinned to
+/// "C" so a database created with a non-C default collation cannot
+/// reorder the recomputation away from the hashed order. `pre_existing`
+/// rows (§B.4.6, written by activation) are baseline members like any
+/// other and are sealed by the same hash — activation re-seals the record
+/// after writing them, so a creation-time hash (which can contain none)
+/// is untouched by the extra kind.
+const BASELINE_ENTRIES_SQL: &str = "SELECT kind, txid, vout FROM invoice_baseline_outpoints
+     WHERE invoice_id = $1 AND kind IN ('output', 'pre_existing', 'replaced_input')
+     ORDER BY kind COLLATE \"C\", txid COLLATE \"C\", vout";
+
 /// Opaque inputs for one transactional invoice-allocation operation.
 ///
 /// `endpoint_publication_payload` is persisted only when the reader has no
@@ -43,8 +55,26 @@ pub struct AtomicInvoiceInput<'a> {
     pub new_reader_payloads: &'a dyn NewReaderPayloadFactory,
     /// Complete Payment Request proposal intent. Exact replay does not rebuild it.
     pub payment_request_intent: DeliveryIntentV1,
-    /// Settlement-authoritative integer satoshi amount captured from the lock.
+    /// Settlement-authoritative integer satoshi amount the invoice binds at:
+    /// the lock or marketplace price plus `nonce_sats` (design §B.8.2).
     pub required_sats: u64,
+    /// CSPRNG-drawn amount nonce in [1, 999], persisted inside the sealed
+    /// payment record so the exact-amount predicate and the phase-1 prepare
+    /// response can report it. Never derived from the order id, the price, a
+    /// counter, or time.
+    pub nonce_sats: u64,
+    /// Lifetime of the `prepared` state (design §B.11.1): the creation
+    /// transaction stamps `prepare_expires_at = NOW() + prepare_ttl` from the
+    /// server clock. Carried here so the config value reaches the INSERT
+    /// without a plaintext config column.
+    pub prepare_ttl: std::time::Duration,
+    /// Caller-supplied Payment Request expiry (design §B.9/§B.11.3), echoed
+    /// on the prepare/activate bodies and carried into the published
+    /// request's `proposal_expires_at`. Required on both prepare
+    /// entrypoints and validated (future, within `max_request_expiry`) by
+    /// the application before allocation; the column is NOT NULL since
+    /// migration 0015.
+    pub expires_at: time::OffsetDateTime,
 }
 
 /// Private payloads for a newly allocated `(creator, reader)` assignment.
@@ -62,6 +92,136 @@ struct InvoicePaymentRecordV2 {
     required_sats: u64,
     creation_chain_height: u32,
     baseline_set_hash: [u8; 32],
+}
+
+/// Version 3 adds the CSPRNG-drawn amount nonce (design §B.8.2). For records
+/// written from W1.1b on, `required_sats` is the nonce'd total the buyer was
+/// told: the lock or marketplace price plus `nonce_sats`. The nonce is an
+/// amount fact, so it lives only inside this AEAD-sealed record, never in a
+/// plaintext column (amounts are sealed at rest under PAYKIT_MASTER_KEY).
+#[derive(Serialize, Deserialize)]
+struct InvoicePaymentRecordV3 {
+    version: u8,
+    derivation_index: i64,
+    bitcoin_address: String,
+    required_sats: u64,
+    nonce_sats: u64,
+    creation_chain_height: u32,
+    baseline_set_hash: [u8; 32],
+}
+
+/// One decrypted invoice payment record at whichever version it was sealed.
+/// Version-2 records predate the amount nonce and read as `nonce_sats = 0`,
+/// so their exact-amount predicate runs against their stored required
+/// amount. That is a behaviour change for exactly one in-flight case: a
+/// version-2 overpayment at fewer than six confirmations, which had
+/// `amount_matched = true` under the old `>=` predicate, flips to false.
+/// The invoice stays `observing`, the observation is stored `confirmed`
+/// with `amount_matched = false`, and the status endpoint reports that
+/// flag; the marketplace service routes the order to its own
+/// `manual_review` state (design §B.8.2, `workers.rs:827-859`). This is
+/// not paykit-server's `baseline_state = 'manual_review'`, which marks
+/// unfetchable-transaction and baseline anomalies. Seller-recoverable,
+/// not stranded.
+/// Finalized version-2 rows are frozen by the finalization guard (six
+/// confirmations and `amount_matched` short-circuit before the predicate is
+/// re-evaluated) and never flip.
+enum InvoicePaymentRecord {
+    V2(InvoicePaymentRecordV2),
+    V3(InvoicePaymentRecordV3),
+}
+
+impl InvoicePaymentRecord {
+    fn parse(plaintext: &[u8]) -> Result<Self, PersistenceError> {
+        match plaintext.first() {
+            Some(2) => {
+                let record: InvoicePaymentRecordV2 = postcard::from_bytes(plaintext)
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                if record.version != 2 {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                Ok(Self::V2(record))
+            }
+            Some(3) => {
+                let record: InvoicePaymentRecordV3 = postcard::from_bytes(plaintext)
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                if record.version != 3 {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                Ok(Self::V3(record))
+            }
+            _ => Err(PersistenceError::CorruptOrMissing),
+        }
+    }
+
+    fn seal(&self) -> Result<Vec<u8>, PersistenceError> {
+        match self {
+            Self::V2(record) => {
+                postcard::to_allocvec(record).map_err(|_| PersistenceError::CorruptOrMissing)
+            }
+            Self::V3(record) => {
+                postcard::to_allocvec(record).map_err(|_| PersistenceError::CorruptOrMissing)
+            }
+        }
+    }
+
+    fn derivation_index(&self) -> i64 {
+        match self {
+            Self::V2(record) => record.derivation_index,
+            Self::V3(record) => record.derivation_index,
+        }
+    }
+
+    fn bitcoin_address(&self) -> &str {
+        match self {
+            Self::V2(record) => &record.bitcoin_address,
+            Self::V3(record) => &record.bitcoin_address,
+        }
+    }
+
+    fn required_sats(&self) -> u64 {
+        match self {
+            Self::V2(record) => record.required_sats,
+            Self::V3(record) => record.required_sats,
+        }
+    }
+
+    fn creation_chain_height(&self) -> u32 {
+        match self {
+            Self::V2(record) => record.creation_chain_height,
+            Self::V3(record) => record.creation_chain_height,
+        }
+    }
+
+    fn baseline_set_hash(&self) -> &[u8; 32] {
+        match self {
+            Self::V2(record) => &record.baseline_set_hash,
+            Self::V3(record) => &record.baseline_set_hash,
+        }
+    }
+
+    /// Re-seals the baseline set hash after the §B.4.6 tick-1 snapshot
+    /// writes `pre_existing` classifications at activation. The creation
+    /// chain height is untouched: the floor is the creation floor forever.
+    fn update_baseline_hash(&mut self, baseline_set_hash: [u8; 32]) {
+        match self {
+            Self::V2(record) => record.baseline_set_hash = baseline_set_hash,
+            Self::V3(record) => record.baseline_set_hash = baseline_set_hash,
+        }
+    }
+
+    fn complete_baseline(&mut self, creation_chain_height: u32, baseline_set_hash: [u8; 32]) {
+        match self {
+            Self::V2(record) => {
+                record.creation_chain_height = creation_chain_height;
+                record.baseline_set_hash = baseline_set_hash;
+            }
+            Self::V3(record) => {
+                record.creation_chain_height = creation_chain_height;
+                record.baseline_set_hash = baseline_set_hash;
+            }
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -108,6 +268,27 @@ pub enum InvoicePreflight {
     New,
     ExactReplay,
     Conflict,
+    /// The idempotent payload matches an invoice whose creation baseline
+    /// is still unresolved (`awaiting_baseline`): an earlier attempt
+    /// committed the invoice row but its outcome — published or voided —
+    /// is not yet known, either because it is still running or because it
+    /// was orphaned by a dropped request and awaits the sweeper. The
+    /// design forbids reporting success for an invoice that has not
+    /// published, so this row is NEVER an [`InvoicePreflight::ExactReplay`]:
+    /// the caller answers with a machine-readable in-progress outcome and
+    /// the client retries until the row resolves (a completed baseline
+    /// replays exactly; the sweeper's void is the terminal fallback).
+    BaselineInProgress,
+    /// The idempotent payload matches an invoice in a final state
+    /// (`void_baseline_failed`, `void_cancelled`, `expired_final`, or
+    /// either resolved state): §B.11.6 answers a phase-1 replay against
+    /// it with the named `invoice_finalized` refusal, never with replay
+    /// success.
+    InvoiceFinalized,
+    /// The idempotent payload matches an invoice reaped at
+    /// `prepare_expires_at` (`void_prepare_expired`): §B.11.6 answers a
+    /// phase-1 replay against it with the named `prepare_expired` refusal.
+    PrepareExpired,
 }
 
 impl AtomicInvoiceResult {
@@ -161,13 +342,95 @@ impl AtomicInvoiceResult {
     }
 }
 
+/// Everything a §B.11.3 body reports about one invoice, loaded by
+/// [`InvoiceStore::prepare_view`]. `bitcoin_address` is internal-only: it
+/// exists so activation can take the §B.4.6 tick-1 snapshot of the derived
+/// address, and it must never be serialised — the prepare body carries only
+/// its fingerprint (§B.11.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvoicePhaseView {
+    pub invoice_id: Uuid,
+    pub baseline_state: String,
+    pub nonce_sats: u64,
+    pub total_sats: u64,
+    pub expires_at: Option<time::OffsetDateTime>,
+    pub prepare_expires_at: Option<time::OffsetDateTime>,
+    pub activated_at: Option<time::OffsetDateTime>,
+    pub updated_at: time::OffsetDateTime,
+    pub allocation_mode: String,
+    /// First 8 bytes of SHA-256 over the derived address string,
+    /// hex-encoded — deliberately not the address (§B.11.3).
+    pub derived_address_fingerprint: String,
+    pub bitcoin_address: String,
+    /// The §B.9 marketplace resolution recorded by `resolve`, when any
+    /// (`paid_manually` | `refunded` | `abandoned`).
+    pub resolution: Option<String>,
+    /// The caller-supplied `resolved_at` recorded with it (recorded only;
+    /// every state decision uses the server clock).
+    pub resolved_at: Option<time::OffsetDateTime>,
+}
+
+/// Row counts of one tick's §B.9 expiry transitions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExpiryTransitions {
+    /// `observing → expired_tail` at `expires_at`.
+    pub tailed: u64,
+    /// `expired_tail → expired_final` at `expires_at + tail`.
+    pub finalized: u64,
+}
+
+/// Outcome of [`InvoiceStore::activate_invoice`] on a known invoice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationWrite {
+    /// `prepared → observing` with the tick-1 snapshot persisted and both
+    /// outbox rows flipped `'prepared' → 'queued'` in one transaction.
+    Activated,
+    /// Idempotent replay on `observing`/`expired_tail`: nothing was written.
+    AlreadyActive,
+}
+
+/// Outcome of [`InvoiceStore::void_invoice`] on a known invoice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoidWrite {
+    /// `prepared → void_cancelled`.
+    Voided,
+    /// Idempotent replay on `void_cancelled`/`void_prepare_expired`:
+    /// nothing was written (§B.11.6).
+    AlreadyVoid,
+}
+
+/// Outcome of [`InvoiceStore::resolve_invoice`] on a known invoice (§B.9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveWrite {
+    /// `observing`/`expired_tail` finalized to the matching resolved
+    /// state and left `observation_plan()` in the same transaction.
+    Finalized,
+    /// `expired_final`: `resolution` + `resolved_at` recorded for audit;
+    /// the state is unchanged and observation does not resume.
+    MetadataOnly,
+    /// Idempotent replay of the already-recorded resolution: zero writes.
+    Replayed,
+}
+
+/// First 8 bytes of SHA-256 over the derived address string, hex-encoded
+/// (design §B.11.3): lets the marketplace and the §D proofs assert the
+/// address the buyer's wallet received is the one paykit derived, without
+/// the marketplace ever holding a Bitcoin address (§B.0).
+fn derived_address_fingerprint(address: &str) -> String {
+    let digest = Sha256::digest(address.as_bytes());
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// PostgreSQL advisory-lock key for cluster-single observer leadership.
 /// Fixed and documented: every replica of one deployment tries the same key,
 /// so exactly one observer is active cluster-wide. (Advisory locks are
-/// server-wide in PostgreSQL; stacks that share one PostgreSQL cluster must
-/// not co-locate two paykit observer deployments without overriding nothing
-/// — the second stack's observer simply idles, which is the designed
-/// fail-closed behaviour.)
+/// per-DATABASE in PostgreSQL — the lock tag is scoped by the database OID —
+/// so two deployments that share one PostgreSQL cluster contend on this key
+/// only when they share one database; in that case the second stack's
+/// observer simply idles, which is the designed fail-closed behaviour.)
 pub const OBSERVER_LEADERSHIP_LOCK_KEY: i64 = 7_216_043_388_155_778_021;
 
 /// Cluster-single observer leadership backed by a session-scoped
@@ -258,7 +521,8 @@ impl InvoiceStore {
             "SELECT invoices.id, creators.creator_lookup_hash,
                     invoices.payment_record_envelope, invoices.bitcoin_address_lookup_hash,
                     invoices.derivation_index_lookup_hash
-             FROM invoices JOIN creators ON creators.id = invoices.creator_id",
+             FROM invoices JOIN creators ON creators.id = invoices.creator_id
+             WHERE invoices.baseline_state <> 'legacy_unbaselined'",
         )
         .fetch_all(&self.pool)
         .await
@@ -272,18 +536,28 @@ impl InvoiceStore {
                     &EncryptedEnvelope::from_bytes(envelope),
                 )
                 .map_err(|_| PersistenceError::CorruptOrMissing)?;
-            let record: InvoicePaymentRecordV2 =
-                postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
-            if record.version != 2
-                || address_hash
-                    != self
-                        .crypto
-                        .bitcoin_address_lookup_hash(record.bitcoin_address.as_bytes())
-                        .as_bytes()
+            let record = InvoicePaymentRecord::parse(&plaintext)?;
+            // A version-3 record always carries a nonce drawn at creation;
+            // one outside [1, 999] was never written by this code.
+            if let InvoicePaymentRecord::V3(record) = &record
+                && !(crate::domain::invoice::NONCE_SATS_MIN
+                    ..=crate::domain::invoice::NONCE_SATS_MAX)
+                    .contains(&record.nonce_sats)
+            {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+            if address_hash
+                != self
+                    .crypto
+                    .bitcoin_address_lookup_hash(record.bitcoin_address().as_bytes())
+                    .as_bytes()
                 || index_hash
                     != self
                         .crypto
-                        .bitcoin_derivation_index_lookup_hash(creator_hash, record.derivation_index)
+                        .bitcoin_derivation_index_lookup_hash(
+                            creator_hash,
+                            record.derivation_index(),
+                        )
                         .as_bytes()
             {
                 return Err(PersistenceError::CorruptOrMissing);
@@ -324,9 +598,22 @@ impl InvoiceStore {
         Ok(())
     }
 
-    /// Loads every non-final invoice as an authenticated observation plan
-    /// entry, ordered oldest successful observation first so budget exhaustion
-    /// defers the freshest targets rather than the stalest.
+    /// Loads every observable invoice as an authenticated observation plan
+    /// entry. Only `observing` and `expired_tail` rows are planned:
+    /// `awaiting_baseline`, `prepared`, `expired_final`, and every void or
+    /// resolved state is unreachable here, which is the §B.11.5 guarantee
+    /// that a `prepared` invoice is never observed. Ordered with every live
+    /// (`observing`) target BEFORE every `expired_tail` target (§B.9: the
+    /// tail is deprioritized in the §B.7 budget, which admits the plan's
+    /// prefix), then oldest ATTEMPT
+    /// first (`last_attempted_at`, falling
+    /// back to `last_observed_at` and then `created_at` for rows that
+    /// predate attempt stamping) so budget exhaustion defers the most
+    /// recently attempted targets and a permanently failing target
+    /// rotates behind the rest of the plan exactly like a success.
+    /// `staleness_secs` deliberately still derives from the last
+    /// SUCCESSFUL observation (`last_observed_at`): a failing target
+    /// keeps its staleness for backlog alerting even as it rotates.
     pub async fn observation_plan(&self) -> Result<Vec<PlannedObservation>, PersistenceError> {
         let rows = sqlx::query_as::<_, ObservationPlanRow>(
             "SELECT invoices.id AS invoice_id, creators.creator_lookup_hash, \
@@ -339,9 +626,13 @@ impl InvoiceStore {
              FROM invoices JOIN creators ON creators.id = invoices.creator_id \
              LEFT JOIN bitcoin_observations AS observations \
                ON observations.invoice_id = invoices.id AND observations.active \
-             WHERE invoices.baseline_state = 'observing' AND NOT (invoices.payment_status = 'confirmed' \
-                        AND invoices.confirmation_count = 6 AND invoices.amount_matched) \
-             ORDER BY COALESCE(invoices.last_observed_at, invoices.created_at), invoices.id",
+              WHERE invoices.baseline_state IN ('observing', 'expired_tail') \
+                AND NOT invoices.integrity_failed
+                AND NOT (invoices.payment_status = 'confirmed' \
+                         AND invoices.confirmation_count = 6 AND invoices.amount_matched) \
+               ORDER BY CASE WHEN invoices.baseline_state = 'observing' THEN 0 ELSE 1 END, \
+                        COALESCE(invoices.last_attempted_at, invoices.last_observed_at, \
+                                 invoices.created_at), invoices.id",
         )
         .fetch_all(&self.pool)
         .await
@@ -360,8 +651,15 @@ impl InvoiceStore {
             .collect()
     }
 
-    /// Stamps every recorded target address as successfully observed just
-    /// now, rotating it behind the rest of the oldest-first plan.
+    /// Stamps one tick's ATTEMPTED target addresses, rotating each behind
+    /// the rest of the oldest-first plan. Observed targets are stamped
+    /// with both `last_observed_at` (success; drives staleness and
+    /// backlog alerting) and `last_attempted_at` (drives scheduling);
+    /// failed targets are stamped with `last_attempted_at` only, so they
+    /// rotate to the tail exactly like successes while keeping their
+    /// staleness. Without the failure stamp a permanently failing target
+    /// would keep the head of the plan and, at enough failing targets,
+    /// starve every honest seller of attempts.
     ///
     /// Every record's UPDATE must match exactly one invoice row: a zero-row
     /// stamp means the lookup hash derived from the observer's canonical
@@ -372,9 +670,10 @@ impl InvoiceStore {
     /// in the return value, but never abort the remaining records.
     pub async fn record_observation_tick(
         &self,
-        addresses: &[String],
+        observed: &[String],
+        failed: &[String],
     ) -> Result<u64, PersistenceError> {
-        if addresses.is_empty() {
+        if observed.is_empty() && failed.is_empty() {
             return Ok(0);
         }
         let mut tx = self
@@ -383,12 +682,27 @@ impl InvoiceStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         let mut misses = 0_u64;
-        for address in addresses {
+        for (address, succeeded) in observed
+            .iter()
+            .map(|address| (address, true))
+            .chain(failed.iter().map(|address| (address, false)))
+        {
             let address_lookup_hash = self.crypto.bitcoin_address_lookup_hash(address.as_bytes());
-            let stamped = sqlx::query(
-                "UPDATE invoices SET last_observed_at = NOW(), updated_at = NOW() \
-                 WHERE bitcoin_address_lookup_hash = $1 AND baseline_state = 'observing'",
-            )
+            let stamped = if succeeded {
+                sqlx::query(
+                    "UPDATE invoices \
+                     SET last_observed_at = NOW(), last_attempted_at = NOW(), updated_at = NOW() \
+                     WHERE bitcoin_address_lookup_hash = $1 \
+                       AND baseline_state IN ('observing', 'expired_tail')",
+                )
+            } else {
+                sqlx::query(
+                    "UPDATE invoices \
+                     SET last_attempted_at = NOW(), updated_at = NOW() \
+                     WHERE bitcoin_address_lookup_hash = $1 \
+                       AND baseline_state IN ('observing', 'expired_tail')",
+                )
+            }
             .bind(address_lookup_hash.as_bytes().as_slice())
             .execute(&mut *tx)
             .await
@@ -423,18 +737,16 @@ impl InvoiceStore {
                 &EncryptedEnvelope::from_bytes(row.payment_record_envelope),
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let payment: InvoicePaymentRecordV2 =
-            postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
-        if payment.version != 2
-            || row.bitcoin_address_lookup_hash
-                != self
-                    .crypto
-                    .bitcoin_address_lookup_hash(payment.bitcoin_address.as_bytes())
-                    .as_bytes()
+        let payment = InvoicePaymentRecord::parse(&plaintext)?;
+        if row.bitcoin_address_lookup_hash
+            != self
+                .crypto
+                .bitcoin_address_lookup_hash(payment.bitcoin_address().as_bytes())
+                .as_bytes()
             || row.derivation_index_lookup_hash
                 != self
                     .crypto
-                    .bitcoin_derivation_index_lookup_hash(creator_hash, payment.derivation_index)
+                    .bitcoin_derivation_index_lookup_hash(creator_hash, payment.derivation_index())
                     .as_bytes()
         {
             return Err(PersistenceError::CorruptOrMissing);
@@ -480,7 +792,10 @@ impl InvoiceStore {
             }
             _ => return Err(PersistenceError::CorruptOrMissing),
         };
-        Ok(ObservationTarget::new(payment.bitcoin_address, current))
+        Ok(ObservationTarget::new(
+            payment.bitcoin_address().to_owned(),
+            current,
+        ))
     }
 
     /// Checks durable invoice idempotency before mutable external validation.
@@ -493,8 +808,9 @@ impl InvoiceStore {
         let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
         let bundle_hash = self.crypto.lookup_hash(bundle_binding);
         let payment_hash = self.crypto.lookup_hash(payment_request_binding);
-        let existing = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT invoices.id, invoices.payment_request_lookup_hash FROM invoices \
+        let existing = sqlx::query_as::<_, (Vec<u8>, String)>(
+            "SELECT invoices.payment_request_lookup_hash, invoices.baseline_state \
+             FROM invoices \
              JOIN creators ON creators.id = invoices.creator_id \
              WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
         )
@@ -505,10 +821,33 @@ impl InvoiceStore {
         .map_err(|_| PersistenceError::Unavailable)?;
         Ok(match existing {
             None => InvoicePreflight::New,
-            Some(existing) if existing.payment_request_lookup_hash == payment_hash.as_bytes() => {
-                InvoicePreflight::ExactReplay
+            Some((request_hash, _)) if request_hash != payment_hash.as_bytes() => {
+                InvoicePreflight::Conflict
             }
-            Some(_) => InvoicePreflight::Conflict,
+            // Phase-1 replay is state-inspecting (design §B.11.6, closes
+            // R3-5): an unresolved baseline is still in flight, a `prepared`
+            // or `observing` invoice replays its stored body, and each final
+            // void state answers with its named refusal rather than replay
+            // success for an invoice that can never be paid.
+            Some((_, baseline_state)) if baseline_state == "awaiting_baseline" => {
+                InvoicePreflight::BaselineInProgress
+            }
+            Some((_, baseline_state)) if baseline_state == "void_prepare_expired" => {
+                InvoicePreflight::PrepareExpired
+            }
+            Some((_, baseline_state))
+                if matches!(
+                    baseline_state.as_str(),
+                    "void_baseline_failed"
+                        | "void_cancelled"
+                        | "expired_final"
+                        | "resolved_paid_manually"
+                        | "resolved_closed"
+                ) =>
+            {
+                InvoicePreflight::InvoiceFinalized
+            }
+            Some(_) => InvoicePreflight::ExactReplay,
         })
     }
 
@@ -543,7 +882,7 @@ impl InvoiceStore {
             return Err(PersistenceError::CorruptOrMissing);
         }
         let existing = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT id, payment_request_lookup_hash FROM invoices \
+            "SELECT id, payment_request_lookup_hash, baseline_state FROM invoices \
              WHERE creator_id = $1 AND bundle_lookup_hash = $2 FOR UPDATE",
         )
         .bind(creator.id)
@@ -554,6 +893,21 @@ impl InvoiceStore {
         .ok_or(PersistenceError::CorruptOrMissing)?;
         if existing.payment_request_lookup_hash != payment_hash.as_bytes() {
             return Err(PersistenceError::Conflict);
+        }
+        // Mirror `preflight` under the row lock: between the caller's
+        // preflight and this read the reaper or a `void` may have moved the
+        // invoice, and §B.11.6 forbids replay success for a voided invoice.
+        match existing.baseline_state.as_str() {
+            "awaiting_baseline" => return Err(PersistenceError::BaselineInProgress),
+            "void_prepare_expired" => return Err(PersistenceError::PrepareExpired),
+            "void_baseline_failed"
+            | "void_cancelled"
+            | "expired_final"
+            | "resolved_paid_manually"
+            | "resolved_closed" => {
+                return Err(PersistenceError::InvoiceFinalized);
+            }
+            _ => {}
         }
         let assignment = self
             .load_assignment(&mut tx, creator.id, reader_hash, bundle_hash, creator_hash)
@@ -594,8 +948,11 @@ impl InvoiceStore {
         let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
         let bundle_hash = self.crypto.lookup_hash(bundle_id.to_string().as_bytes());
         let row = sqlx::query_as::<_, PaymentStatusRow>(
-            "SELECT invoices.payment_status, invoices.confirmation_count, invoices.amount_matched \
+            "SELECT invoices.payment_status, invoices.confirmation_count, invoices.amount_matched, \
+                    COALESCE(observations.late_settlement, FALSE) AS late_settlement \
              FROM invoices JOIN creators ON creators.id = invoices.creator_id \
+             LEFT JOIN bitcoin_observations AS observations \
+               ON observations.invoice_id = invoices.id AND observations.active \
              WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
         )
         .bind(creator_hash.as_bytes().as_slice())
@@ -640,11 +997,7 @@ impl InvoiceStore {
                 &EncryptedEnvelope::from_bytes(row.1),
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let mut record: InvoicePaymentRecordV2 =
-            postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
-        if record.version != 2 {
-            return Err(PersistenceError::CorruptOrMissing);
-        }
+        let mut record = InvoicePaymentRecord::parse(&plaintext)?;
         let mut entries = baseline_outputs
             .iter()
             .map(|outpoint| {
@@ -687,10 +1040,8 @@ impl InvoiceStore {
             .await
             .map_err(|_| PersistenceError::Conflict)?;
         }
-        record.creation_chain_height = creation_chain_height;
-        record.baseline_set_hash = hasher.finalize().into();
-        let record_plaintext =
-            postcard::to_allocvec(&record).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        record.complete_baseline(creation_chain_height, hasher.finalize().into());
+        let record_plaintext = record.seal()?;
         let envelope = self
             .crypto
             .encrypt(
@@ -698,9 +1049,13 @@ impl InvoiceStore {
                 &record_plaintext,
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        // §B.4.1 step 4 (r4): a successful baseline lands the invoice in
+        // `prepared` — baselined, not observed, not published. The outbox
+        // rows stay 'prepared' (invisible to `OutboxStore::claim`) until the
+        // signed activation of §B.11 phase 2 flips state and rows together.
         sqlx::query(
             "UPDATE invoices SET payment_record_envelope = $1,
-                    creation_chain_height = $2, baseline_state = 'observing', updated_at = NOW()
+                    creation_chain_height = $2, baseline_state = 'prepared', updated_at = NOW()
              WHERE id = $3",
         )
         .bind(envelope.as_bytes())
@@ -709,27 +1064,491 @@ impl InvoiceStore {
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        sqlx::query(
-            "UPDATE outbox SET status = 'queued', updated_at = NOW()
-             WHERE invoice_id = $1 AND status = 'prepared'",
-        )
-        .bind(invoice_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| PersistenceError::Unavailable)?;
         tx.commit().await.map_err(|_| PersistenceError::Unavailable)
     }
 
     pub async fn fail_creation_baseline(&self, invoice_id: Uuid) -> Result<(), PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         sqlx::query(
             "UPDATE invoices SET baseline_state = 'void_baseline_failed', updated_at = NOW()
              WHERE id = $1 AND baseline_state = 'awaiting_baseline'",
         )
         .bind(invoice_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(())
+    }
+
+    /// Read model behind every §B.11.3 body (prepare, activate, void) and
+    /// the two-phase state machine. The sealed payment record is decrypted
+    /// for the nonce'd total and the derived address; the address itself is
+    /// carried only so the caller can take the activation tick-1 snapshot
+    /// and is never serialised into any response (§B.11.3, §B.11.5).
+    pub async fn prepare_view(
+        &self,
+        invoice_id: Uuid,
+    ) -> Result<Option<InvoicePhaseView>, PersistenceError> {
+        let row = sqlx::query_as::<_, PhaseViewRow>(
+            "SELECT invoices.baseline_state, invoices.expires_at, invoices.prepare_expires_at,
+                    invoices.activated_at, invoices.updated_at, invoices.payment_record_envelope,
+                    invoices.resolution, invoices.resolved_at,
+                    creators.creator_lookup_hash, creators.allocation_mode
+             FROM invoices JOIN creators ON creators.id = invoices.creator_id
+             WHERE invoices.id = $1",
+        )
+        .bind(invoice_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let creator_hash = lookup_hash_from_storage(&row.creator_lookup_hash)?;
+        let plaintext = self
+            .crypto
+            .decrypt(
+                &EnvelopeContext::invoice_payment_record(creator_hash, invoice_id),
+                &EncryptedEnvelope::from_bytes(row.payment_record_envelope),
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let record = InvoicePaymentRecord::parse(&plaintext)?;
+        let nonce_sats = match &record {
+            InvoicePaymentRecord::V2(_) => 0,
+            InvoicePaymentRecord::V3(record) => record.nonce_sats,
+        };
+        Ok(Some(InvoicePhaseView {
+            invoice_id,
+            baseline_state: row.baseline_state,
+            nonce_sats,
+            total_sats: record.required_sats(),
+            expires_at: row.expires_at,
+            prepare_expires_at: row.prepare_expires_at,
+            activated_at: row.activated_at,
+            updated_at: row.updated_at,
+            allocation_mode: row.allocation_mode,
+            derived_address_fingerprint: derived_address_fingerprint(record.bitcoin_address()),
+            bitcoin_address: record.bitcoin_address().to_owned(),
+            resolution: row.resolution,
+            resolved_at: row.resolved_at,
+        }))
+    }
+
+    /// Phase 2 of §B.11: `prepared → observing`, writing the §B.4.6 tick-1
+    /// snapshot's `pre_existing` classifications and flipping both outbox
+    /// rows `'prepared' → 'queued'`, all in ONE transaction. The Electrum
+    /// snapshot itself is taken by the caller BEFORE this transaction so no
+    /// row lock is ever held across network I/O. Replay on an already-active
+    /// invoice writes nothing (§B.11.6): the outbox flip is
+    /// `WHERE status = 'prepared'`, so a concurrent second activation
+    /// affects zero rows and cannot double-enqueue.
+    ///
+    /// Returns `Ok(None)` when no such invoice exists on this stack
+    /// (`unknown_invoice`), `Ok(Some(AlreadyActive))` for an idempotent
+    /// replay on `observing`/`expired_tail`, and the §B.11.6 named errors
+    /// for every other state.
+    pub async fn activate_invoice(
+        &self,
+        invoice_id: Uuid,
+        pre_existing_outputs: &[bitcoin::OutPoint],
+        pre_existing_inputs: &[bitcoin::OutPoint],
+    ) -> Result<Option<ActivationWrite>, PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let row = sqlx::query_as::<_, (String, Vec<u8>, Vec<u8>)>(
+            "SELECT invoices.baseline_state, invoices.payment_record_envelope,
+                    creators.creator_lookup_hash
+             FROM invoices JOIN creators ON creators.id = invoices.creator_id
+             WHERE invoices.id = $1 FOR UPDATE OF invoices",
+        )
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some((baseline_state, record_envelope, creator_lookup_hash)) = row else {
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(None);
+        };
+        let write = match baseline_state.as_str() {
+            "prepared" => {
+                for (kind, outpoints) in [
+                    ("pre_existing", pre_existing_outputs),
+                    ("replaced_input", pre_existing_inputs),
+                ] {
+                    for outpoint in outpoints {
+                        sqlx::query(
+                            "INSERT INTO invoice_baseline_outpoints (invoice_id, txid, vout, kind)
+                             VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                        )
+                        .bind(invoice_id)
+                        .bind(outpoint.txid.to_string())
+                        .bind(
+                            i32::try_from(outpoint.vout)
+                                .map_err(|_| PersistenceError::CorruptOrMissing)?,
+                        )
+                        .bind(kind)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|_| PersistenceError::Unavailable)?;
+                    }
+                }
+                // The tick-1 rows extend the baseline set, so the sealed
+                // baseline_set_hash is recomputed over the full set and the
+                // record is re-sealed in the same transaction — the hash
+                // continues to authenticate every baseline member.
+                let creator_hash = lookup_hash_from_storage(&creator_lookup_hash)?;
+                let plaintext = self
+                    .crypto
+                    .decrypt(
+                        &EnvelopeContext::invoice_payment_record(creator_hash, invoice_id),
+                        &EncryptedEnvelope::from_bytes(record_envelope),
+                    )
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                let mut record = InvoicePaymentRecord::parse(&plaintext)?;
+                let baseline_entries =
+                    sqlx::query_as::<_, (String, String, i32)>(BASELINE_ENTRIES_SQL)
+                        .bind(invoice_id)
+                        .fetch_all(&mut *tx)
+                        .await
+                        .map_err(|_| PersistenceError::Unavailable)?;
+                let mut hasher = Sha256::new();
+                for (kind, txid, vout) in &baseline_entries {
+                    hasher.update(kind.as_bytes());
+                    hasher.update(b":");
+                    hasher.update(format!("{txid}:{vout}").as_bytes());
+                    hasher.update(b"\n");
+                }
+                record.update_baseline_hash(hasher.finalize().into());
+                let record_plaintext = record.seal()?;
+                let envelope = self
+                    .crypto
+                    .encrypt(
+                        &EnvelopeContext::invoice_payment_record(creator_hash, invoice_id),
+                        &record_plaintext,
+                    )
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                let flipped = sqlx::query(
+                    "UPDATE invoices
+                     SET payment_record_envelope = $1,
+                         baseline_state = 'observing', activated_at = NOW(), updated_at = NOW()
+                     WHERE id = $2 AND baseline_state = 'prepared'",
+                )
+                .bind(envelope.as_bytes())
+                .bind(invoice_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                // The row is held FOR UPDATE and read `prepared` above, so
+                // the guarded flip must apply to exactly that one row.
+                if flipped.rows_affected() != 1 {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                sqlx::query(
+                    "UPDATE outbox SET status = 'queued', updated_at = NOW()
+                     WHERE invoice_id = $1 AND status = 'prepared'",
+                )
+                .bind(invoice_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                ActivationWrite::Activated
+            }
+            "observing" | "expired_tail" => ActivationWrite::AlreadyActive,
+            "void_prepare_expired" => return Err(PersistenceError::PrepareExpired),
+            "void_baseline_failed" | "void_cancelled" | "expired_final" => {
+                return Err(PersistenceError::InvoiceFinalized);
+            }
+            "awaiting_baseline" => return Err(PersistenceError::BaselineInProgress),
+            _ => return Err(PersistenceError::CorruptOrMissing),
+        };
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(Some(write))
+    }
+
+    /// §B.11 phase-2 cancellation: `prepared → void_cancelled`. Replay is
+    /// idempotent (§B.11.6): `void_cancelled` and `void_prepare_expired`
+    /// both report `AlreadyVoid` and write nothing, because the caller's
+    /// intent is already satisfied. A published invoice (`observing`,
+    /// `expired_tail`) is refused `InvoiceFinalized` — it must expire
+    /// through the §B.9 tail rather than vanish.
+    pub async fn void_invoice(
+        &self,
+        invoice_id: Uuid,
+    ) -> Result<Option<VoidWrite>, PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let baseline_state = sqlx::query_scalar::<_, String>(
+            "SELECT baseline_state FROM invoices WHERE id = $1 FOR UPDATE",
+        )
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some(baseline_state) = baseline_state else {
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(None);
+        };
+        let write = match baseline_state.as_str() {
+            "prepared" => {
+                let flipped = sqlx::query(
+                    "UPDATE invoices
+                     SET baseline_state = 'void_cancelled', updated_at = NOW()
+                     WHERE id = $1 AND baseline_state = 'prepared'",
+                )
+                .bind(invoice_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                if flipped.rows_affected() != 1 {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                VoidWrite::Voided
+            }
+            "void_cancelled" | "void_prepare_expired" => VoidWrite::AlreadyVoid,
+            "observing" | "expired_tail" | "void_baseline_failed" | "expired_final" => {
+                return Err(PersistenceError::InvoiceFinalized);
+            }
+            "awaiting_baseline" => return Err(PersistenceError::BaselineInProgress),
+            _ => return Err(PersistenceError::CorruptOrMissing),
+        };
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(Some(write))
+    }
+
+    /// The §B.9 marketplace resolution write: one row of the twelve-row
+    /// table, in one transaction, guarded by the state read under the row
+    /// lock. `paid_manually` finalizes `observing`/`expired_tail` to
+    /// `resolved_paid_manually`; `refunded`/`abandoned` to
+    /// `resolved_closed`; either leaves `observation_plan()` with the
+    /// state flip. On `expired_final` the resolution is metadata-only:
+    /// recorded for audit, the state unchanged, observation never
+    /// resuming — there is no un-final edge. Idempotent on
+    /// `(invoice_id, resolution)`: the same resolution again writes
+    /// nothing and reports [`ResolveWrite::Replayed`]; a different one is
+    /// [`PersistenceError::InvoiceAlreadyResolved`]. A `paid_manually`
+    /// resolution never creates or promotes an observation.
+    ///
+    /// Returns `Ok(None)` for an unknown invoice id. `resolved_at` is
+    /// recorded as supplied; every state decision here reads the stored
+    /// state, never the caller's clock.
+    pub async fn resolve_invoice(
+        &self,
+        invoice_id: Uuid,
+        resolution: &str,
+        resolved_at: time::OffsetDateTime,
+    ) -> Result<Option<ResolveWrite>, PersistenceError> {
+        if !matches!(resolution, "paid_manually" | "refunded" | "abandoned") {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let row = sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT baseline_state, resolution FROM invoices WHERE id = $1 FOR UPDATE",
+        )
+        .bind(invoice_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some((baseline_state, existing_resolution)) = row else {
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(None);
+        };
+        // Idempotency on (invoice_id, resolution), covering both resolved
+        // states and a metadata-only `expired_final` record: the same
+        // resolution returns the existing record with zero writes; a
+        // different one is the named one-way conflict.
+        if let Some(existing) = existing_resolution {
+            if existing == resolution {
+                tx.commit()
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)?;
+                return Ok(Some(ResolveWrite::Replayed));
+            }
+            return Err(PersistenceError::InvoiceAlreadyResolved);
+        }
+        let write = match baseline_state.as_str() {
+            "observing" | "expired_tail" => {
+                let new_state = if resolution == "paid_manually" {
+                    "resolved_paid_manually"
+                } else {
+                    "resolved_closed"
+                };
+                let flipped = sqlx::query(
+                    "UPDATE invoices
+                     SET baseline_state = $2, resolution = $3, resolved_at = $4,
+                         updated_at = NOW()
+                     WHERE id = $1 AND baseline_state = $5",
+                )
+                .bind(invoice_id)
+                .bind(new_state)
+                .bind(resolution)
+                .bind(resolved_at)
+                .bind(&baseline_state)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                if flipped.rows_affected() != 1 {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                ResolveWrite::Finalized
+            }
+            "expired_final" => {
+                let recorded = sqlx::query(
+                    "UPDATE invoices
+                     SET resolution = $2, resolved_at = $3, updated_at = NOW()
+                     WHERE id = $1 AND baseline_state = 'expired_final'",
+                )
+                .bind(invoice_id)
+                .bind(resolution)
+                .bind(resolved_at)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                if recorded.rows_affected() != 1 {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
+                ResolveWrite::MetadataOnly
+            }
+            "prepared" => return Err(PersistenceError::InvoiceNotActivated),
+            "awaiting_baseline" => return Err(PersistenceError::BaselineInProgress),
+            "void_prepare_expired" => return Err(PersistenceError::PrepareExpired),
+            "void_baseline_failed" | "void_cancelled" => {
+                return Err(PersistenceError::InvoiceFinalized);
+            }
+            // `manual_review` and `legacy_unbaselined` have no resolve row
+            // in §B.9's table: safe refusal, zero writes.
+            _ => return Err(PersistenceError::CorruptOrMissing),
+        };
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(Some(write))
+    }
+
+    /// The §B.11.1 reaper, one query per observer tick: a `prepared` invoice
+    /// whose prepare window has elapsed is voided. `void_prepare_expired` is
+    /// final, so the invoice never enters `observation_targets()` — a reaped
+    /// prepare costs one burned derivation index and nothing else.
+    pub async fn reap_expired_prepares(&self) -> Result<u64, PersistenceError> {
+        let reaped = sqlx::query(
+            "UPDATE invoices SET baseline_state = 'void_prepare_expired', updated_at = NOW()
+             WHERE baseline_state = 'prepared' AND prepare_expires_at < NOW()",
+        )
         .execute(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        Ok(())
+        Ok(reaped.rows_affected())
+    }
+
+    /// The §B.9 expiry transitions, two conditional UPDATEs per observer
+    /// tick, never performed by a request handler. Both guards are
+    /// timestamp-derived from `expires_at` on the server clock: at
+    /// `expires_at` an `observing` invoice moves to `expired_tail` (still
+    /// observed, deprioritized behind live targets; observations there
+    /// carry `late_settlement`), and at `expires_at + tail` it moves to
+    /// `expired_final` and leaves `observation_plan()` for good. Exactly at
+    /// `expires_at` the invoice is still `observing` (`now > expires_at`
+    /// is the guard, not `>=`).
+    pub async fn apply_expiry_transitions(
+        &self,
+        tail: std::time::Duration,
+    ) -> Result<ExpiryTransitions, PersistenceError> {
+        let tail_seconds =
+            i64::try_from(tail.as_secs()).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let tailed = sqlx::query(
+            "UPDATE invoices
+             SET baseline_state = 'expired_tail', expired_tail_at = NOW(), updated_at = NOW()
+             WHERE baseline_state = 'observing' AND expires_at < NOW()",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let finalized = sqlx::query(
+            "UPDATE invoices
+             SET baseline_state = 'expired_final', expired_final_at = NOW(), updated_at = NOW()
+             WHERE baseline_state = 'expired_tail'
+               AND expires_at + make_interval(secs => $1) < NOW()",
+        )
+        .bind(tail_seconds)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(ExpiryTransitions {
+            tailed: tailed.rows_affected(),
+            finalized: finalized.rows_affected(),
+        })
+    }
+
+    pub async fn sweep_stale_creation_baselines(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<u64, PersistenceError> {
+        let timeout_seconds =
+            i64::try_from(timeout.as_secs()).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let rows = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM invoices
+             WHERE baseline_state = 'awaiting_baseline'
+               AND created_at <= NOW() - make_interval(secs => $1)
+             FOR UPDATE",
+        )
+        .bind(timeout_seconds)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if !rows.is_empty() {
+            sqlx::query(
+                "UPDATE invoices SET baseline_state = 'void_baseline_failed', updated_at = NOW()
+                 WHERE id = ANY($1) AND baseline_state = 'awaiting_baseline'",
+            )
+            .bind(&rows)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(u64::try_from(rows.len()).unwrap_or(u64::MAX))
     }
 
     pub async fn pending_candidates(&self) -> Result<Vec<PendingCandidate>, PersistenceError> {
@@ -737,11 +1556,15 @@ impl InvoiceStore {
             "SELECT candidates.invoice_id, candidates.txid, candidates.vout
              FROM bitcoin_observation_candidates AS candidates
              JOIN invoices ON invoices.id = candidates.invoice_id
-             WHERE NOT candidates.approved
-               AND invoices.baseline_state = 'observing'
+              WHERE NOT candidates.approved
+                AND candidates.state = 'pending'
+                AND candidates.next_attempt_at <= NOW()
+                AND invoices.baseline_state IN ('observing', 'expired_tail')
+               AND NOT invoices.integrity_failed
                AND NOT (invoices.payment_status = 'confirmed'
                         AND invoices.confirmation_count = 6 AND invoices.amount_matched)
-             ORDER BY candidates.confirmed_height, candidates.created_at",
+             ORDER BY candidates.next_attempt_at, candidates.confirmed_height,
+                      candidates.created_at",
         )
         .fetch_all(&self.pool)
         .await
@@ -757,6 +1580,107 @@ impl InvoiceStore {
                 })
             })
             .collect()
+    }
+
+    pub async fn record_candidate_failure(
+        &self,
+        candidate: &PendingCandidate,
+        error_kind: &str,
+        max_attempts: u32,
+    ) -> Result<(), PersistenceError> {
+        let vout = i32::try_from(candidate.outpoint.vout)
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let txid = candidate.outpoint.txid.to_string();
+        if error_kind == "persistence" {
+            // A persistence failure is not a fetch attempt: it never
+            // increments `attempt_count`, never transitions the candidate
+            // to `unfetchable`, and never moves the invoice to
+            // `manual_review`; only diagnostic state is recorded.
+            sqlx::query(
+                "UPDATE bitcoin_observation_candidates
+                 SET last_attempt_at = NOW(), last_error_kind = $4, updated_at = NOW()
+                 WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND state = 'pending'",
+            )
+            .bind(candidate.invoice_id)
+            .bind(&txid)
+            .bind(vout)
+            .bind(error_kind)
+            .execute(&self.pool)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(());
+        }
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let row = if error_kind == "transaction_too_large" {
+            // A response over `electrum.max_transaction_bytes` is
+            // deterministically unresolvable: one attempt ends the
+            // candidate instead of burning the bounded fetch retries.
+            sqlx::query_as::<_, (Uuid, i32, String)>(
+                "UPDATE bitcoin_observation_candidates
+                 SET attempt_count = attempt_count + 1,
+                     last_attempt_at = NOW(),
+                     last_error_kind = $4,
+                     state = 'unfetchable',
+                     updated_at = NOW()
+                 WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND state = 'pending'
+                 RETURNING invoice_id, attempt_count, state",
+            )
+            .bind(candidate.invoice_id)
+            .bind(&txid)
+            .bind(vout)
+            .bind(error_kind)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?
+        } else {
+            let max_attempts =
+                i32::try_from(max_attempts).map_err(|_| PersistenceError::CorruptOrMissing)?;
+            sqlx::query_as::<_, (Uuid, i32, String)>(
+                "UPDATE bitcoin_observation_candidates
+                 SET attempt_count = attempt_count + 1,
+                     last_attempt_at = NOW(),
+                     last_error_kind = $4,
+                     state = CASE WHEN attempt_count + 1 >= $5
+                                   THEN 'unfetchable' ELSE 'pending' END,
+                     next_attempt_at = NOW() + make_interval(
+                         secs => LEAST(3600, 30 * power(2, LEAST(attempt_count, 7)))::INTEGER
+                     ),
+                     updated_at = NOW()
+                 WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND state = 'pending'
+                 RETURNING invoice_id, attempt_count, state",
+            )
+            .bind(candidate.invoice_id)
+            .bind(&txid)
+            .bind(vout)
+            .bind(error_kind)
+            .bind(max_attempts)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?
+        };
+        if let Some((invoice_id, attempts, state)) = row
+            && state == "unfetchable"
+        {
+            sqlx::query(
+                "UPDATE invoices SET baseline_state = 'manual_review', updated_at = NOW()
+                 WHERE id = $1 AND baseline_state = 'observing'",
+            )
+            .bind(invoice_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            tracing::error!(
+                invoice_id = %invoice_id,
+                attempts,
+                error_kind,
+                "candidate transaction is unresolvable; invoice requires manual review"
+            );
+        }
+        tx.commit().await.map_err(|_| PersistenceError::Unavailable)
     }
 
     pub async fn resolve_candidate(
@@ -815,6 +1739,14 @@ impl InvoiceStore {
                 .execute(&mut *tx)
                 .await
                 .map_err(|_| PersistenceError::Unavailable)?;
+            sqlx::query(
+                "UPDATE invoices SET baseline_state = 'manual_review', updated_at = NOW()
+                 WHERE id = $1 AND baseline_state = 'observing'",
+            )
+            .bind(candidate.invoice_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         } else {
             let row = sqlx::query_as::<_, (i32, i32, Vec<u8>, Vec<u8>)>(
                 "SELECT candidates.confirmations, candidates.confirmed_height,
@@ -843,13 +1775,10 @@ impl InvoiceStore {
                     &EncryptedEnvelope::from_bytes(row.3),
                 )
                 .map_err(|_| PersistenceError::CorruptOrMissing)?;
-            let record: InvoicePaymentRecordV2 =
-                postcard::from_bytes(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
-            if record.version != 2 {
-                return Err(PersistenceError::CorruptOrMissing);
-            }
+            let record = InvoicePaymentRecord::parse(&plaintext)?;
             sqlx::query(
-                "UPDATE bitcoin_observation_candidates SET approved = TRUE, updated_at = NOW()
+                "UPDATE bitcoin_observation_candidates
+                 SET approved = TRUE, state = 'approved', updated_at = NOW()
                  WHERE invoice_id = $1 AND txid = $2 AND vout = $3",
             )
             .bind(candidate.invoice_id)
@@ -862,8 +1791,8 @@ impl InvoiceStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
             approved_binding = Some((
-                record.bitcoin_address,
-                record.required_sats,
+                record.bitcoin_address().to_owned(),
+                record.required_sats(),
                 u32::try_from(row.0).map_err(|_| PersistenceError::CorruptOrMissing)?,
                 u32::try_from(row.1).map_err(|_| PersistenceError::CorruptOrMissing)?,
             ));
@@ -893,6 +1822,7 @@ impl InvoiceStore {
         outpoint: &BitcoinOutpoint,
         observed_sats: u64,
         confirmations: u32,
+        confirmed_height: Option<u32>,
         present: bool,
     ) -> Result<bool, PersistenceError> {
         self.apply_bitcoin_observation_with_gate(
@@ -900,7 +1830,7 @@ impl InvoiceStore {
             outpoint,
             observed_sats,
             confirmations,
-            (confirmations > 0).then_some(confirmations),
+            confirmed_height,
             present,
             false,
         )
@@ -966,19 +1896,10 @@ impl InvoiceStore {
         &self,
         observations: &[BitcoinObservationInput],
     ) -> Result<usize, PersistenceError> {
-        if observations.is_empty() {
-            return Ok(0);
-        }
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| PersistenceError::Unavailable)?;
         let mut applied = 0;
         for observation in observations {
-            if self
-                .apply_bitcoin_observation_in_tx(
-                    &mut tx,
+            match self
+                .apply_bitcoin_observation_with_gate(
                     &observation.address,
                     &observation.outpoint,
                     observation.observed_sats,
@@ -987,15 +1908,55 @@ impl InvoiceStore {
                     observation.present,
                     true,
                 )
-                .await?
+                .await
             {
-                applied += 1;
+                Ok(true) => applied += 1,
+                Ok(false) => {}
+                Err(PersistenceError::CorruptOrMissing) => {
+                    self.mark_invoice_integrity_failed(&observation.address)
+                        .await?;
+                }
+                Err(error) => return Err(error),
             }
         }
-        tx.commit()
-            .await
-            .map_err(|_| PersistenceError::Unavailable)?;
         Ok(applied)
+    }
+
+    async fn mark_invoice_integrity_failed(&self, address: &str) -> Result<(), PersistenceError> {
+        let address_lookup_hash = self.crypto.bitcoin_address_lookup_hash(address.as_bytes());
+        let result = sqlx::query_as::<_, (Uuid, bool, i32)>(
+            "WITH current AS (
+                 SELECT id,
+                        integrity_last_logged_at IS NULL
+                        OR integrity_last_logged_at <= NOW() - INTERVAL '5 minutes' AS should_log
+                 FROM invoices
+                 WHERE bitcoin_address_lookup_hash = $1
+                 FOR UPDATE
+             )
+             UPDATE invoices
+             SET integrity_failed = TRUE,
+                 integrity_failure_count = integrity_failure_count + 1,
+                 integrity_failed_at = COALESCE(integrity_failed_at, NOW()),
+                 integrity_last_logged_at = CASE WHEN current.should_log
+                                                THEN NOW()
+                                                ELSE invoices.integrity_last_logged_at END,
+                 updated_at = NOW()
+             FROM current
+             WHERE invoices.id = current.id
+             RETURNING invoices.id, current.should_log, invoices.integrity_failure_count",
+        )
+        .bind(address_lookup_hash.as_bytes().as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if let Some((invoice_id, true, failure_count)) = result {
+            tracing::error!(
+                invoice_id = %invoice_id,
+                failure_count,
+                "invoice observation integrity validation failed; invoice excluded from future batches"
+            );
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1034,9 +1995,15 @@ impl InvoiceStore {
         let Some(invoice) = invoice else {
             return Ok(false);
         };
-        if invoice.baseline_state != "observing" {
+        // §B.9: observation does not stop at expiry. An `expired_tail`
+        // invoice is still observed; anything recorded there is a late
+        // settlement and can never drive `paid` — the marketplace routes it
+        // to `manual_review` on the flag. Every other state (prepared,
+        // final, void, resolved) no-ops exactly as before.
+        if invoice.baseline_state != "observing" && invoice.baseline_state != "expired_tail" {
             return Ok(true);
         }
+        let late_settlement = invoice.baseline_state == "expired_tail";
         let creator_hash = lookup_hash_from_storage(&invoice.creator_lookup_hash)?;
         let payment_record_plaintext = self
             .crypto
@@ -1045,19 +2012,16 @@ impl InvoiceStore {
                 &EncryptedEnvelope::from_bytes(invoice.payment_record_envelope),
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let payment_record: InvoicePaymentRecordV2 =
-            postcard::from_bytes(&payment_record_plaintext)
-                .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        if payment_record.version != 2
-            || payment_record.bitcoin_address != address
-            || payment_record.creation_chain_height
+        let payment_record = InvoicePaymentRecord::parse(&payment_record_plaintext)?;
+        if payment_record.bitcoin_address() != address
+            || payment_record.creation_chain_height()
                 != u32::try_from(invoice.creation_chain_height)
                     .map_err(|_| PersistenceError::CorruptOrMissing)?
             || invoice.bitcoin_address_lookup_hash != address_lookup_hash.as_bytes()
         {
             return Err(PersistenceError::CorruptOrMissing);
         }
-        let required = payment_record.required_sats;
+        let required = payment_record.required_sats();
         // Final matching outputs are no longer monitored. Keep their persisted
         // six-confirmation fact immutable even if a stale observer reports later.
         if invoice.payment_status == "confirmed"
@@ -1079,15 +2043,11 @@ impl InvoiceStore {
         .fetch_one(&mut **tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        let baseline_entries = sqlx::query_as::<_, (String, String, i32)>(
-            "SELECT kind, txid, vout FROM invoice_baseline_outpoints
-             WHERE invoice_id = $1 AND kind IN ('output', 'replaced_input')
-             ORDER BY kind, txid, vout",
-        )
-        .bind(invoice.id)
-        .fetch_all(&mut **tx)
-        .await
-        .map_err(|_| PersistenceError::Unavailable)?;
+        let baseline_entries = sqlx::query_as::<_, (String, String, i32)>(BASELINE_ENTRIES_SQL)
+            .bind(invoice.id)
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         let mut hasher = Sha256::new();
         for (kind, entry_txid, entry_vout) in &baseline_entries {
             hasher.update(kind.as_bytes());
@@ -1095,7 +2055,7 @@ impl InvoiceStore {
             hasher.update(format!("{entry_txid}:{entry_vout}").as_bytes());
             hasher.update(b"\n");
         }
-        if payment_record.baseline_set_hash != <[u8; 32]>::from(hasher.finalize()) {
+        if payment_record.baseline_set_hash() != &<[u8; 32]>::from(hasher.finalize()) {
             return Err(PersistenceError::CorruptOrMissing);
         }
         let baseline_member: bool = sqlx::query_scalar(
@@ -1120,8 +2080,7 @@ impl InvoiceStore {
         {
             return Ok(true);
         }
-        if present
-            && observed_sats == required
+        if crate::bitcoin::amount_matches(present, observed_sats, required)
             && confirmations > 0
             && !approved_candidate
             && require_candidate
@@ -1135,7 +2094,9 @@ impl InvoiceStore {
                     txid = EXCLUDED.txid, vout = EXCLUDED.vout,
                     confirmations = EXCLUDED.confirmations,
                     confirmed_height = EXCLUDED.confirmed_height,
-                    approved = FALSE, updated_at = NOW()
+                    approved = FALSE, attempt_count = 0, last_attempt_at = NULL,
+                    next_attempt_at = NOW(), last_error_kind = NULL,
+                    state = 'pending', updated_at = NOW()
                  WHERE EXCLUDED.confirmed_height
                     < bitcoin_observation_candidates.confirmed_height",
             )
@@ -1249,11 +2210,12 @@ impl InvoiceStore {
         let observation_write = sqlx::query(
             "INSERT INTO bitcoin_observations \
             (id, invoice_id, observation_envelope, outpoint_lookup_hash,
-            confirmations, present, active) \
-            VALUES ($1, $2, $3, $4, $5, $6, TRUE) \
+            confirmations, present, active, late_settlement) \
+            VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7) \
             ON CONFLICT (outpoint_lookup_hash) DO UPDATE SET
             observation_envelope = EXCLUDED.observation_envelope,
             confirmations = EXCLUDED.confirmations, present = EXCLUDED.present, active = TRUE, \
+            late_settlement = EXCLUDED.late_settlement, \
             updated_at = NOW() WHERE bitcoin_observations.invoice_id = EXCLUDED.invoice_id",
         )
         .bind(observation_id)
@@ -1262,13 +2224,22 @@ impl InvoiceStore {
         .bind(outpoint_lookup_hash.as_bytes().as_slice())
         .bind(confirmations)
         .bind(present)
+        .bind(late_settlement)
         .execute(&mut **tx)
         .await
         .map_err(|_| PersistenceError::Conflict)?;
         if observation_write.rows_affected() != 1 {
             return Err(PersistenceError::Conflict);
         }
-        let amount_matched = present && observed_sats >= required;
+        // §B.8.2: the match is exact. An overpayment reports confirmed with
+        // amount_matched = false; the invoice stays `observing`, and the
+        // marketplace service (marketplace-service
+        // `crates/service/src/workers.rs`) routes the order to its
+        // `manual_review` state — paykit-server's own
+        // `baseline_state = 'manual_review'` is a different thing (an
+        // unfetchable baseline). The nonce is absorbed in the price, never
+        // refunded.
+        let amount_matched = crate::bitcoin::amount_matches(present, observed_sats, required);
         let reported_confirmations = if amount_matched {
             incoming_confirmations.min(6)
         } else if present {
@@ -1339,7 +2310,7 @@ impl InvoiceStore {
         }
 
         if let Some(existing) = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT id, payment_request_lookup_hash FROM invoices \
+            "SELECT id, payment_request_lookup_hash, baseline_state FROM invoices \
              WHERE creator_id = $1 AND bundle_lookup_hash = $2 FOR UPDATE",
         )
         .bind(creator.id)
@@ -1350,6 +2321,25 @@ impl InvoiceStore {
         {
             if existing.payment_request_lookup_hash != payment_request_hash.as_bytes() {
                 return Err(PersistenceError::Conflict);
+            }
+            // Mirror `preflight` under the row lock: two byte-identical
+            // creations whose preflights both returned `New` (TOCTOU before
+            // the first commits) serialise here, and the loser receives the
+            // winner's row. An unresolved baseline must NOT be replayed into
+            // a second snapshot sequence, and a terminally voided binding is
+            // spent — both answer exactly as preflight does (§B.11.6), so the
+            // caller never double-charges the shared limiter for one invoice.
+            match existing.baseline_state.as_str() {
+                "awaiting_baseline" => return Err(PersistenceError::BaselineInProgress),
+                "void_prepare_expired" => return Err(PersistenceError::PrepareExpired),
+                "void_baseline_failed"
+                | "void_cancelled"
+                | "expired_final"
+                | "resolved_paid_manually"
+                | "resolved_closed" => {
+                    return Err(PersistenceError::InvoiceFinalized);
+                }
+                _ => {}
             }
             let assignment = self
                 .load_assignment(&mut tx, creator.id, reader_hash, bundle_hash, creator_hash)
@@ -1456,14 +2446,20 @@ impl InvoiceStore {
             }
         };
 
+        if !(crate::domain::invoice::NONCE_SATS_MIN..=crate::domain::invoice::NONCE_SATS_MAX)
+            .contains(&input.nonce_sats)
+        {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
         let payment_request_plaintext = postcard::to_allocvec(&input.payment_request_intent)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         let invoice_id = Uuid::new_v4();
-        let payment_record_plaintext = postcard::to_allocvec(&InvoicePaymentRecordV2 {
-            version: 2,
+        let payment_record_plaintext = postcard::to_allocvec(&InvoicePaymentRecordV3 {
+            version: 3,
             derivation_index: assignment.child_index,
             bitcoin_address: bitcoin_address.clone(),
             required_sats: input.required_sats,
+            nonce_sats: input.nonce_sats,
             creation_chain_height: 0,
             baseline_set_hash: Sha256::digest([]).into(),
         })
@@ -1488,10 +2484,16 @@ impl InvoiceStore {
                 &payment_request_plaintext,
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        // `prepare_expires_at` is stamped from the server clock in the same
+        // transaction that commits the allocation: the reaper's
+        // `prepare_expires_at < NOW()` comparison is against the same clock
+        // (design §B.11.1).
+        let prepare_ttl_seconds = i64::try_from(input.prepare_ttl.as_secs())
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
         sqlx::query(
             "INSERT INTO invoices \
-             (id, creator_id, reader_lookup_hash, bundle_lookup_hash, payment_request_lookup_hash, invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status, baseline_state) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'undetected', $10)",
+             (id, creator_id, reader_lookup_hash, bundle_lookup_hash, payment_request_lookup_hash, invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status, baseline_state, expires_at, prepare_expires_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'undetected', $10, $11, NOW() + make_interval(secs => $12))",
         )
         .bind(invoice_id)
         .bind(creator.id)
@@ -1503,6 +2505,8 @@ impl InvoiceStore {
         .bind(bitcoin_address_lookup_hash.as_bytes().as_slice())
         .bind(derivation_index_lookup_hash.as_bytes().as_slice())
         .bind(baseline_state)
+        .bind(input.expires_at)
+        .bind(prepare_ttl_seconds)
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Conflict)?;
@@ -1736,6 +2740,7 @@ struct ObservationPlanRow {
 struct ExistingInvoice {
     id: Uuid,
     payment_request_lookup_hash: Vec<u8>,
+    baseline_state: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1745,10 +2750,25 @@ struct ExistingPaymentOutbox {
 }
 
 #[derive(sqlx::FromRow)]
+struct PhaseViewRow {
+    baseline_state: String,
+    expires_at: Option<time::OffsetDateTime>,
+    prepare_expires_at: Option<time::OffsetDateTime>,
+    activated_at: Option<time::OffsetDateTime>,
+    updated_at: time::OffsetDateTime,
+    payment_record_envelope: Vec<u8>,
+    resolution: Option<String>,
+    resolved_at: Option<time::OffsetDateTime>,
+    creator_lookup_hash: Vec<u8>,
+    allocation_mode: String,
+}
+
+#[derive(sqlx::FromRow)]
 struct PaymentStatusRow {
     payment_status: String,
     confirmation_count: i32,
     amount_matched: bool,
+    late_settlement: bool,
 }
 
 impl TryFrom<PaymentStatusRow> for PersistedPaymentStatus {
@@ -1758,14 +2778,18 @@ impl TryFrom<PaymentStatusRow> for PersistedPaymentStatus {
         let confirmations = u32::try_from(row.confirmation_count)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         match row.payment_status.as_str() {
-            "undetected" => Ok(Self::Undetected),
+            "undetected" => Ok(Self::Undetected {
+                late_settlement: row.late_settlement,
+            }),
             "detected" => Ok(Self::Detected {
                 confirmations,
                 amount_matched: row.amount_matched,
+                late_settlement: row.late_settlement,
             }),
             "confirmed" => Ok(Self::Confirmed {
                 confirmations,
                 amount_matched: row.amount_matched,
+                late_settlement: row.late_settlement,
             }),
             _ => Err(PersistenceError::CorruptOrMissing),
         }
@@ -1849,17 +2873,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn baseline_hash_recomputation_orders_with_explicit_c_collation() {
+        assert!(
+            BASELINE_ENTRIES_SQL.contains("ORDER BY kind COLLATE \"C\", txid COLLATE \"C\", vout"),
+            "baseline-hash recomputation ordering must pin byte-exact C collation, got: {BASELINE_ENTRIES_SQL}"
+        );
+    }
+
+    #[test]
     fn read_status_rejects_unknown_text_and_invalid_confirmation_counts() {
         for row in [
             PaymentStatusRow {
                 payment_status: "unexpected".into(),
                 confirmation_count: 0,
                 amount_matched: false,
+                late_settlement: false,
             },
             PaymentStatusRow {
                 payment_status: "confirmed".into(),
                 confirmation_count: -1,
                 amount_matched: true,
+                late_settlement: false,
             },
         ] {
             assert_eq!(

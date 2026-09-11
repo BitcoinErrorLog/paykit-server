@@ -222,7 +222,6 @@ stack_role = "proof"
 endpoint = "{electrum_endpoint}"
 poll_interval = "1s"
 request_timeout = "50ms"
-connect_retries = 0
 
 [outbox]
 poll_interval = "1s"
@@ -353,6 +352,9 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             },
             payment_request_intent: payment_intent(&reader, &marker),
             required_sats: 100,
+            nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();
@@ -369,6 +371,9 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             },
             payment_request_intent: payment_intent(&reader, &marker),
             required_sats: 200,
+            nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();
@@ -387,6 +392,9 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             },
             payment_request_intent: payment_intent(&unreachable_reader, &marker),
             required_sats: 300,
+            nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();

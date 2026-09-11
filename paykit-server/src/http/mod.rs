@@ -6,3 +6,4 @@ pub mod invoices;
 pub mod payment_requests;
 pub mod setup;
 pub mod status;
+pub mod two_phase;

@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     net::SocketAddr,
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -39,11 +42,14 @@ use paykit_server::{
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
-    persistence::{CreatorCredentials, CreatorStore, PostgresStorageAdapter, SdkStateStore},
+    persistence::{
+        CreatorCredentials, CreatorStore, InvoiceStore, PostgresStorageAdapter, SdkStateStore,
+    },
+    runtime::{ElectrumProbe, Runtime},
     startup::initialize_database,
     workers::observer::{
         CandidateTransaction, CreationSnapshot, ElectrumPort, ObservationReport, ObserverError,
-        TipProbe,
+        RequestLimiter, TipProbe,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -86,26 +92,43 @@ struct CreatorSpec {
 type OutboxDiagnostic = (String, bool, i32, Option<String>);
 
 struct DeterministicElectrum {
-    outputs: HashMap<String, (u64, OutPoint)>,
+    outputs: std::sync::Mutex<HashMap<String, (u64, OutPoint)>>,
+    requests: Mutex<Vec<String>>,
+    active_creation_snapshots: AtomicUsize,
+    max_active_creation_snapshots: AtomicUsize,
 }
 
 impl DeterministicElectrum {
     fn new(fixtures: &[&CreatorFixture]) -> Self {
         Self {
-            outputs: fixtures
-                .iter()
-                .enumerate()
-                .map(|(index, fixture)| {
-                    (
-                        fixture.address.clone(),
+            outputs: std::sync::Mutex::new(
+                fixtures
+                    .iter()
+                    .enumerate()
+                    .map(|(index, fixture)| {
                         (
-                            fixture.amount_sats,
-                            OutPoint::new(Txid::from_byte_array([(index + 11) as u8; 32]), 0),
-                        ),
-                    )
-                })
-                .collect(),
+                            fixture.address.clone(),
+                            (
+                                fixture.amount_sats,
+                                OutPoint::new(Txid::from_byte_array([(index + 11) as u8; 32]), 0),
+                            ),
+                        )
+                    })
+                    .collect(),
+            ),
+            requests: Mutex::new(Vec::new()),
+            active_creation_snapshots: AtomicUsize::new(0),
+            max_active_creation_snapshots: AtomicUsize::new(0),
         }
+    }
+
+    /// Reprices a fixture output to the nonce'd total its invoice binds at
+    /// (§B.8.2): the lock price alone is an underpayment once the invoice's
+    /// CSPRNG nonce is added.
+    fn set_amount(&self, address: &str, sats: u64) {
+        let mut outputs = self.outputs.lock().unwrap();
+        let (_, outpoint) = outputs.get(address).unwrap().to_owned();
+        outputs.insert(address.to_owned(), (sats, outpoint));
     }
 }
 
@@ -114,21 +137,44 @@ impl ElectrumPort for DeterministicElectrum {
     async fn creation_snapshot(
         &self,
         _address: &str,
-        _max_history_entries: usize,
-        _max_transaction_bytes: usize,
+        max_history_entries: usize,
+        max_transaction_bytes: usize,
+        _request_limiter: &RequestLimiter,
+        _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<CreationSnapshot, ObserverError> {
+        let active = self
+            .active_creation_snapshots
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        self.max_active_creation_snapshots
+            .fetch_max(active, Ordering::SeqCst);
+        {
+            let mut requests = self.requests.lock().unwrap();
+            requests.push(format!("script_get_history cap={max_history_entries}"));
+            requests.push("script_list_unspent".into());
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        self.requests.lock().unwrap().push(format!(
+            "headers_subscribe tx_bytes={max_transaction_bytes}"
+        ));
+        self.active_creation_snapshots
+            .fetch_sub(1, Ordering::SeqCst);
         Ok(CreationSnapshot {
             tip_height: 300,
             baseline_outputs: Vec::new(),
             unconfirmed_inputs: Vec::new(),
+            unconfirmed_outputs: Vec::new(),
         })
     }
 
     async fn candidate_transaction(
         &self,
         txid: Txid,
-        _max_transaction_bytes: usize,
+        max_transaction_bytes: usize,
     ) -> Result<CandidateTransaction, ObserverError> {
+        self.requests.lock().unwrap().push(format!(
+            "transaction_get candidate tx_bytes={max_transaction_bytes}"
+        ));
         Ok(CandidateTransaction {
             txid,
             inputs: Vec::new(),
@@ -140,11 +186,16 @@ impl ElectrumPort for DeterministicElectrum {
         _tip_height: u32,
         targets: &[ObservationTarget],
     ) -> Result<ObservationReport, ObserverError> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(format!("observer_list_unspent targets={}", targets.len()));
+        let outputs = self.outputs.lock().unwrap();
         Ok(ObservationReport {
             outputs: targets
                 .iter()
                 .filter_map(|target| {
-                    self.outputs
+                    outputs
                         .get(target.address())
                         .map(|(sats, outpoint)| ObservedOutput {
                             network: BitcoinNetwork::Testnet,
@@ -166,6 +217,10 @@ impl ElectrumPort for DeterministicElectrum {
     }
 
     async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push("probe headers_subscribe+block_header".into());
         Ok(TipProbe {
             height: 300,
             time_unix: fresh_tip_time(),
@@ -181,6 +236,21 @@ fn fresh_tip_time() -> u32 {
             .as_secs(),
     )
     .unwrap()
+}
+
+/// Drives the three-probe offer-availability hysteresis to visible so the
+/// runtime creation gate admits first-time binds. Tests in this file run
+/// hour-long poll intervals (a tick must not interfere with their
+/// deterministic request logs), so the required three consecutive
+/// successful probes are published directly instead of waited for.
+async fn publish_offerable_probes(runtime: &Runtime) {
+    for _ in 0..3 {
+        runtime.record_electrum_probe(ElectrumProbe::success(300, fresh_tip_time()));
+    }
+    assert!(
+        runtime.readiness().await.bitcoin_offer_available,
+        "three consecutive successful probes must publish the offer"
+    );
 }
 
 async fn build_pubky_testnet() -> EphemeralTestnet {
@@ -421,7 +491,7 @@ stack_role = "proof"
 endpoint = "tcp://127.0.0.1:1"
 poll_interval = "1s"
 request_timeout = "1s"
-connect_retries = 0
+max_concurrent_creation_snapshots = 1
 [outbox]
 poll_interval = "{poll_interval}"
 batch_size = 16
@@ -457,6 +527,21 @@ fn signed_request(
         .unwrap()
 }
 
+/// §B.9: prepare calls on `/invoices` must carry an `expires_at` within
+/// `max_request_expiry` (default 24 h) of the server clock. The value is
+/// stable per test process because it rides in the exact-replay binding:
+/// two calls that must replay byte-identically share one timestamp.
+fn expires_at() -> String {
+    static VALUE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    VALUE
+        .get_or_init(|| {
+            (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        })
+        .clone()
+}
+
 fn invoice_request(
     signing_key: &SigningKey,
     fixture: &CreatorFixture,
@@ -468,8 +553,28 @@ fn invoice_request(
         Method::POST,
         "/invoices",
         format!(
-            r#"{{"bundle_id":"{bundle}","lock_resource":"{}","reader":"{reader}"}}"#,
+            r#"{{"bundle_id":"{bundle}","expires_at":"{}","lock_resource":"{}","reader":"{reader}"}}"#,
+            expires_at(),
             fixture.lock_resource
+        ),
+    )
+}
+
+/// §B.11 phase 2: the signed activation of a prepared invoice, echoing the
+/// stack identity and the nonce'd total phase 1 returned.
+fn activate_request(
+    signing_key: &SigningKey,
+    invoice_id: &str,
+    stack_id: &str,
+    total_sats: u64,
+) -> Request<Body> {
+    signed_request(
+        signing_key,
+        Method::POST,
+        &format!("/invoices/{invoice_id}/activate"),
+        // The signed-body middleware requires canonical JSON (sorted keys).
+        format!(
+            r#"{{"activation_attempt":1,"invoice_id":"{invoice_id}","stack_id":"{stack_id}","total_sats":{total_sats}}}"#
         ),
     )
 }
@@ -613,7 +718,8 @@ async fn wait_for_completion(
                 == serde_json::json!({
                     "status": "confirmed",
                     "confirmations": 6,
-                    "amount_matched": true
+                    "amount_matched": true,
+                    "late_settlement": false
                 });
         }
         if delivered == 4 && statuses_confirmed {
@@ -693,12 +799,28 @@ async fn raw_database_bytes(pool: &PgPool) -> Vec<Vec<u8>> {
     values
 }
 
+/// Deserialization mirror of the sealed invoice payment record written from
+/// W1.1b on; field order must match the product struct exactly.
+#[derive(serde::Deserialize)]
+struct InvoicePaymentRecordV3 {
+    version: u8,
+    derivation_index: i64,
+    bitcoin_address: String,
+    required_sats: u64,
+    nonce_sats: u64,
+    creation_chain_height: u32,
+    baseline_set_hash: [u8; 32],
+}
+
+/// Asserts the persisted workflow inputs and returns each fixture's
+/// `(address, total_sats)` pair, where the total is the nonce'd amount the
+/// invoice binds at (§B.8.2).
 async fn assert_persisted_workflow_inputs(
     pool: &PgPool,
     crypto: &Crypto,
     reader: &ReaderPubky,
     fixtures: &[(&CreatorFixture, &str)],
-) {
+) -> Vec<(String, u64)> {
     type Row = (
         Vec<u8>,
         i64,
@@ -731,6 +853,7 @@ async fn assert_persisted_workflow_inputs(
 
     let mut ids = HashSet::new();
     let mut envelopes = HashSet::new();
+    let mut totals = Vec::new();
     for (
         creator_hash,
         next_child_index,
@@ -760,7 +883,7 @@ async fn assert_persisted_workflow_inputs(
         envelopes.extend([
             assignment_envelope,
             invoice_envelope,
-            payment_record_envelope,
+            payment_record_envelope.clone(),
             endpoint_envelope.clone(),
             payment_envelope.clone(),
         ]);
@@ -812,10 +935,37 @@ async fn assert_persisted_workflow_inputs(
             "paykit/server"
         );
         assert_eq!(payment.marker_fingerprint(), endpoint.marker_fingerprint());
+        // The sealed payment record carries the CSPRNG nonce and the nonce'd
+        // total (§B.8.2): the total the marketplace would record equals the
+        // lock price plus the nonce, and the buyer-facing Payment Request
+        // amount is that same total.
+        let record_plaintext = crypto
+            .decrypt(
+                &EnvelopeContext::invoice_payment_record(creator_hash, invoice_id),
+                &EncryptedEnvelope::from_bytes(payment_record_envelope),
+            )
+            .unwrap();
+        let record: InvoicePaymentRecordV3 = postcard::from_bytes(&record_plaintext).unwrap();
+        assert_eq!(record.version, 3);
+        assert_eq!(record.derivation_index, 0);
+        assert_eq!(record.bitcoin_address, fixture.address);
+        assert_eq!(record.creation_chain_height, 300);
+        assert_eq!(
+            record.baseline_set_hash,
+            bitcoin::hashes::sha256::Hash::hash(b"").to_byte_array()
+        );
+        assert!(
+            (1..=999).contains(&record.nonce_sats),
+            "nonce {} outside [1, 999]",
+            record.nonce_sats
+        );
+        let total_sats = fixture.amount_sats + record.nonce_sats;
+        assert_eq!(record.required_sats, total_sats);
+        totals.push((fixture.address.clone(), total_sats));
         let amount = format!(
             "{}.{:08}",
-            fixture.amount_sats / 100_000_000,
-            fixture.amount_sats % 100_000_000
+            total_sats / 100_000_000,
+            total_sats % 100_000_000
         );
         assert!(matches!(
             payment.operation(),
@@ -826,7 +976,7 @@ async fn assert_persisted_workflow_inputs(
                         .is_ok_and(|reference| reference.get_version_num() == 4
                             && reference.get_variant() == uuid::Variant::RFC4122
                             && terms.payment_reference == reference.hyphenated().to_string())
-                    && terms.proposal_expires_at.is_none()
+                    && terms.proposal_expires_at.is_some()
                     && terms.accepted_endpoint_identifiers == ["btc-testnet-p2wpkh"]
                     && terms.metadata.get("bundle_id") == Some(&serde_json::json!(bundle))
                     && terms.metadata.get("lock_resource")
@@ -839,6 +989,7 @@ async fn assert_persisted_workflow_inputs(
         10,
         "Creator-bound envelopes must be distinct"
     );
+    totals
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
@@ -927,6 +1078,7 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     }));
     wait_until_listening(first_address).await;
     wait_until_ready(first_address).await;
+    publish_offerable_probes(&first_runtime).await;
 
     let (invoice_a, invoice_b) = tokio::join!(
         send_http(
@@ -940,23 +1092,68 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     );
     assert_eq!(
         invoice_a.status,
-        StatusCode::NO_CONTENT,
+        StatusCode::OK,
         "Creator A invoice body: {}",
         String::from_utf8_lossy(&invoice_a.body)
     );
     assert_eq!(
         invoice_b.status,
-        StatusCode::NO_CONTENT,
+        StatusCode::OK,
         "Creator B invoice body: {}",
         String::from_utf8_lossy(&invoice_b.body)
     );
-    assert_persisted_workflow_inputs(
+    let prepare_a: serde_json::Value = serde_json::from_slice(&invoice_a.body).unwrap();
+    let prepare_b: serde_json::Value = serde_json::from_slice(&invoice_b.body).unwrap();
+    for prepare in [&prepare_a, &prepare_b] {
+        assert_eq!(prepare["state"], "prepared");
+        assert_eq!(
+            prepare["stack_id"],
+            first_initialized.stack_identity.stack_id()
+        );
+    }
+    // Phase 1 publishes nothing: all four outbox rows are 'prepared' and
+    // therefore invisible to the delivery worker (§B.11.5).
+    let prepared_rows: Vec<String> = sqlx::query_scalar("SELECT status FROM outbox ORDER BY id")
+        .fetch_all(&first_pool)
+        .await
+        .unwrap();
+    assert_eq!(prepared_rows.len(), 4);
+    assert!(prepared_rows.iter().all(|status| status == "prepared"));
+    // Phase 2: the signed activation flips each invoice to `observing` and
+    // releases both of its outbox rows in one transaction.
+    let stack_id = first_initialized.stack_identity.stack_id();
+    for prepare in [&prepare_a, &prepare_b] {
+        let activation = send_http(
+            first_address,
+            activate_request(
+                &signing_key,
+                prepare["invoice_id"].as_str().unwrap(),
+                &stack_id,
+                prepare["total_sats"].as_u64().unwrap(),
+            ),
+        )
+        .await;
+        assert_eq!(
+            activation.status,
+            StatusCode::OK,
+            "activation body: {}",
+            String::from_utf8_lossy(&activation.body)
+        );
+        let activated: serde_json::Value = serde_json::from_slice(&activation.body).unwrap();
+        assert_eq!(activated["state"], "observing");
+    }
+    let totals = assert_persisted_workflow_inputs(
         &first_pool,
         &crypto,
         &reader,
         &[(&creator_a, BUNDLE_A), (&creator_b, BUNDLE_B)],
     )
     .await;
+    // Pay what each invoice actually binds at: the nonce'd total, not the
+    // bare lock price (an exact-amount predicate underpays otherwise).
+    for (address, total_sats) in totals {
+        observer.set_amount(&address, total_sats);
+    }
 
     let queued_before: Vec<(String, i32)> =
         sqlx::query_as("SELECT status, attempt_count FROM outbox ORDER BY id")
@@ -997,7 +1194,7 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         second_pool.clone(),
         second_initialized.stack_identity.clone(),
         pubky,
-        observer,
+        observer.clone(),
     )
     .await
     .unwrap();
@@ -1021,6 +1218,54 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     )
     .await;
     assert_eq!(peer_sdk.payment_requests().await.unwrap().len(), 2);
+    assert_eq!(
+        observer
+            .max_active_creation_snapshots
+            .load(Ordering::SeqCst),
+        1,
+        "the configured creation-snapshot semaphore must serialize concurrent creations"
+    );
+    let requests = observer.requests.lock().unwrap().clone();
+    let creation_starts = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| request.as_str() == "script_get_history cap=50")
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    // Two creation baselines plus two §B.4.6 tick-1 snapshots (one inside
+    // each activation): same bounded request shape, same configured caps.
+    assert_eq!(creation_starts.len(), 4, "request log: {requests:?}");
+    for start in creation_starts {
+        assert_eq!(requests[start + 1], "script_list_unspent");
+        assert_eq!(
+            requests[start + 2],
+            "headers_subscribe tx_bytes=400000",
+            "the creation floor tip must be taken after history and unspent"
+        );
+    }
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.starts_with("transaction_get candidate"))
+            .all(|request| request.ends_with("tx_bytes=400000")),
+        "candidate fetches must carry the configured byte cap: {requests:?}"
+    );
+    let mut candidates_since_tick = 0;
+    for request in &requests {
+        if request.starts_with("observer_list_unspent") {
+            assert!(
+                candidates_since_tick <= 1,
+                "more than one candidate fetch occurred in one observer interval: {requests:?}"
+            );
+            candidates_since_tick = 0;
+        } else if request.starts_with("transaction_get candidate") {
+            candidates_since_tick += 1;
+        }
+    }
+    assert!(
+        candidates_since_tick <= 1,
+        "more than one candidate fetch occurred after the final observer interval: {requests:?}"
+    );
 
     let outbox_rows: Vec<(String, bool)> = sqlx::query_as(
         "SELECT status, depends_on_id IS NOT NULL FROM outbox ORDER BY invoice_id, depends_on_id NULLS FIRST",
@@ -1136,10 +1381,387 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     second_pool.close().await;
     database.cleanup().await;
 }
+
+/// A fault-injection port whose creation snapshot parks on a gate, so a
+/// test can drop the HTTP request (client disconnect) after
+/// `create_atomic` has committed but before the baseline resolves.
+struct GatedSnapshotElectrum {
+    snapshot_starts: AtomicUsize,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait]
+impl ElectrumPort for GatedSnapshotElectrum {
+    async fn creation_snapshot(
+        &self,
+        _address: &str,
+        _max_history_entries: usize,
+        _max_transaction_bytes: usize,
+        _request_limiter: &RequestLimiter,
+        _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<CreationSnapshot, ObserverError> {
+        self.snapshot_starts.fetch_add(1, Ordering::SeqCst);
+        self.release.notified().await;
+        Ok(CreationSnapshot {
+            tip_height: 300,
+            baseline_outputs: Vec::new(),
+            unconfirmed_inputs: Vec::new(),
+            unconfirmed_outputs: Vec::new(),
+        })
+    }
+
+    async fn observations(
+        &self,
+        _tip_height: u32,
+        _targets: &[ObservationTarget],
+    ) -> Result<ObservationReport, ObserverError> {
+        Ok(ObservationReport::default())
+    }
+
+    async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        Ok(TipProbe {
+            height: 300,
+            time_unix: fresh_tip_time(),
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_creation_cancelled_after_commit_is_in_progress_on_retry_and_voided_by_the_sweeper() {
+    parse_bundle_id(BUNDLE_A).unwrap();
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    let signing_key = SigningKey::from_bytes(&[9; 32]);
+    let server_config = config(database.database_url(), &signing_key, "1h");
+    let initialized = initialize_database(&server_config).await.unwrap();
+    let pool = initialized.pool.clone();
+    let stack_identity = initialized.stack_identity.clone();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone());
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(&pool, crypto.clone());
+
+    let (reader, peer_key, peer_sdk) = create_peer(&bootstrap, &homeserver).await;
+    let creator = create_creator(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        &pool,
+        crypto.clone(),
+        CreatorSpec {
+            seed: 51,
+            account_index: 0,
+            amount_sats: 100,
+            counter_seed: 500,
+        },
+    )
+    .await;
+    link(
+        &creator.sdk,
+        PubkyPublicKey::from_raw_or_app_key(creator.creator.to_string()).unwrap(),
+        &peer_sdk,
+        peer_key,
+    )
+    .await;
+
+    let electrum = Arc::new(GatedSnapshotElectrum {
+        snapshot_starts: AtomicUsize::new(0),
+        release: tokio::sync::Notify::new(),
+    });
+    let server = Server::build_with_transports(
+        server_config,
+        pool.clone(),
+        stack_identity,
+        pubky,
+        electrum.clone(),
+    )
+    .await
+    .unwrap();
+    let runtime = server.runtime();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(server.run_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_until_listening(address).await;
+    wait_until_ready(address).await;
+    publish_offerable_probes(&runtime).await;
+
+    // Drive the creation until the invoice row is committed
+    // (`awaiting_baseline`) and the snapshot read is parked on the gate —
+    // synchronized on database state and the port counter, not on sleeps.
+    let request_task = tokio::spawn(send_http(
+        address,
+        invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if request_task.is_finished() {
+            let response = request_task.await.unwrap();
+            panic!(
+                "creation request finished before the parked snapshot: {} {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            );
+        }
+        let awaiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM invoices WHERE baseline_state = 'awaiting_baseline'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if awaiting == 1 && electrum.snapshot_starts.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "creation never reached the parked snapshot"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Client disconnect: the request future is dropped after create_atomic
+    // committed, orphaning the awaiting_baseline row.
+    request_task.abort();
+    let _ = request_task.await;
+
+    // §B.11.6: the identical retry WAITS for the orphaned baseline to
+    // resolve — it is never an exact replay of an unpublished invoice and
+    // it never starts a second snapshot. The orphan never resolves (the
+    // snapshot gate stays parked), so the server's own request-deadline
+    // clock is what bounds the wait and answers 503 dependency_timeout;
+    // nothing in the test sleeps to drive it.
+    let retry = send_http(
+        address,
+        invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
+    )
+    .await;
+    assert_eq!(
+        retry.status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "retry body: {}",
+        String::from_utf8_lossy(&retry.body)
+    );
+    let retry_body: serde_json::Value = serde_json::from_slice(&retry.body).unwrap();
+    assert_eq!(retry_body["error"]["code"], "dependency_timeout");
+
+    // Nothing published: both outbox intents stay `prepared`.
+    let statuses: Vec<String> = sqlx::query_scalar("SELECT status FROM outbox ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(statuses, vec!["prepared".to_owned(), "prepared".to_owned()]);
+
+    // The sweeper is the terminal fallback: the orphan is voided and the
+    // outbox is never queued.
+    let store = InvoiceStore::new(&pool, crypto.clone());
+    assert_eq!(
+        store
+            .sweep_stale_creation_baselines(Duration::ZERO)
+            .await
+            .unwrap(),
+        1
+    );
+    let state: String = sqlx::query_scalar("SELECT baseline_state FROM invoices")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "void_baseline_failed");
+    let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM outbox WHERE status = 'queued'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(queued, 0, "a voided orphan's outbox is never queued");
+
+    // The voided binding is spent: §B.11.6 answers a further retry with the
+    // named `invoice_finalized` refusal, still never replay success for an
+    // invoice that never published.
+    let after_void = send_http(
+        address,
+        invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
+    )
+    .await;
+    assert_eq!(after_void.status, StatusCode::CONFLICT);
+    let after_void_body: serde_json::Value = serde_json::from_slice(&after_void.body).unwrap();
+    assert_eq!(after_void_body["error"]["code"], "invoice_finalized");
+
+    electrum.release.notify_waiters();
+    let _ = shutdown_tx.send(());
+    running.await.unwrap().unwrap();
+    pool.close().await;
+    database.cleanup().await;
+}
+
 /// Distinct canonical key tails so the fingerprint-to-seller binding written
 /// by every create/reauthenticate never collides within a test database.
 fn key_tail(seed: u64) -> [u8; 65] {
     let mut tail = [0u8; 65];
     tail[..8].copy_from_slice(&seed.to_be_bytes());
     tail
+}
+
+/// Two byte-identical concurrent creations whose preflights can both read
+/// `New` (TOCTOU before the first commits): exactly one creation_snapshot
+/// runs, exactly one address is allocated, the winner publishes, and the
+/// loser waits for that baseline and is served the same stored body —
+/// never voided, never double-charged, never a second snapshot for the
+/// same invoice (§B.11.4 failure-matrix row 8, §B.11.6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn concurrent_identical_creations_run_exactly_one_baseline_snapshot() {
+    parse_bundle_id(BUNDLE_A).unwrap();
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    let signing_key = SigningKey::from_bytes(&[10; 32]);
+    let server_config = config(database.database_url(), &signing_key, "1h");
+    let initialized = initialize_database(&server_config).await.unwrap();
+    let pool = initialized.pool.clone();
+    let stack_identity = initialized.stack_identity.clone();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone());
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(&pool, crypto.clone());
+
+    let (reader, peer_key, peer_sdk) = create_peer(&bootstrap, &homeserver).await;
+    let creator = create_creator(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        &pool,
+        crypto.clone(),
+        CreatorSpec {
+            seed: 52,
+            account_index: 0,
+            amount_sats: 100,
+            counter_seed: 600,
+        },
+    )
+    .await;
+    link(
+        &creator.sdk,
+        PubkyPublicKey::from_raw_or_app_key(creator.creator.to_string()).unwrap(),
+        &peer_sdk,
+        peer_key,
+    )
+    .await;
+
+    let electrum = Arc::new(GatedSnapshotElectrum {
+        snapshot_starts: AtomicUsize::new(0),
+        release: tokio::sync::Notify::new(),
+    });
+    let server = Server::build_with_transports(
+        server_config,
+        pool.clone(),
+        stack_identity,
+        pubky,
+        electrum.clone(),
+    )
+    .await
+    .unwrap();
+    let runtime = server.runtime();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(server.run_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_until_listening(address).await;
+    wait_until_ready(address).await;
+    publish_offerable_probes(&runtime).await;
+
+    // The winner: drive it until its create_atomic has committed
+    // (`awaiting_baseline`) and its snapshot read is parked on the gate.
+    let winner = tokio::spawn(send_http(
+        address,
+        invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if winner.is_finished() {
+            let response = winner.await.unwrap();
+            panic!(
+                "winning creation finished before the parked snapshot: {} {}",
+                response.status,
+                String::from_utf8_lossy(&response.body)
+            );
+        }
+        if electrum.snapshot_starts.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "winning creation never reached the parked snapshot"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The loser: byte-identical, issued while the winner's baseline is
+    // unresolved. §B.11.6 / §B.11.4 failure-matrix row 8: it WAITS for the
+    // winner's baseline — whether its preflight reads the awaiting row or
+    // its create_atomic serializes behind the winner's row lock — and it
+    // must NEVER start a second snapshot sequence for the same invoice.
+    let loser = tokio::spawn(send_http(
+        address,
+        invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
+    ));
+
+    // Release the winner's parked baseline: the loser's wait ends on the
+    // stored `prepared` row and both callers receive the same body.
+    electrum.release.notify_waiters();
+    let winner = winner.await.unwrap();
+    let loser = loser.await.unwrap();
+    assert_eq!(
+        winner.status,
+        StatusCode::OK,
+        "winner body: {}",
+        String::from_utf8_lossy(&winner.body)
+    );
+    assert_eq!(
+        loser.status,
+        StatusCode::OK,
+        "loser body: {}",
+        String::from_utf8_lossy(&loser.body)
+    );
+    assert_eq!(
+        loser.body, winner.body,
+        "the waiting replay returns the winner's stored body byte-identically"
+    );
+    assert_eq!(
+        electrum.snapshot_starts.load(Ordering::SeqCst),
+        1,
+        "a replayed creation must never run a second baseline snapshot"
+    );
+
+    // Exactly one address was allocated across both creations.
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    for (table, expected) in [("reader_assignments", 1_i64), ("invoices", 1_i64)] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, expected, "unexpected {table} cardinality");
+    }
+
+    // The published invoice now replays exactly.
+    let replay = send_http(
+        address,
+        invoice_request(&signing_key, &creator, &reader, BUNDLE_A),
+    )
+    .await;
+    assert_eq!(replay.status, StatusCode::OK);
+
+    let _ = shutdown_tx.send(());
+    running.await.unwrap().unwrap();
+    pool.close().await;
+    database.cleanup().await;
 }

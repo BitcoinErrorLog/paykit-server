@@ -44,17 +44,17 @@ poll_interval = "5s"
 #[tokio::test]
 async fn booting_with_a_mismatched_network_or_role_fails_before_binding() {
     let database = TestDatabase::create().await;
-    initialize_database(&config(database.database_url(), "regtest", "proof"))
+    initialize_database(&config(database.database_url(), "mainnet", "proof"))
         .await
         .unwrap();
 
     // Same role, different network: refused on the network invariant.
-    let error = initialize_database(&config(database.database_url(), "mainnet", "proof"))
+    let error = initialize_database(&config(database.database_url(), "regtest", "proof"))
         .await
         .unwrap_err();
     assert_eq!(error, StartupError::Deployment);
     // Same network, different role: refused on the stack_role invariant.
-    let error = initialize_database(&config(database.database_url(), "regtest", "production"))
+    let error = initialize_database(&config(database.database_url(), "mainnet", "production"))
         .await
         .unwrap_err();
     assert_eq!(error, StartupError::Deployment);
@@ -65,11 +65,11 @@ async fn booting_with_a_mismatched_network_or_role_fails_before_binding() {
 #[tokio::test]
 async fn booting_a_production_role_against_a_proof_database_fails_before_binding() {
     let database = TestDatabase::create().await;
-    initialize_database(&config(database.database_url(), "testnet", "proof"))
+    initialize_database(&config(database.database_url(), "mainnet", "proof"))
         .await
         .unwrap();
 
-    let error = initialize_database(&config(database.database_url(), "testnet", "production"))
+    let error = initialize_database(&config(database.database_url(), "mainnet", "production"))
         .await
         .unwrap_err();
     assert_eq!(error, StartupError::Deployment);
@@ -80,7 +80,7 @@ async fn booting_a_production_role_against_a_proof_database_fails_before_binding
 #[tokio::test]
 async fn an_unset_stored_role_is_adopted_once_and_then_enforced() {
     let database = TestDatabase::create().await;
-    let configured = config(database.database_url(), "testnet", "proof");
+    let configured = config(database.database_url(), "mainnet", "proof");
     // Simulate a deployment row written before the stack-role migration: the
     // invariants are present but stack_role is still NULL.
     paykit_server::persistence::run_migrations(database.pool())
@@ -112,7 +112,7 @@ async fn an_unset_stored_role_is_adopted_once_and_then_enforced() {
             .unwrap();
     assert_eq!(adopted.as_deref(), Some("proof"));
 
-    let error = initialize_database(&config(database.database_url(), "testnet", "production"))
+    let error = initialize_database(&config(database.database_url(), "mainnet", "production"))
         .await
         .unwrap_err();
     assert_eq!(error, StartupError::Deployment);
@@ -125,7 +125,7 @@ async fn an_unset_stored_role_is_adopted_once_and_then_enforced() {
 async fn concurrent_first_boots_on_an_unset_role_adopt_exactly_once() {
     let database = TestDatabase::create().await;
     // A pre-role deployment row: invariants present, stack_role still NULL.
-    let configured = config(database.database_url(), "testnet", "proof");
+    let configured = config(database.database_url(), "mainnet", "proof");
     paykit_server::persistence::run_migrations(database.pool())
         .await
         .unwrap();
@@ -151,10 +151,10 @@ async fn concurrent_first_boots_on_an_unset_role_adopt_exactly_once() {
     // winner holds the deployment row lock through the test hook while the
     // loser attempts adoption: the loser must block on the row lock until
     // the winner commits, then observe the adopted role and refuse.
-    let proof_invariants = config(database.database_url(), "testnet", "proof")
+    let proof_invariants = config(database.database_url(), "mainnet", "proof")
         .deployment_invariants()
         .clone();
-    let production_invariants = config(database.database_url(), "testnet", "production")
+    let production_invariants = config(database.database_url(), "mainnet", "production")
         .deployment_invariants()
         .clone();
     let (lock_held, held) = tokio::sync::oneshot::channel();
@@ -215,8 +215,8 @@ async fn concurrent_first_boots_on_an_unset_role_adopt_exactly_once() {
     assert_eq!(adopted, "proof", "exactly one concurrent boot adopts");
 
     // Two boots that agree with the adopted role both succeed.
-    let first_config = config(database.database_url(), "testnet", &adopted);
-    let second_config = config(database.database_url(), "testnet", &adopted);
+    let first_config = config(database.database_url(), "mainnet", &adopted);
+    let second_config = config(database.database_url(), "mainnet", &adopted);
     let first = initialize_database(&first_config);
     let second = initialize_database(&second_config);
     let (first, second) = tokio::join!(first, second);
