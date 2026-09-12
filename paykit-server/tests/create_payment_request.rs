@@ -428,9 +428,12 @@ fn ok_session() -> Arc<FakeSession> {
 #[tokio::test]
 async fn persists_exact_terms_bindings_and_derived_address_without_a_lock() {
     let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
-    let request = request(50_000);
+    let mut request = request(50_000);
+    request.expires_at = request.expires_at.replace_nanosecond(123_456_789).unwrap();
     let expires_at = request
         .expires_at
+        .replace_nanosecond(123_456_000)
+        .unwrap()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap();
     let result = service(ok_session(), store.clone(), BitcoinNetwork::Mainnet)

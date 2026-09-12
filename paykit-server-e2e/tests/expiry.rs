@@ -943,18 +943,31 @@ async fn published_request_carries_proposal_expires_at_equal_to_the_column() {
     let stack = boot(94).await;
 
     for (reference, bundle) in [(REFERENCE_A, None), (BUNDLE_LOCKS, Some(()))] {
-        let expires_at = expires_in(1);
+        let expires_at = (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+            .replace_nanosecond(123_456_789)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let canonical_expires_at = time::OffsetDateTime::parse(
+            &expires_at,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap()
+        .replace_nanosecond(123_456_000)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
         let body = if bundle.is_some() {
             prepare_locks(&stack, reference, &expires_at).await
         } else {
             prepare(&stack, reference, &expires_at).await
         };
-        assert_eq!(body["expires_at"], expires_at);
+        assert_eq!(body["expires_at"], canonical_expires_at);
         let invoice_id = body["invoice_id"].as_str().unwrap();
         let terms = published_terms(&stack, invoice_id).await;
         assert_eq!(
             terms.proposal_expires_at.as_deref(),
-            Some(expires_at.as_str()),
+            Some(canonical_expires_at.as_str()),
             "the published request must carry the expiry for the wallet"
         );
         let column: time::OffsetDateTime =
@@ -966,7 +979,10 @@ async fn published_request_carries_proposal_expires_at_equal_to_the_column() {
         let column = column
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap();
-        assert_eq!(column, expires_at, "column and envelope must agree");
+        assert_eq!(
+            column, canonical_expires_at,
+            "column and envelope must agree"
+        );
     }
     stack.shutdown().await;
 }

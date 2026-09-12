@@ -24,7 +24,7 @@ use crate::{
             AlwaysAvailableOffer, CreateInvoiceError, CreatorXpubProvider, DeadlineClock,
             DerivedNewReaderPayloads, InvoicePersistence, MarkerDiscovery,
             OFFER_AVAILABILITY_TIMEOUT, OfferAvailability, PaykitIntentBuilder,
-            SessionValidationError, SessionValidator, SystemDeadlineClock,
+            SessionValidationError, SessionValidator, SystemDeadlineClock, canonicalize_expiry,
             complete_creation_baseline_within_deadline, draw_nonce_sats, map_store,
             preflight_after_baseline_resolution, remaining,
         },
@@ -48,11 +48,14 @@ pub struct MarketplacePaymentRequest {
     pub reader: ReaderPubky,
     pub reference: BundleId,
     pub amount_sats: u64,
-    /// The order's hold deadline (design §B.9/§B.11.3): required, refused
-    /// when past or further out than `max_request_expiry`, persisted on the
+    /// The order's hold deadline (design §B.9/§B.11.3): required,
+    /// canonicalized to PostgreSQL's microsecond precision, refused when
+    /// past or further out than `max_request_expiry`, persisted on the
     /// invoice, echoed on the phase-1/phase-2 bodies, and carried into the
     /// published request's `proposal_expires_at` so the buyer's wallet
-    /// enforces it.
+    /// enforces it. Accepted RFC3339 values that differ only below a
+    /// microsecond bind identically; the response, published proposal, and
+    /// persisted column use the same canonical value.
     pub expires_at: time::OffsetDateTime,
     /// `{order_reference}:{bind_attempt}` (design §B.11.3). It rides in the
     /// payment-request binding, so an identical retry replays the stored
@@ -198,6 +201,8 @@ impl MarketplacePaymentRequestService {
         &self,
         request: MarketplacePaymentRequest,
     ) -> Result<crate::application::two_phase::PrepareBody, CreateInvoiceError> {
+        let mut request = request;
+        request.expires_at = canonicalize_expiry(request.expires_at);
         if request.amount_sats == 0 {
             return Err(CreateInvoiceError::InvalidRequest);
         }

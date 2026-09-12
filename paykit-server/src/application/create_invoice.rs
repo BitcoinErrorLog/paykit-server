@@ -71,10 +71,13 @@ pub struct CreateInvoiceRequest {
     pub lock_resource: PubkyLockResource,
     pub reader: ReaderPubky,
     /// The Payment Request expiry (design §B.9): required on this
-    /// entrypoint exactly as on `/v0/payment-requests`, refused when past
-    /// or further out than `max_request_expiry`, persisted on the invoice,
-    /// and carried into the published request's `proposal_expires_at` so
-    /// the buyer's wallet enforces it.
+    /// entrypoint exactly as on `/v0/payment-requests`, canonicalized to
+    /// PostgreSQL's microsecond precision, refused when past or further out
+    /// than `max_request_expiry`, and persisted on the invoice and carried
+    /// into the published request's `proposal_expires_at` so the buyer's
+    /// wallet enforces it. Accepted RFC3339 values that differ only below a
+    /// microsecond bind identically; the response, published proposal, and
+    /// persisted column use the same canonical value.
     pub expires_at: time::OffsetDateTime,
 }
 
@@ -663,6 +666,8 @@ impl CreateInvoiceService {
         &self,
         request: CreateInvoiceRequest,
     ) -> Result<crate::application::two_phase::PrepareBody, CreateInvoiceError> {
+        let mut request = request;
+        request.expires_at = canonicalize_expiry(request.expires_at);
         let started = self.clock.now();
         let creator = request.lock_resource.creator().clone();
         let bundle_binding = request.bundle_id.to_string().into_bytes();
@@ -1079,6 +1084,19 @@ pub(crate) fn validate_expires_at(
     }
 }
 
+/// Truncates an accepted expiry to PostgreSQL `timestamptz` precision.
+///
+/// This is deliberately truncation rather than rounding: the response,
+/// published proposal, idempotency binding, validation, and persisted column
+/// must all use the same microsecond-canonical value. The nanosecond
+/// component is always in range, so replacing it with the lower microsecond
+/// boundary is checked and infallible for an existing `OffsetDateTime`.
+pub(crate) fn canonicalize_expiry(value: time::OffsetDateTime) -> time::OffsetDateTime {
+    value
+        .replace_nanosecond(value.nanosecond() / 1_000 * 1_000)
+        .expect("canonical expiry nanosecond is always valid")
+}
+
 fn request_binding(request: &CreateInvoiceRequest) -> Result<Vec<u8>, CreateInvoiceError> {
     serde_json_canonicalizer::to_vec(&serde_json::json!({
         "bundle_id": request.bundle_id.to_string(),
@@ -1171,6 +1189,21 @@ fn extract_terms(lock: &ContentLock) -> Result<CriterionAmount, CreateInvoiceErr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::locks::{parse_addressed_lock_resource, parse_bundle_id, parse_reader};
+
+    const TEST_CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+    const TEST_LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
+    const TEST_BUNDLE: &str = "000G40R40M30E209185GR38E1W";
+
+    fn binding_for(expires_at: time::OffsetDateTime) -> Vec<u8> {
+        request_binding(&CreateInvoiceRequest {
+            bundle_id: parse_bundle_id(TEST_BUNDLE).unwrap(),
+            lock_resource: parse_addressed_lock_resource(TEST_LOCK_RESOURCE).unwrap(),
+            reader: parse_reader(TEST_CREATOR).unwrap(),
+            expires_at,
+        })
+        .unwrap()
+    }
 
     /// §B.9 regression: startup validation accepts a
     /// `bitcoin.max_request_expiry` of exactly `i64::MAX` seconds
@@ -1208,5 +1241,77 @@ mod tests {
                 ExpiryRefusal::OverMaximum
             )),
         );
+    }
+
+    #[test]
+    fn canonicalize_expiry_truncates_sub_microsecond_precision() {
+        let value = time::OffsetDateTime::parse(
+            "2030-01-01T00:00:01.123456789Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+
+        assert_eq!(canonicalize_expiry(value).nanosecond(), 123_456_000);
+    }
+
+    #[test]
+    fn canonicalize_expiry_preserves_microseconds_without_rounding() {
+        let value = time::OffsetDateTime::parse(
+            "2030-01-01T00:00:01.999999Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+        let next_second = time::OffsetDateTime::parse(
+            "2030-01-01T00:00:02Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .unwrap();
+
+        assert_eq!(canonicalize_expiry(value), value);
+        assert!(canonicalize_expiry(value) < next_second);
+    }
+
+    #[test]
+    fn sub_microsecond_expiry_variants_bind_identically() {
+        let first = canonicalize_expiry(
+            time::OffsetDateTime::parse(
+                "2030-01-01T00:00:01.123456001Z",
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap(),
+        );
+        let same_microsecond = canonicalize_expiry(
+            time::OffsetDateTime::parse(
+                "2030-01-01T00:00:01.123456999Z",
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap(),
+        );
+        let next_microsecond = canonicalize_expiry(
+            time::OffsetDateTime::parse(
+                "2030-01-01T00:00:01.123457001Z",
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            first
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            same_microsecond
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        );
+        assert_ne!(
+            first
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            next_microsecond
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        );
+        assert_eq!(binding_for(first), binding_for(same_microsecond));
+        assert_ne!(binding_for(first), binding_for(next_microsecond));
     }
 }
