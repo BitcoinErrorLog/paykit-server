@@ -172,6 +172,9 @@ pub enum EnvelopeType {
     BitcoinObservation,
     /// Versioned server-owned semantic inputs for an outbound SDK handoff.
     OutboxSemanticIntent,
+    /// A sentinel detection row's sealed derivation index, address, outpoint
+    /// and value (W1.14, §B.8.7).
+    SentinelEvidence,
 }
 
 impl EnvelopeType {
@@ -184,6 +187,7 @@ impl EnvelopeType {
             Self::InvoicePaymentRecord => b"invoice-payment-record",
             Self::BitcoinObservation => b"bitcoin-observation",
             Self::OutboxSemanticIntent => b"outbox-semantic-intent",
+            Self::SentinelEvidence => b"sentinel-evidence",
         }
     }
 }
@@ -262,6 +266,10 @@ impl EnvelopeContext {
             creator_lookup_hash,
             row_id,
         )
+    }
+    /// Creates the binding context for one sentinel detection evidence row.
+    pub fn sentinel_evidence(creator_lookup_hash: LookupHash, row_id: Uuid) -> Self {
+        Self::new(EnvelopeType::SentinelEvidence, creator_lookup_hash, row_id)
     }
 
     fn new(envelope_type: EnvelopeType, creator_lookup_hash: LookupHash, row_id: Uuid) -> Self {

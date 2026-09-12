@@ -962,3 +962,111 @@ fn deployment_stack_role_is_required_and_named_when_missing_or_unrecognised() {
         "production"
     );
 }
+
+// ---------------------------------------------------------------------------
+// W1.14 [sentinel] section (design §B.8.7): documented defaults, safe
+// nonzero bounds, and the closed-schema contract.
+// ---------------------------------------------------------------------------
+
+fn sentinel_toml(extra: &str) -> String {
+    valid_toml().replace("[outbox]", &format!("[sentinel]\n{extra}\n\n[outbox]"))
+}
+
+#[test]
+fn applies_documented_sentinel_defaults_when_the_section_is_absent() {
+    let config = Config::from_toml_and_environment(&valid_toml(), environment())
+        .expect("the sentinel section is optional with design defaults");
+
+    assert_eq!(config.sentinel.min_value_sats, 294);
+    assert_eq!(config.sentinel.hit_count, 1);
+    assert_eq!(
+        config.sentinel.rescan_interval,
+        Duration::from_secs(10 * 60)
+    );
+    assert_eq!(config.sentinel.max_age, Duration::from_secs(60 * 60));
+    assert_eq!(config.sentinel.max_requests_per_tick, 1000);
+    assert_eq!(config.sentinel.max_requests_per_second, 5);
+    let policy = config.sentinel.policy();
+    assert_eq!(policy.thresholds.min_value_sats, 294);
+    assert_eq!(policy.thresholds.hit_count, 1);
+    assert_eq!(policy.scan_window, 20, "the BIP44 gap window is fixed");
+    assert_eq!(policy.per_tick_creator_limit(), 50);
+}
+
+#[test]
+fn parses_explicit_sentinel_values() {
+    let config = Config::from_toml_and_environment(
+        &sentinel_toml(
+            "min_value_sats = 1000\nhit_count = 3\nrescan_interval = \"15m\"\nmax_age = \"2h\"\nmax_requests_per_tick = 200\nmax_requests_per_second = 2",
+        ),
+        environment(),
+    )
+    .expect("explicit sentinel values parse");
+
+    assert_eq!(config.sentinel.min_value_sats, 1000);
+    assert_eq!(config.sentinel.hit_count, 3);
+    assert_eq!(
+        config.sentinel.rescan_interval,
+        Duration::from_secs(15 * 60)
+    );
+    assert_eq!(config.sentinel.max_age, Duration::from_secs(2 * 60 * 60));
+    assert_eq!(config.sentinel.max_requests_per_tick, 200);
+    assert_eq!(config.sentinel.max_requests_per_second, 2);
+}
+
+#[test]
+fn rejects_zero_sentinel_values_with_literal_messages() {
+    for (extra, message) in [
+        (
+            "min_value_sats = 0",
+            "sentinel.min_value_sats must be greater than zero",
+        ),
+        (
+            "hit_count = 0",
+            "sentinel.hit_count must be greater than zero",
+        ),
+        (
+            "max_requests_per_tick = 0",
+            "sentinel.max_requests_per_tick must be greater than zero",
+        ),
+        (
+            "max_requests_per_second = 0",
+            "sentinel.max_requests_per_second must be greater than zero",
+        ),
+        (
+            "rescan_interval = \"0s\"",
+            "sentinel.rescan_interval must be greater than zero",
+        ),
+        (
+            "max_age = \"0s\"",
+            "sentinel.max_age must be greater than zero",
+        ),
+        (
+            "rescan_interval = \"500ms\"",
+            "sentinel.rescan_interval must be at least one second",
+        ),
+    ] {
+        let error = Config::from_toml_and_environment(&sentinel_toml(extra), environment())
+            .expect_err(&format!("{extra} should be rejected"));
+        assert_eq!(error.to_string(), message, "{extra}");
+    }
+}
+
+#[test]
+fn rejects_unknown_sentinel_keys_fail_closed() {
+    let error = Config::from_toml_and_environment(&sentinel_toml("enabled = true"), environment())
+        .expect_err("unknown sentinel keys are rejected");
+    assert!(error.to_string().contains("enabled"));
+}
+
+#[test]
+fn sentinel_config_is_redacted_in_the_effective_config() {
+    let config =
+        Config::from_toml_and_environment(&sentinel_toml("min_value_sats = 546"), environment())
+            .unwrap();
+    let effective = config.redacted_effective_config();
+
+    assert!(effective.contains("SentinelConfig"), "{effective}");
+    assert!(effective.contains("min_value_sats: 546"), "{effective}");
+    assert!(!effective.contains(MASTER_KEY));
+}

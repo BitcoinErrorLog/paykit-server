@@ -237,7 +237,21 @@ before it is sent.** In THIS tree the callers are exactly:
   the next poll interval;
 - **the observer tick's per-address `list_unspent` lookups** — one
   atomic reserve-up-to against the post-probe balance admits the
-  oldest-first prefix and charges exactly what is dispatched.
+  oldest-first prefix and charges exactly what is dispatched;
+- **the W1.14 sentinel phase** (§B.8.7) — runs LAST inside the same tick,
+  strictly subordinate: its per-tick allowance is ZERO when any live
+  target was deferred this tick, otherwise 10% of the shared bucket's
+  post-live remaining balance (the §B.8.7 default), hard-capped by the
+  configured `[sentinel]` sub-budget (`max_requests_per_tick` capacity,
+  `max_requests_per_second` sustained refill — an accounting limiter, not
+  a second endpoint quota) and by whole 20-address creator windows, and
+  every admitted sentinel request is charged against this same shared
+  bucket before dispatch. Aggregate endpoint traffic — probe + live
+  lookups + candidate fetch + sentinel scans + non-tick callers —
+  therefore never exceeds `electrum.max_requests_per_tick` in one tick or
+  `electrum.max_requests_per_second` sustained, sentinel work can never
+  be the reason a live target defers, and non-tick callers keep at
+  least 90% of the post-live balance.
 
 The **invoice-creation snapshot fetch and the first-bind candidate
 fetch** (W1.1, this tree) run on the same capped connection constructor
@@ -574,6 +588,23 @@ rather than silence, and the marketplace's money-outcome record is one-way.*
   human, not silence. Nothing is silently dropped: the observation is
   recorded factually (`confirmed`, `amount_matched`), and the flag — not
   the absence of a record — is what blocks settlement.
+- **The status contract is versioned, and `allocation_mode` is mandatory
+  (W1.14).** Every `/transactions/status` response carries
+  `contract_version: "paykit.bitcoin_status/v2"` and an `allocation_mode`
+  that is always present, always exactly `exclusive` or `shared_manual`,
+  and always the creator's CURRENT database mode read at request time
+  (never a claim-time cache; an unknown persisted mode fails the read
+  closed rather than emitting a value a consumer could silently ignore).
+  `v1` — the pre-W1.14 observation triple without a mode — is never
+  emitted by this build. The consumer of the automatic paid transition
+  (marketplace **W1.15**) must fail closed — manual review, never
+  auto-confirm — on a missing field, any other contract version, or any
+  mode other than `exclusive`. **W1.14 ships only the producer half of
+  this gate and is deployment-blocked until W1.15 consumes the captured
+  field and passes a real cross-repo test**; this repository contains no
+  cross-repo contract-export mechanism, so the gate is recorded here and
+  pinned by the producer-side exact-shape tests rather than copied
+  marketplace code.
 - **`resolve` is one-way and stack-pinned.** The endpoint records the
   marketplace's money outcome: `paid_manually` finalizes
   `observing`/`expired_tail` to `resolved_paid_manually`,

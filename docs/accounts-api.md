@@ -35,8 +35,14 @@ no claimed account; 200 for the owner. The 200 body carries the persisted
 nullable `downgrade_reason`, the client's required evidence fields
 `key_fingerprint` (a hash, not key material) and `first_derived_address`
 (what invoices reveal anyway) — the same values the claim response emits —
-the derivation coordinates below, and `evidence`, which is always `[]` until
-§B.8.7 sentinel detection records any. `claim_channel` and
+the derivation coordinates below, and `evidence`, the §B.8.7 sentinel
+detection metadata (W1.14): the seller's own durable sentinel rows, oldest
+first, each with fixed field names (`classification` — `candidate`,
+`evidence`, or `superseded_by_assignment` — `derivation_index`, `address`,
+`outpoint` as `txid:vout`, `value_sats`, `confirmations`,
+`first_observed_at`, `last_observed_at` as RFC 3339). `evidence` is `[]`
+until the sentinel records any. The body also carries `alerts`, the durable
+§B.8.7 seller alert (below). `claim_channel` and
 `downgrade_reason` are always present in the JSON body — serialized as an
 explicit `null` when unset (serde `Option`), never omitted — so clients may
 treat them as `.nullish()`. Shape:
@@ -52,9 +58,64 @@ treat them as `.nullish()`. Shape:
   "account_index": 1,
   "first_child_index": 0,
   "next_child_index": 3,
-  "evidence": []
+  "evidence": [
+    {
+      "classification": "evidence",
+      "derivation_index": 4,
+      "address": "tb1q…",
+      "outpoint": "abcd…:1",
+      "value_sats": 550,
+      "confirmations": 3,
+      "first_observed_at": "2026-09-11T00:00:00Z",
+      "last_observed_at": "2026-09-11T00:00:00Z"
+    }
+  ],
+  "alerts": [
+    {
+      "event_kind": "sentinel_downgrade",
+      "reason": "unassigned_sentinel_evidence",
+      "created_at": "2026-09-11T00:00:00Z",
+      "acknowledged_at": null
+    }
+  ]
 }
 ```
+
+## The durable sentinel seller alert
+
+The one `sentinel_downgrade` mode transition produces exactly one durable
+alert row, ever (`UNIQUE (creator_id, event_kind)` plus the conditional
+mode-guarded downgrade UPDATE): repeat evidence after the downgrade still
+commits to `evidence` but never raises a second alert. **Status polling is
+the delivery mechanism** — no push channel, webhook, or outbox entry is
+invented; `alerts` is always present in the 200 body (`[]` until a
+downgrade commits) and W1.16's Shop client renders it. Each entry carries
+only stable identifiers and timestamps — the fixed `event_kind`
+(`sentinel_downgrade`), the fixed §B.8.8 `reason` identifier
+(`unassigned_sentinel_evidence`), the transition `created_at`, and
+`acknowledged_at` — serialized as explicit `null` while UNREAD. No
+address, xpub, outpoint, value, or free text is ever interpolated; the
+seller-facing copy is W1.16's static rendering of the reason identifier.
+
+`POST /v0/accounts/{creator}/alerts/acknowledge` with body
+`{"event_kind": "sentinel_downgrade"}` is the seller's durable read
+receipt: it sets `acknowledged_at` exactly once (the first receipt stands;
+re-acknowledging changes nothing and returns 200 `{"acknowledged": true}`),
+and never clears it. The route shares the status surface's owner-only
+authentication and CORS policy: 401 `invalid_token` without a valid bearer,
+403 `forbidden` for any other authenticated identity, 400 for an unknown
+`event_kind`. A seller with no matching alert gets 200
+`{"acknowledged": false}` — acknowledging is a receipt, never an alert
+creation path.
+
+**Retention.** Sentinel evidence rows and the alert row are creator/account
+audit records retained for the lifetime of the creator account: W1.14 has
+no automatic purge and no deletion path, both tables reference `creators`
+with `ON DELETE RESTRICT` so no cascade can silently erase them, and
+evidence rows are immutable apart from the classification promotion
+(`candidate` → `evidence` / `superseded_by_assignment`), the confirmation
+count, and `last_observed_at`. Deleting or expiring evidence requires a
+future approved retention policy and migration.
 
 The four derivation fields, and what a client verifies with each:
 

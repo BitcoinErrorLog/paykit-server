@@ -30,6 +30,8 @@ pub mod persistence;
 pub mod real_setup;
 /// Server lifecycle, dependency checks, admission control, and shutdown.
 pub mod runtime;
+/// Unassigned-sentinel detection (design §B.8.7, W1.14).
+pub mod sentinel;
 pub mod server;
 pub mod setup;
 /// Relay receive/ack boundary and durable-before-ack setup orchestration.

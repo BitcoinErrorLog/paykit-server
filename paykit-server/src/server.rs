@@ -80,6 +80,7 @@ struct WorkerComponents {
     outbox_retry_initial: Duration,
     outbox_retry_max: Duration,
     electrum_policy: ObserverPolicy,
+    sentinel_policy: crate::sentinel::SentinelPolicy,
 }
 
 impl Server {
@@ -383,6 +384,7 @@ impl Server {
                 baseline_completion_timeout: config.electrum.baseline_completion_timeout,
                 expiry_tail: config.bitcoin.expiry_tail,
             },
+            sentinel_policy: config.sentinel.policy(),
         };
 
         Ok(Self {
@@ -706,6 +708,7 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
             as Arc<dyn ObserverLeadership>,
         workers.bitcoin_network.clone(),
         workers.electrum_policy,
+        workers.sentinel_policy,
         runtime,
     )
     .await;

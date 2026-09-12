@@ -14,7 +14,7 @@ use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
 use uuid::Uuid;
 
-const REQUIRED_TABLES: [&str; 11] = [
+const REQUIRED_TABLES: [&str; 13] = [
     "deployment_metadata",
     "creators",
     "sdk_states",
@@ -26,6 +26,8 @@ const REQUIRED_TABLES: [&str; 11] = [
     "bitcoin_observation_candidates",
     "stack_identity",
     "claimed_key_fingerprints",
+    "sentinel_outpoints",
+    "sentinel_events",
 ];
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
@@ -63,7 +65,7 @@ fn migration_catalog_has_one_contiguous_canonical_version_per_file() {
     let mut versions = migration_versions(names).unwrap();
     versions.sort_unstable();
 
-    assert_eq!(versions, (1..=15).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=16).collect::<Vec<_>>());
     assert_eq!(
         versions.len(),
         versions.iter().collect::<HashSet<_>>().len()
@@ -114,7 +116,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .unwrap();
     assert_eq!(
         applied_versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     );
 
     let retired_observation_budget_columns: Vec<String> = sqlx::query_scalar(
@@ -749,7 +751,169 @@ async fn two_phase_activation_migration_applies_and_constrains_states() {
     database.cleanup().await;
 }
 
-/// Migration 0015 (§B.9 expiry/resolve): legacy NULL `expires_at` rows are
+/// Migration 0016 (§B.8.7 sentinel detection, W1.14): the creator scan
+/// cursor column plus the durable candidate/evidence and exactly-once event
+/// tables, with the classification/event CHECKs, the idempotence UNIQUE
+/// keys, and the restart-safe second application.
+#[tokio::test]
+async fn sentinel_detection_migration_applies_and_constrains() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    for migration in [
+        include_str!("../../paykit-server/migrations/0001_initial.sql"),
+        include_str!("../../paykit-server/migrations/0002_deployment_stack_role.sql"),
+        include_str!("../../paykit-server/migrations/0003_invoice_observation_budget.sql"),
+        include_str!("../../paykit-server/migrations/0004_observation_request_count.sql"),
+        include_str!("../../paykit-server/migrations/0005_observation_overrun.sql"),
+        include_str!("../../paykit-server/migrations/0006_drop_observation_budget_columns.sql"),
+        include_str!("../../paykit-server/migrations/0007_invoice_observation_attempts.sql"),
+        include_str!("../../paykit-server/migrations/0008_invoice_creation_baseline.sql"),
+        include_str!("../../paykit-server/migrations/0009_observation_failure_isolation.sql"),
+        include_str!("../../paykit-server/migrations/0010_invoice_amount_nonce.sql"),
+        include_str!("../../paykit-server/migrations/0011_stack_identity.sql"),
+        include_str!("../../paykit-server/migrations/0012_claimed_key_fingerprints.sql"),
+        include_str!("../../paykit-server/migrations/0013_creator_allocation_mode.sql"),
+        include_str!("../../paykit-server/migrations/0014_two_phase_activation.sql"),
+        include_str!("../../paykit-server/migrations/0015_payment_request_expiry.sql"),
+    ] {
+        sqlx::raw_sql(migration).execute(pool).await.unwrap();
+    }
+    let creator_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO creators (creator_lookup_hash, credential_envelope, first_child_index)
+         VALUES ($1, $2, 0) RETURNING id",
+    )
+    .bind(b"sentinel-creator".as_slice())
+    .bind(b"sentinel-credential".as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(include_str!(
+        "../../paykit-server/migrations/0016_sentinel_detection.sql"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // The scan cursor column exists, nullable (NULL = never scanned).
+    let cursor_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'creators'
+           AND column_name = 'sentinel_last_scanned_at'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(cursor_nullable, "YES");
+
+    // The durable seller-alert acknowledgement column exists, nullable
+    // (NULL = unread).
+    let ack_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'sentinel_events'
+           AND column_name = 'acknowledged_at'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(ack_nullable, "YES");
+
+    let insert_outpoint = |classification: &str, outpoint_hash: &'static [u8]| {
+        let pool = pool.clone();
+        let classification = classification.to_owned();
+        async move {
+            sqlx::query(
+                "INSERT INTO sentinel_outpoints
+                 (creator_id, sentinel_envelope, outpoint_lookup_hash, address_lookup_hash,
+                  derivation_index_lookup_hash, confirmations, classification)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            )
+            .bind(creator_id)
+            .bind(b"sealed-sentinel".as_slice())
+            .bind(outpoint_hash)
+            .bind(b"address-hash".as_slice())
+            .bind(b"derivation-index-hash".as_slice())
+            .bind(1_i32)
+            .bind(classification)
+            .execute(&pool)
+            .await
+        }
+    };
+    // Every legal classification is admitted.
+    for classification in ["candidate", "evidence", "superseded_by_assignment"] {
+        let hash: &'static [u8] = match classification {
+            "candidate" => b"outpoint-candidate",
+            "evidence" => b"outpoint-evidence",
+            _ => b"outpoint-superseded",
+        };
+        insert_outpoint(classification, hash).await.unwrap();
+    }
+    // An unknown classification is rejected (23514).
+    assert_check_violation(insert_outpoint("typo_dust", b"outpoint-bad").await);
+    // The idempotence key: one outpoint per creator, never double-counted.
+    assert_unique_violation(insert_outpoint("evidence", b"outpoint-evidence").await);
+    // Negative confirmation counts are rejected (23514).
+    assert_check_violation(
+        sqlx::query(
+            "INSERT INTO sentinel_outpoints
+             (creator_id, sentinel_envelope, outpoint_lookup_hash, address_lookup_hash,
+              derivation_index_lookup_hash, confirmations, classification)
+             VALUES ($1, $2, $3, $4, $5, -1, 'candidate')",
+        )
+        .bind(creator_id)
+        .bind(b"sealed-sentinel".as_slice())
+        .bind(b"outpoint-negative-conf".as_slice())
+        .bind(b"address-hash".as_slice())
+        .bind(b"derivation-index-hash".as_slice())
+        .execute(pool)
+        .await,
+    );
+
+    // The exactly-once event table: one sentinel_downgrade per creator.
+    let insert_event = |kind: &str, reason: &str| {
+        let pool = pool.clone();
+        let kind = kind.to_owned();
+        let reason = reason.to_owned();
+        async move {
+            sqlx::query(
+                "INSERT INTO sentinel_events (creator_id, event_kind, reason)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(creator_id)
+            .bind(kind)
+            .bind(reason)
+            .execute(&pool)
+            .await
+        }
+    };
+    insert_event("sentinel_downgrade", "unassigned_sentinel_evidence")
+        .await
+        .unwrap();
+    assert_unique_violation(
+        insert_event("sentinel_downgrade", "unassigned_sentinel_evidence").await,
+    );
+    assert_check_violation(insert_event("sentinel_downgrade", "account_has_history").await);
+    assert_check_violation(insert_event("other_kind", "unassigned_sentinel_evidence").await);
+
+    // The creator delete is restricted while evidence or events reference it.
+    let delete = sqlx::query("DELETE FROM creators WHERE id = $1")
+        .bind(creator_id)
+        .execute(pool)
+        .await;
+    assert_eq!(
+        delete
+            .expect_err("deleting a referenced creator unexpectedly succeeded")
+            .as_database_error()
+            .unwrap()
+            .code()
+            .as_deref(),
+        Some("23503"),
+        "ON DELETE RESTRICT protects the audit rows"
+    );
+
+    database.cleanup().await;
+}
 /// backfilled to `created_at + 24 hours` and the column closes to NOT NULL;
 /// the resolution CHECKs reject every invalid combination (23514);
 /// `bitcoin_observations.late_settlement` defaults false.

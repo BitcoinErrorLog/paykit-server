@@ -12,6 +12,7 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
 use paykit_server::{
+    allocation::AllocationMode,
     application::payment_status::{PaymentStatusService, PersistedPaymentStatus, StatusRepository},
     config::{Config, ConfigEnvironment},
     domain::locks::{BundleId, CreatorPubky},
@@ -147,6 +148,7 @@ async fn known_unobserved_status_is_exactly_undetected() {
         &key,
         Some(PersistedPaymentStatus::Undetected {
             late_settlement: false,
+            allocation_mode: AllocationMode::Exclusive,
         }),
     )
     .oneshot(signed_request(&key))
@@ -156,7 +158,7 @@ async fn known_unobserved_status_is_exactly_undetected() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response_body(response).await,
-        r#"{"status":"undetected","confirmations":0,"amount_matched":false,"late_settlement":false}"#
+        r#"{"status":"undetected","confirmations":0,"amount_matched":false,"late_settlement":false,"allocation_mode":"exclusive","contract_version":"paykit.bitcoin_status/v2"}"#
     );
 }
 
@@ -168,16 +170,18 @@ async fn known_observed_statuses_serialize_only_factual_fields() {
                 confirmations: 0,
                 amount_matched: false,
                 late_settlement: false,
+                allocation_mode: AllocationMode::Exclusive,
             },
-            r#"{"status":"detected","confirmations":0,"amount_matched":false,"late_settlement":false}"#,
+            r#"{"status":"detected","confirmations":0,"amount_matched":false,"late_settlement":false,"allocation_mode":"exclusive","contract_version":"paykit.bitcoin_status/v2"}"#,
         ),
         (
             PersistedPaymentStatus::Confirmed {
                 confirmations: 3,
                 amount_matched: true,
                 late_settlement: false,
+                allocation_mode: AllocationMode::Exclusive,
             },
-            r#"{"status":"confirmed","confirmations":3,"amount_matched":true,"late_settlement":false}"#,
+            r#"{"status":"confirmed","confirmations":3,"amount_matched":true,"late_settlement":false,"allocation_mode":"exclusive","contract_version":"paykit.bitcoin_status/v2"}"#,
         ),
     ] {
         let key = SigningKey::from_bytes(&[7; 32]);
@@ -198,6 +202,7 @@ async fn status_route_uses_task9_signed_authentication() {
         &key,
         Some(PersistedPaymentStatus::Undetected {
             late_settlement: false,
+            allocation_mode: AllocationMode::Exclusive,
         }),
     )
     .oneshot(signed_request(&key))
@@ -209,6 +214,7 @@ async fn status_route_uses_task9_signed_authentication() {
         &key,
         Some(PersistedPaymentStatus::Undetected {
             late_settlement: false,
+            allocation_mode: AllocationMode::Exclusive,
         }),
     )
     .oneshot(signed_request(&SigningKey::from_bytes(&[8; 32])))
@@ -229,6 +235,7 @@ async fn status_route_rejects_noncanonical_or_nonclosed_bodies() {
             &key,
             Some(PersistedPaymentStatus::Undetected {
                 late_settlement: false,
+                allocation_mode: AllocationMode::Exclusive,
             }),
         )
         .oneshot(signed_request_with_body(&key, body))
@@ -242,6 +249,7 @@ async fn status_route_rejects_noncanonical_or_nonclosed_bodies() {
 async fn status_service_has_only_the_persisted_status_port() {
     let (service, repository) = service(Some(PersistedPaymentStatus::Undetected {
         late_settlement: false,
+        allocation_mode: AllocationMode::Exclusive,
     }));
     let creator = paykit_server::domain::locks::parse_creator(CREATOR).unwrap();
     let bundle_id = paykit_server::domain::locks::parse_bundle_id(BUNDLE).unwrap();

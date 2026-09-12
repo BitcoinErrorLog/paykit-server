@@ -58,15 +58,25 @@ impl AllocationMode {
             Self::SharedManual => "shared_manual",
         }
     }
+
+    /// Parses a persisted mode. `pasted_auto` has no enabling path and no
+    /// variant: it (and any unexpected value) fails closed to `None`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "exclusive" => Some(Self::Exclusive),
+            "shared_manual" => Some(Self::SharedManual),
+            _ => None,
+        }
+    }
 }
 
 /// §B.8.8's five fixed downgrade-reason identifiers. The seller-visible copy
 /// for each is fixed in §B.8.8 and rendered by the Shop client (W1.16); the
-/// server only ever stores and returns the identifier. Only the four
-/// claim-time reasons are constructed here;
+/// server only ever stores and returns the identifier. The four claim-time
+/// reasons are decided here;
 /// [`DowngradeReason::UnassignedSentinelEvidence`] is §B.8.7's
-/// sentinel-detection reason (W1.14) and exists so the seller status surface
-/// can name a persisted value.
+/// sentinel-detection reason (W1.14), written only by the sentinel's atomic
+/// downgrade transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DowngradeReason {
     /// The claim was not asserted on the Bitkit channel: a paste, a file
@@ -80,9 +90,8 @@ pub enum DowngradeReason {
     AccountIndexMismatch,
     /// The §B.5 claim scan found any history at all on the account.
     AccountHasHistory,
-    /// §B.8.7 definitive downgrade evidence (W1.14); no W1.13 code path
-    /// constructs it.
-    #[allow(dead_code)]
+    /// §B.8.7 definitive downgrade evidence (W1.14): confirmed
+    /// qualifying-value outputs at never-assigned derived addresses.
     UnassignedSentinelEvidence,
 }
 

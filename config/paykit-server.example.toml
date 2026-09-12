@@ -149,6 +149,42 @@ max_response_bytes = 1048576
 # trouble.
 # max_tip_age = "4h"
 
+# Unassigned-sentinel detection (W1.14, design B.8.7). The sentinel is the
+# creator-level backstop for exclusive (bitkit_watch_only_v1) creators: it
+# re-derives each exclusive creator's never-assigned BIP44 gap window (20
+# addresses, fixed) INSIDE the observer tick above — no second worker or
+# cadence — and treats confirmed outputs there as account-wide evidence.
+# Its only effect is the one-way downgrade exclusive -> shared_manual with
+# the fixed unassigned_sentinel_evidence reason; it never upgrades, never
+# auto-pays, and never touches assigned-address (under/over/late) payments.
+# The sentinel runs under a SUBORDINATE sub-budget of the shared electrum.*
+# request quota above — NOT a second endpoint quota. One tick's sentinel
+# allowance defaults to 10% of the shared bucket's remaining balance after
+# every live invoice target is satisfied (zero when any live target was
+# deferred), hard-capped by max_requests_per_tick and sustained-capped by
+# max_requests_per_second below; every admitted sentinel request is then
+# charged against the shared electrum bucket itself, so aggregate endpoint
+# traffic (probe + live lookups + sentinel scans + non-tick callers) never
+# exceeds electrum.max_requests_per_tick per tick or
+# electrum.max_requests_per_second sustained, and sentinel work never defers
+# a live target.
+# min_value_sats defaults to 294, the relay-standard P2WPKH dust floor
+# (98 vbytes x 3 sat/vbyte): below it an output is uneconomic spam, never a
+# candidate or evidence. hit_count defaults to 1: one confirmed qualifying
+# outpoint is definitive evidence. Mempool-only outputs are durable
+# candidates, never evidence. rescan_interval (default 10 minutes) is the
+# per-creator re-admission cadence; max_age (default 1 hour) is the
+# freshness SLO the sentinel age alert reports against — it never gates
+# creation and never mutates a mode. All fields are optional and every
+# value must be nonzero.
+# [sentinel]
+# min_value_sats = 294
+# hit_count = 1
+# rescan_interval = "10m"
+# max_age = "1h"
+# max_requests_per_tick = 1000
+# max_requests_per_second = 5
+
 [outbox]
 poll_interval = "5s"
 batch_size = 16

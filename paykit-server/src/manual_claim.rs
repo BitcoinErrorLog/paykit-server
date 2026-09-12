@@ -142,6 +142,16 @@ pub struct SellerAllocationStatus {
     /// The mutable derivation cursor the next invoice address derives from.
     /// Informational: it moves as invoices are allocated.
     pub next_child_index: u32,
+    /// The §B.8.7 sentinel detection evidence metadata (W1.14): every
+    /// durable candidate/evidence row for this creator, oldest first. Empty
+    /// until the sentinel records any.
+    pub evidence: Vec<crate::sentinel::SentinelEvidenceRecord>,
+    /// The durable, owner-visible §B.8.7 alerts (W1.14): at most one
+    /// `sentinel_downgrade` row with the fixed reason identifier, the
+    /// transition time and the seller's acknowledgement. Empty until a
+    /// downgrade commits. Status polling is the delivery mechanism — no
+    /// push channel exists; W1.16 renders it.
+    pub alerts: Vec<crate::sentinel::SentinelAlertRecord>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -535,12 +545,12 @@ impl ManualClaimService {
     }
 
     /// The authenticated seller's own allocation status (design §B.8.6):
-    /// mode, recorded claim channel, downgrade reason if any, and the two
-    /// evidence fields the Ring-verification client fails closed without —
+    /// mode, recorded claim channel, downgrade reason if any, the §B.8.7
+    /// sentinel detection evidence metadata (W1.14), and the two evidence
+    /// fields the Ring-verification client fails closed without —
     /// `key_fingerprint` and `first_derived_address`, derived from the
     /// persisted xpub by the exact functions the claim response uses (no
-    /// Electrum, no I/O beyond the creator row read). Detection evidence
-    /// metadata is §B.8.7's (W1.14) and not yet recorded.
+    /// Electrum, no I/O beyond the creator row reads).
     pub async fn allocation_status(
         &self,
         creator: &CreatorPubky,
@@ -555,6 +565,16 @@ impl ManualClaimService {
         };
         let (key_fingerprint, first_derived_address) =
             status_evidence(&record, &self.bitcoin_network)?;
+        let evidence = self
+            .creators
+            .sentinel_evidence(creator)
+            .await
+            .map_err(|_| ManualClaimError::Unavailable)?;
+        let alerts = self
+            .creators
+            .sentinel_alerts(creator)
+            .await
+            .map_err(|_| ManualClaimError::Unavailable)?;
         Ok(Some(SellerAllocationStatus {
             allocation_mode: record.allocation.allocation_mode,
             claim_channel: record.allocation.claim_channel,
@@ -566,7 +586,25 @@ impl ManualClaimService {
                 .map_err(|_| ManualClaimError::Unavailable)?,
             next_child_index: u32::try_from(record.next_child_index)
                 .map_err(|_| ManualClaimError::Unavailable)?,
+            evidence,
+            alerts,
         }))
+    }
+
+    /// The seller's durable read receipt for a sentinel alert (W1.14):
+    /// idempotent — acknowledging twice keeps the first receipt; unknown
+    /// event kinds fail closed and a missing alert is a no-op returning
+    /// false. Authentication/ownership is the caller's gate (the same
+    /// bearer-token check the status surface performs).
+    pub async fn acknowledge_sentinel_alert(
+        &self,
+        creator: &CreatorPubky,
+        event_kind: &str,
+    ) -> Result<bool, ManualClaimError> {
+        self.creators
+            .acknowledge_sentinel_alert(creator, event_kind)
+            .await
+            .map_err(|_| ManualClaimError::Unavailable)
     }
 
     /// Decodes and verifies the `AuthToken` and its exact capability set —

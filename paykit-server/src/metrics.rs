@@ -39,6 +39,8 @@ pub struct Metrics {
     electrum_observation_address_failures: Family<AddressFailureLabels, Counter>,
     electrum_zero_success_ticks: Counter,
     electrum_budget_exhausted_ticks: Counter,
+    sentinel_downgrades: Counter,
+    sentinel_oldest_unscanned_age_seconds: Gauge,
     payment_states: Gauge,
     runtime_active: Gauge,
     session_validation_results: Counter,
@@ -59,6 +61,8 @@ impl Metrics {
         let electrum_observation_address_failures = Family::default();
         let electrum_zero_success_ticks = Counter::default();
         let electrum_budget_exhausted_ticks = Counter::default();
+        let sentinel_downgrades = Counter::default();
+        let sentinel_oldest_unscanned_age_seconds = Gauge::default();
         let payment_states = Gauge::default();
         let runtime_active = Gauge::default();
         let session_validation_results = Counter::default();
@@ -125,6 +129,17 @@ impl Metrics {
             electrum_budget_exhausted_ticks.clone(),
         );
         registry.register(
+            "paykit_sentinel_downgrades",
+            "Exclusive accounts downgraded to shared_manual by unassigned-sentinel \
+             evidence (W1.14); one per account, on the transition only.",
+            sentinel_downgrades.clone(),
+        );
+        registry.register(
+            "paykit_sentinel_oldest_unscanned_age_seconds",
+            "Age of the oldest admitted exclusive account's last completed sentinel scan.",
+            sentinel_oldest_unscanned_age_seconds.clone(),
+        );
+        registry.register(
             "paykit_payment_states",
             "Aggregate persisted payment-state count.",
             payment_states.clone(),
@@ -153,6 +168,8 @@ impl Metrics {
             electrum_observation_address_failures,
             electrum_zero_success_ticks,
             electrum_budget_exhausted_ticks,
+            sentinel_downgrades,
+            sentinel_oldest_unscanned_age_seconds,
             payment_states,
             runtime_active,
             session_validation_results,
@@ -194,6 +211,13 @@ impl Metrics {
     }
     pub fn electrum_budget_exhausted_tick(&self) {
         self.electrum_budget_exhausted_ticks.inc();
+    }
+    pub fn sentinel_downgrade(&self) {
+        self.sentinel_downgrades.inc();
+    }
+    pub fn set_sentinel_oldest_unscanned_age_seconds(&self, seconds: i64) {
+        self.sentinel_oldest_unscanned_age_seconds
+            .set(seconds.max(0));
     }
     pub fn set_payment_states(&self, value: i64) {
         self.payment_states.set(value);

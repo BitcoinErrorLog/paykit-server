@@ -947,9 +947,17 @@ impl InvoiceStore {
     ) -> Result<Option<PersistedPaymentStatus>, PersistenceError> {
         let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
         let bundle_hash = self.crypto.lookup_hash(bundle_id.to_string().as_bytes());
+        // The creator's CURRENT allocation mode is read from the database
+        // in this same query (W1.14, design D.3 F9): the automatic paid
+        // transition the marketplace drives off this surface gates on the
+        // mode at transition time, never on a claim-time cached copy, so a
+        // sentinel downgrade landing after invoice creation but before the
+        // payment commit routes the order to the manual-review /
+        // seller-confirm path instead of auto-paying.
         let row = sqlx::query_as::<_, PaymentStatusRow>(
             "SELECT invoices.payment_status, invoices.confirmation_count, invoices.amount_matched, \
-                    COALESCE(observations.late_settlement, FALSE) AS late_settlement \
+                    COALESCE(observations.late_settlement, FALSE) AS late_settlement, \
+                    creators.allocation_mode \
              FROM invoices JOIN creators ON creators.id = invoices.creator_id \
              LEFT JOIN bitcoin_observations AS observations \
                ON observations.invoice_id = invoices.id AND observations.active \
@@ -961,6 +969,43 @@ impl InvoiceStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         row.map(PersistedPaymentStatus::try_from).transpose()
+    }
+
+    /// W1.14 sentinel admission plan, delegated to the creator store so the
+    /// observer tick's single `ObservationBackend` covers invoice
+    /// observation and sentinel work. See
+    /// [`crate::persistence::CreatorStore::sentinel_plan`].
+    pub async fn sentinel_plan(
+        &self,
+        rescan_interval: std::time::Duration,
+        limit: i64,
+    ) -> Result<Vec<crate::sentinel::SentinelScanTarget>, PersistenceError> {
+        crate::persistence::CreatorStore::new(&self.pool, self.crypto.clone())
+            .sentinel_plan(rescan_interval, limit)
+            .await
+    }
+
+    /// The sentinel's atomic apply; see
+    /// [`crate::persistence::CreatorStore::apply_sentinel_scan`].
+    pub async fn apply_sentinel_scan(
+        &self,
+        creator_id: Uuid,
+        findings: &[crate::sentinel::SentinelFinding],
+        thresholds: &crate::sentinel::SentinelThresholds,
+    ) -> Result<crate::sentinel::SentinelScanOutcome, PersistenceError> {
+        crate::persistence::CreatorStore::new(&self.pool, self.crypto.clone())
+            .apply_sentinel_scan(creator_id, findings, thresholds)
+            .await
+    }
+
+    /// The oldest admitted exclusive creator's scan age; see
+    /// [`crate::persistence::CreatorStore::oldest_exclusive_sentinel_age`].
+    pub async fn oldest_exclusive_sentinel_age(
+        &self,
+    ) -> Result<Option<std::time::Duration>, PersistenceError> {
+        crate::persistence::CreatorStore::new(&self.pool, self.crypto.clone())
+            .oldest_exclusive_sentinel_age()
+            .await
     }
 
     pub async fn complete_creation_baseline(
@@ -2769,6 +2814,7 @@ struct PaymentStatusRow {
     confirmation_count: i32,
     amount_matched: bool,
     late_settlement: bool,
+    allocation_mode: String,
 }
 
 impl TryFrom<PaymentStatusRow> for PersistedPaymentStatus {
@@ -2777,19 +2823,24 @@ impl TryFrom<PaymentStatusRow> for PersistedPaymentStatus {
     fn try_from(row: PaymentStatusRow) -> Result<Self, Self::Error> {
         let confirmations = u32::try_from(row.confirmation_count)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let allocation_mode = crate::allocation::AllocationMode::parse(&row.allocation_mode)
+            .ok_or(PersistenceError::CorruptOrMissing)?;
         match row.payment_status.as_str() {
             "undetected" => Ok(Self::Undetected {
                 late_settlement: row.late_settlement,
+                allocation_mode,
             }),
             "detected" => Ok(Self::Detected {
                 confirmations,
                 amount_matched: row.amount_matched,
                 late_settlement: row.late_settlement,
+                allocation_mode,
             }),
             "confirmed" => Ok(Self::Confirmed {
                 confirmations,
                 amount_matched: row.amount_matched,
                 late_settlement: row.late_settlement,
+                allocation_mode,
             }),
             _ => Err(PersistenceError::CorruptOrMissing),
         }
@@ -2888,12 +2939,23 @@ mod tests {
                 confirmation_count: 0,
                 amount_matched: false,
                 late_settlement: false,
+                allocation_mode: "exclusive".into(),
             },
             PaymentStatusRow {
                 payment_status: "confirmed".into(),
                 confirmation_count: -1,
                 amount_matched: true,
                 late_settlement: false,
+                allocation_mode: "exclusive".into(),
+            },
+            PaymentStatusRow {
+                // `pasted_auto` has no enabling path and no variant: the
+                // read fails closed.
+                payment_status: "confirmed".into(),
+                confirmation_count: 1,
+                amount_matched: true,
+                late_settlement: false,
+                allocation_mode: "pasted_auto".into(),
             },
         ] {
             assert_eq!(

@@ -308,6 +308,30 @@ pub trait ObservationBackend: Send + Sync {
     ) -> Result<crate::persistence::ExpiryTransitions, ObserverError> {
         Ok(crate::persistence::ExpiryTransitions::default())
     }
+    /// The W1.14 sentinel admission plan (§B.8.7): exclusive creators whose
+    /// last completed scan is older than `rescan_interval`, stalest first.
+    async fn sentinel_plan(
+        &self,
+        _rescan_interval: Duration,
+        _limit: i64,
+    ) -> Result<Vec<crate::sentinel::SentinelScanTarget>, ObserverError> {
+        Ok(Vec::new())
+    }
+    /// The sentinel's atomic evidence + downgrade apply for one creator's
+    /// completed window scan (§B.8.7, F11).
+    async fn apply_sentinel_scan(
+        &self,
+        _creator_id: uuid::Uuid,
+        _findings: Vec<crate::sentinel::SentinelFinding>,
+        _thresholds: crate::sentinel::SentinelThresholds,
+    ) -> Result<crate::sentinel::SentinelScanOutcome, ObserverError> {
+        Ok(crate::sentinel::SentinelScanOutcome::default())
+    }
+    /// The oldest admitted exclusive creator's scan age: the sentinel
+    /// freshness alert input.
+    async fn oldest_sentinel_age(&self) -> Result<Option<Duration>, ObserverError> {
+        Ok(None)
+    }
 }
 
 #[async_trait]
@@ -391,6 +415,33 @@ impl ObservationBackend for InvoiceStore {
         tail: Duration,
     ) -> Result<crate::persistence::ExpiryTransitions, ObserverError> {
         InvoiceStore::apply_expiry_transitions(self, tail)
+            .await
+            .map_err(map_persistence)
+    }
+
+    async fn sentinel_plan(
+        &self,
+        rescan_interval: Duration,
+        limit: i64,
+    ) -> Result<Vec<crate::sentinel::SentinelScanTarget>, ObserverError> {
+        InvoiceStore::sentinel_plan(self, rescan_interval, limit)
+            .await
+            .map_err(map_persistence)
+    }
+
+    async fn apply_sentinel_scan(
+        &self,
+        creator_id: uuid::Uuid,
+        findings: Vec<crate::sentinel::SentinelFinding>,
+        thresholds: crate::sentinel::SentinelThresholds,
+    ) -> Result<crate::sentinel::SentinelScanOutcome, ObserverError> {
+        InvoiceStore::apply_sentinel_scan(self, creator_id, &findings, &thresholds)
+            .await
+            .map_err(map_persistence)
+    }
+
+    async fn oldest_sentinel_age(&self) -> Result<Option<Duration>, ObserverError> {
+        InvoiceStore::oldest_exclusive_sentinel_age(self)
             .await
             .map_err(map_persistence)
     }
@@ -748,6 +799,27 @@ impl AddressFailureLog {
     }
 }
 
+/// Cross-tick sentinel state: the W1.14 policy and the sentinel's
+/// subordinate per-tick sub-budget. The sub-budget is an ACCOUNTING limiter
+/// only — it bounds the sentinel to its configured per-tick capacity and
+/// sustained per-second refill — while every sentinel Electrum request is
+/// ALSO charged against the shared global bucket (the same
+/// [`RequestLimiter`] the probe, live lookups, candidate fetch and every
+/// non-tick caller draw from). There is exactly one endpoint quota: the
+/// tick's probe + live lookups + sentinel scans + non-tick callers can
+/// never jointly exceed `electrum.max_requests_per_tick` in one tick or
+/// `electrum.max_requests_per_second` sustained. The sentinel's allowance
+/// is computed AFTER the probe and every live admission: zero when any
+/// live target was deferred, otherwise 10% of the shared bucket's
+/// remaining balance (the design §B.8.7 default), bounded further by the
+/// configured sentinel caps and by whole creator scan windows — so sentinel
+/// work can never be the reason a live target is deferred.
+#[derive(Clone, Debug)]
+pub struct SentinelTickState {
+    policy: crate::sentinel::SentinelPolicy,
+    sub_budget: RequestLimiter,
+}
+
 /// Cross-tick observer state owned by the loop: the shared sustained
 /// request limiter, the per-address failure-log rate limiter, and the
 /// zero-success-tick log streak.
@@ -762,6 +834,10 @@ pub struct ObserverTickState {
     max_transaction_bytes: usize,
     baseline_completion_timeout: Duration,
     expiry_tail: Duration,
+    /// W1.14 sentinel state; `None` until [`Self::enable_sentinel`] (the
+    /// production loop always enables it; sentinel work never runs without
+    /// an explicit policy).
+    sentinel: Option<SentinelTickState>,
 }
 
 impl ObserverTickState {
@@ -797,7 +873,33 @@ impl ObserverTickState {
             max_transaction_bytes,
             baseline_completion_timeout: Duration::from_secs(60),
             expiry_tail: Duration::from_secs(24 * 60 * 60),
+            sentinel: None,
         }
+    }
+
+    /// Enables the W1.14 sentinel for this loop with its subordinate
+    /// sub-budget built from the policy (`max_requests_per_tick` capacity,
+    /// `max_requests_per_second` refill). The sub-budget only accounts the
+    /// sentinel's configured caps; every admitted sentinel request is
+    /// charged against THIS state's shared `budget` limiter — the one
+    /// global endpoint quota the probe, live lookups and non-tick callers
+    /// already draw from.
+    pub fn enable_sentinel(&mut self, policy: crate::sentinel::SentinelPolicy) {
+        self.sentinel = Some(SentinelTickState {
+            policy,
+            sub_budget: RequestLimiter::new(
+                u64::from(policy.max_requests_per_tick),
+                u64::from(policy.max_requests_per_second),
+            ),
+        });
+    }
+
+    /// Tokens the sentinel sub-budget currently holds (post-refill), for
+    /// tests and diagnostics. `None` when the sentinel is not enabled.
+    pub fn sentinel_budget_available(&self) -> Option<u64> {
+        self.sentinel
+            .as_ref()
+            .map(|sentinel| sentinel.sub_budget.available())
     }
 
     /// The shared limiter this tick charges, for other callers to clone.
@@ -1026,6 +1128,19 @@ pub async fn observe_tick(
     let deferred = selection.deferred.len();
     if selection.batch.is_empty() {
         runtime.set_electrum_available(true);
+        // No live work this tick: the sentinel phase still runs (inside
+        // this same tick, from the leftover shared budget — zero when any
+        // live target was deferred).
+        sentinel_phase(
+            port,
+            backend,
+            network,
+            runtime,
+            state,
+            tip.height,
+            selection.deferred.len(),
+        )
+        .await;
         return ObserverTickOutcome::Observed {
             processed,
             deferred,
@@ -1183,10 +1298,192 @@ pub async fn observe_tick(
     // successes); they never degrade endpoint availability. The endpoint
     // degrades solely on a probe or connect failure, handled above.
     runtime.set_electrum_available(true);
+    // The W1.14 sentinel phase runs LAST in the tick, strictly subordinate
+    // to live invoice observation: every live admission, lookup, stamp and
+    // the candidate fetch are already settled, and the sentinel draws only
+    // leftover shared-bucket tokens under its subordinate allowance.
+    sentinel_phase(port, backend, network, runtime, state, tip.height, deferred).await;
     ObserverTickOutcome::Observed {
         processed,
         deferred,
         failed: failed_count,
+    }
+}
+
+/// Runs the W1.14 sentinel phase at the END of one observer tick (§B.8.7):
+/// after every live-target decision of the tick, exclusive creators due for
+/// a re-scan are admitted one whole BIP44 window at a time against the
+/// sentinel's SUBORDINATE allowance. The allowance is computed here, after
+/// the probe and every live admission: ZERO when any live target was
+/// deferred this tick, otherwise 10% of the shared bucket's remaining
+/// balance (the §B.8.7 default), bounded by the configured sentinel caps
+/// (accounted in the sub-budget limiter) and by whole creator windows.
+/// Every admitted request is then charged against the shared global bucket
+/// itself, so the tick's probe + live lookups + sentinel scans + non-tick
+/// callers never jointly exceed the configured endpoint quota
+/// (`electrum.max_requests_per_tick`, `electrum.max_requests_per_second`),
+/// live targets are never deferred by sentinel work, and non-tick callers
+/// keep at least 90% of the post-live balance. Every sentinel failure is
+/// isolated: it is logged and counted, and never changes the tick's
+/// outcome or endpoint availability. A window with any per-address lookup
+/// failure is retried next tick untouched — Electrum failure downgrades
+/// nothing.
+async fn sentinel_phase(
+    port: &dyn ElectrumPort,
+    backend: &dyn ObservationBackend,
+    network: &BitcoinNetwork,
+    runtime: &Runtime,
+    state: &mut ObserverTickState,
+    tip_height: u32,
+    live_deferred: usize,
+) {
+    // Clone the shared limiter handle up front (an `Arc` bump, not a second
+    // bucket) so the phase can charge the global quota while the sentinel
+    // sub-budget is borrowed.
+    let shared_budget = state.budget.clone();
+    let Some(sentinel) = state.sentinel.as_mut() else {
+        return;
+    };
+    let policy = sentinel.policy;
+    // The freshness SLO alert: it reports the oldest admitted exclusive
+    // creator's scan age — it never hides creation and never mutates a mode.
+    match backend.oldest_sentinel_age().await {
+        Ok(Some(age)) => {
+            runtime.metrics().set_sentinel_oldest_unscanned_age_seconds(
+                i64::try_from(age.as_secs()).unwrap_or(i64::MAX),
+            );
+            if age > policy.max_age {
+                tracing::warn!(
+                    age_secs = age.as_secs(),
+                    "oldest admitted exclusive creator exceeds the sentinel freshness SLO"
+                );
+            }
+        }
+        Ok(None) => runtime
+            .metrics()
+            .set_sentinel_oldest_unscanned_age_seconds(0),
+        Err(_) => {
+            tracing::warn!("sentinel staleness read failed; the age alert is stale this tick")
+        }
+    }
+    let plan = match backend
+        .sentinel_plan(policy.rescan_interval, policy.per_tick_creator_limit())
+        .await
+    {
+        Ok(plan) => plan,
+        Err(_) => {
+            tracing::warn!("sentinel plan unavailable; skipping sentinel work this tick");
+            return;
+        }
+    };
+    if plan.is_empty() {
+        return;
+    }
+    // The subordinate allowance, computed AFTER the probe and every live
+    // admission of this tick. A tick that deferred any live target admits
+    // no sentinel work at all; otherwise the default is 10% of the shared
+    // bucket's remaining balance, hard-capped so the sentinel can never be
+    // the reason a live target defers and non-tick callers keep the rest.
+    let allowance = if live_deferred > 0 {
+        0
+    } else {
+        shared_budget.available() / 10
+    };
+    let scan_window = u64::from(policy.scan_window);
+    // Two atomic reservations, one accounting, one real:
+    // 1. the sub-budget accounts the configured sentinel caps (per-tick
+    //    capacity, sustained per-second refill) over the allowance;
+    // 2. the SHARED bucket charges the actual endpoint requests — the
+    //    sentinel can only ever spend leftover global tokens, so the joint
+    //    live+sentinel+non-tick total stays inside the one endpoint quota.
+    let window_demand = scan_window.saturating_mul(u64::try_from(plan.len()).unwrap_or(u64::MAX));
+    let sub_grant = sentinel
+        .sub_budget
+        .reserve_up_to(allowance.min(window_demand))
+        .granted();
+    let grant = shared_budget.reserve_up_to(sub_grant).granted();
+    let mut remaining = grant;
+    for target in &plan {
+        if remaining < scan_window {
+            break;
+        }
+        remaining -= scan_window;
+        let window = match crate::sentinel::scan_window_addresses(
+            target.xpub(),
+            target.account_index(),
+            network,
+            target.window_start(),
+            policy.scan_window,
+        ) {
+            Ok(window) => window,
+            Err(_) => {
+                tracing::warn!("sentinel window derivation failed; skipping one creator");
+                continue;
+            }
+        };
+        let index_by_address: HashMap<String, i64> = window
+            .iter()
+            .map(|(index, address)| (address.clone(), *index))
+            .collect();
+        let targets: Vec<ObservationTarget> = window
+            .into_iter()
+            .map(|(_, address)| ObservationTarget::new(address, None))
+            .collect();
+        let report = match port.observations(tip_height, &targets).await {
+            Ok(report) => report,
+            Err(_) => {
+                // Endpoint-level failure: later creators would fail
+                // identically; nothing was applied or stamped.
+                tracing::warn!("sentinel window lookup failed at the endpoint; ending the phase");
+                break;
+            }
+        };
+        if !report.failed.is_empty() {
+            // Isolated per-address failures: this window is evidence
+            // neither way. The creator is not stamped, so the per-creator
+            // cadence is not consumed and a persistent failure surfaces
+            // through the freshness alert above.
+            tracing::warn!(
+                failed = report.failed.len(),
+                "sentinel window had isolated lookup failures; the creator is retried next tick"
+            );
+            continue;
+        }
+        let findings: Vec<crate::sentinel::SentinelFinding> = report
+            .outputs
+            .iter()
+            .filter(|output| output.present)
+            .filter_map(|output| {
+                index_by_address.get(output.address.as_str()).map(|index| {
+                    crate::sentinel::SentinelFinding::new(
+                        *index,
+                        output.address.clone(),
+                        output.outpoint,
+                        output.sats,
+                        output.confirmations,
+                    )
+                })
+            })
+            .collect();
+        match backend
+            .apply_sentinel_scan(target.creator_id(), findings, policy.thresholds)
+            .await
+        {
+            Ok(outcome) => {
+                if outcome.downgraded {
+                    runtime.metrics().sentinel_downgrade();
+                    tracing::info!(
+                        evidence = outcome.evidence,
+                        "unassigned-sentinel evidence downgraded an exclusive creator to shared_manual"
+                    );
+                }
+            }
+            Err(_) => {
+                tracing::warn!(
+                    "sentinel apply failed for one creator; it stays due for the next tick"
+                );
+            }
+        }
     }
 }
 
@@ -1201,6 +1498,7 @@ pub async fn observation_loop(
     leadership: Arc<dyn ObserverLeadership>,
     network: BitcoinNetwork,
     policy: ObserverPolicy,
+    sentinel_policy: crate::sentinel::SentinelPolicy,
     runtime: Arc<Runtime>,
 ) {
     let mut backoff = ObserverBackoff::new();
@@ -1214,6 +1512,9 @@ pub async fn observation_loop(
     );
     state.baseline_completion_timeout = policy.baseline_completion_timeout;
     state.expiry_tail = policy.expiry_tail;
+    // The W1.14 sentinel runs INSIDE this same tick, from its own distinct
+    // token budget — never a second worker or cadence.
+    state.enable_sentinel(sentinel_policy);
     let mut first_tick = true;
     let mut was_leader = true;
     loop {

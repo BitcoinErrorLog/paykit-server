@@ -36,6 +36,7 @@ pub struct Config {
     pub paykit: PaykitConfig,
     pub bitcoin: BitcoinConfig,
     pub electrum: ElectrumConfig,
+    pub sentinel: SentinelConfig,
     pub outbox: OutboxConfig,
     pub limits: LimitsConfig,
     pub rate_limits: RateLimitsConfig,
@@ -122,6 +123,7 @@ impl Config {
                 claim_scan_window_deadline: raw.electrum.claim_scan_window_deadline,
                 max_concurrent_claim_scans: raw.electrum.max_concurrent_claim_scans,
             },
+            sentinel: SentinelConfig::from(raw.sentinel),
             outbox: OutboxConfig::from(raw.outbox),
             limits: LimitsConfig::from(raw.limits),
             rate_limits: RateLimitsConfig::from(raw.rate_limits),
@@ -181,6 +183,8 @@ impl Config {
                 "electrum.claim_scan_window_deadline",
                 self.electrum.claim_scan_window_deadline,
             ),
+            ("sentinel.rescan_interval", self.sentinel.rescan_interval),
+            ("sentinel.max_age", self.sentinel.max_age),
         ] {
             if value.is_zero() {
                 return Err(ConfigError::ZeroDuration(name));
@@ -196,6 +200,13 @@ impl Config {
         if self.bitcoin.expiry_tail.as_secs() > MAX_POSTGRES_INTERVAL_SECONDS {
             return Err(ConfigError::DurationExceedsPostgresInterval(
                 "bitcoin.expiry_tail",
+            ));
+        }
+        // `sentinel.rescan_interval` flows to `make_interval(secs => i64)`
+        // in the sentinel admission plan, so it takes the same bound.
+        if self.sentinel.rescan_interval.as_secs() > MAX_POSTGRES_INTERVAL_SECONDS {
+            return Err(ConfigError::DurationExceedsPostgresInterval(
+                "sentinel.rescan_interval",
             ));
         }
         for (name, value) in [
@@ -262,6 +273,16 @@ impl Config {
                 "rate_limits.claims_per_minute",
                 self.rate_limits.claims_per_minute,
             ),
+            ("sentinel.min_value_sats", self.sentinel.min_value_sats),
+            ("sentinel.hit_count", self.sentinel.hit_count),
+            (
+                "sentinel.max_requests_per_tick",
+                u64::from(self.sentinel.max_requests_per_tick),
+            ),
+            (
+                "sentinel.max_requests_per_second",
+                u64::from(self.sentinel.max_requests_per_second),
+            ),
         ] {
             if value == 0 {
                 return Err(ConfigError::ZeroValue(name));
@@ -272,6 +293,7 @@ impl Config {
             ("outbox.lease_duration", self.outbox.lease_duration),
             ("outbox.retry_initial", self.outbox.retry_initial),
             ("outbox.retry_max", self.outbox.retry_max),
+            ("sentinel.rescan_interval", self.sentinel.rescan_interval),
         ] {
             if value < Duration::from_secs(1) {
                 return Err(ConfigError::SubsecondPersistenceDuration(name));
@@ -758,6 +780,57 @@ pub struct OutboxConfig {
     pub retry_max: Duration,
 }
 
+/// W1.14 unassigned-sentinel configuration (design §B.8.7). The sentinel
+/// runs INSIDE the §B.7 observer tick (no second worker or cadence) under a
+/// SUBORDINATE sub-budget of the shared `electrum.*` request quota — not a
+/// second endpoint quota. One tick's sentinel allowance defaults to 10% of
+/// the shared bucket's remaining balance after every live invoice target is
+/// satisfied (zero when any live target was deferred), hard-capped by
+/// `max_requests_per_tick`, sustained-capped by `max_requests_per_second`,
+/// and every admitted sentinel request is charged against the shared bucket
+/// itself: aggregate endpoint traffic never exceeds
+/// `electrum.max_requests_per_tick` per tick or
+/// `electrum.max_requests_per_second` sustained, and sentinel work never
+/// defers a live target.
+#[derive(Debug)]
+pub struct SentinelConfig {
+    /// Minimum output value: the relay-standard P2WPKH dust floor (default
+    /// 294 sats). Below it an output is never a candidate or evidence.
+    pub min_value_sats: u64,
+    /// Distinct `txid:vout` hits required for the downgrade predicate
+    /// (default 1).
+    pub hit_count: u64,
+    /// Per-creator re-scan cadence (default 10 minutes): a scanned creator
+    /// is not re-admitted within this interval.
+    pub rescan_interval: Duration,
+    /// Freshness SLO (default 1 hour): the sentinel age alert reports the
+    /// oldest admitted exclusive creator older than this; it never gates
+    /// creation and never mutates a mode.
+    pub max_age: Duration,
+    /// Sentinel sub-budget capacity per tick (default 1,000): a cap on the
+    /// subordinate allowance, never additional endpoint capacity.
+    pub max_requests_per_tick: u32,
+    /// Sentinel sub-budget sustained refill (default 5/second).
+    pub max_requests_per_second: u32,
+}
+
+impl SentinelConfig {
+    /// The validated runtime policy; the BIP44 scan window is fixed.
+    pub fn policy(&self) -> crate::sentinel::SentinelPolicy {
+        crate::sentinel::SentinelPolicy {
+            thresholds: crate::sentinel::SentinelThresholds {
+                min_value_sats: self.min_value_sats,
+                hit_count: self.hit_count,
+            },
+            rescan_interval: self.rescan_interval,
+            max_age: self.max_age,
+            max_requests_per_tick: self.max_requests_per_tick,
+            max_requests_per_second: self.max_requests_per_second,
+            scan_window: crate::sentinel::SENTINEL_SCAN_WINDOW,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct LimitsConfig {
     pub request_body_bytes: u64,
@@ -943,6 +1016,8 @@ struct RawConfig {
     #[serde(default)]
     deployment: Option<RawDeploymentConfig>,
     electrum: RawElectrumConfig,
+    #[serde(default)]
+    sentinel: RawSentinelConfig,
     outbox: RawOutboxConfig,
     #[serde(default)]
     limits: RawLimitsConfig,
@@ -1148,6 +1223,73 @@ fn default_electrum_request_timeout() -> Duration {
 
 fn default_outbox_batch_size() -> u32 {
     16
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSentinelConfig {
+    #[serde(default = "default_sentinel_min_value_sats")]
+    min_value_sats: u64,
+    #[serde(default = "default_sentinel_hit_count")]
+    hit_count: u64,
+    #[serde(default = "default_sentinel_rescan_interval", with = "humantime_serde")]
+    rescan_interval: Duration,
+    #[serde(default = "default_sentinel_max_age", with = "humantime_serde")]
+    max_age: Duration,
+    #[serde(default = "default_sentinel_max_requests_per_tick")]
+    max_requests_per_tick: u32,
+    #[serde(default = "default_sentinel_max_requests_per_second")]
+    max_requests_per_second: u32,
+}
+
+const fn default_sentinel_min_value_sats() -> u64 {
+    crate::sentinel::DEFAULT_MIN_VALUE_SATS
+}
+
+const fn default_sentinel_hit_count() -> u64 {
+    crate::sentinel::DEFAULT_HIT_COUNT
+}
+
+const fn default_sentinel_rescan_interval() -> Duration {
+    crate::sentinel::DEFAULT_RESCAN_INTERVAL
+}
+
+const fn default_sentinel_max_age() -> Duration {
+    crate::sentinel::DEFAULT_MAX_AGE
+}
+
+const fn default_sentinel_max_requests_per_tick() -> u32 {
+    crate::sentinel::DEFAULT_MAX_REQUESTS_PER_TICK
+}
+
+const fn default_sentinel_max_requests_per_second() -> u32 {
+    crate::sentinel::DEFAULT_MAX_REQUESTS_PER_SECOND
+}
+
+impl Default for RawSentinelConfig {
+    fn default() -> Self {
+        Self {
+            min_value_sats: default_sentinel_min_value_sats(),
+            hit_count: default_sentinel_hit_count(),
+            rescan_interval: default_sentinel_rescan_interval(),
+            max_age: default_sentinel_max_age(),
+            max_requests_per_tick: default_sentinel_max_requests_per_tick(),
+            max_requests_per_second: default_sentinel_max_requests_per_second(),
+        }
+    }
+}
+
+impl From<RawSentinelConfig> for SentinelConfig {
+    fn from(value: RawSentinelConfig) -> Self {
+        Self {
+            min_value_sats: value.min_value_sats,
+            hit_count: value.hit_count,
+            rescan_interval: value.rescan_interval,
+            max_age: value.max_age,
+            max_requests_per_tick: value.max_requests_per_tick,
+            max_requests_per_second: value.max_requests_per_second,
+        }
+    }
 }
 
 #[derive(Deserialize)]

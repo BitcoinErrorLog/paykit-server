@@ -719,7 +719,11 @@ async fn wait_for_completion(
                     "status": "confirmed",
                     "confirmations": 6,
                     "amount_matched": true,
-                    "late_settlement": false
+                    "late_settlement": false,
+                    // W1.14: the creator's current mode rides the status
+                    // contract; the composed creators are shared_manual.
+                    "allocation_mode": "shared_manual",
+                    "contract_version": "paykit.bitcoin_status/v2"
                 });
         }
         if delivered == 4 && statuses_confirmed {

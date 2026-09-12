@@ -447,6 +447,7 @@ async fn paste_is_shared_manual_bitkit_corroborated_is_exclusive_and_status_is_o
     assert_eq!(body["first_child_index"], 0);
     assert_eq!(body["next_child_index"], 0);
     assert_eq!(body["evidence"], serde_json::json!([]));
+    assert_eq!(body["alerts"], serde_json::json!([]));
     // No key material beyond the claim response's fields is present.
     let object = body.as_object().unwrap();
     for key in object.keys() {
@@ -463,6 +464,7 @@ async fn paste_is_shared_manual_bitkit_corroborated_is_exclusive_and_status_is_o
                     | "first_child_index"
                     | "next_child_index"
                     | "evidence"
+                    | "alerts"
             ),
             "unexpected status field: {key}"
         );
@@ -1011,6 +1013,251 @@ async fn unknown_channel_requests_do_not_consume_the_claim_rate_limit() {
         StatusCode::OK,
         "the valid claim is admitted — the garbage consumed no budget: {body}"
     );
+
+    fixture.database.cleanup().await;
+}
+
+/// W1.14: after the sentinel's atomic downgrade, the authenticated seller
+/// status surface serves the current mode, the fixed §B.8.8 reason
+/// identifier, and the §B.8.7 detection evidence metadata — the seller's
+/// own durable rows, with fixed field names and no interpolated text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn status_serves_sentinel_evidence_after_the_downgrade() {
+    use bitcoin::{OutPoint, Txid, hashes::Hash};
+    use paykit_server::sentinel::{SentinelFinding, SentinelPolicy, scan_window_addresses};
+
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let fixture = fixture().await;
+    let seller = fixture.seller().await;
+    let history = ScriptedHistory::clean();
+    let router = fixture.router(fixture.service(StackRole::Proof, history));
+    let xpub = account_xpub(103, 3);
+    let (status, body) = post_claim(
+        &router,
+        &seller,
+        &fixture.required_capabilities,
+        &xpub,
+        3,
+        Some("bitkit_watch_only_v1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bitkit claim: {body}");
+    assert_eq!(body["allocation_mode"], "exclusive");
+
+    // The store-level seam the tick drives: one qualifying confirmed output
+    // at a never-assigned window address (index 4 of the gap window).
+    let creator = creator_of(&seller);
+    let creator_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM creators")
+        .fetch_one(fixture.database.pool())
+        .await
+        .unwrap();
+    let window = scan_window_addresses(&xpub, 3, &BitcoinNetwork::Testnet, 0, 20).unwrap();
+    let outpoint = OutPoint::new(Txid::from_byte_array([77; 32]), 1);
+    let findings = [SentinelFinding::new(
+        4,
+        window[4].1.clone(),
+        outpoint,
+        550,
+        3,
+    )];
+    let outcome = fixture
+        .creators
+        .apply_sentinel_scan(creator_id, &findings, &SentinelPolicy::default().thresholds)
+        .await
+        .unwrap();
+    assert!(outcome.downgraded);
+
+    let (status, body) = get_status(
+        &router,
+        &creator,
+        Some(&claim_token(&seller, &fixture.required_capabilities)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "owner status: {body}");
+    assert_eq!(body["allocation_mode"], "shared_manual");
+    assert_eq!(body["downgrade_reason"], "unassigned_sentinel_evidence");
+    let evidence = body["evidence"].as_array().unwrap();
+    assert_eq!(evidence.len(), 1, "one durable evidence row: {body}");
+    let row = &evidence[0];
+    assert_eq!(row["classification"], "evidence");
+    assert_eq!(row["derivation_index"], 4);
+    assert_eq!(row["address"], window[4].1);
+    assert_eq!(row["outpoint"], outpoint.to_string());
+    assert_eq!(row["value_sats"], 550);
+    assert_eq!(row["confirmations"], 3);
+    assert!(row["first_observed_at"].is_string());
+    assert!(row["last_observed_at"].is_string());
+
+    fixture.database.cleanup().await;
+}
+
+/// W1.14: the one `sentinel_downgrade` transition event is a durable,
+/// unread/acknowledgeable seller alert delivered through the authenticated
+/// owner status surface (status polling is the only repo mechanism — no
+/// push channel is invented; W1.16 renders it). The owner sees exactly one
+/// alert with the stable event kind, the fixed reason identifier, the
+/// transition time and a null acknowledgement; the acknowledge call sets
+/// the receipt exactly once (idempotent); an unrelated authenticated
+/// identity gets 403 on both surfaces; and repeat post-downgrade evidence
+/// never raises a second alert. All served fields are static identifiers
+/// and timestamps — no address/xpub/outpoint/value interpolation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn owner_status_serves_and_acknowledges_the_sentinel_alert_once() {
+    use bitcoin::{OutPoint, Txid, hashes::Hash};
+    use paykit_server::sentinel::{SentinelFinding, SentinelPolicy, scan_window_addresses};
+
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let fixture = fixture().await;
+    let seller = fixture.seller().await;
+    let other = fixture.seller().await;
+    let router = fixture.router(fixture.service(StackRole::Proof, ScriptedHistory::clean()));
+    let xpub = account_xpub(104, 3);
+    let (status, body) = post_claim(
+        &router,
+        &seller,
+        &fixture.required_capabilities,
+        &xpub,
+        3,
+        Some("bitkit_watch_only_v1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bitkit claim: {body}");
+    let creator = creator_of(&seller);
+    let owner_token = claim_token(&seller, &fixture.required_capabilities);
+    let other_token = claim_token(&other, &fixture.required_capabilities);
+    let ack_path = format!("/v0/accounts/{creator}/alerts/acknowledge");
+    let ack = |bearer: Option<&str>, kind: &str| {
+        let router = router.clone();
+        let path = ack_path.clone();
+        let bearer = bearer.map(str::to_owned);
+        let kind = kind.to_owned();
+        async move {
+            let mut request = Request::post(path).header("content-type", "application/json");
+            if let Some(bearer) = bearer {
+                request = request.header("authorization", format!("Bearer {bearer}"));
+            }
+            let response = router
+                .oneshot(
+                    request
+                        .body(Body::from(
+                            serde_json::json!({ "event_kind": kind }).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            )
+        }
+    };
+
+    // Before any downgrade: the alerts array is present and empty.
+    let (status, body) = get_status(&router, &creator, Some(&owner_token)).await;
+    assert_eq!(status, StatusCode::OK, "owner status: {body}");
+    assert_eq!(body["alerts"].as_array().unwrap().len(), 0, "{body}");
+
+    // The sentinel's atomic downgrade commits (one qualifying confirmed
+    // output at a never-assigned window address).
+    let creator_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM creators")
+        .fetch_one(fixture.database.pool())
+        .await
+        .unwrap();
+    let window = scan_window_addresses(&xpub, 3, &BitcoinNetwork::Testnet, 0, 20).unwrap();
+    let outpoint = OutPoint::new(Txid::from_byte_array([78; 32]), 1);
+    let findings = [SentinelFinding::new(
+        4,
+        window[4].1.clone(),
+        outpoint,
+        550,
+        3,
+    )];
+    let outcome = fixture
+        .creators
+        .apply_sentinel_scan(creator_id, &findings, &SentinelPolicy::default().thresholds)
+        .await
+        .unwrap();
+    assert!(outcome.downgraded);
+
+    // The owner sees exactly one durable, UNREAD alert with the stable
+    // kind, fixed reason and transition time.
+    let (status, body) = get_status(&router, &creator, Some(&owner_token)).await;
+    assert_eq!(status, StatusCode::OK, "owner status: {body}");
+    let alerts = body["alerts"].as_array().unwrap();
+    assert_eq!(
+        alerts.len(),
+        1,
+        "exactly one alert, on the transition: {body}"
+    );
+    let alert = &alerts[0];
+    assert_eq!(alert["event_kind"], "sentinel_downgrade");
+    assert_eq!(alert["reason"], "unassigned_sentinel_evidence");
+    assert!(alert["created_at"].is_string());
+    assert!(
+        alert["acknowledged_at"].is_null(),
+        "unread until the owner acknowledges"
+    );
+
+    // Unauthenticated and unrelated identities: 401 / 403 on the
+    // acknowledge surface; the unrelated identity is 403 on the status
+    // surface too (the alert is the seller's own data).
+    let (status, _) = ack(None, "sentinel_downgrade").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = ack(Some(&other_token), "sentinel_downgrade").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = get_status(&router, &creator, Some(&other_token)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    // An unknown event kind fails closed before any write.
+    let (status, _) = ack(Some(&owner_token), "typo_kind").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // The owner's acknowledgement is durable and exactly-once: the first
+    // receipt stands, a second acknowledge changes nothing.
+    let (status, body) = ack(Some(&owner_token), "sentinel_downgrade").await;
+    assert_eq!(status, StatusCode::OK, "acknowledge: {body}");
+    assert_eq!(body["acknowledged"], true);
+    let (_, body) = get_status(&router, &creator, Some(&owner_token)).await;
+    let first_receipt = body["alerts"][0]["acknowledged_at"].clone();
+    assert!(first_receipt.is_string(), "the receipt is served: {body}");
+    let (status, _) = ack(Some(&owner_token), "sentinel_downgrade").await;
+    assert_eq!(status, StatusCode::OK, "idempotent");
+    let (_, body) = get_status(&router, &creator, Some(&owner_token)).await;
+    assert_eq!(
+        body["alerts"][0]["acknowledged_at"], first_receipt,
+        "the first receipt is never moved or cleared"
+    );
+
+    // Repeat post-downgrade evidence commits (the §B.8.7 in-flight commit)
+    // but raises NO second alert.
+    let outpoint2 = OutPoint::new(Txid::from_byte_array([79; 32]), 2);
+    let findings2 = [SentinelFinding::new(
+        5,
+        window[5].1.clone(),
+        outpoint2,
+        600,
+        2,
+    )];
+    let second = fixture
+        .creators
+        .apply_sentinel_scan(
+            creator_id,
+            &findings2,
+            &SentinelPolicy::default().thresholds,
+        )
+        .await
+        .unwrap();
+    assert!(!second.admitted && !second.downgraded);
+    assert_eq!(second.evidence, 1, "post-downgrade evidence still commits");
+    let (_, body) = get_status(&router, &creator, Some(&owner_token)).await;
+    assert_eq!(
+        body["alerts"].as_array().unwrap().len(),
+        1,
+        "repeat evidence never raises a second alert: {body}"
+    );
+    assert_eq!(body["evidence"].as_array().unwrap().len(), 2, "{body}");
 
     fixture.database.cleanup().await;
 }
