@@ -1087,7 +1087,7 @@ struct RawBitcoinConfig {
 }
 
 const fn default_bitcoin_creation_enabled() -> bool {
-    true
+    false
 }
 
 /// §B.11.1: `prepare_expires_at = created_at + prepare_ttl`. Far longer than
@@ -1465,4 +1465,14 @@ const fn default_claims_per_minute() -> u64 {
 }
 const fn default_shutdown_drain_timeout() -> Duration {
     Duration::from_secs(30)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_bitcoin_creation_enabled;
+
+    #[test]
+    fn omitted_bitcoin_creation_is_disabled() {
+        assert!(!default_bitcoin_creation_enabled());
+    }
 }

@@ -181,6 +181,7 @@ allowed_origins = ["https://app.example"]
 receiver_path = "paykit/server"
 network = "testnet"
 [bitcoin]
+creation_enabled = true
 network = "testnet"
 [deployment]
 stack_role = "proof"

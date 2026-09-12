@@ -110,6 +110,29 @@ fn parses_exact_local_compose_config_contract() {
 }
 
 #[test]
+fn bitcoin_creation_flag_requires_explicit_enablement() {
+    let omitted = Config::from_toml_and_environment(&valid_toml(), environment())
+        .expect("configuration with omitted creation flag");
+    assert!(!omitted.bitcoin.creation_enabled);
+
+    let enabled_toml = valid_toml().replace(
+        "[bitcoin]\nnetwork = \"testnet\"",
+        "[bitcoin]\ncreation_enabled = true\nnetwork = \"testnet\"",
+    );
+    let enabled = Config::from_toml_and_environment(&enabled_toml, environment())
+        .expect("configuration with explicit creation enablement");
+    assert!(enabled.bitcoin.creation_enabled);
+
+    let disabled_toml = valid_toml().replace(
+        "[bitcoin]\nnetwork = \"testnet\"",
+        "[bitcoin]\ncreation_enabled = false\nnetwork = \"testnet\"",
+    );
+    let disabled = Config::from_toml_and_environment(&disabled_toml, environment())
+        .expect("configuration with explicit creation disablement");
+    assert!(!disabled.bitcoin.creation_enabled);
+}
+
+#[test]
 fn local_compose_config_rejects_unknown_keys() {
     let input = format!("unknown = true\n{}", local_compose_toml());
 

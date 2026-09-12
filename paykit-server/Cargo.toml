@@ -2,6 +2,7 @@
 name = "paykit-server"
 version = "0.1.0"
 default-run = "paykit-server"
+build = "build.rs"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

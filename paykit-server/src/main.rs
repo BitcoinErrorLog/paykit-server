@@ -2,6 +2,7 @@ use std::{env, fs, process::ExitCode};
 
 use paykit_server::{
     Server,
+    build_metadata::emit_startup_metadata,
     config::{Config, ConfigEnvironment},
     startup::{InitializedDatabase, initialize_database},
 };
@@ -51,18 +52,10 @@ async fn run_server() -> anyhow::Result<()> {
         pool,
         stack_identity,
     } = initialize_database(&config).await?;
-    let electrum_host = url::Url::parse(&config.electrum.endpoint)
-        .ok()
-        .and_then(|endpoint| endpoint.host_str().map(str::to_owned))
-        .unwrap_or_else(|| "<unparseable>".to_owned());
-    tracing::info!(
-        bitcoin_network = config.deployment_invariants().bitcoin_network.as_str(),
-        stack_role = config.deployment_invariants().stack_role.as_str(),
-        stack_id = stack_identity.stack_id(),
-        electrum_host = electrum_host,
-        version = env!("CARGO_PKG_VERSION"),
-        "deployment invariants verified; the stack role is adopted once on \
-         first boot and every later boot refuses a mismatch"
+    emit_startup_metadata(
+        config.deployment_invariants().bitcoin_network.as_str(),
+        config.deployment_invariants().stack_role.as_str(),
+        &stack_identity.stack_id(),
     );
     let listen_addr = config.http.listen_addr.clone();
     let server = Server::build(config, pool, stack_identity).await?;

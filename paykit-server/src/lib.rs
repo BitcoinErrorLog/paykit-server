@@ -8,6 +8,8 @@ pub mod bitcoin;
 pub mod bitkit_claim;
 /// SDK-owned normal AUTH initiation bound to the Bitkit claim query pair.
 pub mod bitkit_setup;
+/// Build and startup provenance metadata.
+pub mod build_metadata;
 /// Claim-time address-index history scan (design §B.5).
 pub mod chain_history;
 pub mod config;

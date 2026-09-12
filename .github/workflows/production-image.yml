@@ -1,0 +1,171 @@
+name: Production image
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-image-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/bitcoinerrorlog/paykit-server
+
+jobs:
+  check:
+    name: Build production image check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Check production image definitions
+        run: |
+          set -eu
+          test -f Dockerfile.production
+          test -f .dockerignore
+          if grep -nE 'ttl\.sh|(^|[[:space:]])\.\./|paykit-lib|paykit-sdk|locks' Dockerfile.production; then
+            echo "Dockerfile.production contains a forbidden build input" >&2
+            exit 1
+          fi
+          grep -qE '^ARG RUST_IMAGE=rust:1\.91\.1-bookworm@sha256:[0-9a-f]{64}$' Dockerfile.production
+          if grep -nE 'apt(-get)?([[:space:]]|$)|(^|[[:space:]])apt([[:space:]]|$)' Dockerfile.production; then
+            echo "Dockerfile.production must not install packages with apt" >&2
+            exit 1
+          fi
+          grep -q 'cargo build --locked --release -p paykit-server --bin paykit-server' Dockerfile.production
+          grep -q 'org.opencontainers.image.revision' Dockerfile.production
+          grep -q 'SOURCE_SHA' Dockerfile.production
+          grep -q 'USER paykit:paykit' Dockerfile.production
+          grep -q 'SOURCE_SHA' paykit-server/build.rs
+          grep -q 'bitcoin.creation_enabled = false' docs/production-rehearsal.md
+          grep -q 'ssl://bitkit.to:9999' docs/production-rehearsal.md
+          grep -q 'packages: write' .github/workflows/production-image.yml
+          if grep -nE ':[[:space:]]*latest([[:space:]]|$)' .github/workflows/production-image.yml; then
+            echo "workflow contains a mutable image tag" >&2
+            exit 1
+          fi
+          grep -q "github.ref == 'refs/heads/master'" .github/workflows/production-image.yml
+          imagetools_pattern='imagetools'" inspect"
+          if grep -q "$imagetools_pattern" .github/workflows/production-image.yml; then
+            echo "workflow must not substitute imagetools metadata for push metadata" >&2
+            exit 1
+          fi
+          grep -q 'containerimage.digest' .github/workflows/production-image.yml
+
+      - name: Build without publishing
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/production-image"
+          docker buildx build \
+            --file Dockerfile.production \
+            --build-arg "SOURCE_SHA=$SOURCE_SHA" \
+            --tag "$IMAGE:sha-$SOURCE_SHA" \
+            --provenance=true \
+            --sbom=true \
+            --metadata-file "$RUNNER_TEMP/production-image/metadata.json" \
+            --output "type=oci,dest=$RUNNER_TEMP/production-image/image.tar" \
+            .
+          test -s "$RUNNER_TEMP/production-image/image.tar"
+          {
+            echo "### Production image check"
+            echo "- source SHA: \`$SOURCE_SHA\`"
+            echo "- image build: passed without publishing"
+            cat "$RUNNER_TEMP/production-image/metadata.json"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Reject invalid source SHA
+        run: |
+          set -eu
+          if SOURCE_SHA=not-a-commit cargo check --locked --release -p paykit-server >/tmp/paykit-invalid-sha.log 2>&1; then
+            cat /tmp/paykit-invalid-sha.log
+            echo "invalid SOURCE_SHA was accepted" >&2
+            exit 1
+          fi
+          grep -q 'SOURCE_SHA must be exactly 40 hexadecimal characters' /tmp/paykit-invalid-sha.log
+
+      - name: Upload build evidence
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: paykit-server-production-image-${{ github.sha }}
+          path: ${{ runner.temp }}/production-image/metadata.json
+
+  publish:
+    name: Publish immutable production image
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "${GITHUB_ACTOR}" --password-stdin
+
+      - name: Publish source-tagged image
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          test "$GITHUB_REF" = refs/heads/master
+          test "$SOURCE_SHA" = "$(git rev-parse HEAD)"
+          git merge-base --is-ancestor "$SOURCE_SHA" refs/remotes/origin/master
+          metadata_file="$RUNNER_TEMP/production-image-push-metadata.json"
+          mkdir -p "$(dirname "$metadata_file")" "$RUNNER_TEMP/production-image"
+          docker buildx build \
+            --file Dockerfile.production \
+            --build-arg "SOURCE_SHA=$SOURCE_SHA" \
+            --tag "$IMAGE:sha-$SOURCE_SHA" \
+            --provenance=true \
+            --sbom=true \
+            --push \
+            --metadata-file "$metadata_file" \
+            .
+          digest="$(jq -r '."containerimage.digest" // empty' "$metadata_file")"
+          case "$digest" in sha256:*) ;; *) echo "missing image digest" >&2; exit 1 ;; esac
+          {
+            echo "### Published production image"
+            echo "- source SHA: \`$SOURCE_SHA\`"
+            echo "- immutable image: \`$IMAGE@$digest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          jq -n \
+            --arg immutable_image "$IMAGE@$digest" \
+            --arg digest "$digest" \
+            --arg source_sha "$SOURCE_SHA" \
+            --slurpfile buildx_push_metadata "$metadata_file" \
+            '{
+              immutable_image: $immutable_image,
+              digest: $digest,
+              source_sha: $source_sha,
+              buildx_push_metadata: $buildx_push_metadata[0]
+            }' > "$RUNNER_TEMP/production-image/publish-evidence.json"
+
+      - name: Upload publish evidence
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4
+        with:
+          name: paykit-server-production-image-publish-${{ github.sha }}
+          path: ${{ runner.temp }}/production-image/publish-evidence.json
+          retention-days: 14

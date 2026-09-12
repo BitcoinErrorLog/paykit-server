@@ -38,7 +38,8 @@ network = "testnet"
 network = "testnet"
 # Kill switch: when false, new Bitcoin payment-request binds are refused with
 # the stable code bitcoin_creation_disabled while existing invoices keep
-# being observed. Defaults to true.
+# being observed. Omitted configuration defaults to false; set this explicitly
+# to true only in an environment intended to enable creation.
 # creation_enabled = true
 # Lifetime of a `prepared` invoice awaiting the marketplace's signed
 # activation (two-phase creation, design §B.11): prepare_expires_at is
