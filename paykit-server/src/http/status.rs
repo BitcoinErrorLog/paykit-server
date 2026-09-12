@@ -27,6 +27,17 @@ struct StatusResponse {
     status: &'static str,
     confirmations: u32,
     amount_matched: bool,
+    late_settlement: bool,
+    /// The creator's CURRENT database allocation mode (W1.14): the
+    /// automatic paid transition gates on it at transition time — never a
+    /// claim-time cached copy. Always present, always exactly `exclusive`
+    /// or `shared_manual` (an unknown persisted mode fails the read
+    /// closed rather than emitting an ignorable value).
+    allocation_mode: &'static str,
+    /// The versioned status contract identifier (W1.14): consumers that
+    /// auto-confirm MUST fail closed on any other (or missing) version —
+    /// see [`crate::application::payment_status::BITCOIN_STATUS_CONTRACT_V2`].
+    contract_version: &'static str,
 }
 
 pub fn status_router(service: Arc<PaymentStatusService>) -> Router {
@@ -60,6 +71,9 @@ impl From<PaymentStatusResponse> for StatusResponse {
             status: value.status(),
             confirmations: value.confirmations(),
             amount_matched: value.amount_matched(),
+            late_settlement: value.late_settlement(),
+            allocation_mode: value.allocation_mode().as_str(),
+            contract_version: crate::application::payment_status::BITCOIN_STATUS_CONTRACT_V2,
         }
     }
 }

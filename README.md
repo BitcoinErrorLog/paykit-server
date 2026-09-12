@@ -1,5 +1,34 @@
 # Paykit Server
 
+## This fork: Pubky Marketplace project
+
+This is `BitcoinErrorLog/paykit-server` (branch `marketplace-rails`), a fork
+of the official [`pubky/paykit-server`](https://github.com/pubky/paykit-server)
+used by the Pubky Marketplace's deployed payment rails
+(`BitcoinErrorLog/pubky-payment-rails`). No upstream PRs are filed while the
+protocol shape settles.
+
+**Added over upstream:**
+
+- **Signed marketplace payment requests**: a payment-request route
+  authenticated exactly like `/invoices` (canonical JSON body, single
+  `x-paykit-signature` header), whose expected signer is the marketplace
+  transaction service — configured via the optional `marketplace`
+  trust-anchor config. One signer uses `marketplace.trusted_public_key`;
+  several marketplace-service instances (for example production and staging,
+  each signing with its own key) use the list form
+  `marketplace.trusted_public_keys = ["pubky...", "pubky..."]`. A request is
+  accepted when any trusted key verifies; the verified key's id (a truncated
+  SHA-256 fingerprint, never key material) is logged. This is how the
+  service requests receiver-side invoices for physical-bitcoin orders
+  without ever holding wallet material.
+- **Manual watch-only claims**: a companion-claim path used by the composed
+  test environment and the live Bitkit wallet-leg proof.
+
+**Fixes:** endpoint identifiers and JSON payloads are advertised
+network-correct (and the e2e workflow/reader-demo assertions validate
+spec-correct payloads as JSON values rather than strings).
+
 A PostgreSQL-backed, receiver-side Paykit prototype for Locks invoice workflows. It derives and observes a direct invoice-specific Bitcoin address. It does not use payer identity, payer inbox messages, or payment-proof messages to attribute payment.
 
 This repository is pre-production. Persisted-data compatibility, stable releases, and production deployment support are not yet provided.
@@ -29,7 +58,7 @@ Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report sec
 
 ## Executable boundary
 
-`paykit-server` composes and supervises the production HTTP routes, Paykit delivery workers, and BDK Electrum observer in one process.
+`paykit-server` composes and supervises the production HTTP routes, Paykit delivery workers, and Electrum observer in one process.
 
 Public operational routes:
 
@@ -41,10 +70,14 @@ Business routes:
 
 - `GET /setup`
 - `POST /setup/{flow_id}/complete`
-- signed `POST /invoices`
-- signed `POST /transactions/status`
+- signed `POST /invoices` — two-phase prepare (design §B.11): `200` with the prepare body; the invoice lands `prepared`, nothing is published
+- signed `POST /v0/payment-requests` — the marketplace entrypoint, same two-phase prepare and body
+- signed `POST /invoices/{invoice_id}/activate` and `POST /v0/payment-requests/{invoice_id}/activate` — phase 2: verifies the echoed `stack_id`/`total_sats`, takes the §B.4.6 tick-1 snapshot, flips `prepared → observing` and releases the outbox in one transaction; idempotent
+- signed `POST /invoices/{invoice_id}/void` and `POST /v0/payment-requests/{invoice_id}/void` — cancels a `prepared` invoice; idempotent, with the §B.11.3 named errors (`prepare_expired`, `invoice_finalized`, `unknown_invoice`, `stack_identity_mismatch`, `activation_total_mismatch`)
+- signed `POST /invoices/{invoice_id}/resolve` and `POST /v0/payment-requests/{invoice_id}/resolve` — the §B.9 marketplace money-outcome record: `paid_manually` finalizes `observing`/`expired_tail` to `resolved_paid_manually`, `refunded`/`abandoned` to `resolved_closed`; on `expired_final` the resolution is recorded for audit without resuming observation; one-way and idempotent on `(invoice_id, resolution)`, with the §B.9 named errors (`invoice_not_activated`, `invoice_already_resolved`, `invoice_baseline_in_progress`, `unknown_invoice`, `stack_identity_mismatch`)
+- signed `POST /transactions/status` — factual payment status; carries `late_settlement` for observations recorded in the §B.9 expiry tail (never a settlement: the marketplace routes them to `manual_review`)
 
-Invoice/status signatures use the configured trusted Locks Ed25519 key. Setup uses the Bitkit Pubky Auth companion-claim flow and an exact configured browser origin.
+Invoice/status signatures use the configured trusted Locks Ed25519 key; the activate/void/resolve routes use the same signed-body authentication as the create routes. Setup uses the Bitkit Pubky Auth companion-claim flow and an exact configured browser origin. A `prepared` invoice is never observed and never published (§B.11.5); the reaper voids it at `bitcoin.prepare_ttl` (default 15 min) without activation. Both prepare entrypoints require `expires_at` (refused when missing, past, or beyond `bitcoin.max_request_expiry`, default 24 h) and carry it into the published request's `proposal_expires_at`; at `expires_at` the invoice moves `observing → expired_tail` (still observed, deprioritized) and at `expires_at + bitcoin.expiry_tail` (default 24 h) to `expired_final`, leaving observation for good.
 
 ### Setup iframe
 
@@ -157,7 +190,7 @@ The invoice API returns after durable intent commit. It does not wait for Encryp
 
 ## Bitcoin settlement semantics
 
-Each invoice receives a unique BIP84 external-chain address. Observation uses the configured `bdk_electrum` adapter and persists complete validated batches atomically.
+Each invoice receives a unique BIP84 external-chain address. Observation uses one raw `script_list_unspent` lookup per tracked address (exactly one Electrum request per address, no history fetch or transaction fanout; see [`docs/observer-threat-model.md`](docs/observer-threat-model.md)) and persists complete validated batches atomically.
 
 - Outputs are evaluated independently; split or multi-output payments are not aggregated.
 - A single amount-matched output is sufficient for the factual amount match.

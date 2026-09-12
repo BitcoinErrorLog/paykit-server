@@ -9,7 +9,7 @@ use bitcoin::bip32::Xpub;
 use paykit_sdk::{PubkyAuthCompanionClaim, PubkyLocalSecretKey, PubkySessionBootstrap};
 use paykit_server::{
     bitkit_claim::{CLAIM_TYPE, LOCAL_DEMO_CAPABILITIES, QUERY_PARAMETER, encode_unsigned_payload},
-    config::BitcoinNetwork,
+    config::{BitcoinNetwork, StackRole},
     real_setup::validate_xpub,
 };
 use serde::Deserialize;
@@ -73,10 +73,13 @@ async fn run() -> Result<(), Failure> {
     if !input.account_xpub.starts_with("tpub") || input.account_xpub != xpub.to_string() {
         return Err(Failure::InvalidInput);
     }
+    // A local CLI encoding helper, not a claim path: validate under the proof
+    // role so the deny-list (a server-side claim gate) does not apply here.
     validate_xpub(
         &xpub.encode(),
         input.account_index,
         &BitcoinNetwork::Regtest,
+        StackRole::Proof,
     )
     .map_err(|_| Failure::InvalidInput)?;
     let payload = encode_unsigned_payload(input.account_index, &xpub.encode());

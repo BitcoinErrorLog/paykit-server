@@ -1,6 +1,6 @@
 //! Direct Bitcoin observation boundary for invoice-specific addresses.
 
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use bitcoin::OutPoint;
 
@@ -80,6 +80,7 @@ pub struct ObservedOutput {
     pub outpoint: OutPoint,
     pub sats: u64,
     pub confirmations: u32,
+    pub confirmed_height: Option<u32>,
     /// False models an output removed by a replacement or reorganization.
     pub present: bool,
 }
@@ -93,6 +94,7 @@ impl fmt::Debug for ObservedOutput {
             .field("outpoint", &"<redacted>")
             .field("sats", &"<redacted>")
             .field("confirmations", &self.confirmations)
+            .field("confirmed_height", &self.confirmed_height)
             .field("present", &self.present)
             .finish()
     }
@@ -110,11 +112,24 @@ impl ObservedOutput {
     }
 }
 
+/// The exact-amount settlement predicate (design §B.8.2): an observed output
+/// settles an invoice only when it pays exactly the required amount. An
+/// overpayment is a mismatch: the invoice stays `observing`, and the
+/// marketplace service (marketplace-service `crates/service/src/workers.rs`)
+/// routes the order to its `manual_review` state — paykit-server's own
+/// `baseline_state = 'manual_review'` is a different thing (an unfetchable
+/// baseline). The per-invoice amount nonce is absorbed in the price and is
+/// never refunded on chain.
+pub fn amount_matches(present: bool, observed_sats: u64, required_sats: u64) -> bool {
+    present && observed_sats == required_sats
+}
+
 /// The durable binding currently associated with an invoice address.
 ///
-/// A matching output freezes after its first confirmation, but a confirmed
-/// underpayment remains replaceable. A matching output finalizes at six
-/// confirmations; callers report its count as exactly six thereafter.
+/// An exact-amount output freezes after its first confirmation, but a
+/// confirmed amount mismatch (under- or overpayment) remains replaceable. An
+/// exact-amount output finalizes at six confirmations; callers report its
+/// count as exactly six thereafter.
 #[derive(Clone, PartialEq, Eq)]
 pub struct DirectBinding {
     outpoint: String,
@@ -150,11 +165,11 @@ impl DirectBinding {
     }
 
     pub fn is_final(&self, required_sats: u64) -> bool {
-        self.present && self.sats >= required_sats && self.confirmations >= 6
+        amount_matches(self.present, self.sats, required_sats) && self.confirmations >= 6
     }
 
     pub fn reported_confirmations(&self, required_sats: u64) -> u32 {
-        if self.sats >= required_sats {
+        if amount_matches(self.present, self.sats, required_sats) {
             self.confirmations.min(6)
         } else {
             self.confirmations
@@ -187,7 +202,7 @@ impl DirectBinding {
         if self.is_final(required_sats) {
             return ObservationAction::Ignore;
         }
-        if self.sats < required_sats || !self.present || self.confirmations == 0 {
+        if self.sats != required_sats || !self.present || self.confirmations == 0 {
             ObservationAction::Replace
         } else {
             ObservationAction::Ignore
@@ -200,4 +215,40 @@ pub enum ObservationAction {
     Update,
     Replace,
     Ignore,
+}
+
+/// One scheduled observation target. Observing a target costs exactly one
+/// Electrum `script_list_unspent` lookup regardless of the address's
+/// history or UTXO count, so the plan carries no request-cost bookkeeping:
+/// `staleness` (the age of the last successful observation, or of the
+/// invoice itself when it has never been observed) is the only scheduling
+/// input, and the oldest target is always first.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PlannedObservation {
+    target: ObservationTarget,
+    staleness: Duration,
+}
+
+impl PlannedObservation {
+    pub fn new(target: ObservationTarget, staleness: Duration) -> Self {
+        Self { target, staleness }
+    }
+
+    pub fn target(&self) -> &ObservationTarget {
+        &self.target
+    }
+
+    pub fn staleness(&self) -> Duration {
+        self.staleness
+    }
+}
+
+impl fmt::Debug for PlannedObservation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PlannedObservation")
+            .field("target", &self.target)
+            .field("staleness", &self.staleness)
+            .finish()
+    }
 }

@@ -1,10 +1,13 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use paykit_server::{
     Server,
+    bitcoin::ObservationTarget,
     config::{Config, ConfigEnvironment},
     persistence::run_migrations,
     runtime::ComponentState,
+    workers::observer::{ElectrumPort, ObservationReport, ObserverError, TipProbe},
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use pubky_testnet::EphemeralTestnet;
@@ -41,12 +44,13 @@ network = "testnet"
 
 [bitcoin]
 network = "testnet"
+[deployment]
+stack_role = "proof"
 
 [electrum]
 endpoint = "{electrum_endpoint}"
 poll_interval = "1s"
 request_timeout = "1s"
-connect_retries = 0
 
 [outbox]
 poll_interval = "1s"
@@ -76,6 +80,45 @@ async fn unavailable_electrum_endpoint() -> String {
     endpoint
 }
 
+/// Injected Electrum whose active probe always succeeds, so readiness no
+/// longer depends on the removed empty-target shortcut.
+struct HealthyElectrum;
+
+fn fresh_tip_time() -> u32 {
+    u32::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+}
+
+#[async_trait]
+impl ElectrumPort for HealthyElectrum {
+    async fn observations(
+        &self,
+        _tip_height: u32,
+        targets: &[ObservationTarget],
+    ) -> Result<ObservationReport, ObserverError> {
+        Ok(ObservationReport {
+            outputs: Vec::new(),
+            observed: targets
+                .iter()
+                .map(|target| target.address().to_owned())
+                .collect(),
+            failed: Vec::new(),
+        })
+    }
+
+    async fn probe(&self) -> Result<TipProbe, ObserverError> {
+        Ok(TipProbe {
+            height: 100,
+            time_unix: fresh_tip_time(),
+        })
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn production_workers_publish_startup_evidence_before_readiness() {
     let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
@@ -83,10 +126,14 @@ async fn production_workers_publish_startup_evidence_before_readiness() {
     run_migrations(database.pool()).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let endpoint = unavailable_electrum_endpoint().await;
-    let server = Server::build_with_pubky(
-        config(database.database_url(), &endpoint, "1s"),
+    let config = config(database.database_url(), &endpoint, "1s");
+    let stack_identity = stack_identity(database.pool(), &config).await;
+    let server = Server::build_with_transports(
+        config,
         database.pool().clone(),
+        stack_identity,
         testnet.sdk().unwrap(),
+        Arc::new(HealthyElectrum),
     )
     .await
     .unwrap();
@@ -127,9 +174,12 @@ async fn shutdown_deadline_aborts_a_database_blocked_owned_worker() {
     run_migrations(database.pool()).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let endpoint = unavailable_electrum_endpoint().await;
+    let config = config(database.database_url(), &endpoint, "100ms");
+    let stack_identity = stack_identity(database.pool(), &config).await;
     let server = Server::build_with_pubky(
-        config(database.database_url(), &endpoint, "100ms"),
+        config,
         database.pool().clone(),
+        stack_identity,
         testnet.sdk().unwrap(),
     )
     .await
@@ -182,4 +232,15 @@ async fn shutdown_deadline_aborts_a_database_blocked_owned_worker() {
     sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();
     drop(lock);
     database.cleanup().await;
+}
+/// Mints (once) and reads this test database's stack identity, as the
+/// production boot path does inside `initialize_database`.
+async fn stack_identity(
+    pool: &sqlx::PgPool,
+    config: &Config,
+) -> paykit_server::persistence::StackIdentity {
+    paykit_server::persistence::DeploymentStore::new(pool)
+        .stack_identity(config.deployment_invariants().stack_role)
+        .await
+        .unwrap()
 }

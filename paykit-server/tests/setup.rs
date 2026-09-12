@@ -22,8 +22,10 @@ use bitcoin::{
     secp256k1::Secp256k1,
 };
 use paykit_server::{
-    config::BitcoinNetwork,
+    bitkit_claim::ClaimError,
+    config::{BitcoinNetwork, StackRole},
     http::setup::setup_router,
+    key_identity::{canonical_key_tail, deny_list_account_xpub},
     real_setup::validate_xpub,
     setup::{
         BeginError, Completion, ManualClock, PollResult, SetupAttempt, SetupCompleter, SetupLimits,
@@ -53,8 +55,13 @@ fn account_xpub(network: Network, coin_type: u32, account_index: u32) -> Xpub {
 fn setup_claim_accepts_only_a_usable_canonical_bip84_account_xpub() {
     let xpub = account_xpub(Network::Bitcoin, 0, 7);
 
-    let canonical =
-        validate_xpub(&xpub.encode(), 7, &BitcoinNetwork::Mainnet).expect("valid account claim");
+    let canonical = validate_xpub(
+        &xpub.encode(),
+        7,
+        &BitcoinNetwork::Mainnet,
+        StackRole::Production,
+    )
+    .expect("valid account claim");
 
     assert_eq!(canonical, xpub.to_string());
     assert!(
@@ -72,10 +79,26 @@ fn setup_claim_accepts_only_a_usable_canonical_bip84_account_xpub() {
 #[test]
 fn setup_claim_rejects_xpub_for_the_wrong_configured_network() {
     let testnet = account_xpub(Network::Testnet, 1, 0);
-    assert!(validate_xpub(&testnet.encode(), 0, &BitcoinNetwork::Mainnet).is_err());
+    assert!(
+        validate_xpub(
+            &testnet.encode(),
+            0,
+            &BitcoinNetwork::Mainnet,
+            StackRole::Production
+        )
+        .is_err()
+    );
 
     let mainnet = account_xpub(Network::Bitcoin, 0, 0);
-    assert!(validate_xpub(&mainnet.encode(), 0, &BitcoinNetwork::Testnet).is_err());
+    assert!(
+        validate_xpub(
+            &mainnet.encode(),
+            0,
+            &BitcoinNetwork::Testnet,
+            StackRole::Production
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -84,14 +107,30 @@ fn setup_claim_rejects_non_account_depth_xpub() {
     let master = Xpriv::new_master(Network::Bitcoin, &[42; 32]).unwrap();
     let master_xpub = Xpub::from_priv(&secp, &master);
 
-    assert!(validate_xpub(&master_xpub.encode(), 0, &BitcoinNetwork::Mainnet).is_err());
+    assert!(
+        validate_xpub(
+            &master_xpub.encode(),
+            0,
+            &BitcoinNetwork::Mainnet,
+            StackRole::Production
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn setup_claim_rejects_account_xpub_for_a_different_hardened_account_index() {
     let account_one = account_xpub(Network::Bitcoin, 0, 1);
 
-    assert!(validate_xpub(&account_one.encode(), 0, &BitcoinNetwork::Mainnet).is_err());
+    assert!(
+        validate_xpub(
+            &account_one.encode(),
+            0,
+            &BitcoinNetwork::Mainnet,
+            StackRole::Production
+        )
+        .is_err()
+    );
 }
 
 #[test]
@@ -99,7 +138,99 @@ fn setup_claim_rejects_malformed_public_key_bytes() {
     let mut malformed = account_xpub(Network::Bitcoin, 0, 0).encode();
     malformed[45..78].fill(0);
 
-    assert!(validate_xpub(&malformed, 0, &BitcoinNetwork::Mainnet).is_err());
+    assert!(
+        validate_xpub(
+            &malformed,
+            0,
+            &BitcoinNetwork::Mainnet,
+            StackRole::Production
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn setup_claim_accepts_account_zero_under_both_roles() {
+    // The r4 behaviour: account 0 is the commonest legitimate case (most
+    // wallets export only account 0's xpub), so it is accepted under BOTH
+    // roles. Under r3's rule (0 refused) this test fails.
+    let xpub = account_xpub(Network::Bitcoin, 0, 0);
+    for role in [StackRole::Production, StackRole::Proof] {
+        assert_eq!(
+            validate_xpub(&xpub.encode(), 0, &BitcoinNetwork::Mainnet, role).as_deref(),
+            Ok(xpub.to_string().as_str()),
+            "account_index = 0 must be accepted under {role:?}"
+        );
+    }
+}
+
+#[test]
+fn setup_claim_bounds_the_account_index_at_ninety_nine() {
+    let ninety_nine = account_xpub(Network::Bitcoin, 0, 99);
+    assert!(
+        validate_xpub(
+            &ninety_nine.encode(),
+            99,
+            &BitcoinNetwork::Mainnet,
+            StackRole::Production
+        )
+        .is_ok(),
+        "account_index = 99 is the top of the claimable range"
+    );
+    let one_hundred = account_xpub(Network::Bitcoin, 0, 100);
+    assert_eq!(
+        validate_xpub(
+            &one_hundred.encode(),
+            100,
+            &BitcoinNetwork::Mainnet,
+            StackRole::Production
+        ),
+        Err(ClaimError::AccountIndexOutOfRange),
+        "account_index = 100 is refused with the named reason"
+    );
+}
+
+#[test]
+fn setup_claim_deny_lists_the_public_test_vector_key_on_production_only() {
+    // The BIP84 `abandon … about` account-0 key, as a client would submit it
+    // after normalizing either encoding: the zpub form's SLIP-132 version
+    // rewrite yields byte-identical 78 bytes, so one tail entry refuses both.
+    let xpub_bytes = deny_list_account_xpub(0, 0).encode();
+    let mut zpub_bytes = xpub_bytes;
+    zpub_bytes[..4].copy_from_slice(&0x02AA7ED3u32.to_be_bytes());
+    let zpub_string = bitcoin::base58::encode_check(&zpub_bytes);
+    let mut normalized: [u8; 78] = bitcoin::base58::decode_check(&zpub_string)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    normalized[..4].copy_from_slice(&0x0488B21Eu32.to_be_bytes());
+    assert_eq!(
+        canonical_key_tail(&normalized),
+        canonical_key_tail(&xpub_bytes),
+        "xpub and zpub encodings of one key share one canonical tail"
+    );
+
+    for bytes in [xpub_bytes, normalized] {
+        assert_eq!(
+            validate_xpub(&bytes, 0, &BitcoinNetwork::Mainnet, StackRole::Production),
+            Err(ClaimError::KeyDenyListed),
+            "the test-vector key is refused under production in either encoding's canonical bytes"
+        );
+    }
+    assert_eq!(
+        validate_xpub(&xpub_bytes, 0, &BitcoinNetwork::Mainnet, StackRole::Proof).as_deref(),
+        Ok(deny_list_account_xpub(0, 0).to_string().as_str()),
+        "the proof role exempts the deny-list (MAINNET-NEG claims account 0 of the public vector)"
+    );
+
+    // An unrelated key is accepted under both roles.
+    let unrelated = account_xpub(Network::Bitcoin, 0, 0);
+    for role in [StackRole::Production, StackRole::Proof] {
+        assert!(
+            validate_xpub(&unrelated.encode(), 0, &BitcoinNetwork::Mainnet, role).is_ok(),
+            "an unrelated key is accepted under {role:?}"
+        );
+    }
 }
 
 struct MockCompleter {

@@ -15,7 +15,7 @@ async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 bitcoin = "=0.32.101"
-bdk_electrum = { version = "=0.24.0", default-features = false, features = ["use-rustls-ring"] }
+electrum-client = { version = "=0.25", default-features = false, features = ["proxy", "rustls-ring"] }
 blake3 = "1"
 chacha20poly1305 = "0.10"
 crypto_secretbox = "0.1"
@@ -36,7 +36,7 @@ serde_json = "1"
 serde_json_canonicalizer = "=0.3.2"
 rand = "0.9"
 sha2 = "0.10"
-sqlx = { version = "0.8", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-ring", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-ring", "time", "uuid"] }
 thiserror = "2"
 time = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }

@@ -8,24 +8,29 @@ use crate::{
             CreateInvoiceError, CreateInvoiceService, LockFetchError, LockFetcher, MarkerDiscovery,
             PaykitIntentBuilder, SessionValidationError, SessionValidator,
         },
+        create_payment_request::MarketplacePaymentRequestService,
         payment_status::PaymentStatusService,
     },
     bitkit_setup::BitkitAuthStarter,
     config::{Config, OutboxConfig, PaykitConfig, PaykitNetwork},
     crypto::Crypto,
     domain::locks::{CreatorPubky, PubkyLockResource, ReaderPubky},
-    http::{self, auth::SignedLocksAuth},
+    http::{self, accounts::AccountsState, auth::SignedLocksAuth},
+    manual_claim::{ManualClaimService, RelayLoopbackSessionMinter},
     paykit::{CreatorSessionProvider, PaykitAdapter},
     persistence::{
         CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PersistenceError,
-        PostgresStorageAdapter, SdkStateStore,
+        PostgresStorageAdapter, SdkStateStore, StackIdentity,
     },
     real_setup::RealSetupCompleter,
     runtime::{PostgresDependency, Runtime, operational_router},
     setup::{SetupLimits, SetupService, SystemClock},
     setup_orchestration::PubkyCompanionRelay,
     workers::{
-        observer::{ElectrumAdapter, ElectrumPort, ObserverError, observe_once},
+        observer::{
+            ElectrumAdapter, ElectrumPort, ObservationBackend, ObserverError, ObserverLeadership,
+            ObserverPolicy, RequestLimiter, observation_loop,
+        },
         outbox::{ProcessingHealth, process_claim_with_health, process_reconciliation_with_health},
     },
 };
@@ -74,14 +79,19 @@ struct WorkerComponents {
     outbox_lease_duration: Duration,
     outbox_retry_initial: Duration,
     outbox_retry_max: Duration,
-    electrum_poll_interval: Duration,
+    electrum_policy: ObserverPolicy,
+    sentinel_policy: crate::sentinel::SentinelPolicy,
 }
 
 impl Server {
     /// Builds every required production adapter and all public routes.
-    pub async fn build(config: Config, pool: PgPool) -> Result<Self, ServerBuildError> {
+    pub async fn build(
+        config: Config,
+        pool: PgPool,
+        stack_identity: StackIdentity,
+    ) -> Result<Self, ServerBuildError> {
         let pubky = configured_pubky(config.paykit.network)?;
-        Self::build_with_client(config, pool, pubky).await
+        Self::build_with_client(config, pool, stack_identity, pubky).await
     }
 
     /// Builds the production composition with a controlled Pubky client for E2E tests.
@@ -90,9 +100,10 @@ impl Server {
     pub async fn build_with_pubky(
         config: Config,
         pool: PgPool,
+        stack_identity: StackIdentity,
         pubky: Pubky,
     ) -> Result<Self, ServerBuildError> {
-        Self::build_with_client(config, pool, pubky).await
+        Self::build_with_client(config, pool, stack_identity, pubky).await
     }
 
     /// Builds the production composition with controlled transport ports for E2E tests.
@@ -101,30 +112,35 @@ impl Server {
     pub async fn build_with_transports(
         config: Config,
         pool: PgPool,
+        stack_identity: StackIdentity,
         pubky: Pubky,
         electrum: Arc<dyn ElectrumPort>,
     ) -> Result<Self, ServerBuildError> {
-        Self::build_with_clients(config, pool, pubky, electrum).await
+        Self::build_with_clients(config, pool, stack_identity, pubky, electrum).await
     }
 
     async fn build_with_client(
         config: Config,
         pool: PgPool,
+        stack_identity: StackIdentity,
         pubky: Pubky,
     ) -> Result<Self, ServerBuildError> {
         let electrum = ElectrumAdapter::configured(
             config.electrum.endpoint.clone(),
             config.deployment_invariants().bitcoin_network.clone(),
             config.electrum.request_timeout,
-            config.electrum.connect_retries,
+            usize::try_from(config.electrum.max_utxos_per_address).unwrap_or(usize::MAX),
+            config.electrum.address_deadline,
+            config.electrum.max_response_bytes,
         )
         .map_err(map_electrum_error)?;
-        Self::build_with_clients(config, pool, pubky, Arc::new(electrum)).await
+        Self::build_with_clients(config, pool, stack_identity, pubky, Arc::new(electrum)).await
     }
 
     async fn build_with_clients(
         config: Config,
         pool: PgPool,
+        stack_identity: StackIdentity,
         pubky: Pubky,
         electrum: Arc<dyn ElectrumPort>,
     ) -> Result<Self, ServerBuildError> {
@@ -143,6 +159,7 @@ impl Server {
             relay,
             creators.clone(),
             config.deployment_invariants().bitcoin_network.clone(),
+            config.deployment_invariants().stack_role,
             config.paykit.receiver_path.clone(),
         ));
         let setup = SetupService::new(
@@ -167,38 +184,181 @@ impl Server {
             },
         );
 
-        let invoice_service = Arc::new(CreateInvoiceService::new(
-            Arc::new(CreatorSessionValidator {
-                creators: creators.clone(),
-                pubky: pubky.clone(),
-            }),
-            Arc::new(PubkyLockFetcher {
-                storage: pubky.public_storage(),
-                max_bytes: config.limits.lock_resource_bytes,
-                timeout: config.limits.lock_fetch_timeout,
-            }),
-            Arc::new(PubkyMarkerDiscovery {
-                storage: pubky.public_storage(),
-            }),
-            config.paykit.receiver_path_priority.clone(),
-            config.paykit.receiver_path.clone(),
-            Arc::new(creators.clone()),
-            config.deployment_invariants().bitcoin_network.clone(),
-            Arc::new(invoices.clone()),
-            Arc::new(PaykitIntentBuilder),
-        ));
-        let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
-        let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
-        let business_routes = http::setup::setup_router(setup).merge(
-            http::invoices::invoices_router(invoice_service)
-                .merge(http::status::status_router(status_service))
-                .layer(Extension(signed_auth)),
+        let electrum_request_limiter = RequestLimiter::new(
+            u64::from(config.electrum.max_requests_per_tick),
+            u64::from(config.electrum.max_requests_per_second),
         );
-
+        let creation_snapshot_slots = Arc::new(tokio::sync::Semaphore::new(
+            usize::try_from(config.electrum.max_concurrent_creation_snapshots)
+                .expect("validated creation snapshot concurrency fits usize"),
+        ));
+        // The runtime is built before the creation services so both can
+        // gate first-time binds on its live `bitcoin_offer_available`
+        // verdict (read per request, never cached).
         let runtime = Arc::new(Runtime::new(
             Arc::new(PostgresDependency::new(pool.clone())),
             64,
         ));
+        let invoice_service = Arc::new(
+            CreateInvoiceService::new(
+                Arc::new(CreatorSessionValidator {
+                    creators: creators.clone(),
+                    pubky: pubky.clone(),
+                }),
+                Arc::new(PubkyLockFetcher {
+                    storage: pubky.public_storage(),
+                    max_bytes: config.limits.lock_resource_bytes,
+                    timeout: config.limits.lock_fetch_timeout,
+                }),
+                Arc::new(PubkyMarkerDiscovery {
+                    storage: pubky.public_storage(),
+                }),
+                config.paykit.receiver_path_priority.clone(),
+                config.paykit.receiver_path.clone(),
+                Arc::new(creators.clone()),
+                config.deployment_invariants().bitcoin_network.clone(),
+                config.bitcoin.creation_enabled,
+                Arc::new(invoices.clone()),
+                electrum.clone(),
+                usize::try_from(config.electrum.max_creation_history_entries)
+                    .expect("validated history cap fits usize"),
+                usize::try_from(config.electrum.max_transaction_bytes)
+                    .expect("validated transaction cap fits usize"),
+                Arc::new(PaykitIntentBuilder::for_network(
+                    &config.deployment_invariants().bitcoin_network,
+                )),
+            )
+            .with_electrum_controls(
+                electrum_request_limiter.clone(),
+                creation_snapshot_slots.clone(),
+            )
+            .with_offer_availability(runtime.clone())
+            .with_stack_identity(stack_identity.stack_id())
+            .with_prepare_ttl(config.bitcoin.prepare_ttl)
+            .with_max_request_expiry(config.bitcoin.max_request_expiry),
+        );
+        let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
+        let payment_request_service = Arc::new(
+            MarketplacePaymentRequestService::new(
+                Arc::new(CreatorSessionValidator {
+                    creators: creators.clone(),
+                    pubky: pubky.clone(),
+                }),
+                Arc::new(PubkyMarkerDiscovery {
+                    storage: pubky.public_storage(),
+                }),
+                config.paykit.receiver_path_priority.clone(),
+                config.paykit.receiver_path.clone(),
+                Arc::new(creators.clone()),
+                config.deployment_invariants().bitcoin_network.clone(),
+                config.bitcoin.creation_enabled,
+                Arc::new(invoices.clone()),
+                electrum.clone(),
+                usize::try_from(config.electrum.max_creation_history_entries)
+                    .expect("validated history cap fits usize"),
+                usize::try_from(config.electrum.max_transaction_bytes)
+                    .expect("validated transaction cap fits usize"),
+                Arc::new(PaykitIntentBuilder::for_network(
+                    &config.deployment_invariants().bitcoin_network,
+                )),
+            )
+            .with_electrum_controls(
+                electrum_request_limiter.clone(),
+                creation_snapshot_slots.clone(),
+            )
+            .with_offer_availability(runtime.clone())
+            .with_stack_identity(stack_identity.stack_id())
+            .with_prepare_ttl(config.bitcoin.prepare_ttl)
+            .with_max_request_expiry(config.bitcoin.max_request_expiry),
+        );
+        // §B.11 phase 2: the signed activate/void service. It reuses the
+        // same Electrum adapter, request limiter and snapshot slots as
+        // creation (the tick-1 snapshot is one bounded round inside the
+        // §B.7 budget), and the same signed-body authentication as the
+        // create routes — no new auth path.
+        let two_phase_service = Arc::new(crate::application::two_phase::TwoPhaseService::new(
+            Arc::new(invoices.clone()),
+            electrum.clone(),
+            electrum_request_limiter.clone(),
+            creation_snapshot_slots,
+            usize::try_from(config.electrum.max_creation_history_entries)
+                .expect("validated history cap fits usize"),
+            usize::try_from(config.electrum.max_transaction_bytes)
+                .expect("validated transaction cap fits usize"),
+            stack_identity.stack_id(),
+        ));
+        // The claim-time history scan (design §B.5) reuses the observer's
+        // Electrum adapter type and timeout configuration; each scan batch
+        // opens its own bounded connection, so no second client type is
+        // introduced. The response-item cap, per-window deadline, and
+        // process-wide concurrency bound come from the validated electrum
+        // config.
+        let claim_history = Arc::new(
+            ElectrumAdapter::configured(
+                config.electrum.endpoint.clone(),
+                config.deployment_invariants().bitcoin_network.clone(),
+                config.electrum.request_timeout,
+                usize::try_from(config.electrum.max_utxos_per_address).unwrap_or(usize::MAX),
+                config.electrum.address_deadline,
+                config.electrum.max_response_bytes,
+            )
+            .map_err(map_electrum_error)?
+            .with_claim_scan_bounds(
+                usize::try_from(config.electrum.max_history_items_per_window)
+                    .expect("validated history item cap fits usize"),
+                config.electrum.claim_scan_window_deadline,
+                usize::try_from(config.electrum.max_concurrent_claim_scans)
+                    .expect("validated claim scan concurrency bound fits usize"),
+            ),
+        );
+        let manual_claims = Arc::new(ManualClaimService::new(
+            pubky.clone(),
+            Arc::new(RelayLoopbackSessionMinter::new(
+                pubky.clone(),
+                config.paykit.auth_relay.clone(),
+            )),
+            creators.clone(),
+            Arc::new(creators.clone()),
+            Arc::new(crate::real_setup::DirectMarkerPublisher),
+            claim_history,
+            config.deployment_invariants().bitcoin_network.clone(),
+            config.deployment_invariants().stack_role,
+            stack_identity.stack_id(),
+            config.paykit.receiver_path.clone(),
+        ));
+        let accounts_state = AccountsState::new(
+            manual_claims,
+            config.rate_limits.claims_per_minute,
+            config.setup.allowed_origins.clone(),
+        );
+        let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
+        let business_routes = http::setup::setup_router(setup)
+            .merge(http::accounts::accounts_router(accounts_state))
+            .merge(
+                http::invoices::invoices_router(invoice_service)
+                    .merge(http::status::status_router(status_service))
+                    .merge(http::payment_requests::payment_requests_router(
+                        payment_request_service,
+                    ))
+                    .merge(http::two_phase::two_phase_router(two_phase_service))
+                    .layer(Extension(signed_auth)),
+            );
+
+        runtime.set_stack_id(stack_identity.stack_id());
+        runtime.set_electrum_probe_interval(config.electrum.poll_interval);
+        // One app-owned Electrum request limiter, built from the validated
+        // budget config: the observer tick and every non-tick Electrum
+        // caller (creation snapshot fetches, first-bind candidate fetch,
+        // claim-time history scan) charge this single bucket.
+        runtime.set_electrum_request_limiter(electrum_request_limiter);
+        // Regtest tips are mined on demand and can be arbitrarily old
+        // without indicating endpoint trouble, so the tip-age check only
+        // applies to networks with a live block cadence.
+        runtime.set_electrum_max_tip_age(match config.deployment_invariants().bitcoin_network {
+            crate::config::BitcoinNetwork::Regtest => None,
+            _ => Some(config.electrum.max_tip_age),
+        });
+        runtime.set_bitcoin_creation_enabled(config.bitcoin.creation_enabled);
         let router = operational_router(business_routes, runtime.clone());
         let workers = WorkerComponents {
             pool,
@@ -215,7 +375,16 @@ impl Server {
             outbox_lease_duration: config.outbox.lease_duration,
             outbox_retry_initial: config.outbox.retry_initial,
             outbox_retry_max: config.outbox.retry_max,
-            electrum_poll_interval: config.electrum.poll_interval,
+            electrum_policy: ObserverPolicy {
+                poll_interval: config.electrum.poll_interval,
+                max_requests_per_tick: config.electrum.max_requests_per_tick,
+                max_requests_per_second: config.electrum.max_requests_per_second,
+                max_transaction_bytes: usize::try_from(config.electrum.max_transaction_bytes)
+                    .expect("validated transaction cap fits usize"),
+                baseline_completion_timeout: config.electrum.baseline_completion_timeout,
+                expiry_tail: config.bitcoin.expiry_tail,
+            },
+            sentinel_policy: config.sentinel.policy(),
         };
 
         Ok(Self {
@@ -532,38 +701,17 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
 }
 
 async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
-    let mut interval = tokio::time::interval(workers.electrum_poll_interval);
-    interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            _ = runtime.cancelled() => break,
-            _ = interval.tick() => {}
-        }
-        if !runtime.may_start_worker_claim() {
-            break;
-        }
-        let targets = match workers.invoices.observation_targets().await {
-            Ok(targets) => targets,
-            Err(_) => {
-                runtime.set_electrum_available(false);
-                continue;
-            }
-        };
-        if targets.is_empty() {
-            runtime.set_electrum_available(true);
-            continue;
-        }
-        runtime.set_electrum_available(
-            observe_once(
-                workers.electrum.as_ref(),
-                &workers.invoices,
-                &workers.bitcoin_network,
-                &targets,
-            )
-            .await
-            .is_ok(),
-        );
-    }
+    observation_loop(
+        workers.electrum.clone(),
+        Arc::new(workers.invoices.clone()) as Arc<dyn ObservationBackend>,
+        Arc::new(crate::persistence::PgObserverLeadership::new(&workers.pool))
+            as Arc<dyn ObserverLeadership>,
+        workers.bitcoin_network.clone(),
+        workers.electrum_policy,
+        workers.sentinel_policy,
+        runtime,
+    )
+    .await;
 }
 
 fn configured_pubky(network: PaykitNetwork) -> Result<Pubky, ServerBuildError> {
@@ -743,10 +891,11 @@ receiver_path = "paykit/server"
 network = "testnet"
 [bitcoin]
 network = "testnet"
+[deployment]
+stack_role = "proof"
 [electrum]
 endpoint = "tcp://127.0.0.1:1"
 request_timeout = "1s"
-connect_retries = 0
 [outbox]
 poll_interval = "1s"
 "#
@@ -760,10 +909,91 @@ poll_interval = "1s"
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://127.0.0.1:1/paykit")
             .unwrap();
-        let server = Server::build(config, pool).await.unwrap();
+        let stack_identity = StackIdentity::new(crate::config::StackRole::Proof, Uuid::new_v4());
+        let server = Server::build(config, pool, stack_identity).await.unwrap();
         let mut tasks = spawn_owned_workers(server.workers, server.runtime);
         assert_eq!(tasks.len(), 3);
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn startup_installs_the_configured_limiter_over_the_fail_closed_default() {
+        use crate::{runtime::DependencyCheck, workers::observer::BudgetExhausted};
+
+        struct ReadyPostgres;
+        #[async_trait]
+        impl DependencyCheck for ReadyPostgres {
+            async fn postgres_ready(&self) -> bool {
+                true
+            }
+        }
+
+        // The pre-install state Server::build starts from: Runtime::new's
+        // limiter is fail-closed (an empty, non-refilling bucket), so no
+        // caller can issue unbudgeted Electrum requests before startup
+        // installs the configured one.
+        let before = Runtime::new(Arc::new(ReadyPostgres), 64);
+        assert_eq!(
+            before.electrum_request_limiter().try_reserve(1),
+            Err(BudgetExhausted {
+                requested: 1,
+                available: 0
+            }),
+            "the fail-closed default admits nothing before install"
+        );
+
+        // The same build path as production: Server::build installs one
+        // app-owned limiter from the validated electrum budget config.
+        let config = Config::from_toml_and_environment(
+            &format!(
+                r#"
+[http]
+listen_addr = "127.0.0.1:0"
+[locks]
+trusted_public_key = "{CONFIG_KEY}"
+[setup]
+allowed_origins = ["https://app.example"]
+[paykit]
+receiver_path = "paykit/server"
+network = "testnet"
+[bitcoin]
+network = "testnet"
+[deployment]
+stack_role = "proof"
+[electrum]
+endpoint = "tcp://127.0.0.1:1"
+request_timeout = "1s"
+max_requests_per_tick = 7
+max_requests_per_second = 3
+[outbox]
+poll_interval = "1s"
+"#
+            ),
+            ConfigEnvironment {
+                database_url: Some("postgres://127.0.0.1:1/paykit".into()),
+                master_key: Some(CONFIG_MASTER_KEY.into()),
+            },
+        )
+        .unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1:1/paykit")
+            .unwrap();
+        let stack_identity = StackIdentity::new(crate::config::StackRole::Proof, Uuid::new_v4());
+        let server = Server::build(config, pool, stack_identity).await.unwrap();
+        let installed = server.runtime.electrum_request_limiter();
+        assert_eq!(
+            installed.available(),
+            7,
+            "the installed limiter is the configured one: a fresh bucket holds the full \
+             max_requests_per_tick capacity"
+        );
+        assert!(
+            installed.try_reserve(1).is_ok(),
+            "admission succeeds after startup installs the configured limiter"
+        );
+        // The installed limiter is the runtime's one shared bucket: the
+        // reservation above is visible to every other holder.
+        assert_eq!(server.runtime.electrum_request_limiter().available(), 6);
     }
 }

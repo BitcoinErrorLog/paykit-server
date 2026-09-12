@@ -61,6 +61,14 @@ impl NewReaderPayloadFactory for Payloads {
     }
 }
 
+/// Distinct canonical key tails so the fingerprint-to-seller binding written
+/// by every create/reauthenticate never collides within a test database.
+fn key_tail(seed: u64) -> [u8; 65] {
+    let mut tail = [0u8; 65];
+    tail[..8].copy_from_slice(&seed.to_be_bytes());
+    tail
+}
+
 async fn build_pubky_testnet() -> EphemeralTestnet {
     let postgres = std::env::var("TEST_DATABASE_URL").unwrap();
     let postgres = pubky_testnet::pubky_homeserver::ConnectionString::new(&postgres).unwrap();
@@ -106,6 +114,9 @@ async fn create_creator(
                 0,
             ),
             &state,
+            &key_tail(counter_seed),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -204,12 +215,13 @@ network = "testnet"
 
 [bitcoin]
 network = "testnet"
+[deployment]
+stack_role = "proof"
 
 [electrum]
 endpoint = "{electrum_endpoint}"
-poll_interval = "50ms"
+poll_interval = "1s"
 request_timeout = "50ms"
-connect_retries = 0
 
 [outbox]
 poll_interval = "1s"
@@ -340,6 +352,9 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             },
             payment_request_intent: payment_intent(&reader, &marker),
             required_sats: 100,
+            nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();
@@ -356,6 +371,9 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             },
             payment_request_intent: payment_intent(&reader, &marker),
             required_sats: 200,
+            nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();
@@ -374,6 +392,9 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             },
             payment_request_intent: payment_intent(&unreachable_reader, &marker),
             required_sats: 300,
+            nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
         .await
         .unwrap();
@@ -400,13 +421,14 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
     let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let electrum_endpoint = format!("tcp://{}", unavailable.local_addr().unwrap());
     drop(unavailable);
-    let server = Server::build_with_pubky(
-        config(database.database_url(), &electrum_endpoint),
-        database.pool().clone(),
-        pubky,
-    )
-    .await
-    .unwrap();
+    let config = config(database.database_url(), &electrum_endpoint);
+    let stack_identity = paykit_server::persistence::DeploymentStore::new(database.pool())
+        .stack_identity(config.deployment_invariants().stack_role)
+        .await
+        .unwrap();
+    let server = Server::build_with_pubky(config, database.pool().clone(), stack_identity, pubky)
+        .await
+        .unwrap();
     let runtime = server.runtime();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_task = tokio::spawn(server.run(listener));

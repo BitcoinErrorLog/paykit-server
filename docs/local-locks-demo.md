@@ -53,6 +53,9 @@ network = "testnet"
 [bitcoin]
 network = "regtest"
 
+[deployment]
+stack_role = "proof"
+
 [electrum]
 endpoint = "tcp://fulcrum:50001"
 poll_interval = "1s"

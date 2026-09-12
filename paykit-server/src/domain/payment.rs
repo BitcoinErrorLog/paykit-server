@@ -165,7 +165,7 @@ impl PaymentObservation {
         self.confirmations
     }
 
-    /// Returns whether one observed output pays at least the invoice amount.
+    /// Returns whether one observed output pays exactly the invoice amount.
     pub fn amount_matched(&self) -> bool {
         self.amount_matched
     }
@@ -191,14 +191,16 @@ impl PaymentBinding {
 
     /// Creates a payment binding from a single observed output and confirmation count.
     ///
-    /// A matching output at six or more confirmations becomes final and records
-    /// exactly six confirmations. Underpayments retain their actual count.
+    /// An exact-amount output at six or more confirmations becomes final and
+    /// records exactly six confirmations. Amount mismatches (under- or
+    /// overpayment) retain their actual count.
     pub fn observed(
         invoice_amount: CriterionAmount,
         observed_sats: u64,
         confirmations: u32,
     ) -> Self {
-        let amount_matched = observed_sats >= invoice_amount.as_sats();
+        let amount_matched =
+            crate::bitcoin::amount_matches(true, observed_sats, invoice_amount.as_sats());
         Self {
             invoice_sats: invoice_amount.as_sats(),
             observed_sats: Some(observed_sats),
@@ -213,17 +215,18 @@ impl PaymentBinding {
     /// Returns the current factual observation.
     pub fn observation(&self) -> PaymentObservation {
         match self.observed_sats {
-            Some(observed_sats) => {
-                PaymentObservation::observed(self.confirmations, observed_sats >= self.invoice_sats)
-            }
+            Some(observed_sats) => PaymentObservation::observed(
+                self.confirmations,
+                crate::bitcoin::amount_matches(true, observed_sats, self.invoice_sats),
+            ),
             None => PaymentObservation::undetected(),
         }
     }
 
-    /// Returns whether the binding is a matching payment finalized at six confirmations.
+    /// Returns whether the binding is an exact-amount payment finalized at six confirmations.
     pub fn is_final(&self) -> bool {
         self.observed_sats
-            .is_some_and(|sats| sats >= self.invoice_sats)
+            .is_some_and(|sats| sats == self.invoice_sats)
             && self.confirmations == 6
     }
 
@@ -231,7 +234,7 @@ impl PaymentBinding {
     pub fn is_replaceable(&self) -> bool {
         match self.observed_sats {
             None => true,
-            Some(observed_sats) if observed_sats < self.invoice_sats => true,
+            Some(observed_sats) if observed_sats != self.invoice_sats => true,
             Some(_) => !self.is_final() && self.confirmations < 1,
         }
     }

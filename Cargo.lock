@@ -507,25 +507,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "bdk_core"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb3028782f6bf14a6df987244333d34e6b272b5a40a53e4879ec2dfd82275a3a"
-dependencies = [
- "bitcoin",
-]
-
-[[package]]
-name = "bdk_electrum"
-version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00a9846105bf6e751adbb6946b000ff919ce24a15a941cbfe68485549b552a9c"
-dependencies = [
- "bdk_core",
- "electrum-client",
-]
-
-[[package]]
 name = "bech32"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3039,12 +3020,12 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
- "bdk_electrum",
  "bitcoin",
  "blake3",
  "chacha20poly1305",
  "crypto_secretbox",
  "ed25519-dalek 2.2.0",
+ "electrum-client",
  "hkdf",
  "hmac",
  "http-relay",
@@ -3056,6 +3037,7 @@ dependencies = [
  "prometheus-client",
  "pubky 0.8.0",
  "rand 0.9.5",
+ "rustls",
  "serde",
  "serde_ignored",
  "serde_json",
@@ -3071,6 +3053,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "webpki-roots 0.25.4",
  "zeroize",
 ]
 
@@ -3092,6 +3075,7 @@ dependencies = [
  "pubky-testnet",
  "serde",
  "serde_json",
+ "serde_json_canonicalizer",
  "sqlx",
  "time",
  "tokio",
@@ -4820,6 +4804,7 @@ dependencies = [
  "sha2 0.10.9",
  "smallvec",
  "thiserror 2.0.19",
+ "time",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -4905,6 +4890,7 @@ dependencies = [
  "sqlx-core",
  "stringprep",
  "thiserror 2.0.19",
+ "time",
  "tracing",
  "uuid",
  "whoami",
@@ -4944,6 +4930,7 @@ dependencies = [
  "sqlx-core",
  "stringprep",
  "thiserror 2.0.19",
+ "time",
  "tracing",
  "uuid",
  "whoami",
@@ -4970,6 +4957,7 @@ dependencies = [
  "serde_urlencoded",
  "sqlx-core",
  "thiserror 2.0.19",
+ "time",
  "tracing",
  "url",
  "uuid",

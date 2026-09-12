@@ -1,3 +1,5 @@
+/// Creator allocation mode and the claim-channel corroborating checks (design §B.8.6).
+pub mod allocation;
 /// Application services and explicit side-effect ports.
 pub mod application;
 /// Bitcoin output observation values and injected transport boundary.
@@ -6,12 +8,20 @@ pub mod bitcoin;
 pub mod bitkit_claim;
 /// SDK-owned normal AUTH initiation bound to the Bitkit claim query pair.
 pub mod bitkit_setup;
+/// Build and startup provenance metadata.
+pub mod build_metadata;
+/// Claim-time address-index history scan (design §B.5).
+pub mod chain_history;
 pub mod config;
 /// Versioned authenticated encryption for persisted private state.
 pub mod crypto;
 /// Side-effect-free protocol and business value objects.
 pub mod domain;
 pub mod http;
+/// Canonical key identity (tail, display fingerprint) and the claim deny-list.
+pub mod key_identity;
+/// Manual watch-only account claims authenticated by capability-scoped AuthTokens.
+pub mod manual_claim;
 /// Identifier-free operational metrics.
 pub mod metrics;
 /// Concrete per-Creator public Paykit SDK adapter.
@@ -22,6 +32,8 @@ pub mod persistence;
 pub mod real_setup;
 /// Server lifecycle, dependency checks, admission control, and shutdown.
 pub mod runtime;
+/// Unassigned-sentinel detection (design §B.8.7, W1.14).
+pub mod sentinel;
 pub mod server;
 pub mod setup;
 /// Relay receive/ack boundary and durable-before-ack setup orchestration.

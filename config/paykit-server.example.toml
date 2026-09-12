@@ -10,6 +10,17 @@ listen_addr = "127.0.0.1:8080"
 # Use the exact Pubky rendered by Locks as credentials.lock_server_public_key.
 # trusted_public_key = "pubky<pubky-key>"
 
+# Optional marketplace transaction-service trust anchors. Requests signed by
+# any listed key are accepted on the signed business routes exactly like Lock
+# Server signatures. Use the single-key form for one marketplace signer, or
+# the list form when several marketplace-service instances (for example
+# production and staging) each sign with their own key. The two forms are
+# mutually exclusive; a malformed or empty list fails startup.
+# [marketplace]
+# trusted_public_key = "pubky<pubky-key>"
+# or:
+# trusted_public_keys = ["pubky<production-key>", "pubky<staging-key>"]
+
 [setup]
 # Configure exact HTTP(S) origins, or use ["*"] alone to accept any valid
 # HTTP(S) parent. Even with "*", CSP and postMessage use the caller's concrete origin.
@@ -25,14 +36,155 @@ network = "testnet"
 [bitcoin]
 # Must match the supplied Creator xpubs, derived addresses, and Electrum chain.
 network = "testnet"
+# Kill switch: when false, new Bitcoin payment-request binds are refused with
+# the stable code bitcoin_creation_disabled while existing invoices keep
+# being observed. Omitted configuration defaults to false; set this explicitly
+# to true only in an environment intended to enable creation.
+# creation_enabled = true
+# Lifetime of a `prepared` invoice awaiting the marketplace's signed
+# activation (two-phase creation, design §B.11): prepare_expires_at is
+# stamped as created_at + prepare_ttl at creation commit, and the observer
+# tick's reaper voids the invoice once it elapses. Far longer than any
+# plausible marketplace commit-plus-outbox latency, far shorter than the
+# marketplace's 1 h hold window. Defaults to 15 minutes.
+# prepare_ttl = "15min"
+# Furthest future Payment Request expiry a prepare call may carry (design
+# §B.9): expires_at is required on both prepare entrypoints, and a value
+# already in the past or further out than server clock + max_request_expiry
+# is refused fail-closed. The expiry is carried in the published request and
+# enforced by the buyer's wallet. Defaults to 24 hours.
+# max_request_expiry = "24h"
+# Observation tail after expires_at (design §B.9): at expires_at the invoice
+# moves observing -> expired_tail (still observed, deprioritized behind live
+# targets; observations carry late_settlement and can never drive paid), and
+# at expires_at + expiry_tail it moves to expired_final and leaves the
+# observation target set. Timestamp-derived from expires_at, server clock.
+# Defaults to 24 hours.
+# expiry_tail = "24h"
+
+[deployment]
+# Required, no default. "production" serves real-money traffic; "proof" marks
+# proof-of-concept stacks. The role is persisted adopt-once: a database that
+# has never recorded a role adopts the configured one on first boot, and every
+# later boot refuses to start when the configured role differs.
+stack_role = "proof"
 
 [electrum]
-# Use one CA-valid ssl:// endpoint in production. tcp:// is accepted but has no
-# server authentication or transport confidentiality. No failover pool exists.
+# Use one CA-valid ssl:// endpoint in production. When bitcoin.network is
+# mainnet, startup refuses anything but ssl:// — tcp:// has no server
+# authentication or transport confidentiality and is accepted only on
+# regtest/signet/testnet (local fulcrum-style endpoints). No failover pool
+# exists.
 endpoint = "ssl://electrum.example.invalid:50002"
 poll_interval = "10s"
 request_timeout = "10s"
-connect_retries = 1
+# Sustained request budget and burst capacity, as a token bucket: tokens
+# refill from elapsed wall time at max_requests_per_second up to
+# max_requests_per_tick, so no loop cadence (including the shortest ±20%
+# jitter interval) can sustain a higher request rate. Each admitted
+# observation target costs exactly one script_list_unspent lookup —
+# client-side call retries are pinned at zero, so the observer's own next
+# tick is the only retry — and each tick's two probe requests
+# (headers.subscribe + block_header(0)) are charged against the bucket.
+# The effective per-tick budget min(max_requests_per_tick,
+# max_requests_per_second * poll_interval seconds) must exceed 2 (the
+# probe reservation) or startup is rejected. Targets beyond the budget are
+# deferred to the next tick, oldest-last-observed first; there is no
+# bypass and no unmetered admission. See docs/observer-threat-model.md.
+max_requests_per_tick = 1000
+max_requests_per_second = 5
+# Hard cap on decoded list_unspent items accepted for one address. A
+# response listing more UTXOs is rejected before any per-UTXO record is
+# materialised and fails only that address (metric label
+# response_too_large); the target stays stale and retried next tick.
+# Coupled to max_response_bytes: startup refuses an item cap whose
+# maximum reply (items x 176 B per-item wire bound, plus the JSON-RPC
+# envelope) would exceed the transport byte cap.
+max_utxos_per_address = 200
+# Per-address wall-clock deadline over connect + call + decode, shared
+# by the tick's probe so a drip-feeding endpoint cannot stall the tick
+# before any address is attempted. A lookup exceeding it fails only
+# that address (metric label deadline); the connection is dropped and
+# never reused. The blocking socket read itself cannot be cancelled and
+# request_timeout is PER READ, so a drip-feeding server keeps the
+# abandoned blocking-pool thread and socket alive for up to
+# (max_response_bytes + 1) x drip interval; the residual is bounded in
+# count (one thread + socket per abandoned attempt, under the tokio
+# blocking-pool cap of 512), not in time by request_timeout.
+address_deadline = "5s"
+# Transport-level cap on one Electrum response line, in bytes. Every
+# connection the server opens wraps its stream in a capped reader, so no
+# single response line larger than this is ever held in memory: the read
+# fails with "electrum response exceeds max_response_bytes" before the
+# client buffers or JSON-decodes the line, and the poisoned connection is
+# torn down (the next lookup reconnects). A poisoned line of any length
+# costs the source exactly cap + 1 bytes of consumption before the read
+# fails. Default 1 MiB; startup refuses values below 64 KiB or above
+# 16 MiB.
+max_response_bytes = 1048576
+# Claim-time address-index scan bounds (design B.5; see
+# docs/observer-threat-model.md, "claim-time scan"). Each claim scans the
+# account's external chain in windows of 20 scripthashes (one batched
+# get_history per window, presence only) for at most 50 windows.
+# max_history_items_per_window caps the raw history items accepted across
+# one window's batched response before any domain value is materialised;
+# an over-cap window is treated as used (it only advances the start
+# index; the 50-window bound still refuses with account_history_too_deep).
+# claim_scan_window_deadline is the per-window wall-clock deadline over
+# connect + call + decode. max_concurrent_claim_scans bounds concurrent
+# window fetches process-wide; over the bound a claim fails
+# claim_scan_unavailable immediately (no queueing).
+# max_history_items_per_window = 2000
+# claim_scan_window_deadline = "5s"
+# max_concurrent_claim_scans = 2
+# Readiness also requires a trustworthy chain tip: a probed tip older than
+# max_tip_age, a tip-height regression beyond the six-block reorg
+# tolerance, or a tip height that stops advancing within this window marks
+# Electrum not_ready on /health/ready (HTTP 503), so a load balancer or
+# pager sees the failure. A probe older than the freshness window, a tip
+# time over two hours in the future, or a regression within the tolerance
+# (a trailing backend of a pool-balanced endpoint) stays at HTTP 200
+# degraded. A regression beyond the tolerance is 503 until the chain
+# exceeds the previous maximum. Ignored on regtest, whose tips are mined
+# on demand and can be arbitrarily old without indicating endpoint
+# trouble.
+# max_tip_age = "4h"
+
+# Unassigned-sentinel detection (W1.14, design B.8.7). The sentinel is the
+# creator-level backstop for exclusive (bitkit_watch_only_v1) creators: it
+# re-derives each exclusive creator's never-assigned BIP44 gap window (20
+# addresses, fixed) INSIDE the observer tick above — no second worker or
+# cadence — and treats confirmed outputs there as account-wide evidence.
+# Its only effect is the one-way downgrade exclusive -> shared_manual with
+# the fixed unassigned_sentinel_evidence reason; it never upgrades, never
+# auto-pays, and never touches assigned-address (under/over/late) payments.
+# The sentinel runs under a SUBORDINATE sub-budget of the shared electrum.*
+# request quota above — NOT a second endpoint quota. One tick's sentinel
+# allowance defaults to 10% of the shared bucket's remaining balance after
+# every live invoice target is satisfied (zero when any live target was
+# deferred), hard-capped by max_requests_per_tick and sustained-capped by
+# max_requests_per_second below; every admitted sentinel request is then
+# charged against the shared electrum bucket itself, so aggregate endpoint
+# traffic (probe + live lookups + sentinel scans + non-tick callers) never
+# exceeds electrum.max_requests_per_tick per tick or
+# electrum.max_requests_per_second sustained, and sentinel work never defers
+# a live target.
+# min_value_sats defaults to 294, the relay-standard P2WPKH dust floor
+# (98 vbytes x 3 sat/vbyte): below it an output is uneconomic spam, never a
+# candidate or evidence. hit_count defaults to 1: one confirmed qualifying
+# outpoint is definitive evidence. Mempool-only outputs are durable
+# candidates, never evidence. rescan_interval (default 10 minutes) is the
+# per-creator re-admission cadence; max_age (default 1 hour) is the
+# freshness SLO the sentinel age alert reports against — it never gates
+# creation and never mutates a mode. All fields are optional and every
+# value must be nonzero.
+# [sentinel]
+# min_value_sats = 294
+# hit_count = 1
+# rescan_interval = "10m"
+# max_age = "1h"
+# max_requests_per_tick = 1000
+# max_requests_per_second = 5
 
 [outbox]
 poll_interval = "5s"

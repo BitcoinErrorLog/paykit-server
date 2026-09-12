@@ -1,0 +1,34 @@
+-- Invoice amount nonce (W1.1b, design §B.8.2).
+--
+-- Every invoice created after this migration draws nonce_sats in [1, 999]
+-- from a CSPRNG and binds at exactly required_sats = price_sats + nonce_sats.
+-- The nonce and the nonce'd total are amount facts, and the design requires
+-- amounts sealed at rest under PAYKIT_MASTER_KEY (the composed workflow e2e
+-- asserts no payment amount ever appears in raw persistence), so they are
+-- persisted inside the encrypted invoice payment record — record version 3
+-- adds nonce_sats beside the existing required_sats, which now carries the
+-- total. No plaintext column is added, and no DDL is required: the record is
+-- an opaque AEAD envelope, so the change is a code-level record-version bump,
+-- not a schema change.
+--
+-- Invoices created before this migration keep version-2 records. They are
+-- read as nonce_sats = 0 with the exact-amount predicate applied against
+-- their stored required_sats. Behaviour is unchanged with one in-flight
+-- exception: a version-2 invoice holding an overpayment at fewer than six
+-- confirmations had amount_matched = true under the old >= predicate and
+-- now flips to amount_matched = false, taking the manual_review path —
+-- seller-recoverable, not stranded. Finalized version-2 rows are frozen by
+-- the finalization guard (six confirmations and amount_matched
+-- short-circuit before the predicate is ever re-evaluated), so they never
+-- flip.
+--
+-- Rollback semantics: there is no schema change to roll back (this migration
+-- intentionally executes no DDL). Rolling back the code past W1.1b after any
+-- version-3 record exists makes those records unreadable to the old binary —
+-- it rejects any record version other than 2 as CorruptOrMissing — so the
+-- record-version bump is forward-only, matching the forward-only migration
+-- policy in persistence/migrations.rs. A database restored to before this
+-- migration contains only version-2 records and works under both old and new
+-- code.
+
+SELECT 1;

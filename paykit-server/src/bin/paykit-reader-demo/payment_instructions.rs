@@ -8,7 +8,9 @@ use paykit_sdk::{
 
 use super::{Failure, ReceiveOutput};
 
-pub(super) const BITCOIN_ENDPOINT: &str = "btc-bitcoin-p2wpkh";
+/// The demo validates regtest instructions, so it expects the
+/// network-correct endpoint identifier the patched server advertises.
+pub(super) const BITCOIN_ENDPOINT: &str = "btc-regtest-p2wpkh";
 const MAX_BITCOIN_SATS: u64 = 2_100_000_000_000_000;
 
 pub(super) fn select_actionable_request(
@@ -50,7 +52,9 @@ pub(super) fn payment_instructions(
         return Err(Failure::ProtocolFailed);
     }
     let terms = request.terms.as_ref().ok_or(Failure::ProtocolFailed)?;
-    if terms.amount.asset != "BTC"
+    // Spec-lowercase asset string, matching the endpoint identifier's asset
+    // segment (what real wallets enforce and the server now emits).
+    if terms.amount.asset != "btc"
         || terms.recurrence.is_some()
         || terms.proposal_expires_at.is_some()
         || terms.accepted_payment_endpoint_identifiers != [BITCOIN_ENDPOINT.to_owned()]
@@ -71,9 +75,17 @@ pub(super) fn payment_instructions(
     if private_list.payment_endpoints.len() != 1 {
         return Err(Failure::ProtocolFailed);
     }
-    let raw_address = private_list
+    let raw_payload = private_list
         .payment_endpoints
         .get(BITCOIN_ENDPOINT)
+        .ok_or(Failure::ProtocolFailed)?;
+    // Payment-endpoint-identifier spec section 7: the interoperable payload
+    // is a JSON object carrying the receiving handle under "value".
+    let payload: serde_json::Value =
+        serde_json::from_str(raw_payload).map_err(|_| Failure::ProtocolFailed)?;
+    let raw_address = payload
+        .get("value")
+        .and_then(serde_json::Value::as_str)
         .ok_or(Failure::ProtocolFailed)?;
     let address = Address::from_str(raw_address)
         .map_err(|_| Failure::ProtocolFailed)?
@@ -139,7 +151,7 @@ mod tests {
             proposal_event_id: Some("8a0d8b4c-913f-4e31-9f2c-2a6f5bb4d101".into()),
             terms: Some(PaymentRequestTermsRecord {
                 amount: AmountRecord {
-                    asset: "BTC".into(),
+                    asset: "btc".into(),
                     value: "0.00050000".into(),
                 },
                 payment_reference: "reference-1".into(),
@@ -166,7 +178,10 @@ mod tests {
     fn private_list(address: &str) -> PrivatePaymentListView {
         PrivatePaymentListView {
             latest_stream_item_id: Some(2),
-            payment_endpoints: HashMap::from([(BITCOIN_ENDPOINT.into(), address.into())]),
+            payment_endpoints: HashMap::from([(
+                BITCOIN_ENDPOINT.into(),
+                json!({ "value": address }).to_string(),
+            )]),
             last_refresh_at: None,
         }
     }

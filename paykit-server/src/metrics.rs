@@ -3,17 +3,28 @@
 use std::sync::Mutex;
 
 use prometheus_client::{
-    encoding::text::encode,
+    encoding::{EncodeLabelSet, text::encode},
     metrics::{
         counter::Counter,
+        family::Family,
         gauge::Gauge,
         histogram::{Histogram, exponential_buckets},
     },
     registry::Registry,
 };
 
-/// Metrics intentionally have no labels: routes, identifiers, and caller input
-/// must never become metric cardinality or data-exposure boundaries.
+/// Label set for per-address observation lookup failures. The value set is
+/// a closed code-owned enum (`error`, `response_too_large`, `deadline`) —
+/// never caller input — so cardinality is bounded at three series.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct AddressFailureLabels {
+    reason: &'static str,
+}
+
+/// Metrics intentionally carry no route, identifier, or caller-input
+/// labels: the only label anywhere is the closed failure-reason enum above,
+/// so caller input can never become metric cardinality or a data-exposure
+/// boundary.
 pub struct Metrics {
     registry: Mutex<Registry>,
     http_requests: Counter,
@@ -23,6 +34,13 @@ pub struct Metrics {
     outbox_permanent_failures: Counter,
     electrum_available: Gauge,
     electrum_last_success_age_seconds: Gauge,
+    electrum_backlog_oldest_age_seconds: Gauge,
+    electrum_observation_stamp_misses: Counter,
+    electrum_observation_address_failures: Family<AddressFailureLabels, Counter>,
+    electrum_zero_success_ticks: Counter,
+    electrum_budget_exhausted_ticks: Counter,
+    sentinel_downgrades: Counter,
+    sentinel_oldest_unscanned_age_seconds: Gauge,
     payment_states: Gauge,
     runtime_active: Gauge,
     session_validation_results: Counter,
@@ -38,6 +56,13 @@ impl Metrics {
         let outbox_permanent_failures = Counter::default();
         let electrum_available = Gauge::default();
         let electrum_last_success_age_seconds = Gauge::default();
+        let electrum_backlog_oldest_age_seconds = Gauge::default();
+        let electrum_observation_stamp_misses = Counter::default();
+        let electrum_observation_address_failures = Family::default();
+        let electrum_zero_success_ticks = Counter::default();
+        let electrum_budget_exhausted_ticks = Counter::default();
+        let sentinel_downgrades = Counter::default();
+        let sentinel_oldest_unscanned_age_seconds = Gauge::default();
         let payment_states = Gauge::default();
         let runtime_active = Gauge::default();
         let session_validation_results = Counter::default();
@@ -77,6 +102,44 @@ impl Metrics {
             electrum_last_success_age_seconds.clone(),
         );
         registry.register(
+            "paykit_electrum_backlog_oldest_age_seconds",
+            "Age of the oldest pending Electrum observation.",
+            electrum_backlog_oldest_age_seconds.clone(),
+        );
+        registry.register(
+            "paykit_electrum_observation_stamp_misses",
+            "Observation tick stamps that matched no invoice row.",
+            electrum_observation_stamp_misses.clone(),
+        );
+        registry.register(
+            "paykit_electrum_observation_address_failures",
+            "Isolated per-address Electrum lookup failures by closed reason label \
+             (error, response_too_large, or deadline).",
+            electrum_observation_address_failures.clone(),
+        );
+        registry.register(
+            "paykit_electrum_zero_success_ticks",
+            "Observer ticks that attempted lookups and succeeded at none.",
+            electrum_zero_success_ticks.clone(),
+        );
+        registry.register(
+            "paykit_electrum_budget_exhausted_ticks",
+            "Observer ticks deferred because the shared request budget could not \
+             cover the probe reservation; the tick sent no Electrum requests.",
+            electrum_budget_exhausted_ticks.clone(),
+        );
+        registry.register(
+            "paykit_sentinel_downgrades",
+            "Exclusive accounts downgraded to shared_manual by unassigned-sentinel \
+             evidence (W1.14); one per account, on the transition only.",
+            sentinel_downgrades.clone(),
+        );
+        registry.register(
+            "paykit_sentinel_oldest_unscanned_age_seconds",
+            "Age of the oldest admitted exclusive account's last completed sentinel scan.",
+            sentinel_oldest_unscanned_age_seconds.clone(),
+        );
+        registry.register(
             "paykit_payment_states",
             "Aggregate persisted payment-state count.",
             payment_states.clone(),
@@ -100,6 +163,13 @@ impl Metrics {
             outbox_permanent_failures,
             electrum_available,
             electrum_last_success_age_seconds,
+            electrum_backlog_oldest_age_seconds,
+            electrum_observation_stamp_misses,
+            electrum_observation_address_failures,
+            electrum_zero_success_ticks,
+            electrum_budget_exhausted_ticks,
+            sentinel_downgrades,
+            sentinel_oldest_unscanned_age_seconds,
             payment_states,
             runtime_active,
             session_validation_results,
@@ -124,6 +194,30 @@ impl Metrics {
     }
     pub fn set_electrum_last_success_age_seconds(&self, seconds: i64) {
         self.electrum_last_success_age_seconds.set(seconds.max(0));
+    }
+    pub fn set_electrum_backlog_oldest_age_seconds(&self, seconds: i64) {
+        self.electrum_backlog_oldest_age_seconds.set(seconds.max(0));
+    }
+    pub fn electrum_observation_stamp_misses(&self, misses: u64) {
+        self.electrum_observation_stamp_misses.inc_by(misses);
+    }
+    pub fn electrum_observation_address_failures(&self, reason: &'static str, failures: u64) {
+        self.electrum_observation_address_failures
+            .get_or_create(&AddressFailureLabels { reason })
+            .inc_by(failures);
+    }
+    pub fn electrum_zero_success_tick(&self) {
+        self.electrum_zero_success_ticks.inc();
+    }
+    pub fn electrum_budget_exhausted_tick(&self) {
+        self.electrum_budget_exhausted_ticks.inc();
+    }
+    pub fn sentinel_downgrade(&self) {
+        self.sentinel_downgrades.inc();
+    }
+    pub fn set_sentinel_oldest_unscanned_age_seconds(&self, seconds: i64) {
+        self.sentinel_oldest_unscanned_age_seconds
+            .set(seconds.max(0));
     }
     pub fn set_payment_states(&self, value: i64) {
         self.payment_states.set(value);

@@ -18,10 +18,25 @@ struct LiveResponse {
 #[derive(Serialize)]
 struct ReadyResponse {
     status: &'static str,
+    stack_id: String,
     postgres: &'static str,
-    electrum: &'static str,
+    electrum: ElectrumResponse,
+    bitcoin_creation_enabled: bool,
+    bitcoin_offer_available: bool,
+    electrum_tip_height: Option<u32>,
+    electrum_tip_age_seconds: Option<u64>,
     paykit_delivery: &'static str,
     outbox: &'static str,
+}
+
+#[derive(Serialize)]
+struct ElectrumResponse {
+    state: &'static str,
+    available: bool,
+    tip_height: Option<u32>,
+    tip_age_secs: Option<u64>,
+    last_probe_at: Option<u64>,
+    genesis_ok: bool,
 }
 
 pub fn router(runtime: Arc<Runtime>) -> Router {
@@ -44,8 +59,20 @@ async fn ready(State(runtime): State<Arc<Runtime>>) -> impl IntoResponse {
     };
     let body = Json(ReadyResponse {
         status,
+        stack_id: report.stack_id,
         postgres: report.postgres.as_str(),
-        electrum: report.electrum.as_str(),
+        electrum: ElectrumResponse {
+            state: report.electrum.as_str(),
+            available: report.electrum_probe.available,
+            tip_height: report.electrum_probe.tip_height,
+            tip_age_secs: report.electrum_probe.tip_age_secs,
+            last_probe_at: report.electrum_probe.last_probe_at,
+            genesis_ok: report.electrum_probe.genesis_ok,
+        },
+        bitcoin_creation_enabled: report.bitcoin_creation_enabled,
+        bitcoin_offer_available: report.bitcoin_offer_available,
+        electrum_tip_height: report.electrum_probe.tip_height,
+        electrum_tip_age_seconds: report.electrum_probe.tip_age_secs,
         paykit_delivery: report.paykit_delivery.as_str(),
         outbox: report.outbox.as_str(),
     });

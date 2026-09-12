@@ -9,13 +9,34 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
+use crate::workers::{
+    electrum::{
+        ENDPOINT_SCHEME_ERROR_MESSAGE, ElectrumEndpoint, LISTUNSPENT_ITEM_BYTES_UPPER_BOUND,
+        MAX_MAX_RESPONSE_BYTES, MIN_MAX_RESPONSE_BYTES,
+    },
+    observer::{ObserverPolicy, PROBE_REQUESTS_PER_TICK},
+};
+
+/// Allowance for the JSON-RPC envelope around a `listunspent` reply
+/// (`{"jsonrpc":"2.0","id":<u64>,"result":[…]}` plus separators): well
+/// under 1 KiB. Used only by the item-cap/byte-cap coupling rule.
+pub const LISTUNSPENT_RESPONSE_ENVELOPE_BYTES: u64 = 1024;
+const MAX_POSTGRES_INTERVAL_SECONDS: u64 = i64::MAX as u64;
+
 #[derive(Debug)]
 pub struct Config {
     pub http: HttpConfig,
     pub locks: LocksConfig,
+    /// Optional marketplace transaction-service trust anchors. When present,
+    /// requests signed by any of these keys are accepted on the signed
+    /// business routes (payment requests and status lookups) exactly like
+    /// Lock Server signatures.
+    pub marketplace: Option<MarketplaceConfig>,
     pub setup: SetupConfig,
     pub paykit: PaykitConfig,
+    pub bitcoin: BitcoinConfig,
     pub electrum: ElectrumConfig,
+    pub sentinel: SentinelConfig,
     pub outbox: OutboxConfig,
     pub limits: LimitsConfig,
     pub rate_limits: RateLimitsConfig,
@@ -54,27 +75,55 @@ impl Config {
             return Err(ConfigError::DuplicateReceiverPathPriority);
         }
         let bitcoin_network = BitcoinNetwork::parse(&raw.bitcoin.network)?;
+        let stack_role = StackRole::parse(raw.deployment)?;
 
         validate_url("electrum.endpoint", &raw.electrum.endpoint)?;
         let allowed_origins = validate_allowed_origins(raw.setup.allowed_origins)?;
+        let marketplace = raw.marketplace.map(MarketplaceConfig::parse).transpose()?;
+        let auth_relay = match raw.paykit.auth_relay {
+            Some(value) => validate_url("paykit.auth_relay", &value)?,
+            None => Url::parse(pubky::DEFAULT_HTTP_RELAY_INBOX)
+                .expect("default HTTP relay inbox URL parses"),
+        };
 
         let config = Self {
             http: HttpConfig {
                 listen_addr: raw.http.listen_addr,
             },
             locks: LocksConfig { trusted_public_key },
+            marketplace,
             setup: SetupConfig { allowed_origins },
             paykit: PaykitConfig {
                 receiver_path: receiver_path.clone(),
                 receiver_path_priority,
                 network: PaykitNetwork::parse(&raw.paykit.network)?,
+                auth_relay,
+            },
+            bitcoin: BitcoinConfig {
+                creation_enabled: raw.bitcoin.creation_enabled,
+                prepare_ttl: raw.bitcoin.prepare_ttl,
+                max_request_expiry: raw.bitcoin.max_request_expiry,
+                expiry_tail: raw.bitcoin.expiry_tail,
             },
             electrum: ElectrumConfig {
                 endpoint: raw.electrum.endpoint,
                 poll_interval: raw.electrum.poll_interval,
                 request_timeout: raw.electrum.request_timeout,
-                connect_retries: raw.electrum.connect_retries,
+                max_requests_per_tick: raw.electrum.max_requests_per_tick,
+                max_requests_per_second: raw.electrum.max_requests_per_second,
+                max_utxos_per_address: raw.electrum.max_utxos_per_address,
+                address_deadline: raw.electrum.address_deadline,
+                max_response_bytes: raw.electrum.max_response_bytes,
+                max_tip_age: raw.electrum.max_tip_age,
+                max_creation_history_entries: raw.electrum.max_creation_history_entries,
+                max_transaction_bytes: raw.electrum.max_transaction_bytes,
+                max_concurrent_creation_snapshots: raw.electrum.max_concurrent_creation_snapshots,
+                baseline_completion_timeout: raw.electrum.baseline_completion_timeout,
+                max_history_items_per_window: raw.electrum.max_history_items_per_window,
+                claim_scan_window_deadline: raw.electrum.claim_scan_window_deadline,
+                max_concurrent_claim_scans: raw.electrum.max_concurrent_claim_scans,
             },
+            sentinel: SentinelConfig::from(raw.sentinel),
             outbox: OutboxConfig::from(raw.outbox),
             limits: LimitsConfig::from(raw.limits),
             rate_limits: RateLimitsConfig::from(raw.rate_limits),
@@ -83,6 +132,7 @@ impl Config {
             master_key,
             deployment_invariants: DeploymentInvariants {
                 bitcoin_network,
+                stack_role,
                 receiver_path,
                 trusted_locks_key_fingerprint,
             },
@@ -111,19 +161,88 @@ impl Config {
         for (name, value) in [
             ("electrum.poll_interval", self.electrum.poll_interval),
             ("electrum.request_timeout", self.electrum.request_timeout),
+            ("electrum.address_deadline", self.electrum.address_deadline),
+            ("electrum.max_tip_age", self.electrum.max_tip_age),
+            (
+                "electrum.baseline_completion_timeout",
+                self.electrum.baseline_completion_timeout,
+            ),
+            ("bitcoin.prepare_ttl", self.bitcoin.prepare_ttl),
+            (
+                "bitcoin.max_request_expiry",
+                self.bitcoin.max_request_expiry,
+            ),
+            ("bitcoin.expiry_tail", self.bitcoin.expiry_tail),
             ("outbox.poll_interval", self.outbox.poll_interval),
             ("outbox.lease_duration", self.outbox.lease_duration),
             ("outbox.retry_initial", self.outbox.retry_initial),
             ("outbox.retry_max", self.outbox.retry_max),
             ("limits.lock_fetch_timeout", self.limits.lock_fetch_timeout),
             ("shutdown.drain_timeout", self.shutdown.drain_timeout),
+            (
+                "electrum.claim_scan_window_deadline",
+                self.electrum.claim_scan_window_deadline,
+            ),
+            ("sentinel.rescan_interval", self.sentinel.rescan_interval),
+            ("sentinel.max_age", self.sentinel.max_age),
         ] {
             if value.is_zero() {
                 return Err(ConfigError::ZeroDuration(name));
             }
         }
+        // Only `bitcoin.expiry_tail` flows to
+        // `make_interval(secs => i64)` in the expiry transitions, so only
+        // it needs the PostgreSQL interval bound at startup.
+        // `bitcoin.max_request_expiry` never reaches PostgreSQL: it
+        // bounds `expires_at` at request time with checked calendar
+        // arithmetic that fails closed (see
+        // `application::create_invoice::validate_expires_at`).
+        if self.bitcoin.expiry_tail.as_secs() > MAX_POSTGRES_INTERVAL_SECONDS {
+            return Err(ConfigError::DurationExceedsPostgresInterval(
+                "bitcoin.expiry_tail",
+            ));
+        }
+        // `sentinel.rescan_interval` flows to `make_interval(secs => i64)`
+        // in the sentinel admission plan, so it takes the same bound.
+        if self.sentinel.rescan_interval.as_secs() > MAX_POSTGRES_INTERVAL_SECONDS {
+            return Err(ConfigError::DurationExceedsPostgresInterval(
+                "sentinel.rescan_interval",
+            ));
+        }
         for (name, value) in [
             ("outbox.batch_size", u64::from(self.outbox.batch_size)),
+            (
+                "electrum.max_requests_per_tick",
+                u64::from(self.electrum.max_requests_per_tick),
+            ),
+            (
+                "electrum.max_requests_per_second",
+                u64::from(self.electrum.max_requests_per_second),
+            ),
+            (
+                "electrum.max_utxos_per_address",
+                u64::from(self.electrum.max_utxos_per_address),
+            ),
+            (
+                "electrum.max_creation_history_entries",
+                u64::from(self.electrum.max_creation_history_entries),
+            ),
+            (
+                "electrum.max_transaction_bytes",
+                u64::from(self.electrum.max_transaction_bytes),
+            ),
+            (
+                "electrum.max_concurrent_creation_snapshots",
+                u64::from(self.electrum.max_concurrent_creation_snapshots),
+            ),
+            (
+                "electrum.max_history_items_per_window",
+                u64::from(self.electrum.max_history_items_per_window),
+            ),
+            (
+                "electrum.max_concurrent_claim_scans",
+                u64::from(self.electrum.max_concurrent_claim_scans),
+            ),
             ("limits.request_body_bytes", self.limits.request_body_bytes),
             (
                 "limits.lock_resource_bytes",
@@ -150,15 +269,31 @@ impl Config {
                 "rate_limits.max_completion_polls",
                 self.rate_limits.max_completion_polls,
             ),
+            (
+                "rate_limits.claims_per_minute",
+                self.rate_limits.claims_per_minute,
+            ),
+            ("sentinel.min_value_sats", self.sentinel.min_value_sats),
+            ("sentinel.hit_count", self.sentinel.hit_count),
+            (
+                "sentinel.max_requests_per_tick",
+                u64::from(self.sentinel.max_requests_per_tick),
+            ),
+            (
+                "sentinel.max_requests_per_second",
+                u64::from(self.sentinel.max_requests_per_second),
+            ),
         ] {
             if value == 0 {
                 return Err(ConfigError::ZeroValue(name));
             }
         }
         for (name, value) in [
+            ("electrum.poll_interval", self.electrum.poll_interval),
             ("outbox.lease_duration", self.outbox.lease_duration),
             ("outbox.retry_initial", self.outbox.retry_initial),
             ("outbox.retry_max", self.outbox.retry_max),
+            ("sentinel.rescan_interval", self.sentinel.rescan_interval),
         ] {
             if value < Duration::from_secs(1) {
                 return Err(ConfigError::SubsecondPersistenceDuration(name));
@@ -166,6 +301,80 @@ impl Config {
         }
         if self.outbox.retry_initial > self.outbox.retry_max {
             return Err(ConfigError::InconsistentRetries("outbox"));
+        }
+        // Every tick reserves PROBE_REQUESTS_PER_TICK requests for the
+        // active probe before admitting observation targets, so the
+        // effective per-tick budget —
+        // min(max_requests_per_tick,
+        //     max_requests_per_second * poll_interval_secs)
+        // — must exceed the reservation, or every tick would probe
+        // successfully while admitting zero address lookups forever.
+        let effective_per_tick = ObserverPolicy {
+            poll_interval: self.electrum.poll_interval,
+            max_requests_per_tick: self.electrum.max_requests_per_tick,
+            max_requests_per_second: self.electrum.max_requests_per_second,
+            max_transaction_bytes: usize::try_from(self.electrum.max_transaction_bytes)
+                .unwrap_or(usize::MAX),
+            baseline_completion_timeout: self.electrum.baseline_completion_timeout,
+            expiry_tail: self.bitcoin.expiry_tail,
+        }
+        .per_tick_budget();
+        if effective_per_tick <= PROBE_REQUESTS_PER_TICK {
+            return Err(ConfigError::InsufficientElectrumBudget);
+        }
+        if self.deployment_invariants.stack_role == StackRole::Production
+            && self.deployment_invariants.bitcoin_network != BitcoinNetwork::Mainnet
+        {
+            return Err(ConfigError::ProductionRequiresMainnet);
+        }
+        if self.electrum.max_response_bytes < MIN_MAX_RESPONSE_BYTES {
+            return Err(ConfigError::ElectrumResponseCapBelowFloor);
+        }
+        if self.electrum.max_response_bytes > MAX_MAX_RESPONSE_BYTES {
+            return Err(ConfigError::ElectrumResponseCapAboveCeiling);
+        }
+        // Coupling rule: the item cap must never demand a reply the
+        // transport byte cap refuses. A maximal listunspent reply is
+        // max_utxos_per_address items of at most
+        // LISTUNSPENT_ITEM_BYTES_UPPER_BOUND bytes each plus the
+        // JSON-RPC envelope; if that exceeds max_response_bytes, the
+        // byte cap would poison the server's own largest legitimate
+        // response, so startup refuses the configuration. u32 ×
+        // LISTUNSPENT_ITEM_BYTES_UPPER_BOUND (176) cannot overflow u64.
+        let largest_legitimate_response = u64::from(self.electrum.max_utxos_per_address)
+            * LISTUNSPENT_ITEM_BYTES_UPPER_BOUND
+            + LISTUNSPENT_RESPONSE_ENVELOPE_BYTES;
+        if largest_legitimate_response > self.electrum.max_response_bytes {
+            return Err(ConfigError::ElectrumUtxoCapExceedsResponseCap(
+                self.electrum.max_utxos_per_address,
+                self.electrum.max_response_bytes,
+            ));
+        }
+        // Plaintext Electrum carries the merchant's invoice addresses and
+        // UTXO sets unauthenticated and in the clear; on mainnet the only
+        // acceptable transport is TLS (`tcp://` stays allowed on
+        // regtest/signet/testnet for local fulcrum-style endpoints).
+        if self.deployment_invariants.bitcoin_network == BitcoinNetwork::Mainnet {
+            // Delegate endpoint-shape validation to the same parser the
+            // adapter construction uses, so a malformed endpoint (for
+            // example `ssl://host:port/tcp://`) is refused at config load
+            // with the parser's own literal instead of later at adapter
+            // construction.
+            let endpoint = ElectrumEndpoint::parse(&self.electrum.endpoint)
+                .map_err(|_| ConfigError::InvalidElectrumEndpoint(ENDPOINT_SCHEME_ERROR_MESSAGE))?;
+            // Fail closed on scheme case as well: `SSL://` is refused
+            // even though the URL parser would normalize it to `ssl`.
+            let scheme = self
+                .electrum
+                .endpoint
+                .split("://")
+                .next()
+                .unwrap_or_default();
+            if scheme != "ssl" || !endpoint.use_tls() {
+                return Err(ConfigError::PlaintextElectrumEndpointOnMainnet(
+                    scheme.to_owned(),
+                ));
+            }
         }
         Ok(())
     }
@@ -180,8 +389,40 @@ pub struct ConfigEnvironment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeploymentInvariants {
     pub bitcoin_network: BitcoinNetwork,
+    /// Deployment role distinguishing real-money production stacks from
+    /// proof-of-concept stacks. Persisted adopt-once: a database that has
+    /// never recorded a role adopts the configured one on first boot, and
+    /// every later boot refuses to start on a mismatch.
+    pub stack_role: StackRole,
     pub receiver_path: PaykitReceiverPath,
     pub trusted_locks_key_fingerprint: TrustedLocksKeyFingerprint,
+}
+
+/// Whether this stack serves production traffic or proof-of-concept testing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StackRole {
+    Production,
+    Proof,
+}
+
+impl StackRole {
+    fn parse(raw: Option<RawDeploymentConfig>) -> Result<Self, ConfigError> {
+        let value = raw
+            .and_then(|deployment| deployment.stack_role)
+            .ok_or(ConfigError::MissingStackRole)?;
+        match value.as_str() {
+            "production" => Ok(Self::Production),
+            "proof" => Ok(Self::Proof),
+            _ => Err(ConfigError::InvalidStackRole),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Production => "production",
+            Self::Proof => "proof",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,6 +536,84 @@ pub struct LocksConfig {
     pub trusted_public_key: TrustedLocksPublicKey,
 }
 
+/// Trusted marketplace request-signing keys. Every configured key is trusted
+/// equally; a request is authentic when any one of them verifies.
+#[derive(Debug)]
+pub struct MarketplaceConfig {
+    pub trusted_keys: Vec<TrustedMarketplaceKey>,
+}
+
+impl MarketplaceConfig {
+    fn parse(raw: RawMarketplaceConfig) -> Result<Self, ConfigError> {
+        if raw.trusted_public_key.is_some() && !raw.trusted_public_keys.is_empty() {
+            return Err(ConfigError::ConflictingTrustedMarketplacePublicKeys);
+        }
+        let values = match raw.trusted_public_key {
+            Some(single) => vec![single],
+            None => raw.trusted_public_keys,
+        };
+        if values.is_empty() {
+            return Err(ConfigError::EmptyTrustedMarketplacePublicKeys);
+        }
+        let trusted_keys = values
+            .into_iter()
+            .map(TrustedMarketplaceKey::parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut seen_key_ids = std::collections::HashSet::new();
+        for key in &trusted_keys {
+            if !seen_key_ids.insert(key.key_id().to_owned()) {
+                return Err(ConfigError::DuplicateTrustedMarketplacePublicKey(
+                    key.key_id().to_owned(),
+                ));
+            }
+        }
+        Ok(Self { trusted_keys })
+    }
+}
+
+/// One trusted marketplace signing key. `key_id` is a short fingerprint
+/// prefix safe to log; the key material itself is never rendered.
+#[derive(Clone, PartialEq, Eq)]
+pub struct TrustedMarketplaceKey {
+    public_key: TrustedLocksPublicKey,
+    key_id: String,
+}
+
+impl TrustedMarketplaceKey {
+    fn parse(value: String) -> Result<Self, ConfigError> {
+        let public_key = TrustedLocksPublicKey::parse(value)
+            .map_err(|_| ConfigError::InvalidTrustedMarketplacePublicKey)?;
+        let key_id = public_key
+            .fingerprint()
+            .as_bytes()
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Ok(Self { public_key, key_id })
+    }
+
+    /// Stable, secret-free identifier (truncated SHA-256 fingerprint) used in
+    /// verification logs.
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub(crate) fn verifying_key(&self) -> VerifyingKey {
+        self.public_key.verifying_key()
+    }
+}
+
+impl fmt::Debug for TrustedMarketplaceKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TrustedMarketplaceKey")
+            .field("key_id", &self.key_id)
+            .field("public_key", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 pub struct SetupConfig {
     pub allowed_origins: Vec<String>,
@@ -306,6 +625,10 @@ pub struct PaykitConfig {
     /// Ordered first-segment preference for discovered reader receiver paths.
     pub receiver_path_priority: Vec<ReceiverPathPriority>,
     pub network: PaykitNetwork,
+    /// HTTP relay inbox base used both by the SDK auth flows and by the
+    /// manual claim loopback that exchanges a caller-supplied AuthToken for
+    /// a homeserver session.
+    pub auth_relay: Url,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,12 +667,108 @@ impl ReceiverPathPriority {
     }
 }
 
+/// Operational switches for the Bitcoin settlement path.
+#[derive(Debug)]
+pub struct BitcoinConfig {
+    /// When false, new Bitcoin payment-request binds are refused while every
+    /// existing invoice keeps being observed.
+    pub creation_enabled: bool,
+    /// Lifetime of a `prepared` invoice awaiting activation (design §B.11.1):
+    /// `prepare_expires_at = created_at + prepare_ttl`, stamped from the
+    /// server clock at creation commit. The reaper voids a `prepared` invoice
+    /// once this elapses without activation.
+    pub prepare_ttl: Duration,
+    /// Furthest future Payment Request expiry a prepare call may carry
+    /// (design §B.9): `expires_at` further out than
+    /// `server clock + max_request_expiry` is refused fail-closed, so a
+    /// delivered request can never be payable (and observed) effectively
+    /// forever. The buyer's wallet enforces the carried expiry.
+    pub max_request_expiry: Duration,
+    /// Length of the observation tail after `expires_at` (design §B.9): the
+    /// observer tick moves `observing → expired_tail` at `expires_at` and
+    /// `expired_tail → expired_final` at `expires_at + expiry_tail`, both
+    /// timestamp-derived from `expires_at` on the server clock. Through the
+    /// tail the invoice is still observed, deprioritized behind live
+    /// targets; observations recorded there carry `late_settlement`.
+    pub expiry_tail: Duration,
+}
+
 #[derive(Debug)]
 pub struct ElectrumConfig {
+    /// `tcp://host:port` or `ssl://host:port`. When
+    /// `bitcoin.network == mainnet`, startup refuses anything but
+    /// `ssl://`: plaintext Electrum on mainnet would expose every
+    /// tracked invoice address and UTXO set unauthenticated and in the
+    /// clear. `tcp://` stays allowed on regtest/signet/testnet for
+    /// local fulcrum-style endpoints.
     pub endpoint: String,
     pub poll_interval: Duration,
     pub request_timeout: Duration,
-    pub connect_retries: u8,
+    /// Hard cap on Electrum lookups admitted to one tick, including the
+    /// tick's two probe requests (headers.subscribe + block_header(0)),
+    /// which are reserved before observation targets are admitted. Each
+    /// admitted target costs exactly one `script_list_unspent` lookup;
+    /// there is no bypass and no unmetered admission.
+    pub max_requests_per_tick: u32,
+    /// Sustained request budget: the observer's token bucket refills from
+    /// elapsed wall time at this rate, so no loop cadence (including the
+    /// shortest jitter interval) can sustain a higher request rate.
+    pub max_requests_per_second: u32,
+    /// Hard cap on decoded `list_unspent` items accepted for one address.
+    /// Over-limit responses are rejected before any per-UTXO record is
+    /// materialised and fail only that address.
+    pub max_utxos_per_address: u32,
+    /// Per-address wall-clock deadline over connect + call + decode. A
+    /// lookup exceeding it fails only that address; the connection is
+    /// dropped and never reused.
+    pub address_deadline: Duration,
+    /// Transport-level cap on one Electrum response line, in bytes. Every
+    /// connection wraps its stream in a capped reader, so no single
+    /// response line larger than this is ever held in memory: the read
+    /// fails before the client buffers or decodes it, and the poisoned
+    /// connection is torn down. Floor: 64 KiB; ceiling: 16 MiB (startup
+    /// refuses values outside the range).
+    pub max_response_bytes: u64,
+    /// Maximum accepted chain-tip age for readiness. On networks with a
+    /// live block cadence, /health/ready answers 503 (not_ready) when the
+    /// probed tip is older than this, when the tip height regresses by
+    /// more than the six-block reorg tolerance, or when the tip height
+    /// stops advancing within this window — the endpoint's chain view
+    /// cannot be trusted, so a load balancer or pager must see the
+    /// failure. A probe older than the freshness window, a tip time over
+    /// two hours in the future, or a tip-height regression within the
+    /// reorg tolerance (a trailing backend of a pool-balanced endpoint)
+    /// stays at HTTP 200 degraded. A regression beyond the tolerance is
+    /// 503 until the chain exceeds the previous maximum. Skipped on
+    /// regtest, whose tips are mined on demand and can be arbitrarily old
+    /// without indicating endpoint trouble.
+    pub max_tip_age: Duration,
+    /// Maximum complete history entries accepted by one creation snapshot.
+    pub max_creation_history_entries: u32,
+    /// Maximum raw transaction response accepted by bounded transaction fetches.
+    pub max_transaction_bytes: u32,
+    /// Maximum creation snapshots allowed to occupy the blocking pool concurrently.
+    pub max_concurrent_creation_snapshots: u32,
+    /// Maximum age of an invoice left between creation commit and baseline completion.
+    pub baseline_completion_timeout: Duration,
+    /// Claim-scan response bound: raw history items accepted across one
+    /// window's batched `get_history` (20 scripthashes), enforced on the
+    /// raw response values before any domain value is materialised. An
+    /// over-cap window is treated as used (design §B.5; conservative — it
+    /// only advances the start index, and the 50-window scan bound still
+    /// yields `account_history_too_deep`).
+    pub max_history_items_per_window: u32,
+    /// Claim-scan per-window wall-clock deadline over connect + call +
+    /// decode. The blocking socket read behind it cannot be cancelled, so
+    /// an over-deadline window keeps one blocking-pool thread occupied
+    /// until the read returns (bounded at latest by
+    /// `electrum.request_timeout` on the wire); see
+    /// docs/observer-threat-model.md, "claim-time scan".
+    pub claim_scan_window_deadline: Duration,
+    /// Process-wide bound on concurrent claim-scan window fetches; over
+    /// the bound a claim fails `claim_scan_unavailable` immediately (no
+    /// queueing, no Electrum call).
+    pub max_concurrent_claim_scans: u32,
 }
 
 #[derive(Debug)]
@@ -359,6 +778,57 @@ pub struct OutboxConfig {
     pub lease_duration: Duration,
     pub retry_initial: Duration,
     pub retry_max: Duration,
+}
+
+/// W1.14 unassigned-sentinel configuration (design §B.8.7). The sentinel
+/// runs INSIDE the §B.7 observer tick (no second worker or cadence) under a
+/// SUBORDINATE sub-budget of the shared `electrum.*` request quota — not a
+/// second endpoint quota. One tick's sentinel allowance defaults to 10% of
+/// the shared bucket's remaining balance after every live invoice target is
+/// satisfied (zero when any live target was deferred), hard-capped by
+/// `max_requests_per_tick`, sustained-capped by `max_requests_per_second`,
+/// and every admitted sentinel request is charged against the shared bucket
+/// itself: aggregate endpoint traffic never exceeds
+/// `electrum.max_requests_per_tick` per tick or
+/// `electrum.max_requests_per_second` sustained, and sentinel work never
+/// defers a live target.
+#[derive(Debug)]
+pub struct SentinelConfig {
+    /// Minimum output value: the relay-standard P2WPKH dust floor (default
+    /// 294 sats). Below it an output is never a candidate or evidence.
+    pub min_value_sats: u64,
+    /// Distinct `txid:vout` hits required for the downgrade predicate
+    /// (default 1).
+    pub hit_count: u64,
+    /// Per-creator re-scan cadence (default 10 minutes): a scanned creator
+    /// is not re-admitted within this interval.
+    pub rescan_interval: Duration,
+    /// Freshness SLO (default 1 hour): the sentinel age alert reports the
+    /// oldest admitted exclusive creator older than this; it never gates
+    /// creation and never mutates a mode.
+    pub max_age: Duration,
+    /// Sentinel sub-budget capacity per tick (default 1,000): a cap on the
+    /// subordinate allowance, never additional endpoint capacity.
+    pub max_requests_per_tick: u32,
+    /// Sentinel sub-budget sustained refill (default 5/second).
+    pub max_requests_per_second: u32,
+}
+
+impl SentinelConfig {
+    /// The validated runtime policy; the BIP44 scan window is fixed.
+    pub fn policy(&self) -> crate::sentinel::SentinelPolicy {
+        crate::sentinel::SentinelPolicy {
+            thresholds: crate::sentinel::SentinelThresholds {
+                min_value_sats: self.min_value_sats,
+                hit_count: self.hit_count,
+            },
+            rescan_interval: self.rescan_interval,
+            max_age: self.max_age,
+            max_requests_per_tick: self.max_requests_per_tick,
+            max_requests_per_second: self.max_requests_per_second,
+            scan_window: crate::sentinel::SENTINEL_SCAN_WINDOW,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -376,6 +846,9 @@ pub struct RateLimitsConfig {
     pub max_pending_setup_flows: u64,
     pub max_completion_polls_per_flow: u64,
     pub max_completion_polls: u64,
+    /// Process-wide manual claim budget: each claim performs a relay
+    /// round-trip and a homeserver session exchange.
+    pub claims_per_minute: u64,
 }
 
 #[derive(Debug)]
@@ -420,8 +893,24 @@ pub enum ConfigError {
     InvalidMasterKey,
     #[error("locks.trusted_public_key must be a canonical pubky-prefixed public key")]
     InvalidTrustedLocksPublicKey,
+    #[error("marketplace trusted public keys must be canonical pubky-prefixed public keys")]
+    InvalidTrustedMarketplacePublicKey,
+    #[error(
+        "marketplace.trusted_public_key and marketplace.trusted_public_keys are mutually exclusive"
+    )]
+    ConflictingTrustedMarketplacePublicKeys,
+    #[error("marketplace.trusted_public_keys must contain at least one key")]
+    EmptyTrustedMarketplacePublicKeys,
+    #[error("marketplace.trusted_public_keys must not contain duplicates (key_id {0})")]
+    DuplicateTrustedMarketplacePublicKey(String),
     #[error("bitcoin.network must be mainnet, testnet, signet, or regtest")]
     InvalidNetwork,
+    #[error("[deployment] stack_role is required and must be production or proof")]
+    MissingStackRole,
+    #[error("[deployment] stack_role must be production or proof")]
+    InvalidStackRole,
+    #[error("deployment invariant refused: stack_role=production requires bitcoin.network=mainnet")]
+    ProductionRequiresMainnet,
     #[error("{0} must be a valid absolute URL")]
     InvalidUrl(&'static str),
     #[error(
@@ -444,8 +933,30 @@ pub enum ConfigError {
     ZeroValue(&'static str),
     #[error("{0} must be at least one second")]
     SubsecondPersistenceDuration(&'static str),
+    #[error("{0} must fit PostgreSQL make_interval(secs => i64)")]
+    DurationExceedsPostgresInterval(&'static str),
     #[error("{0}.retry_initial must not exceed {0}.retry_max")]
     InconsistentRetries(&'static str),
+    #[error(
+        "electrum request budget must exceed the {PROBE_REQUESTS_PER_TICK} reserved probe requests per tick: \
+         min(electrum.max_requests_per_tick, electrum.max_requests_per_second * electrum.poll_interval seconds) \
+         must be greater than {PROBE_REQUESTS_PER_TICK}"
+    )]
+    InsufficientElectrumBudget,
+    #[error("electrum.max_response_bytes must be at least 65536 bytes (64 KiB)")]
+    ElectrumResponseCapBelowFloor,
+    #[error("electrum.max_response_bytes must be at most 16777216 bytes (16 MiB)")]
+    ElectrumResponseCapAboveCeiling,
+    #[error(
+        "electrum.max_utxos_per_address {0} × {LISTUNSPENT_ITEM_BYTES_UPPER_BOUND} B exceeds electrum.max_response_bytes {1}"
+    )]
+    ElectrumUtxoCapExceedsResponseCap(u32, u64),
+    #[error(
+        "bitcoin.network mainnet requires an ssl:// electrum.endpoint; the {0}:// scheme is plaintext and refused"
+    )]
+    PlaintextElectrumEndpointOnMainnet(String),
+    #[error("{0}")]
+    InvalidElectrumEndpoint(&'static str),
 }
 
 fn decode_base64url_no_pad(value: &str, error: ConfigError) -> Result<Vec<u8>, ConfigError> {
@@ -497,10 +1008,16 @@ fn validate_allowed_origins(values: Vec<String>) -> Result<Vec<String>, ConfigEr
 struct RawConfig {
     http: RawHttpConfig,
     locks: RawLocksConfig,
+    #[serde(default)]
+    marketplace: Option<RawMarketplaceConfig>,
     setup: RawSetupConfig,
     paykit: RawPaykitConfig,
     bitcoin: RawBitcoinConfig,
+    #[serde(default)]
+    deployment: Option<RawDeploymentConfig>,
     electrum: RawElectrumConfig,
+    #[serde(default)]
+    sentinel: RawSentinelConfig,
     outbox: RawOutboxConfig,
     #[serde(default)]
     limits: RawLimitsConfig,
@@ -524,6 +1041,15 @@ struct RawLocksConfig {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawMarketplaceConfig {
+    #[serde(default)]
+    trusted_public_key: Option<String>,
+    #[serde(default)]
+    trusted_public_keys: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawSetupConfig {
     allowed_origins: Vec<String>,
 }
@@ -535,6 +1061,8 @@ struct RawPaykitConfig {
     #[serde(default = "default_receiver_path_priority")]
     receiver_path_priority: Vec<String>,
     network: String,
+    #[serde(default)]
+    auth_relay: Option<String>,
 }
 
 fn default_receiver_path_priority() -> Vec<String> {
@@ -545,6 +1073,51 @@ fn default_receiver_path_priority() -> Vec<String> {
 #[serde(deny_unknown_fields)]
 struct RawBitcoinConfig {
     network: String,
+    #[serde(default = "default_bitcoin_creation_enabled")]
+    creation_enabled: bool,
+    #[serde(default = "default_bitcoin_prepare_ttl", with = "humantime_serde")]
+    prepare_ttl: Duration,
+    #[serde(
+        default = "default_bitcoin_max_request_expiry",
+        with = "humantime_serde"
+    )]
+    max_request_expiry: Duration,
+    #[serde(default = "default_bitcoin_expiry_tail", with = "humantime_serde")]
+    expiry_tail: Duration,
+}
+
+const fn default_bitcoin_creation_enabled() -> bool {
+    false
+}
+
+/// §B.11.1: `prepare_expires_at = created_at + prepare_ttl`. Far longer than
+/// any plausible marketplace commit-plus-outbox latency and far shorter than
+/// the 1 h hold window, so a reaped prepare is always distinguishable from an
+/// expired order. A paykit-server config value, never marketplace-supplied.
+fn default_bitcoin_prepare_ttl() -> Duration {
+    Duration::from_secs(15 * 60)
+}
+
+/// §B.9: a prepare carrying `expires_at` further out than this is refused.
+/// Bounded so every delivered Payment Request expires on a horizon the
+/// observer tail and the marketplace hold window can actually cover.
+fn default_bitcoin_max_request_expiry() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
+}
+
+/// §B.9: `expired_tail → expired_final` at `expires_at + expiry_tail`. The
+/// tail is the window in which a late payment still reaches a human
+/// (`manual_review`) rather than silence; aligned with the marketplace's
+/// 24-hour seller-confirmation window (§B.8.8).
+fn default_bitcoin_expiry_tail() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDeploymentConfig {
+    #[serde(default)]
+    stack_role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -555,20 +1128,168 @@ struct RawElectrumConfig {
     poll_interval: Duration,
     #[serde(default = "default_electrum_request_timeout", with = "humantime_serde")]
     request_timeout: Duration,
-    #[serde(default = "default_electrum_connect_retries")]
-    connect_retries: u8,
+    #[serde(default = "default_electrum_max_requests_per_tick")]
+    max_requests_per_tick: u32,
+    #[serde(default = "default_electrum_max_requests_per_second")]
+    max_requests_per_second: u32,
+    #[serde(default = "default_electrum_max_utxos_per_address")]
+    max_utxos_per_address: u32,
+    #[serde(
+        default = "default_electrum_address_deadline",
+        with = "humantime_serde"
+    )]
+    address_deadline: Duration,
+    #[serde(default = "default_electrum_max_response_bytes")]
+    max_response_bytes: u64,
+    #[serde(default = "default_electrum_max_tip_age", with = "humantime_serde")]
+    max_tip_age: Duration,
+    #[serde(default = "default_electrum_max_creation_history_entries")]
+    max_creation_history_entries: u32,
+    #[serde(default = "default_electrum_max_transaction_bytes")]
+    max_transaction_bytes: u32,
+    #[serde(default = "default_electrum_max_concurrent_creation_snapshots")]
+    max_concurrent_creation_snapshots: u32,
+    #[serde(
+        default = "default_electrum_baseline_completion_timeout",
+        with = "humantime_serde"
+    )]
+    baseline_completion_timeout: Duration,
+    #[serde(default = "default_electrum_max_history_items_per_window")]
+    max_history_items_per_window: u32,
+    #[serde(
+        default = "default_electrum_claim_scan_window_deadline",
+        with = "humantime_serde"
+    )]
+    claim_scan_window_deadline: Duration,
+    #[serde(default = "default_electrum_max_concurrent_claim_scans")]
+    max_concurrent_claim_scans: u32,
+}
+
+const fn default_electrum_max_requests_per_tick() -> u32 {
+    1000
+}
+
+const fn default_electrum_max_requests_per_second() -> u32 {
+    5
+}
+
+const fn default_electrum_max_utxos_per_address() -> u32 {
+    200
+}
+
+const fn default_electrum_address_deadline() -> Duration {
+    Duration::from_secs(5)
+}
+
+const fn default_electrum_max_creation_history_entries() -> u32 {
+    50
+}
+
+const fn default_electrum_max_transaction_bytes() -> u32 {
+    400_000
+}
+
+const fn default_electrum_max_concurrent_creation_snapshots() -> u32 {
+    4
+}
+
+const fn default_electrum_baseline_completion_timeout() -> Duration {
+    Duration::from_secs(60)
+}
+
+const fn default_electrum_max_response_bytes() -> u64 {
+    crate::workers::electrum::DEFAULT_MAX_RESPONSE_BYTES
+}
+
+const fn default_electrum_max_history_items_per_window() -> u32 {
+    2_000
+}
+
+const fn default_electrum_claim_scan_window_deadline() -> Duration {
+    Duration::from_secs(5)
+}
+
+const fn default_electrum_max_concurrent_claim_scans() -> u32 {
+    2
+}
+
+const fn default_electrum_max_tip_age() -> Duration {
+    Duration::from_secs(4 * 60 * 60)
 }
 
 fn default_electrum_request_timeout() -> Duration {
     Duration::from_secs(10)
 }
 
-fn default_electrum_connect_retries() -> u8 {
-    1
-}
-
 fn default_outbox_batch_size() -> u32 {
     16
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSentinelConfig {
+    #[serde(default = "default_sentinel_min_value_sats")]
+    min_value_sats: u64,
+    #[serde(default = "default_sentinel_hit_count")]
+    hit_count: u64,
+    #[serde(default = "default_sentinel_rescan_interval", with = "humantime_serde")]
+    rescan_interval: Duration,
+    #[serde(default = "default_sentinel_max_age", with = "humantime_serde")]
+    max_age: Duration,
+    #[serde(default = "default_sentinel_max_requests_per_tick")]
+    max_requests_per_tick: u32,
+    #[serde(default = "default_sentinel_max_requests_per_second")]
+    max_requests_per_second: u32,
+}
+
+const fn default_sentinel_min_value_sats() -> u64 {
+    crate::sentinel::DEFAULT_MIN_VALUE_SATS
+}
+
+const fn default_sentinel_hit_count() -> u64 {
+    crate::sentinel::DEFAULT_HIT_COUNT
+}
+
+const fn default_sentinel_rescan_interval() -> Duration {
+    crate::sentinel::DEFAULT_RESCAN_INTERVAL
+}
+
+const fn default_sentinel_max_age() -> Duration {
+    crate::sentinel::DEFAULT_MAX_AGE
+}
+
+const fn default_sentinel_max_requests_per_tick() -> u32 {
+    crate::sentinel::DEFAULT_MAX_REQUESTS_PER_TICK
+}
+
+const fn default_sentinel_max_requests_per_second() -> u32 {
+    crate::sentinel::DEFAULT_MAX_REQUESTS_PER_SECOND
+}
+
+impl Default for RawSentinelConfig {
+    fn default() -> Self {
+        Self {
+            min_value_sats: default_sentinel_min_value_sats(),
+            hit_count: default_sentinel_hit_count(),
+            rescan_interval: default_sentinel_rescan_interval(),
+            max_age: default_sentinel_max_age(),
+            max_requests_per_tick: default_sentinel_max_requests_per_tick(),
+            max_requests_per_second: default_sentinel_max_requests_per_second(),
+        }
+    }
+}
+
+impl From<RawSentinelConfig> for SentinelConfig {
+    fn from(value: RawSentinelConfig) -> Self {
+        Self {
+            min_value_sats: value.min_value_sats,
+            hit_count: value.hit_count,
+            rescan_interval: value.rescan_interval,
+            max_age: value.max_age,
+            max_requests_per_tick: value.max_requests_per_tick,
+            max_requests_per_second: value.max_requests_per_second,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -612,6 +1333,8 @@ struct RawRateLimitsConfig {
     max_completion_polls_per_flow: u64,
     #[serde(default = "default_max_completion_polls")]
     max_completion_polls: u64,
+    #[serde(default = "default_claims_per_minute")]
+    claims_per_minute: u64,
 }
 
 #[derive(Deserialize)]
@@ -640,6 +1363,7 @@ impl Default for RawRateLimitsConfig {
             max_pending_setup_flows: default_max_pending_setup_flows(),
             max_completion_polls_per_flow: default_max_completion_polls_per_flow(),
             max_completion_polls: default_max_completion_polls(),
+            claims_per_minute: default_claims_per_minute(),
         }
     }
 }
@@ -683,6 +1407,7 @@ impl From<RawRateLimitsConfig> for RateLimitsConfig {
             max_pending_setup_flows: value.max_pending_setup_flows,
             max_completion_polls_per_flow: value.max_completion_polls_per_flow,
             max_completion_polls: value.max_completion_polls,
+            claims_per_minute: value.claims_per_minute,
         }
     }
 }
@@ -735,6 +1460,19 @@ const fn default_max_completion_polls_per_flow() -> u64 {
 const fn default_max_completion_polls() -> u64 {
     200
 }
+const fn default_claims_per_minute() -> u64 {
+    30
+}
 const fn default_shutdown_drain_timeout() -> Duration {
     Duration::from_secs(30)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_bitcoin_creation_enabled;
+
+    #[test]
+    fn omitted_bitcoin_creation_is_disabled() {
+        assert!(!default_bitcoin_creation_enabled());
+    }
 }

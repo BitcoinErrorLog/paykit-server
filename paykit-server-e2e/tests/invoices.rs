@@ -11,7 +11,7 @@ use paykit_server::{
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
     persistence::{
-        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
+        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePreflight, InvoiceStore,
         NewReaderPayloadFactory, NewReaderPayloads, PersistenceError, run_migrations,
     },
 };
@@ -150,6 +150,9 @@ async fn invoice_store(database: &TestDatabase) -> InvoiceStore {
                 0,
             ),
             &StorageState::default(),
+            &key_tail(24),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -170,7 +173,16 @@ fn input<'a>(
         new_reader_payloads: &TEST_PAYLOADS,
         payment_request_intent: payment_intent(),
         required_sats: 100,
+        nonce_sats: 1,
+        prepare_ttl: std::time::Duration::from_secs(900),
+        expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
     }
+}
+
+/// Distinct canonical key tails so the fingerprint-to-seller binding written
+/// by every create/reauthenticate never collides within a test database.
+fn key_tail(seed: u8) -> [u8; 65] {
+    [seed; 65]
 }
 
 #[tokio::test]
@@ -473,6 +485,339 @@ async fn concurrent_exact_invoice_allocation_serializes_to_one_durable_result() 
 }
 
 #[tokio::test]
+async fn failed_baseline_burns_index_and_never_reissues_it() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let burned = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"burned-bundle",
+            b"burned-request",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(burned.reader_child_index(), 0);
+    store
+        .fail_creation_baseline(burned.invoice_id())
+        .await
+        .unwrap();
+
+    let next = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"after-burn-bundle",
+            b"after-burn-request",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next.reader_child_index(), 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        2
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn failed_snapshot_voids_without_delivery_or_target_membership() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let created = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"failed-snapshot-bundle",
+            b"failed-snapshot-request",
+        ))
+        .await
+        .unwrap();
+    store
+        .fail_creation_baseline(created.invoice_id())
+        .await
+        .unwrap();
+
+    let state: String = sqlx::query_scalar("SELECT baseline_state FROM invoices WHERE id = $1")
+        .bind(created.invoice_id())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(state, "void_baseline_failed");
+    let statuses: Vec<String> =
+        sqlx::query_scalar("SELECT status FROM outbox WHERE invoice_id = $1 ORDER BY id")
+            .bind(created.invoice_id())
+            .fetch_all(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(statuses, vec!["prepared", "prepared"]);
+    assert!(store.observation_plan().await.unwrap().is_empty());
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn preflight_never_replays_an_unpublished_baseline_row() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let created = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"preflight-orphan-bundle",
+            b"preflight-orphan-request",
+        ))
+        .await
+        .unwrap();
+
+    // An orphaned `awaiting_baseline` row never published: the preflight
+    // reports in-progress, NEVER ExactReplay (design r13).
+    assert_eq!(
+        store
+            .preflight(
+                &creator,
+                b"preflight-orphan-bundle",
+                b"preflight-orphan-request"
+            )
+            .await
+            .unwrap(),
+        InvoicePreflight::BaselineInProgress
+    );
+    // A different payload over the same bundle stays a conflict.
+    assert_eq!(
+        store
+            .preflight(
+                &creator,
+                b"preflight-orphan-bundle",
+                b"preflight-other-request"
+            )
+            .await
+            .unwrap(),
+        InvoicePreflight::Conflict
+    );
+
+    // The sweeper's void is terminal: §B.11.6 answers a phase-1 replay
+    // against it with the named `invoice_finalized` refusal, still never
+    // ExactReplay.
+    store
+        .fail_creation_baseline(created.invoice_id())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .preflight(
+                &creator,
+                b"preflight-orphan-bundle",
+                b"preflight-orphan-request"
+            )
+            .await
+            .unwrap(),
+        InvoicePreflight::InvoiceFinalized
+    );
+
+    // A published invoice (baseline completed, outbox queued) replays.
+    let published = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"preflight-published-bundle",
+            b"preflight-published-request",
+        ))
+        .await
+        .unwrap();
+    store
+        .complete_creation_baseline(published.invoice_id(), 100, &[], &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .preflight(
+                &creator,
+                b"preflight-published-bundle",
+                b"preflight-published-request"
+            )
+            .await
+            .unwrap(),
+        InvoicePreflight::ExactReplay
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn create_atomic_replay_branch_mirrors_preflight_for_every_baseline_state() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+
+    // The race: both preflights read `New`, the winner commits
+    // `awaiting_baseline`, and the loser's create_atomic takes the row
+    // lock second. The unresolved row must answer BaselineInProgress —
+    // never a replay that would run a second snapshot sequence for the
+    // same invoice.
+    let created = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"replay-race-bundle",
+            b"replay-race-request",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .create_awaiting_baseline(input(
+                &creator,
+                &reader,
+                b"replay-race-bundle",
+                b"replay-race-request",
+            ))
+            .await,
+        Err(PersistenceError::BaselineInProgress)
+    );
+
+    // Once the winner published, the identical payload replays normally.
+    store
+        .complete_creation_baseline(created.invoice_id(), 100, &[], &[])
+        .await
+        .unwrap();
+    let replay = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"replay-race-bundle",
+            b"replay-race-request",
+        ))
+        .await
+        .unwrap();
+    assert!(replay.replayed());
+    assert_eq!(replay.invoice_id(), created.invoice_id());
+
+    // A terminally voided binding is spent: the replay branch mirrors
+    // preflight's named `invoice_finalized` refusal (§B.11.6) under the row
+    // lock.
+    let voided = store
+        .create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"replay-voided-bundle",
+            b"replay-voided-request",
+        ))
+        .await
+        .unwrap();
+    store
+        .fail_creation_baseline(voided.invoice_id())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .create_awaiting_baseline(input(
+                &creator,
+                &reader,
+                b"replay-voided-bundle",
+                b"replay-voided-request",
+            ))
+            .await,
+        Err(PersistenceError::InvoiceFinalized)
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn concurrent_identical_awaiting_baseline_creations_have_exactly_one_baseline_owner() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let other_store = store.clone();
+    let creator = creator();
+    let reader = reader();
+
+    let (first, second) = tokio::join!(
+        store.create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"baseline-race-bundle",
+            b"baseline-race-request",
+        )),
+        other_store.create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"baseline-race-bundle",
+            b"baseline-race-request",
+        ))
+    );
+
+    // Exactly one creation owns the new invoice; the other is told the
+    // baseline is in progress — never voided, never double-charged.
+    let (winners, in_progress): (Vec<_>, Vec<_>) = [first, second]
+        .into_iter()
+        .partition(|result| matches!(result, Ok(created) if !created.replayed()));
+    assert_eq!(winners.len(), 1, "outcomes: {in_progress:?}");
+    assert_eq!(in_progress.len(), 1);
+    assert_eq!(in_progress[0], Err(PersistenceError::BaselineInProgress));
+    for (table, expected) in [("reader_assignments", 1_i64), ("invoices", 1_i64)] {
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, expected, "unexpected {table} cardinality");
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        1,
+        "exactly one address allocated"
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn concurrent_first_binds_derive_distinct_indices_under_unique_constraint() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let other_store = store.clone();
+    let creator = creator();
+    let reader = reader();
+
+    let (first, second) = tokio::join!(
+        store.create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"first-bind-a",
+            b"first-request-a",
+        )),
+        other_store.create_awaiting_baseline(input(
+            &creator,
+            &reader,
+            b"first-bind-b",
+            b"first-request-b",
+        ))
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_ne!(first.reader_child_index(), second.reader_child_index());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT derivation_index_lookup_hash) FROM invoices"
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap(),
+        2
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn atomic_store_rejects_wrong_intent_role_and_reader_before_any_insert() {
     static BAD_PAYLOADS: PaymentAsEndpointPayloads = PaymentAsEndpointPayloads;
     let database = TestDatabase::create().await;
@@ -594,6 +939,9 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
                 0,
             ),
             &StorageState::default(),
+            &key_tail(25),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -607,6 +955,9 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
                 0,
             ),
             &StorageState::default(),
+            &key_tail(26),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
         )
         .await
         .unwrap();
@@ -629,6 +980,9 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             new_reader_payloads: &first_payloads,
             payment_request_intent: payment_intent(),
             required_sats: 100,
+            nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         }),
         second_store.create_atomic(AtomicInvoiceInput {
             creator: &second_creator,
@@ -638,6 +992,9 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             new_reader_payloads: &second_payloads,
             payment_request_intent: payment_intent(),
             required_sats: 100,
+            nonce_sats: 1,
+            prepare_ttl: std::time::Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
         })
     );
     let first = first.unwrap();
