@@ -103,7 +103,10 @@ fn expires_at() -> &'static str {
     static VALUE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     VALUE
         .get_or_init(|| {
-            (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+            let value = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+            value
+                .replace_nanosecond(value.nanosecond() / 1_000 * 1_000)
+                .unwrap()
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap()
         })
