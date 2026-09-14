@@ -24,10 +24,10 @@ async fn begin(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
-    let Some((return_to, state)) = parse_setup_query(query.as_deref()) else {
+    let Some((return_to, state, creator)) = parse_setup_query(query.as_deref()) else {
         return invalid_request();
     };
-    match service.begin(peer.ip(), &return_to, &state).await {
+    match service.begin(peer.ip(), &return_to, &state, &creator).await {
         Ok(flow) => match iframe_response(flow) {
             Ok(response) => response,
             Err(()) => safe_response_with_retry(
@@ -57,17 +57,19 @@ async fn complete(
     response_for_poll(service.complete_and_poll(&flow_id).await)
 }
 
-fn parse_setup_query(query: Option<&str>) -> Option<(String, String)> {
+fn parse_setup_query(query: Option<&str>) -> Option<(String, String, String)> {
     let mut return_to = None;
     let mut state = None;
+    let mut creator = None;
     for (key, value) in url::form_urlencoded::parse(query?.as_bytes()) {
         match key.as_ref() {
             "return_to" if return_to.is_none() => return_to = Some(value.into_owned()),
             "state" if state.is_none() => state = Some(value.into_owned()),
+            "creator" if creator.is_none() => creator = Some(value.into_owned()),
             _ => return None,
         }
     }
-    Some((return_to?, state?))
+    Some((return_to?, state?, creator?))
 }
 
 fn iframe_response(flow: StartedFlow) -> Result<Response<Body>, ()> {
@@ -91,7 +93,7 @@ fn iframe_response(flow: StartedFlow) -> Result<Response<Body>, ()> {
     shell.push_str(";const targetOrigin=");
     shell.push_str(&origin);
     shell.push_str(
-        ";\nconst status=document.getElementById('status');const restart=document.getElementById('restart');const retryable=new Set([408,425,429,502,503,504]);const waitLimit=6*60*1000;let delay=500;let finished=false;\nfunction finish(){finished=true;}\nfunction stopWaiting(){if(finished)return;finished=true;status.textContent='No approval received. Update Bitkit to 2.5 or newer and start again.';restart.href=window.location.pathname+window.location.search;restart.hidden=false;}\nsetTimeout(stopWaiting,waitLimit);\nasync function poll(){if(finished)return;try{const response=await fetch('/setup/'+flowId+'/complete',{method:'POST'});if(response.status===200){finish();status.textContent='Connected';window.parent.postMessage({type:'paykit-setup-callback',state},targetOrigin);return;}if(!retryable.has(response.status)){finish();status.textContent='Setup failed… try again';window.parent.postMessage({type:'paykit-setup-callback',state,error:'setup-failed'},targetOrigin);return;}}catch(_error){}if(!finished){setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script></body></html>",
+        ";\nconst status=document.getElementById('status');const restart=document.getElementById('restart');const retryable=new Set([408,425,429,502,503,504]);const waitLimit=6*60*1000;let delay=500;let finished=false;\nfunction finish(){finished=true;}\nfunction stopWaiting(){if(finished)return;finished=true;status.textContent='No approval received. Update Bitkit to 2.5 or newer and start again.';restart.href=window.location.pathname+window.location.search;restart.hidden=false;}\nsetTimeout(stopWaiting,waitLimit);\nasync function poll(){if(finished)return;try{const response=await fetch('/setup/'+flowId+'/complete',{method:'POST'});if(response.status===200){finish();status.textContent='Connected';window.parent.postMessage({type:'paykit-setup-callback',state},targetOrigin);return;}if(response.status===409){finish();status.textContent='Setup failed… identity mismatch';window.parent.postMessage({type:'paykit-setup-callback',state,error:'identity-mismatch'},targetOrigin);return;}if(!retryable.has(response.status)){finish();status.textContent='Setup failed… try again';window.parent.postMessage({type:'paykit-setup-callback',state,error:'setup-failed'},targetOrigin);return;}}catch(_error){}if(!finished){setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script></body></html>",
     );
     let mut response = Response::new(Body::from(shell));
     *response.status_mut() = StatusCode::OK;
@@ -147,6 +149,9 @@ fn json_for_script(value: &str) -> String {
 fn response_for_poll(result: PollResult) -> Response<Body> {
     let mut response = match result {
         PollResult::Complete => safe_response(StatusCode::OK, json!({"status":"complete"})),
+        PollResult::IdentityMismatch => {
+            safe_response(StatusCode::CONFLICT, json!({"status":"identity_mismatch"}))
+        }
         PollResult::PendingTimeout => {
             safe_response(StatusCode::REQUEST_TIMEOUT, json!({"status":"pending"}))
         }
