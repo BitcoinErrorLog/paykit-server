@@ -1110,6 +1110,8 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
         response.headers()["content-security-policy"],
         "frame-ancestors https://app.example"
     );
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
     let shell = body(response).await;
     assert!(shell.contains("new Set([408,425,429,502,503,504])"));
     assert!(shell.contains("delay=500"));
@@ -1121,6 +1123,9 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
     assert_eq!(shell.matches("postMessage(").count(), 2);
     assert!(!shell.contains("</script><img"));
     assert!(shell.contains("\\u003c/script\\u003e\\u003cimg\\u003e"));
+    assert!(shell.contains("Waiting for Bitkit"));
+    assert!(shell.contains("Connected"));
+    assert!(shell.contains("Setup failed"));
 
     let script = shell
         .split_once("<script>")
@@ -1147,7 +1152,7 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
 }
 
 #[tokio::test]
-async fn setup_iframe_displays_escaped_auth_url_and_approved_cli_command() {
+async fn setup_page_renders_exact_claim_as_deep_link_and_qr() {
     let response = request(
         setup_router(service(
             Arc::new(InstructionCompleter),
@@ -1160,15 +1165,48 @@ async fn setup_iframe_displays_escaped_auth_url_and_approved_cli_command() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let shell = body(response).await;
-    let (instructions, script) = shell
+    let (page, script) = shell
         .split_once("<script>")
         .expect("setup shell contains polling script");
-    assert!(instructions.contains("pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;"));
+    let claim = "pubkyauth://signin?secret=mock&label=<approve>";
+    assert!(page.contains("href=\"pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;\""));
+    assert!(page.contains("Bitkit 2.5 or newer is required."));
+    assert!(page.contains("Scan this code with Bitkit"));
+    let expected_qr =
+        qrcode::QrCode::with_error_correction_level(claim.as_bytes(), qrcode::EcLevel::M)
+            .unwrap()
+            .render::<qrcode::render::svg::Color>()
+            .min_dimensions(256, 256)
+            .build();
+    assert!(page.contains(&expected_qr));
     assert!(!script.contains("pubkyauth://signin?secret=mock"));
-    assert!(instructions.contains(
-        "docker compose exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator"
-    ));
-    assert!(instructions.contains("npm --prefix examples/js-sdk run generate-paykit-account-tpub"));
+    for forbidden in ["regtest", "tpub", "npm", "docker", "examples/js-sdk"] {
+        assert!(
+            !shell.contains(forbidden),
+            "page contained forbidden value {forbidden}"
+        );
+    }
+    std::fs::create_dir_all("/tmp/ps-setup-handoff").unwrap();
+    std::fs::write("/tmp/ps-setup-handoff/setup-sample.html", &shell).unwrap();
+}
+
+#[tokio::test]
+async fn setup_page_escapes_hostile_state_and_return_to_values() {
+    let response = request(
+        setup_router(service(
+            Arc::new(MockCompleter::new([])),
+            Arc::new(ManualClock::default()),
+        )),
+        Method::GET,
+        "/setup?return_to=https%3A%2F%2Fapp.example%2F%22%3C%2Fscript%3E&state=%22%3C%2Fscript%3E%3Cimg%20src%3Dx%3E",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let shell = body(response).await;
+    assert!(!shell.contains("</script><img"));
+    assert!(shell.contains(r#"\""#));
+    assert!(shell.contains("\\u003c/script\\u003e\\u003cimg src=x\\u003e"));
+    assert!(!shell.contains("frame-ancestors https://app.example/"));
 }
 
 #[tokio::test]

@@ -6,6 +6,7 @@ use axum::{
     response::Response,
     routing::{get, post},
 };
+use qrcode::{EcLevel, QrCode, render::svg};
 use serde_json::json;
 use std::net::SocketAddr;
 
@@ -66,15 +67,37 @@ fn iframe_response(flow: StartedFlow) -> Response<Body> {
     let flow_id = json_for_script(&flow.flow_id);
     let state = json_for_script(&flow.state);
     let origin = json_for_script(&flow.origin);
-    let authorization_url = html_for_text(&flow.authorization_url);
-    let shell = format!(
-        "<!doctype html><meta charset=\"utf-8\"><main><p>Paykit auth URL:</p><code>{authorization_url}</code><p>Generate the regtest BIP84 account tpub:</p><code>npm --prefix examples/js-sdk run generate-paykit-account-tpub</code><p>Then authenticate and paste the auth URL, tpub, and account index:</p><code>docker compose exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator</code></main><script>\nconst flowId={flow_id};const state={state};const targetOrigin={origin};\nconst retryable=new Set([408,425,429,502,503,504]);let delay=500;\nasync function poll(){{try{{const response=await fetch('/setup/'+flowId+'/complete',{{method:'POST'}});if(response.status===200){{window.parent.postMessage({{type:'paykit-setup-callback',state}},targetOrigin);return;}}if(!retryable.has(response.status)){{window.parent.postMessage({{type:'paykit-setup-callback',state,error:'setup-failed'}},targetOrigin);return;}}}}catch(_error){{}}setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script>"
+    let authorization_url = html_for_attribute(&flow.authorization_url);
+    let qr_svg = qr_code_svg(&flow.authorization_url);
+    let mut shell = String::from(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Connect Bitkit</title></head><body><main><h1>Connect Bitkit</h1><p>Scan this code with Bitkit, or open this page on your phone and tap <em>Open in Bitkit</em>.</p><p><a href=\"",
+    );
+    shell.push_str(&authorization_url);
+    shell.push_str("\">Open in Bitkit</a></p><div aria-label=\"Bitkit connection QR code\">");
+    shell.push_str(&qr_svg);
+    shell.push_str(
+        "</div><p>Bitkit 2.5 or newer is required.</p><p id=\"status\" role=\"status\" aria-live=\"polite\">Waiting for Bitkit…</p></main><script>\nconst flowId=",
+    );
+    shell.push_str(&flow_id);
+    shell.push_str(";const state=");
+    shell.push_str(&state);
+    shell.push_str(";const targetOrigin=");
+    shell.push_str(&origin);
+    shell.push_str(
+        ";\nconst status=document.getElementById('status');const retryable=new Set([408,425,429,502,503,504]);let delay=500;\nasync function poll(){try{const response=await fetch('/setup/'+flowId+'/complete',{method:'POST'});if(response.status===200){status.textContent='Connected';window.parent.postMessage({type:'paykit-setup-callback',state},targetOrigin);return;}if(!retryable.has(response.status)){status.textContent='Setup failed… try again';window.parent.postMessage({type:'paykit-setup-callback',state,error:'setup-failed'},targetOrigin);return;}}catch(_error){}setTimeout(poll,delay);delay=Math.min(delay*2,5000);}setTimeout(poll,delay);\n</script></body></html>",
     );
     let mut response = Response::new(Body::from(shell));
     *response.status_mut() = StatusCode::OK;
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
     );
     response.headers_mut().insert(
         header::CONTENT_SECURITY_POLICY,
@@ -84,7 +107,7 @@ fn iframe_response(flow: StartedFlow) -> Response<Body> {
     response
 }
 
-fn html_for_text(value: &str) -> String {
+fn html_for_attribute(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
         match character {
@@ -97,6 +120,14 @@ fn html_for_text(value: &str) -> String {
         }
     }
     escaped
+}
+
+fn qr_code_svg(value: &str) -> String {
+    QrCode::with_error_correction_level(value.as_bytes(), EcLevel::M)
+        .expect("authorization URL fits QR code")
+        .render::<svg::Color>()
+        .min_dimensions(256, 256)
+        .build()
 }
 
 fn json_for_script(value: &str) -> String {
