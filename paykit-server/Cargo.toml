@@ -34,6 +34,7 @@ paykit-sdk.workspace = true
 pubky.workspace = true
 prometheus-client.workspace = true
 postcard.workspace = true
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 serde.workspace = true
 serde_ignored.workspace = true
 serde_json.workspace = true

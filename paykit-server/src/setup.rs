@@ -11,6 +11,7 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use paykit_sdk::PubkyPublicKey;
 use rand::{TryRngCore, rngs::OsRng};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use url::Url;
@@ -18,6 +19,7 @@ use url::Url;
 const FLOW_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const SETUP_RATE_WINDOW: Duration = Duration::from_secs(60);
+const Z_BASE_32_ALPHABET: &[u8] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
 
 /// Opaque, secret-bearing state owned by exactly one setup flow.
 pub trait SetupAttempt: Send + 'static {
@@ -55,12 +57,17 @@ pub trait SetupCompleter: Send + Sync {
     /// within one in-memory flow, not in a process-global completer.
     async fn start(&self) -> Result<StartedSetup, Completion>;
     /// Consumes the exact per-flow attempt after the iframe asks to complete.
-    async fn complete(&self, attempt: Box<dyn SetupAttempt>) -> Completion;
+    async fn complete(
+        &self,
+        attempt: Box<dyn SetupAttempt>,
+        expected_creator: &PubkyPublicKey,
+    ) -> Completion;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Completion {
     DurableSuccess,
+    IdentityMismatch,
     DefinitiveFailure,
     TransientOverload,
     TransientUnavailable,
@@ -133,10 +140,12 @@ struct Flow {
     state: String,
     origin: String,
     authorization_url: String,
+    expected_creator: PubkyPublicKey,
     attempt: Option<Box<dyn SetupAttempt>>,
     reservation: Option<OwnedSemaphorePermit>,
     expires_at: Duration,
     status: FlowStatus,
+    failure_result: Option<PollResult>,
     active_polls: Arc<AtomicUsize>,
 }
 
@@ -245,6 +254,7 @@ pub struct StartedFlow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PollResult {
     Complete,
+    IdentityMismatch,
     PendingTimeout,
     Unknown,
     Expired,
@@ -304,12 +314,14 @@ impl SetupService {
         peer_ip: IpAddr,
         return_to: &str,
         state: &str,
+        creator: &str,
     ) -> Result<StartedFlow, BeginError> {
         let origin = validated_origin(return_to, &self.inner.allowed_origins)
             .ok_or(BeginError::InvalidRequest)?;
         if !valid_state(state) {
             return Err(BeginError::InvalidRequest);
         }
+        let expected_creator = parse_expected_creator(creator).ok_or(BeginError::InvalidRequest)?;
         let now = self.inner.clock.now();
         if !self.inner.setup_rate.lock().await.permit(peer_ip, now) {
             return Err(BeginError::RateLimited);
@@ -349,10 +361,12 @@ impl SetupService {
                 state: state.to_owned(),
                 origin: started.origin.clone(),
                 authorization_url: started_setup.authorization_url,
+                expected_creator,
                 attempt: Some(started_setup.attempt),
                 reservation: Some(reservation),
                 expires_at: self.inner.clock.now() + FLOW_LIFETIME,
                 status: FlowStatus::Pending,
+                failure_result: None,
                 active_polls: Arc::new(AtomicUsize::new(0)),
             },
         );
@@ -362,7 +376,7 @@ impl SetupService {
     /// Runs real completion for precisely this flow. A completion attempt is
     /// consumed once because Pubky AUTH approval is one-shot.
     pub async fn trigger_completion(&self, flow_id: &str) -> PollResult {
-        let (attempt, reservation) = {
+        let (attempt, reservation, expected_creator) = {
             let mut guard = self.inner.state.lock().await;
             let now = self.inner.clock.now();
             cleanup_expired(&mut guard, now);
@@ -371,7 +385,9 @@ impl SetupService {
             };
             match flow.status {
                 FlowStatus::Completed => return PollResult::Complete,
-                FlowStatus::Failed => return PollResult::Failed,
+                FlowStatus::Failed => {
+                    return flow.failure_result.unwrap_or(PollResult::Failed);
+                }
                 FlowStatus::Completing => return PollResult::PendingTimeout,
                 FlowStatus::Pending => {}
             }
@@ -383,11 +399,16 @@ impl SetupService {
                 flow.reservation
                     .take()
                     .expect("pending flow has a setup reservation"),
+                flow.expected_creator.clone(),
             )
         };
         let completion_lease =
             CompletionLease::new(self.inner.clone(), flow_id.to_owned(), reservation);
-        let completion = self.inner.completer.complete(attempt).await;
+        let completion = self
+            .inner
+            .completer
+            .complete(attempt, &expected_creator)
+            .await;
         let mut guard = self.inner.state.lock().await;
         let now = self.inner.clock.now();
         cleanup_expired(&mut guard, now);
@@ -398,6 +419,11 @@ impl SetupService {
                     flow.status = FlowStatus::Completed;
                     PollResult::Complete
                 }
+                Completion::IdentityMismatch => {
+                    flow.status = FlowStatus::Failed;
+                    flow.failure_result = Some(PollResult::IdentityMismatch);
+                    PollResult::IdentityMismatch
+                }
                 // One-shot auth requests cannot safely be replayed after any
                 // completion failure. Fail closed rather than falsely retaining
                 // a consumed request as pending.
@@ -405,6 +431,7 @@ impl SetupService {
                 | Completion::TransientOverload
                 | Completion::TransientUnavailable => {
                     flow.status = FlowStatus::Failed;
+                    flow.failure_result = Some(PollResult::Failed);
                     PollResult::Failed
                 }
             },
@@ -467,8 +494,9 @@ impl SetupService {
             }) => PollResult::Complete,
             Some(Flow {
                 status: FlowStatus::Failed,
+                failure_result,
                 ..
-            }) => PollResult::Failed,
+            }) => failure_result.unwrap_or(PollResult::Failed),
         }
     }
 
@@ -480,7 +508,9 @@ impl SetupService {
             return Err(expired_or_unknown(&guard, flow_id));
         };
         match flow.status {
-            FlowStatus::Failed => return Err(PollResult::Failed),
+            FlowStatus::Failed => {
+                return Err(flow.failure_result.unwrap_or(PollResult::Failed));
+            }
             FlowStatus::Completed => return Err(PollResult::Complete),
             FlowStatus::Pending | FlowStatus::Completing => {}
         }
@@ -541,6 +571,7 @@ fn fail_cancelled_completion(state: &mut State, flow_id: &str) {
         && flow.status == FlowStatus::Completing
     {
         flow.status = FlowStatus::Failed;
+        flow.failure_result = Some(PollResult::Failed);
     }
 }
 
@@ -554,6 +585,17 @@ fn expired_or_unknown(state: &State, flow_id: &str) -> PollResult {
 
 fn valid_state(state: &str) -> bool {
     (1..=512).contains(&state.len()) && !state.chars().any(char::is_control)
+}
+
+fn parse_expected_creator(creator: &str) -> Option<PubkyPublicKey> {
+    if creator.len() != 52
+        || !creator
+            .bytes()
+            .all(|byte| Z_BASE_32_ALPHABET.contains(&byte))
+    {
+        return None;
+    }
+    PubkyPublicKey::new(creator).ok()
 }
 
 fn validated_origin(return_to: &str, allowed_origins: &[String]) -> Option<String> {

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use bitcoin::bip32::Xpub;
 use ed25519_dalek::VerifyingKey;
 use paykit_lib::{PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath};
-use paykit_sdk::{ReceiverNoiseSecretKey, storage::StorageState};
+use paykit_sdk::{PubkyPublicKey, ReceiverNoiseSecretKey, storage::StorageState};
 
 use crate::{
     application::create_invoice::derive_bip84_p2wpkh_address,
@@ -172,7 +172,11 @@ impl SetupCompleter for RealSetupCompleter {
         ))
     }
 
-    async fn complete(&self, attempt: Box<dyn SetupAttempt>) -> Completion {
+    async fn complete(
+        &self,
+        attempt: Box<dyn SetupAttempt>,
+        expected_creator: &PubkyPublicKey,
+    ) -> Completion {
         let Ok(attempt) = attempt.into_any().downcast::<BitkitSetupAttempt>() else {
             return Completion::DefinitiveFailure;
         };
@@ -190,12 +194,23 @@ impl SetupCompleter for RealSetupCompleter {
             Ok(auth) => auth,
             Err(_) => return Completion::DefinitiveFailure,
         };
-        let owner = match auth.public_key.to_public_key() {
-            Ok(owner) => owner,
-            Err(_) => return Completion::DefinitiveFailure,
-        };
+        if auth.public_key != *expected_creator {
+            let authenticated_creator = auth.public_key.to_string();
+            let expected_creator = expected_creator.to_string();
+            tracing::warn!(
+                route = "/setup/:flow_id/complete",
+                authenticated_creator_prefix = %&authenticated_creator[..8],
+                expected_creator_prefix = %&expected_creator[..8],
+                "setup identity mismatch"
+            );
+            return Completion::IdentityMismatch;
+        }
         let creator = match parse_creator(&auth.public_key.to_app_key()) {
             Ok(creator) => creator,
+            Err(_) => return Completion::DefinitiveFailure,
+        };
+        let owner = match auth.public_key.to_public_key() {
+            Ok(owner) => owner,
             Err(_) => return Completion::DefinitiveFailure,
         };
         let verifying_key = match VerifyingKey::from_bytes(owner.as_bytes()) {

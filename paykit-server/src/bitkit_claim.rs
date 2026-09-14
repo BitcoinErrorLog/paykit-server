@@ -262,6 +262,17 @@ mod tests {
                 .encode(blake3::hash(&[CLAIM_TYPE.as_bytes(), b"|", &secret].concat()).as_bytes())
         );
     }
+
+    #[test]
+    fn refuses_non_pubkyauth_scheme_before_rendering() {
+        let secret = [7; 32];
+        let invalid_scheme = auth(&secret).replacen("pubkyauth://", "https://", 1);
+        assert_eq!(
+            parse_auth_request(&invalid_scheme, LOCAL_DEMO_CAPABILITIES),
+            Err(ClaimError::InvalidAuthRequest)
+        );
+    }
+
     #[test]
     fn rejects_missing_duplicate_or_mismatched_request_values() {
         let secret = [7; 32];

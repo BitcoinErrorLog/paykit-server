@@ -21,6 +21,7 @@ use bitcoin::{
     bip32::{ChildNumber, Xpriv, Xpub},
     secp256k1::Secp256k1,
 };
+use paykit_sdk::PubkyPublicKey;
 use paykit_server::{
     bitkit_claim::ClaimError,
     config::{BitcoinNetwork, StackRole},
@@ -34,6 +35,9 @@ use paykit_server::{
 };
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tower::ServiceExt;
+
+const EXPECTED_CREATOR: &str = "tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+const OTHER_CREATOR: &str = "7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 
 fn account_xpub(network: Network, coin_type: u32, account_index: u32) -> Xpub {
     let secp = Secp256k1::new();
@@ -265,7 +269,7 @@ impl SetupCompleter for InstructionCompleter {
         ))
     }
 
-    async fn complete(&self, _: Box<dyn SetupAttempt>) -> Completion {
+    async fn complete(&self, _: Box<dyn SetupAttempt>, _: &PubkyPublicKey) -> Completion {
         Completion::DurableSuccess
     }
 }
@@ -297,7 +301,7 @@ impl SetupCompleter for TrackingCompleter {
         ))
     }
 
-    async fn complete(&self, _: Box<dyn SetupAttempt>) -> Completion {
+    async fn complete(&self, _: Box<dyn SetupAttempt>, _: &PubkyPublicKey) -> Completion {
         Completion::DurableSuccess
     }
 }
@@ -329,7 +333,7 @@ impl SetupCompleter for BlockingStartCompleter {
         ))
     }
 
-    async fn complete(&self, _: Box<dyn SetupAttempt>) -> Completion {
+    async fn complete(&self, _: Box<dyn SetupAttempt>, _: &PubkyPublicKey) -> Completion {
         Completion::DurableSuccess
     }
 }
@@ -348,7 +352,7 @@ impl SetupCompleter for FailFirstStartCompleter {
         ))
     }
 
-    async fn complete(&self, _: Box<dyn SetupAttempt>) -> Completion {
+    async fn complete(&self, _: Box<dyn SetupAttempt>, _: &PubkyPublicKey) -> Completion {
         Completion::DurableSuccess
     }
 }
@@ -362,7 +366,7 @@ impl SetupCompleter for BlockingCompleter {
         ))
     }
 
-    async fn complete(&self, _: Box<dyn SetupAttempt>) -> Completion {
+    async fn complete(&self, _: Box<dyn SetupAttempt>, _: &PubkyPublicKey) -> Completion {
         self.entered.notify_one();
         self.release.notified().await;
         Completion::DurableSuccess
@@ -378,13 +382,52 @@ impl SetupCompleter for MockCompleter {
         ))
     }
 
-    async fn complete(&self, _: Box<dyn SetupAttempt>) -> Completion {
+    async fn complete(&self, _: Box<dyn SetupAttempt>, _: &PubkyPublicKey) -> Completion {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.results
             .lock()
             .await
             .pop_front()
             .unwrap_or(Completion::DurableSuccess)
+    }
+}
+
+struct IdentityBindingCompleter {
+    authenticated_creator: PubkyPublicKey,
+    publish_calls: AtomicUsize,
+    persist_calls: AtomicUsize,
+}
+
+impl IdentityBindingCompleter {
+    fn new(authenticated_creator: &str) -> Self {
+        Self {
+            authenticated_creator: PubkyPublicKey::new(authenticated_creator).unwrap(),
+            publish_calls: AtomicUsize::new(0),
+            persist_calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl SetupCompleter for IdentityBindingCompleter {
+    async fn start(&self) -> Result<StartedSetup, Completion> {
+        Ok(StartedSetup::new(
+            "pubkyauth://signin?secret=identity-binding".to_owned(),
+            Box::new(MockAttempt),
+        ))
+    }
+
+    async fn complete(
+        &self,
+        _: Box<dyn SetupAttempt>,
+        expected_creator: &PubkyPublicKey,
+    ) -> Completion {
+        if &self.authenticated_creator != expected_creator {
+            return Completion::IdentityMismatch;
+        }
+        self.publish_calls.fetch_add(1, Ordering::SeqCst);
+        self.persist_calls.fetch_add(1, Ordering::SeqCst);
+        Completion::DurableSuccess
     }
 }
 
@@ -469,12 +512,14 @@ async fn invalid_and_unknown_setup_queries_are_rejected_without_a_flow_or_comple
     let completer = Arc::new(MockCompleter::new([]));
     let router = setup_router(service(completer.clone(), Arc::new(ManualClock::default())));
     for uri in [
-        "/setup?return_to=https://evil.example&state=ok",
-        "/setup?return_to=https://app.example&state=ok&delivery=redirect",
-        "/setup?return_to=https://app.example&state=ok&extra=x",
-        "/setup?return_to=https://app.example&state=ok&state=twice",
-        "/setup?return_to=https://user:pass@app.example&state=ok",
-        "/setup?return_to=https://app.example&state=%00",
+        "/setup?return_to=https://app.example&state=ok",
+        "/setup?return_to=https://evil.example&state=ok&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+        "/setup?return_to=https://app.example&state=ok&delivery=redirect&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+        "/setup?return_to=https://app.example&state=ok&extra=x&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+        "/setup?return_to=https://app.example&state=ok&state=twice&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+        "/setup?return_to=https://app.example&state=ok&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy&creator=7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
+        "/setup?return_to=https://user:pass@app.example&state=ok&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+        "/setup?return_to=https://app.example&state=%00&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
     ] {
         let response = request(router.clone(), Method::GET, uri).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -488,11 +533,11 @@ async fn flow_ids_are_random_base64url_32_byte_values() {
     let completer = Arc::new(MockCompleter::new([]));
     let setup = service(completer, Arc::new(ManualClock::default()));
     let first = setup
-        .begin(peer(), "https://app.example/path", "one")
+        .begin(peer(), "https://app.example/path", "one", EXPECTED_CREATOR)
         .await
         .unwrap();
     let second = setup
-        .begin(peer(), "https://app.example/path", "two")
+        .begin(peer(), "https://app.example/path", "two", EXPECTED_CREATOR)
         .await
         .unwrap();
     assert_eq!(first.flow_id.len(), 43);
@@ -506,12 +551,33 @@ async fn flow_ids_are_random_base64url_32_byte_values() {
 }
 
 #[tokio::test]
+async fn begin_rejects_missing_or_malformed_expected_creator() {
+    let setup = service(
+        Arc::new(MockCompleter::new([])),
+        Arc::new(ManualClock::default()),
+    );
+    for creator in [
+        String::new(),
+        "y".repeat(51),
+        EXPECTED_CREATOR.to_ascii_uppercase(),
+        "0".repeat(52),
+    ] {
+        assert_eq!(
+            setup
+                .begin(peer(), "https://app.example", "state", &creator)
+                .await,
+            Err(BeginError::InvalidRequest)
+        );
+    }
+}
+
+#[tokio::test]
 async fn flow_lifecycle_is_memory_only_single_initiation_and_expiry_is_terminal() {
     let completer = Arc::new(MockCompleter::new([Completion::DurableSuccess]));
     let clock = Arc::new(ManualClock::default());
     let setup = service(completer, clock.clone());
     let flow = setup
-        .begin(peer(), "https://app.example", "state")
+        .begin(peer(), "https://app.example", "state", EXPECTED_CREATOR)
         .await
         .unwrap();
     assert_eq!(
@@ -526,6 +592,68 @@ async fn flow_lifecycle_is_memory_only_single_initiation_and_expiry_is_terminal(
 }
 
 #[tokio::test]
+async fn identity_mismatch_is_terminal_and_has_no_publish_or_persist_side_effects() {
+    let completer = Arc::new(IdentityBindingCompleter::new(OTHER_CREATOR));
+    let setup = service(completer.clone(), Arc::new(ManualClock::default()));
+    let flow = setup
+        .begin(
+            peer(),
+            "https://app.example",
+            "identity-mismatch",
+            EXPECTED_CREATOR,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        setup.complete_and_poll(&flow.flow_id).await,
+        PollResult::IdentityMismatch
+    );
+    assert_eq!(
+        setup.complete_and_poll(&flow.flow_id).await,
+        PollResult::IdentityMismatch
+    );
+    assert_eq!(
+        setup.poll(&flow.flow_id).await,
+        PollResult::IdentityMismatch
+    );
+    assert_eq!(completer.publish_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(completer.persist_calls.load(Ordering::SeqCst), 0);
+
+    let response = request(
+        setup_router(setup),
+        Method::POST,
+        &format!("/setup/{}/complete", flow.flow_id),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(body(response).await, r#"{"status":"identity_mismatch"}"#);
+}
+
+#[tokio::test]
+async fn matching_identity_completes_and_runs_publish_and_persist_side_effects() {
+    let completer = Arc::new(IdentityBindingCompleter::new(EXPECTED_CREATOR));
+    let setup = service(completer.clone(), Arc::new(ManualClock::default()));
+    let flow = setup
+        .begin(
+            peer(),
+            "https://app.example",
+            "identity-match",
+            EXPECTED_CREATOR,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        setup.complete_and_poll(&flow.flow_id).await,
+        PollResult::Complete
+    );
+    assert_eq!(completer.publish_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(completer.persist_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn expired_flows_drop_secret_attempts_but_retain_a_bounded_expired_tombstone() {
     let dropped = Arc::new(AtomicUsize::new(0));
     let clock = Arc::new(ManualClock::default());
@@ -536,7 +664,7 @@ async fn expired_flows_drop_secret_attempts_but_retain_a_bounded_expired_tombsto
         clock.clone(),
     );
     let flow = setup
-        .begin(peer(), "https://app.example", "state")
+        .begin(peer(), "https://app.example", "state", EXPECTED_CREATOR)
         .await
         .unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
@@ -564,19 +692,19 @@ async fn completion_port_results_map_to_terminal_and_transient_states_without_se
     ]));
     let setup = service(completer, clock);
     let complete = setup
-        .begin(peer(), "https://app.example", "a")
+        .begin(peer(), "https://app.example", "a", EXPECTED_CREATOR)
         .await
         .unwrap();
     let failed = setup
-        .begin(peer(), "https://app.example", "b")
+        .begin(peer(), "https://app.example", "b", EXPECTED_CREATOR)
         .await
         .unwrap();
     let overloaded = setup
-        .begin(peer(), "https://app.example", "c")
+        .begin(peer(), "https://app.example", "c", EXPECTED_CREATOR)
         .await
         .unwrap();
     let unavailable = setup
-        .begin(peer(), "https://app.example", "d")
+        .begin(peer(), "https://app.example", "d", EXPECTED_CREATOR)
         .await
         .unwrap();
     assert_eq!(
@@ -627,11 +755,11 @@ async fn complete_route_returns_safe_json_and_preserves_expired_status() {
     let clock = Arc::new(ManualClock::default());
     let setup = service(completer, clock.clone());
     let complete = setup
-        .begin(peer(), "https://app.example", "complete")
+        .begin(peer(), "https://app.example", "complete", EXPECTED_CREATOR)
         .await
         .unwrap();
     let failed = setup
-        .begin(peer(), "https://app.example", "failed")
+        .begin(peer(), "https://app.example", "failed", EXPECTED_CREATOR)
         .await
         .unwrap();
     assert_eq!(
@@ -647,6 +775,7 @@ async fn complete_route_returns_safe_json_and_preserves_expired_status() {
     )
     .await;
     assert_eq!(completed.status(), StatusCode::OK);
+    assert_eq!(completed.headers()["cache-control"], "no-store");
     assert_eq!(body(completed).await, r#"{"status":"complete"}"#);
     let failed = request(
         router.clone(),
@@ -655,10 +784,11 @@ async fn complete_route_returns_safe_json_and_preserves_expired_status() {
     )
     .await;
     assert_eq!(failed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(failed.headers()["cache-control"], "no-store");
     assert_eq!(body(failed).await, r#"{"error":"setup_failed"}"#);
 
     let expired = setup
-        .begin(peer(), "https://app.example", "expired")
+        .begin(peer(), "https://app.example", "expired", EXPECTED_CREATOR)
         .await
         .unwrap();
     clock.advance(Duration::from_secs(300));
@@ -669,9 +799,11 @@ async fn complete_route_returns_safe_json_and_preserves_expired_status() {
     )
     .await;
     assert_eq!(expired.status(), StatusCode::GONE);
+    assert_eq!(expired.headers()["cache-control"], "no-store");
     assert_eq!(body(expired).await, r#"{"error":"expired"}"#);
     let missing = request(router, Method::POST, "/setup/missing/complete").await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(missing.headers()["cache-control"], "no-store");
     assert_eq!(body(missing).await, r#"{"error":"not_found"}"#);
 }
 
@@ -680,7 +812,7 @@ async fn manual_claim_route_is_not_mounted() {
     let completer = Arc::new(MockCompleter::new([]));
     let setup = service(completer.clone(), Arc::new(ManualClock::default()));
     let flow = setup
-        .begin(peer(), "https://app.example", "state")
+        .begin(peer(), "https://app.example", "state", EXPECTED_CREATOR)
         .await
         .unwrap();
 
@@ -701,7 +833,7 @@ async fn xpub_bearing_completion_request_cannot_override_normal_completion_failu
     let completer = Arc::new(MockCompleter::new([Completion::DefinitiveFailure]));
     let setup = service(completer.clone(), Arc::new(ManualClock::default()));
     let flow = setup
-        .begin(peer(), "https://app.example", "state")
+        .begin(peer(), "https://app.example", "state", EXPECTED_CREATOR)
         .await
         .unwrap();
 
@@ -734,7 +866,7 @@ async fn complete_route_uses_the_bounded_poll_path_and_maps_poll_limits() {
         Duration::from_secs(5),
     );
     let flow = setup
-        .begin(peer(), "https://app.example", "state")
+        .begin(peer(), "https://app.example", "state", EXPECTED_CREATOR)
         .await
         .unwrap();
     let router = setup_router(setup);
@@ -776,11 +908,11 @@ async fn concurrent_polls_are_limited_per_flow_and_globally() {
         limits,
     );
     let first = setup
-        .begin(peer(), "https://app.example", "one")
+        .begin(peer(), "https://app.example", "one", EXPECTED_CREATOR)
         .await
         .unwrap();
     let second = setup
-        .begin(peer(), "https://app.example", "two")
+        .begin(peer(), "https://app.example", "two", EXPECTED_CREATOR)
         .await
         .unwrap();
     let first_poll = tokio::spawn({
@@ -816,7 +948,7 @@ async fn concurrent_polls_are_limited_per_flow_and_globally() {
         limits,
     );
     let per_flow = per_flow_setup
-        .begin(peer(), "https://app.example", "three")
+        .begin(peer(), "https://app.example", "three", EXPECTED_CREATOR)
         .await
         .unwrap();
     let poll_one = tokio::spawn({
@@ -863,7 +995,9 @@ async fn concurrent_starts_never_exceed_pending_setup_capacity() {
     for state in ["one", "two"] {
         let setup = setup.clone();
         starts.push(tokio::spawn(async move {
-            setup.begin(peer(), "https://app.example", state).await
+            setup
+                .begin(peer(), "https://app.example", state, EXPECTED_CREATOR)
+                .await
         }));
     }
     while entered.load(Ordering::SeqCst) < 2 {
@@ -873,7 +1007,9 @@ async fn concurrent_starts_never_exceed_pending_setup_capacity() {
         }
     }
     assert_eq!(
-        setup.begin(peer(), "https://app.example", "three").await,
+        setup
+            .begin(peer(), "https://app.example", "three", EXPECTED_CREATOR,)
+            .await,
         Err(BeginError::Unavailable)
     );
     assert_eq!(entered.load(Ordering::SeqCst), 2);
@@ -896,7 +1032,7 @@ async fn setup_policy_uses_transport_ip_and_ignores_forwarded_for() {
         let mut request = Request::builder()
             .method(Method::GET)
             .uri(format!(
-                "/setup?return_to=https://app.example&state={state}"
+                "/setup?return_to=https://app.example&state={state}&creator={EXPECTED_CREATOR}"
             ))
             .header("X-Forwarded-For", forwarded_for)
             .body(Body::empty())
@@ -946,13 +1082,13 @@ async fn reservation_releases_after_start_failure_terminal_completion_and_expiry
     );
     assert_eq!(
         failed_start
-            .begin(peer(), "https://app.example", "first")
+            .begin(peer(), "https://app.example", "first", EXPECTED_CREATOR)
             .await,
         Err(BeginError::Unavailable)
     );
     assert!(
         failed_start
-            .begin(peer(), "https://app.example", "second")
+            .begin(peer(), "https://app.example", "second", EXPECTED_CREATOR,)
             .await
             .is_ok()
     );
@@ -965,11 +1101,13 @@ async fn reservation_releases_after_start_failure_terminal_completion_and_expiry
         1,
     );
     let completed = setup
-        .begin(peer(), "https://app.example", "completed")
+        .begin(peer(), "https://app.example", "completed", EXPECTED_CREATOR)
         .await
         .unwrap();
     assert_eq!(
-        setup.begin(peer(), "https://app.example", "blocked").await,
+        setup
+            .begin(peer(), "https://app.example", "blocked", EXPECTED_CREATOR,)
+            .await,
         Err(BeginError::Unavailable)
     );
     assert_eq!(
@@ -984,7 +1122,7 @@ async fn reservation_releases_after_start_failure_terminal_completion_and_expiry
         1,
     );
     let failed_flow = failed
-        .begin(peer(), "https://app.example", "failed")
+        .begin(peer(), "https://app.example", "failed", EXPECTED_CREATOR)
         .await
         .unwrap();
     assert_eq!(
@@ -993,19 +1131,29 @@ async fn reservation_releases_after_start_failure_terminal_completion_and_expiry
     );
     assert!(
         failed
-            .begin(peer(), "https://app.example", "after-failure")
+            .begin(
+                peer(),
+                "https://app.example",
+                "after-failure",
+                EXPECTED_CREATOR,
+            )
             .await
             .is_ok()
     );
 
     let expiring = setup
-        .begin(peer(), "https://app.example", "expiring")
+        .begin(peer(), "https://app.example", "expiring", EXPECTED_CREATOR)
         .await
         .unwrap();
     clock.advance(Duration::from_secs(300));
     assert!(
         setup
-            .begin(peer(), "https://app.example", "after-expiry")
+            .begin(
+                peer(),
+                "https://app.example",
+                "after-expiry",
+                EXPECTED_CREATOR,
+            )
             .await
             .is_ok()
     );
@@ -1031,7 +1179,7 @@ async fn cancelling_start_and_completion_releases_reservation() {
         let setup = setup.clone();
         async move {
             setup
-                .begin(peer(), "https://app.example", "cancelled")
+                .begin(peer(), "https://app.example", "cancelled", EXPECTED_CREATOR)
                 .await
         }
     });
@@ -1047,7 +1195,12 @@ async fn cancelling_start_and_completion_releases_reservation() {
         let setup = setup.clone();
         async move {
             setup
-                .begin(peer(), "https://app.example", "replacement")
+                .begin(
+                    peer(),
+                    "https://app.example",
+                    "replacement",
+                    EXPECTED_CREATOR,
+                )
                 .await
         }
     });
@@ -1071,7 +1224,7 @@ async fn cancelling_start_and_completion_releases_reservation() {
         1,
     );
     let flow = setup
-        .begin(peer(), "https://app.example", "complete")
+        .begin(peer(), "https://app.example", "complete", EXPECTED_CREATOR)
         .await
         .unwrap();
     let flow_id = flow.flow_id.clone();
@@ -1088,7 +1241,12 @@ async fn cancelling_start_and_completion_releases_reservation() {
     assert_eq!(setup.poll(&flow_id).await, PollResult::Failed);
     assert!(
         setup
-            .begin(peer(), "https://app.example", "after-cancel")
+            .begin(
+                peer(),
+                "https://app.example",
+                "after-cancel",
+                EXPECTED_CREATOR,
+            )
             .await
             .is_ok()
     );
@@ -1102,7 +1260,7 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
             Arc::new(ManualClock::default()),
         )),
         Method::GET,
-        "/setup?return_to=https://app.example/path?x=1&state=%3C%2Fscript%3E%3Cimg%3E",
+        "/setup?return_to=https://app.example/path?x=1&state=%3C%2Fscript%3E%3Cimg%3E&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -1110,6 +1268,8 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
         response.headers()["content-security-policy"],
         "frame-ancestors https://app.example"
     );
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
     let shell = body(response).await;
     assert!(shell.contains("new Set([408,425,429,502,503,504])"));
     assert!(shell.contains("delay=500"));
@@ -1118,9 +1278,19 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
     assert!(shell.contains(
         "postMessage({type:'paykit-setup-callback',state,error:'setup-failed'},targetOrigin)"
     ));
-    assert_eq!(shell.matches("postMessage(").count(), 2);
+    assert!(shell.contains(
+        "postMessage({type:'paykit-setup-callback',state,error:'identity-mismatch'},targetOrigin)"
+    ));
+    assert!(shell.contains("response.status===409"));
+    assert_eq!(shell.matches("postMessage(").count(), 3);
     assert!(!shell.contains("</script><img"));
     assert!(shell.contains("\\u003c/script\\u003e\\u003cimg\\u003e"));
+    assert!(shell.contains("Waiting for Bitkit"));
+    assert!(shell.contains("No approval received. Update Bitkit to 2.5 or newer and start again."));
+    assert!(shell.contains("restart.href=window.location.pathname+window.location.search"));
+    assert!(shell.contains("waitLimit=6*60*1000"));
+    assert!(shell.contains("Connected"));
+    assert!(shell.contains("Setup failed"));
 
     let script = shell
         .split_once("<script>")
@@ -1147,28 +1317,68 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
 }
 
 #[tokio::test]
-async fn setup_iframe_displays_escaped_auth_url_and_approved_cli_command() {
+async fn setup_page_renders_exact_claim_as_deep_link_and_qr() {
     let response = request(
         setup_router(service(
             Arc::new(InstructionCompleter),
             Arc::new(ManualClock::default()),
         )),
         Method::GET,
-        "/setup?return_to=https://app.example/callback&state=opaque",
+        "/setup?return_to=https://app.example/callback&state=opaque&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
     )
     .await;
 
     assert_eq!(response.status(), StatusCode::OK);
     let shell = body(response).await;
-    let (instructions, script) = shell
+    let (page, script) = shell
         .split_once("<script>")
         .expect("setup shell contains polling script");
-    assert!(instructions.contains("pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;"));
+    let claim = "pubkyauth://signin?secret=mock&label=<approve>";
+    let href = page
+        .split_once("href=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(href, _)| href)
+        .expect("setup page contains a deep-link href");
+    assert!(href.starts_with("pubkyauth://"));
+    assert_eq!(
+        href,
+        "pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;"
+    );
+    assert!(page.contains("Bitkit 2.5 or newer is required."));
+    assert!(page.contains("Scan this code with Bitkit"));
+    let expected_qr =
+        qrcode::QrCode::with_error_correction_level(claim.as_bytes(), qrcode::EcLevel::M)
+            .unwrap()
+            .render::<qrcode::render::svg::Color>()
+            .min_dimensions(256, 256)
+            .build();
+    assert!(page.contains(&expected_qr));
     assert!(!script.contains("pubkyauth://signin?secret=mock"));
-    assert!(instructions.contains(
-        "docker compose exec creator-demo npm --prefix examples/js-sdk run authenticate-paykit -- --role content-creator"
-    ));
-    assert!(instructions.contains("npm --prefix examples/js-sdk run generate-paykit-account-tpub"));
+    for forbidden in ["regtest", "tpub", "npm", "docker", "examples/js-sdk"] {
+        assert!(
+            !shell.contains(forbidden),
+            "page contained forbidden value {forbidden}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn setup_page_escapes_hostile_state_and_return_to_values() {
+    let response = request(
+        setup_router(service(
+            Arc::new(MockCompleter::new([])),
+            Arc::new(ManualClock::default()),
+        )),
+        Method::GET,
+        "/setup?return_to=https%3A%2F%2Fapp.example%2F%22%3C%2Fscript%3E&state=%22%3C%2Fscript%3E%3Cimg%20src%3Dx%3E&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let shell = body(response).await;
+    assert!(!shell.contains("</script><img"));
+    assert!(shell.contains(r#"\""#));
+    assert!(shell.contains("\\u003c/script\\u003e\\u003cimg src=x\\u003e"));
+    assert!(!shell.contains("frame-ancestors https://app.example/"));
 }
 
 #[tokio::test]
@@ -1183,7 +1393,7 @@ async fn wildcard_setup_policy_uses_the_callers_concrete_origin() {
     let response = request(
         setup_router(setup),
         Method::GET,
-        "/setup?return_to=https://creator.example/callback&state=opaque",
+        "/setup?return_to=https://creator.example/callback&state=opaque&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
     )
     .await;
 
@@ -1212,14 +1422,18 @@ async fn wildcard_setup_policy_uses_the_callers_concrete_origin() {
         "https://user:password@creator.example/callback",
     ] {
         assert_eq!(
-            wildcard.begin(peer(), return_to, "opaque").await,
+            wildcard
+                .begin(peer(), return_to, "opaque", EXPECTED_CREATOR)
+                .await,
             Err(BeginError::InvalidRequest),
             "wildcard accepted invalid return_to {return_to:?}"
         );
     }
     let oversized = format!("https://creator.example/{}", "x".repeat(2049));
     assert_eq!(
-        wildcard.begin(peer(), &oversized, "opaque").await,
+        wildcard
+            .begin(peer(), &oversized, "opaque", EXPECTED_CREATOR)
+            .await,
         Err(BeginError::InvalidRequest)
     );
 }
