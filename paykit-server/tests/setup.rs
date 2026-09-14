@@ -647,6 +647,7 @@ async fn complete_route_returns_safe_json_and_preserves_expired_status() {
     )
     .await;
     assert_eq!(completed.status(), StatusCode::OK);
+    assert_eq!(completed.headers()["cache-control"], "no-store");
     assert_eq!(body(completed).await, r#"{"status":"complete"}"#);
     let failed = request(
         router.clone(),
@@ -655,6 +656,7 @@ async fn complete_route_returns_safe_json_and_preserves_expired_status() {
     )
     .await;
     assert_eq!(failed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(failed.headers()["cache-control"], "no-store");
     assert_eq!(body(failed).await, r#"{"error":"setup_failed"}"#);
 
     let expired = setup
@@ -669,9 +671,11 @@ async fn complete_route_returns_safe_json_and_preserves_expired_status() {
     )
     .await;
     assert_eq!(expired.status(), StatusCode::GONE);
+    assert_eq!(expired.headers()["cache-control"], "no-store");
     assert_eq!(body(expired).await, r#"{"error":"expired"}"#);
     let missing = request(router, Method::POST, "/setup/missing/complete").await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(missing.headers()["cache-control"], "no-store");
     assert_eq!(body(missing).await, r#"{"error":"not_found"}"#);
 }
 
@@ -1124,6 +1128,9 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
     assert!(!shell.contains("</script><img"));
     assert!(shell.contains("\\u003c/script\\u003e\\u003cimg\\u003e"));
     assert!(shell.contains("Waiting for Bitkit"));
+    assert!(shell.contains("No approval received. Update Bitkit to 2.5 or newer and start again."));
+    assert!(shell.contains("restart.href=window.location.pathname+window.location.search"));
+    assert!(shell.contains("waitLimit=6*60*1000"));
     assert!(shell.contains("Connected"));
     assert!(shell.contains("Setup failed"));
 
@@ -1169,7 +1176,16 @@ async fn setup_page_renders_exact_claim_as_deep_link_and_qr() {
         .split_once("<script>")
         .expect("setup shell contains polling script");
     let claim = "pubkyauth://signin?secret=mock&label=<approve>";
-    assert!(page.contains("href=\"pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;\""));
+    let href = page
+        .split_once("href=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(href, _)| href)
+        .expect("setup page contains a deep-link href");
+    assert!(href.starts_with("pubkyauth://"));
+    assert_eq!(
+        href,
+        "pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;"
+    );
     assert!(page.contains("Bitkit 2.5 or newer is required."));
     assert!(page.contains("Scan this code with Bitkit"));
     let expected_qr =
@@ -1186,8 +1202,6 @@ async fn setup_page_renders_exact_claim_as_deep_link_and_qr() {
             "page contained forbidden value {forbidden}"
         );
     }
-    std::fs::create_dir_all("/tmp/ps-setup-handoff").unwrap();
-    std::fs::write("/tmp/ps-setup-handoff/setup-sample.html", &shell).unwrap();
 }
 
 #[tokio::test]

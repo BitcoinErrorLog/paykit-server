@@ -28,7 +28,14 @@ async fn begin(
         return invalid_request();
     };
     match service.begin(peer.ip(), &return_to, &state).await {
-        Ok(flow) => iframe_response(flow),
+        Ok(flow) => match iframe_response(flow) {
+            Ok(response) => response,
+            Err(()) => safe_response_with_retry(
+                StatusCode::SERVICE_UNAVAILABLE,
+                json!({"error":"unavailable"}),
+                "1",
+            ),
+        },
         Err(BeginError::InvalidRequest) => invalid_request(),
         Err(BeginError::RateLimited) => safe_response_with_retry(
             StatusCode::TOO_MANY_REQUESTS,
@@ -63,12 +70,12 @@ fn parse_setup_query(query: Option<&str>) -> Option<(String, String)> {
     Some((return_to?, state?))
 }
 
-fn iframe_response(flow: StartedFlow) -> Response<Body> {
+fn iframe_response(flow: StartedFlow) -> Result<Response<Body>, ()> {
     let flow_id = json_for_script(&flow.flow_id);
     let state = json_for_script(&flow.state);
     let origin = json_for_script(&flow.origin);
     let authorization_url = html_for_attribute(&flow.authorization_url);
-    let qr_svg = qr_code_svg(&flow.authorization_url);
+    let qr_svg = qr_code_svg(&flow.authorization_url)?;
     let mut shell = String::from(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Connect Bitkit</title></head><body><main><h1>Connect Bitkit</h1><p>Scan this code with Bitkit, or open this page on your phone and tap <em>Open in Bitkit</em>.</p><p><a href=\"",
     );
@@ -76,7 +83,7 @@ fn iframe_response(flow: StartedFlow) -> Response<Body> {
     shell.push_str("\">Open in Bitkit</a></p><div aria-label=\"Bitkit connection QR code\">");
     shell.push_str(&qr_svg);
     shell.push_str(
-        "</div><p>Bitkit 2.5 or newer is required.</p><p id=\"status\" role=\"status\" aria-live=\"polite\">Waiting for Bitkit…</p></main><script>\nconst flowId=",
+        "</div><p>Bitkit 2.5 or newer is required.</p><p id=\"status\" role=\"status\" aria-live=\"polite\">Waiting for Bitkit…</p><p><a id=\"restart\" hidden>Start again</a></p></main><script>\nconst flowId=",
     );
     shell.push_str(&flow_id);
     shell.push_str(";const state=");
@@ -84,7 +91,7 @@ fn iframe_response(flow: StartedFlow) -> Response<Body> {
     shell.push_str(";const targetOrigin=");
     shell.push_str(&origin);
     shell.push_str(
-        ";\nconst status=document.getElementById('status');const retryable=new Set([408,425,429,502,503,504]);let delay=500;\nasync function poll(){try{const response=await fetch('/setup/'+flowId+'/complete',{method:'POST'});if(response.status===200){status.textContent='Connected';window.parent.postMessage({type:'paykit-setup-callback',state},targetOrigin);return;}if(!retryable.has(response.status)){status.textContent='Setup failed… try again';window.parent.postMessage({type:'paykit-setup-callback',state,error:'setup-failed'},targetOrigin);return;}}catch(_error){}setTimeout(poll,delay);delay=Math.min(delay*2,5000);}setTimeout(poll,delay);\n</script></body></html>",
+        ";\nconst status=document.getElementById('status');const restart=document.getElementById('restart');const retryable=new Set([408,425,429,502,503,504]);const waitLimit=6*60*1000;let delay=500;let finished=false;\nfunction finish(){finished=true;}\nfunction stopWaiting(){if(finished)return;finished=true;status.textContent='No approval received. Update Bitkit to 2.5 or newer and start again.';restart.href=window.location.pathname+window.location.search;restart.hidden=false;}\nsetTimeout(stopWaiting,waitLimit);\nasync function poll(){if(finished)return;try{const response=await fetch('/setup/'+flowId+'/complete',{method:'POST'});if(response.status===200){finish();status.textContent='Connected';window.parent.postMessage({type:'paykit-setup-callback',state},targetOrigin);return;}if(!retryable.has(response.status)){finish();status.textContent='Setup failed… try again';window.parent.postMessage({type:'paykit-setup-callback',state,error:'setup-failed'},targetOrigin);return;}}catch(_error){}if(!finished){setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script></body></html>",
     );
     let mut response = Response::new(Body::from(shell));
     *response.status_mut() = StatusCode::OK;
@@ -104,7 +111,7 @@ fn iframe_response(flow: StartedFlow) -> Response<Body> {
         HeaderValue::from_str(&format!("frame-ancestors {}", flow.origin))
             .expect("validated origin is a header value"),
     );
-    response
+    Ok(response)
 }
 
 fn html_for_attribute(value: &str) -> String {
@@ -122,12 +129,9 @@ fn html_for_attribute(value: &str) -> String {
     escaped
 }
 
-fn qr_code_svg(value: &str) -> String {
-    QrCode::with_error_correction_level(value.as_bytes(), EcLevel::M)
-        .expect("authorization URL fits QR code")
-        .render::<svg::Color>()
-        .min_dimensions(256, 256)
-        .build()
+fn qr_code_svg(value: &str) -> Result<String, ()> {
+    let code = QrCode::with_error_correction_level(value.as_bytes(), EcLevel::M).map_err(|_| ())?;
+    Ok(code.render::<svg::Color>().min_dimensions(256, 256).build())
 }
 
 fn json_for_script(value: &str) -> String {
@@ -141,7 +145,7 @@ fn json_for_script(value: &str) -> String {
 }
 
 fn response_for_poll(result: PollResult) -> Response<Body> {
-    match result {
+    let mut response = match result {
         PollResult::Complete => safe_response(StatusCode::OK, json!({"status":"complete"})),
         PollResult::PendingTimeout => {
             safe_response(StatusCode::REQUEST_TIMEOUT, json!({"status":"pending"}))
@@ -162,7 +166,11 @@ fn response_for_poll(result: PollResult) -> Response<Body> {
             json!({"error":"unavailable"}),
             "1",
         ),
-    }
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 fn invalid_request() -> Response<Body> {
