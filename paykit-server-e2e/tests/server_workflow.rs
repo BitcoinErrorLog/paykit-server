@@ -715,17 +715,15 @@ async fn wait_for_completion(
                 continue;
             }
             let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
-            statuses_confirmed &= body
-                == serde_json::json!({
-                    "status": "confirmed",
-                    "confirmations": 6,
-                    "amount_matched": true,
-                    "late_settlement": false,
-                    // W1.14: the creator's current mode rides the status
-                    // contract; the composed creators are shared_manual.
-                    "allocation_mode": "shared_manual",
-                    "contract_version": "paykit.bitcoin_status/v2"
-                });
+            statuses_confirmed &= body["status"] == "confirmed"
+                && body["confirmations"] == 6
+                && body["amount_matched"] == true
+                && body["late_settlement"] == false
+                && body["allocation_mode"] == "shared_manual"
+                && body["contract_version"] == "paykit.bitcoin_status/v2"
+                && body["delivery_generation"].is_string()
+                && body["delivery_revision"].is_i64()
+                && body["paykit_delivery_state"].is_string();
         }
         if delivered == 4 && statuses_confirmed {
             return;
