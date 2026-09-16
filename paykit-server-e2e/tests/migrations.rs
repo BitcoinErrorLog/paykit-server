@@ -31,6 +31,8 @@ const REQUIRED_TABLES: [&str; 14] = [
     "outbox_terminal_events",
 ];
 
+const ACCOUNT_RETENTION_REGISTRY: [&str; 14] = REQUIRED_TABLES;
+
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
 /// migration tests deliberately use the production migration lock key, so
 /// they must not contend with one another when the test harness runs them in
@@ -666,6 +668,35 @@ async fn terminal_outbox_rows_reject_resurrection_and_linkage_repair() {
             .await,
     );
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn creator_and_invoice_children_are_in_account_retention_registry() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    run_migrations(pool).await.unwrap();
+    let child_tables: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT table_name
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND column_name IN ('creator_id', 'invoice_id')
+         ORDER BY table_name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    for table in child_tables {
+        assert!(
+            ACCOUNT_RETENTION_REGISTRY.contains(&table.as_str()),
+            "retention registry is missing child table {table}"
+        );
+    }
+    assert!(
+        ACCOUNT_RETENTION_REGISTRY.contains(&"outbox_terminal_events"),
+        "terminal evidence must be classified for retention"
+    );
     database.cleanup().await;
 }
 
