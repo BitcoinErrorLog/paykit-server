@@ -157,6 +157,7 @@ fn resolve_error(error: ResolveError) -> Response {
         }
         ResolveError::PrepareExpired => ApiError::PrepareExpired.into_response(),
         ResolveError::InvoiceFinalized => ApiError::InvoiceFinalized.into_response(),
+        ResolveError::PaymentObserved => ApiError::PaymentObserved.into_response(),
         ResolveError::BaselineInProgress => ApiError::InvoiceBaselineInProgress.into_response(),
         ResolveError::Unavailable => ApiError::CreatorSessionUnavailable.into_response(),
     }

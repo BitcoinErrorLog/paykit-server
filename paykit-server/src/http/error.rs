@@ -27,6 +27,7 @@ pub enum ApiError {
     UnknownInvoice,
     StackIdentityMismatch,
     InvoiceNotActivated,
+    PaymentObserved,
 }
 
 #[derive(Serialize)]
@@ -145,6 +146,11 @@ impl ApiError {
                 StatusCode::CONFLICT,
                 "invoice_not_activated",
                 "invoice was never activated; nothing was ever published",
+            ),
+            Self::PaymentObserved => (
+                StatusCode::CONFLICT,
+                "payment_observed",
+                "payment was observed before abandonment could commit",
             ),
         }
     }

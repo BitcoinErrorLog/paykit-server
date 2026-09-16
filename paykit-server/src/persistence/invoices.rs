@@ -1366,6 +1366,7 @@ impl InvoiceStore {
                 if flipped.rows_affected() != 1 {
                     return Err(PersistenceError::CorruptOrMissing);
                 }
+                terminalize_invoice_outbox(&mut tx, invoice_id, "invoice_voided").await?;
                 VoidWrite::Voided
             }
             "void_cancelled" | "void_prepare_expired" => VoidWrite::AlreadyVoid,
@@ -1411,19 +1412,23 @@ impl InvoiceStore {
             .begin()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
-        let row = sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT baseline_state, resolution FROM invoices WHERE id = $1 FOR UPDATE",
+        let row = sqlx::query_as::<_, (String, Option<String>, String)>(
+            "SELECT baseline_state, resolution, payment_status
+             FROM invoices WHERE id = $1 FOR UPDATE",
         )
         .bind(invoice_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        let Some((baseline_state, existing_resolution)) = row else {
+        let Some((baseline_state, existing_resolution, payment_status)) = row else {
             tx.commit()
                 .await
                 .map_err(|_| PersistenceError::Unavailable)?;
             return Ok(None);
         };
+        if resolution == "abandoned" && payment_status != "undetected" {
+            return Err(PersistenceError::PaymentObserved);
+        }
         // Idempotency on (invoice_id, resolution), covering both resolved
         // states and a metadata-only `expired_final` record: the same
         // resolution returns the existing record with zero writes; a
@@ -1460,6 +1465,9 @@ impl InvoiceStore {
                 .map_err(|_| PersistenceError::Unavailable)?;
                 if flipped.rows_affected() != 1 {
                     return Err(PersistenceError::CorruptOrMissing);
+                }
+                if resolution == "abandoned" {
+                    terminalize_invoice_outbox(&mut tx, invoice_id, "invoice_abandoned").await?;
                 }
                 ResolveWrite::Finalized
             }
@@ -2668,6 +2676,38 @@ struct OutboxInsert<'a> {
     depends_on_id: Option<Uuid>,
     reader_assignment_id: Option<Uuid>,
     status: &'static str,
+}
+
+async fn terminalize_invoice_outbox(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    invoice_id: Uuid,
+    reason: &'static str,
+) -> Result<(), PersistenceError> {
+    sqlx::query(
+        "WITH terminalized AS (
+             UPDATE outbox
+             SET status = 'permanently_failed',
+                 error_class = $2,
+                 failure_reason = $2,
+                 lease_owner = NULL,
+                 claim_token = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = NOW()
+             WHERE invoice_id = $1
+               AND status IN ('prepared', 'queued', 'leased', 'retryable')
+             RETURNING creator_id, invoice_id, id
+         )
+         INSERT INTO outbox_terminal_events
+             (creator_id, invoice_id, outbox_id, event_class, reason)
+         SELECT creator_id, invoice_id, id, $2, $2
+         FROM terminalized",
+    )
+    .bind(invoice_id)
+    .bind(reason)
+    .execute(&mut **tx)
+    .await
+    .map_err(|_| PersistenceError::Unavailable)?;
+    Ok(())
 }
 
 async fn insert_outbox(

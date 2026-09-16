@@ -145,6 +145,8 @@ pub enum ResolveError {
     /// A different resolution is already recorded; the existing one is
     /// named (`invoice_already_resolved`).
     InvoiceAlreadyResolved(String),
+    /// Payment observation won the invoice-row race (`payment_observed`).
+    PaymentObserved,
     /// `void_prepare_expired`, reusing the W1.1c name (`prepare_expired`).
     PrepareExpired,
     /// `void_baseline_failed` / `void_cancelled`, reusing the W1.1c name
@@ -403,6 +405,7 @@ impl TwoPhaseService {
             }
             Err(PersistenceError::PrepareExpired) => return Err(ResolveError::PrepareExpired),
             Err(PersistenceError::InvoiceFinalized) => return Err(ResolveError::InvoiceFinalized),
+            Err(PersistenceError::PaymentObserved) => return Err(ResolveError::PaymentObserved),
             Err(PersistenceError::BaselineInProgress) => {
                 return Err(ResolveError::BaselineInProgress);
             }
