@@ -169,6 +169,7 @@ pub struct TerminalFailureHealth {
     pub count: i64,
     pub oldest_age_seconds: Option<i64>,
     pub by_class: BTreeMap<String, i64>,
+    pub transitions: Vec<(String, String, i64)>,
 }
 
 impl OutboxStore {
@@ -209,11 +210,59 @@ impl OutboxStore {
         .fetch_one(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        let transitions = sqlx::query_as(
+            "SELECT event_class, reason, COUNT(*)::BIGINT
+             FROM outbox_terminal_events
+             GROUP BY event_class, reason",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
         Ok(TerminalFailureHealth {
             count,
             oldest_age_seconds,
             by_class: rows.into_iter().collect(),
+            transitions,
         })
+    }
+
+    pub async fn claim_metrics(&self, limit: i64) -> Result<(bool, i64), PersistenceError> {
+        let (saturated, active_partitions): (bool, i64) = sqlx::query_as(
+            "WITH RECURSIVE eligible AS (
+                 SELECT id, creator_id, reader_assignment_id AS root_reader_assignment_id, depends_on_id
+                 FROM outbox WHERE depends_on_id IS NULL
+                 UNION ALL
+                 SELECT child.id, child.creator_id, eligible.root_reader_assignment_id, child.depends_on_id
+                 FROM outbox child JOIN eligible ON eligible.id = child.depends_on_id
+             ), roots AS (
+                 SELECT DISTINCT ON (id) id, root_reader_assignment_id FROM eligible ORDER BY id
+             ), active AS (
+                 SELECT o.creator_id, roots.root_reader_assignment_id
+                 FROM outbox o JOIN roots ON roots.id = o.id
+                 WHERE o.status = 'leased' AND o.lease_expires_at > NOW()
+                 GROUP BY o.creator_id, roots.root_reader_assignment_id
+             ), due_partitions AS (
+                 SELECT o.creator_id, roots.root_reader_assignment_id
+                 FROM outbox o JOIN roots ON roots.id = o.id
+                 LEFT JOIN outbox dependency ON dependency.id = o.depends_on_id
+                 LEFT JOIN invoices invoice ON invoice.id = o.invoice_id
+                 WHERE ((o.status = 'queued' AND o.next_attempt_at <= NOW())
+                     OR (o.status = 'leased' AND o.lease_expires_at <= NOW())
+                     OR (o.status = 'retryable' AND o.next_attempt_at <= NOW()))
+                   AND (o.invoice_id IS NULL OR invoice.baseline_state NOT IN (
+                     'expired_final', 'void_baseline_failed', 'void_prepare_expired',
+                     'void_cancelled', 'resolved_paid_manually', 'resolved_closed'))
+                   AND (o.depends_on_id IS NULL OR dependency.status = 'delivered')
+                 GROUP BY o.creator_id, roots.root_reader_assignment_id
+             )
+             SELECT (SELECT COUNT(*) FROM due_partitions) > $1,
+                    (SELECT COUNT(*) FROM active)",
+        )
+        .bind(limit)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok((saturated, active_partitions))
     }
 
     /// Claims eligible rows while preserving endpoint-publication dependencies.

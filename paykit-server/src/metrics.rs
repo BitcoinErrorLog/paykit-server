@@ -1,6 +1,6 @@
 //! Identifier-free Prometheus metrics for the process runtime.
 
-use std::sync::Mutex;
+use std::{collections::BTreeMap, sync::Mutex};
 
 use prometheus_client::{
     encoding::{EncodeLabelSet, text::encode},
@@ -51,6 +51,7 @@ pub struct Metrics {
     runtime_active: Gauge,
     session_validation_results: Counter,
     outbox_terminal_transitions: Family<OutboxTransitionLabels, Counter>,
+    outbox_terminal_transition_counts: Mutex<BTreeMap<(String, String), i64>>,
     outbox_terminal_failure_count: Gauge,
     outbox_terminal_oldest_age_seconds: Gauge,
     outbox_reader_saturated: Counter,
@@ -215,6 +216,7 @@ impl Metrics {
             runtime_active,
             session_validation_results,
             outbox_terminal_transitions,
+            outbox_terminal_transition_counts: Mutex::new(BTreeMap::new()),
             outbox_terminal_failure_count,
             outbox_terminal_oldest_age_seconds,
             outbox_reader_saturated,
@@ -279,6 +281,25 @@ impl Metrics {
             .get_or_create(&OutboxTransitionLabels { class, reason })
             .inc();
     }
+    pub fn observe_outbox_terminal_transitions(&self, counts: Vec<(String, String, i64)>) {
+        let mut observed = self
+            .outbox_terminal_transition_counts
+            .lock()
+            .expect("terminal transition counts mutex is not poisoned");
+        for (class, reason, count) in counts {
+            let previous = observed.entry((class.clone(), reason.clone())).or_default();
+            let delta = count.saturating_sub(*previous);
+            if delta > 0 {
+                self.outbox_terminal_transitions
+                    .get_or_create(&OutboxTransitionLabels {
+                        class: terminal_class_label(&class),
+                        reason: terminal_reason_label(&reason),
+                    })
+                    .inc_by(u64::try_from(delta).expect("positive terminal count fits u64"));
+                *previous = count;
+            }
+        }
+    }
     pub fn set_outbox_terminal_health(&self, count: i64, oldest_age_seconds: Option<i64>) {
         self.outbox_terminal_failure_count.set(count);
         self.outbox_terminal_oldest_age_seconds
@@ -300,6 +321,34 @@ impl Metrics {
                 .expect("metrics registry mutex is not poisoned"),
         )?;
         Ok(text)
+    }
+}
+
+fn terminal_class_label(class: &str) -> &'static str {
+    match class {
+        "link_establishment_exhausted" => "link_establishment_exhausted",
+        "dependency_failed" => "dependency_failed",
+        "permanent" => "permanent",
+        "invoice_finalized" => "invoice_finalized",
+        "invoice_voided" => "invoice_voided",
+        "invoice_abandoned" => "invoice_abandoned",
+        "permanent_sdk_reconciliation" => "permanent_sdk_reconciliation",
+        _ => "unknown",
+    }
+}
+
+fn terminal_reason_label(reason: &str) -> &'static str {
+    match reason {
+        "attempt_ceiling" => "attempt_ceiling",
+        "age_ceiling" => "age_ceiling",
+        "parent_link_establishment_exhausted" => "parent_link_establishment_exhausted",
+        "parent_permanently_failed" => "parent_permanently_failed",
+        "permanent" => "permanent",
+        "invoice_finalized" => "invoice_finalized",
+        "invoice_voided" => "invoice_voided",
+        "invoice_abandoned" => "invoice_abandoned",
+        "permanent_sdk_reconciliation" => "permanent_sdk_reconciliation",
+        _ => "unknown",
     }
 }
 

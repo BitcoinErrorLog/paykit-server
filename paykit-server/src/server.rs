@@ -554,6 +554,21 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
         if !runtime.may_start_worker_claim() {
             break;
         }
+        match workers
+            .outbox
+            .claim_metrics(workers.outbox_batch_size)
+            .await
+        {
+            Ok((saturated, active_partitions)) => {
+                if saturated {
+                    runtime.metrics().outbox_reader_saturated();
+                }
+                runtime
+                    .metrics()
+                    .set_outbox_active_partitions(active_partitions);
+            }
+            Err(_) => runtime.set_outbox_enqueue_available(false),
+        }
         let claims = match workers
             .outbox
             .claim(
@@ -649,6 +664,9 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
             runtime
                 .metrics()
                 .set_outbox_terminal_health(health.count, health.oldest_age_seconds);
+            runtime
+                .metrics()
+                .observe_outbox_terminal_transitions(health.transitions);
             runtime.set_outbox_terminal_health(OutboxTerminalHealth {
                 count: health.count,
                 oldest_age_seconds: health.oldest_age_seconds,
