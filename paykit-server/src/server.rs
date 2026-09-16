@@ -79,6 +79,8 @@ struct WorkerComponents {
     outbox_lease_duration: Duration,
     outbox_retry_initial: Duration,
     outbox_retry_max: Duration,
+    link_establishment_max_attempts: i32,
+    link_establishment_max_age: Duration,
     electrum_policy: ObserverPolicy,
     sentinel_policy: crate::sentinel::SentinelPolicy,
 }
@@ -375,6 +377,11 @@ impl Server {
             outbox_lease_duration: config.outbox.lease_duration,
             outbox_retry_initial: config.outbox.retry_initial,
             outbox_retry_max: config.outbox.retry_max,
+            link_establishment_max_attempts: i32::try_from(
+                config.outbox.link_establishment_max_attempts,
+            )
+            .expect("validated link-establishment attempt ceiling fits i32"),
+            link_establishment_max_age: config.outbox.link_establishment_max_age,
             electrum_policy: ObserverPolicy {
                 poll_interval: config.electrum.poll_interval,
                 max_requests_per_tick: config.electrum.max_requests_per_tick,
@@ -574,6 +581,17 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                     workers.outbox_retry_max,
                     claim.attempt_count(),
                 );
+                if workers
+                    .outbox
+                    .exhaust_claim_if_due(
+                        &claim,
+                        workers.link_establishment_max_attempts,
+                        workers.link_establishment_max_age,
+                    )
+                    .await?
+                {
+                    return Ok((true, ProcessingHealth::PermanentFailure));
+                }
                 match creator_adapter(&workers, claim.creator_id()).await {
                     Ok(adapter) => {
                         process_claim_with_health(&workers.outbox, &adapter, &claim, delay).await

@@ -166,6 +166,12 @@ pub async fn process_claim_with_health(
     claim: &ClaimedOutbox,
     retry_delay: Duration,
 ) -> Result<(bool, ProcessingHealth), PersistenceError> {
+    if store
+        .exhaust_claim_if_due(claim, 20, Duration::from_secs(60 * 60))
+        .await?
+    {
+        return Ok((true, ProcessingHealth::PermanentFailure));
+    }
     let intent = match store.delivery_intent(claim) {
         Ok(intent) => intent,
         Err(_) => {

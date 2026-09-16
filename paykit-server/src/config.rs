@@ -177,6 +177,10 @@ impl Config {
             ("outbox.lease_duration", self.outbox.lease_duration),
             ("outbox.retry_initial", self.outbox.retry_initial),
             ("outbox.retry_max", self.outbox.retry_max),
+            (
+                "outbox.link_establishment_max_age",
+                self.outbox.link_establishment_max_age,
+            ),
             ("limits.lock_fetch_timeout", self.limits.lock_fetch_timeout),
             ("shutdown.drain_timeout", self.shutdown.drain_timeout),
             (
@@ -293,6 +297,10 @@ impl Config {
             ("outbox.lease_duration", self.outbox.lease_duration),
             ("outbox.retry_initial", self.outbox.retry_initial),
             ("outbox.retry_max", self.outbox.retry_max),
+            (
+                "outbox.link_establishment_max_age",
+                self.outbox.link_establishment_max_age,
+            ),
             ("sentinel.rescan_interval", self.sentinel.rescan_interval),
         ] {
             if value < Duration::from_secs(1) {
@@ -301,6 +309,14 @@ impl Config {
         }
         if self.outbox.retry_initial > self.outbox.retry_max {
             return Err(ConfigError::InconsistentRetries("outbox"));
+        }
+        if self.outbox.link_establishment_max_attempts == 0 {
+            return Err(ConfigError::ZeroValue(
+                "outbox.link_establishment_max_attempts",
+            ));
+        }
+        if self.outbox.retry_max > self.outbox.link_establishment_max_age {
+            return Err(ConfigError::InconsistentLinkEstablishmentCeiling);
         }
         // Every tick reserves PROBE_REQUESTS_PER_TICK requests for the
         // active probe before admitting observation targets, so the
@@ -778,6 +794,8 @@ pub struct OutboxConfig {
     pub lease_duration: Duration,
     pub retry_initial: Duration,
     pub retry_max: Duration,
+    pub link_establishment_max_attempts: u32,
+    pub link_establishment_max_age: Duration,
 }
 
 /// W1.14 unassigned-sentinel configuration (design §B.8.7). The sentinel
@@ -937,6 +955,8 @@ pub enum ConfigError {
     DurationExceedsPostgresInterval(&'static str),
     #[error("{0}.retry_initial must not exceed {0}.retry_max")]
     InconsistentRetries(&'static str),
+    #[error("outbox.retry_max must not exceed outbox.link_establishment_max_age")]
+    InconsistentLinkEstablishmentCeiling,
     #[error(
         "electrum request budget must exceed the {PROBE_REQUESTS_PER_TICK} reserved probe requests per tick: \
          min(electrum.max_requests_per_tick, electrum.max_requests_per_second * electrum.poll_interval seconds) \
@@ -1305,6 +1325,13 @@ struct RawOutboxConfig {
     retry_initial: Duration,
     #[serde(default = "default_outbox_retry_max", with = "humantime_serde")]
     retry_max: Duration,
+    #[serde(default = "default_link_establishment_max_attempts")]
+    link_establishment_max_attempts: u32,
+    #[serde(
+        default = "default_link_establishment_max_age",
+        with = "humantime_serde"
+    )]
+    link_establishment_max_age: Duration,
 }
 
 #[derive(Deserialize)]
@@ -1384,6 +1411,8 @@ impl From<RawOutboxConfig> for OutboxConfig {
             lease_duration: value.lease_duration,
             retry_initial: value.retry_initial,
             retry_max: value.retry_max,
+            link_establishment_max_attempts: value.link_establishment_max_attempts,
+            link_establishment_max_age: value.link_establishment_max_age,
         }
     }
 }
@@ -1431,6 +1460,12 @@ const fn default_retry_initial() -> Duration {
 }
 const fn default_outbox_retry_max() -> Duration {
     Duration::from_secs(5 * 60)
+}
+const fn default_link_establishment_max_attempts() -> u32 {
+    20
+}
+const fn default_link_establishment_max_age() -> Duration {
+    Duration::from_secs(60 * 60)
 }
 
 const fn default_request_body_bytes() -> u64 {

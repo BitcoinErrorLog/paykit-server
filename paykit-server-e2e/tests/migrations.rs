@@ -14,7 +14,7 @@ use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
 use uuid::Uuid;
 
-const REQUIRED_TABLES: [&str; 13] = [
+const REQUIRED_TABLES: [&str; 14] = [
     "deployment_metadata",
     "creators",
     "sdk_states",
@@ -28,6 +28,7 @@ const REQUIRED_TABLES: [&str; 13] = [
     "claimed_key_fingerprints",
     "sentinel_outpoints",
     "sentinel_events",
+    "outbox_terminal_events",
 ];
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
@@ -65,7 +66,7 @@ fn migration_catalog_has_one_contiguous_canonical_version_per_file() {
     let mut versions = migration_versions(names).unwrap();
     versions.sort_unstable();
 
-    assert_eq!(versions, (1..=16).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=17).collect::<Vec<_>>());
     assert_eq!(
         versions.len(),
         versions.iter().collect::<HashSet<_>>().len()
@@ -116,7 +117,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .unwrap();
     assert_eq!(
         applied_versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     );
 
     let retired_observation_budget_columns: Vec<String> = sqlx::query_scalar(

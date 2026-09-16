@@ -176,7 +176,7 @@ impl OutboxStore {
         sqlx::query_scalar(
             "SELECT NOT EXISTS ( \
                  SELECT 1 FROM outbox \
-                 WHERE status IN ('retryable', 'handed_off', 'permanently_failed') \
+                 WHERE status IN ('retryable', 'handed_off') \
              )",
         )
         .fetch_one(&self.pool)
@@ -226,6 +226,98 @@ impl OutboxStore {
         .fetch_all(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)
+    }
+
+    /// Atomically closes a leased link-establishment claim at either delivery
+    /// ceiling. This runs before decrypting the intent or constructing an
+    /// adapter, so a bounded claim cannot reach the public SDK.
+    pub async fn exhaust_claim_if_due(
+        &self,
+        claim: &ClaimedOutbox,
+        max_attempts: i32,
+        max_age: Duration,
+    ) -> Result<bool, PersistenceError> {
+        let max_age_seconds =
+            i64::try_from(max_age.as_secs()).map_err(|_| PersistenceError::Unavailable)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let parent = sqlx::query_scalar::<_, String>(
+            "UPDATE outbox
+             SET status = 'permanently_failed',
+                 error_class = 'link_establishment_exhausted',
+                 failure_reason = CASE
+                     WHEN attempt_count >= $1 THEN 'attempt_ceiling'
+                     ELSE 'age_ceiling'
+                 END,
+                 lease_owner = NULL,
+                 claim_token = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = NOW()
+             WHERE id = $2
+               AND status = 'leased'
+               AND claim_token = $3
+               AND lease_expires_at > NOW()
+               AND error_class = 'link_establishment'
+               AND (attempt_count >= $1 OR NOW() >= created_at + ($4 * INTERVAL '1 second'))
+             RETURNING id",
+        )
+        .bind(max_attempts)
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .bind(max_age_seconds)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some(parent_id) = parent else {
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(false);
+        };
+
+        sqlx::query(
+            "WITH RECURSIVE descendants AS (
+                 SELECT id FROM outbox WHERE depends_on_id = $1
+                 UNION ALL
+                 SELECT child.id
+                 FROM outbox child
+                 JOIN descendants parent ON child.depends_on_id = parent.id
+             )
+             UPDATE outbox
+             SET status = 'permanently_failed',
+                 error_class = 'dependency_failed',
+                 failure_reason = 'parent_link_establishment_exhausted',
+                 lease_owner = NULL,
+                 claim_token = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = NOW()
+             WHERE id IN (SELECT id FROM descendants)
+               AND status IN ('prepared', 'queued', 'leased', 'retryable')",
+        )
+        .bind(&parent_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+
+        sqlx::query(
+            "INSERT INTO outbox_terminal_events
+                 (creator_id, invoice_id, outbox_id, event_class, reason)
+             SELECT creator_id, invoice_id, id, 'link_establishment_exhausted',
+                    failure_reason
+             FROM outbox
+             WHERE id = $1",
+        )
+        .bind(&parent_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(true)
     }
 
     /// Claims attributable handed-off rows independently from enqueue work.
