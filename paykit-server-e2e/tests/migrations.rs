@@ -68,7 +68,7 @@ fn migration_catalog_has_one_contiguous_canonical_version_per_file() {
     let mut versions = migration_versions(names).unwrap();
     versions.sort_unstable();
 
-    assert_eq!(versions, (1..=19).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=20).collect::<Vec<_>>());
     assert_eq!(
         versions.len(),
         versions.iter().collect::<HashSet<_>>().len()
@@ -120,7 +120,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
     assert_eq!(
         applied_versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20
         ]
     );
 
@@ -677,6 +677,40 @@ async fn terminal_rows_reject_generation_id_edits() {
             .await,
     );
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn runtime_role_cannot_disable_terminal_trigger() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    run_migrations(pool).await.unwrap();
+    let role = format!("paykit_runtime_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE ROLE {role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    let mut connection = database.acquire_connection().await;
+    sqlx::query(&format!("SET ROLE {role}"))
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    let disable = sqlx::query("ALTER TABLE outbox DISABLE TRIGGER outbox_terminal_repair_barrier")
+        .execute(&mut *connection)
+        .await;
+    assert!(disable.is_err(), "runtime role disabled terminal trigger");
+    sqlx::query("RESET ROLE")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+    sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(pool)
+        .await
+        .unwrap();
     database.cleanup().await;
 }
 
