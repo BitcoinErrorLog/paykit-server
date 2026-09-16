@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use uuid::Uuid;
 
 use crate::{
     allocation::AllocationMode,
@@ -59,6 +60,25 @@ pub trait StatusRepository: Send + Sync {
         creator: &CreatorPubky,
         bundle_id: &BundleId,
     ) -> Result<Option<PersistedPaymentStatus>, PersistenceError>;
+
+    async fn delivery_status(
+        &self,
+        _creator: &CreatorPubky,
+        _bundle_id: &BundleId,
+    ) -> Result<Option<DeliveryStatus>, PersistenceError> {
+        Ok(Some(DeliveryStatus {
+            generation: Uuid::nil(),
+            revision: 0,
+            state: "pending_delivery",
+        }))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeliveryStatus {
+    pub generation: Uuid,
+    pub revision: i64,
+    pub state: &'static str,
 }
 
 #[async_trait]
@@ -69,6 +89,14 @@ impl StatusRepository for InvoiceStore {
         bundle_id: &BundleId,
     ) -> Result<Option<PersistedPaymentStatus>, PersistenceError> {
         InvoiceStore::payment_status(self, creator, bundle_id).await
+    }
+
+    async fn delivery_status(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<DeliveryStatus>, PersistenceError> {
+        InvoiceStore::delivery_status(self, creator, bundle_id).await
     }
 }
 
@@ -112,6 +140,9 @@ pub struct PaymentStatusResponse {
     amount_matched: bool,
     late_settlement: bool,
     allocation_mode: AllocationMode,
+    delivery_generation: Uuid,
+    delivery_revision: i64,
+    paykit_delivery_state: &'static str,
 }
 
 impl PaymentStatusResponse {
@@ -121,6 +152,7 @@ impl PaymentStatusResponse {
         amount_matched: bool,
         late_settlement: bool,
         allocation_mode: AllocationMode,
+        delivery: DeliveryStatus,
     ) -> Self {
         Self {
             status,
@@ -128,6 +160,9 @@ impl PaymentStatusResponse {
             amount_matched,
             late_settlement,
             allocation_mode,
+            delivery_generation: delivery.generation,
+            delivery_revision: delivery.revision,
+            paykit_delivery_state: delivery.state,
         }
     }
 
@@ -151,6 +186,15 @@ impl PaymentStatusResponse {
     /// `shared_manual`), read at transition time.
     pub fn allocation_mode(&self) -> AllocationMode {
         self.allocation_mode
+    }
+    pub fn delivery_generation(&self) -> Uuid {
+        self.delivery_generation
+    }
+    pub fn delivery_revision(&self) -> i64 {
+        self.delivery_revision
+    }
+    pub fn paykit_delivery_state(&self) -> &'static str {
+        self.paykit_delivery_state
     }
 }
 
@@ -182,13 +226,24 @@ impl PaymentStatusService {
             .await
             .map_err(|_| PaymentStatusError::Unavailable)?
             .ok_or(PaymentStatusError::NotFound)?;
+        let delivery = self
+            .repository
+            .delivery_status(creator, bundle_id)
+            .await
+            .map_err(|_| PaymentStatusError::Unavailable)?
+            .ok_or(PaymentStatusError::NotFound)?;
         Ok(match persisted {
             PersistedPaymentStatus::Undetected {
                 late_settlement,
                 allocation_mode,
-            } => {
-                PaymentStatusResponse::new("undetected", 0, false, late_settlement, allocation_mode)
-            }
+            } => PaymentStatusResponse::new(
+                "undetected",
+                0,
+                false,
+                late_settlement,
+                allocation_mode,
+                delivery,
+            ),
             PersistedPaymentStatus::Detected {
                 confirmations,
                 amount_matched,
@@ -200,6 +255,7 @@ impl PaymentStatusService {
                 amount_matched,
                 late_settlement,
                 allocation_mode,
+                delivery,
             ),
             PersistedPaymentStatus::Confirmed {
                 confirmations,
@@ -212,6 +268,7 @@ impl PaymentStatusService {
                 amount_matched,
                 late_settlement,
                 allocation_mode,
+                delivery,
             ),
         })
     }

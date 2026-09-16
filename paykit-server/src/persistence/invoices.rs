@@ -13,7 +13,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    application::payment_status::PersistedPaymentStatus,
+    application::payment_status::{DeliveryStatus, PersistedPaymentStatus},
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     bitcoin::{
         DirectBinding, ObservationAction, ObservationTarget, PlannedObservation, TrackedOutput,
@@ -969,6 +969,61 @@ impl InvoiceStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         row.map(PersistedPaymentStatus::try_from).transpose()
+    }
+
+    pub async fn delivery_status(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &crate::domain::locks::BundleId,
+    ) -> Result<Option<DeliveryStatus>, PersistenceError> {
+        let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        let bundle_hash = self.crypto.lookup_hash(bundle_id.to_string().as_bytes());
+        Ok(sqlx::query_as::<_, (Uuid, i64, String)>(
+            "SELECT invoices.id, invoices.delivery_revision,
+                    CASE
+                      WHEN invoices.baseline_state IN
+                        ('void_baseline_failed', 'void_prepare_expired',
+                         'void_cancelled', 'expired_final',
+                         'resolved_paid_manually', 'resolved_closed')
+                        THEN 'cancelled'
+                      WHEN EXISTS (
+                        SELECT 1 FROM outbox
+                        WHERE outbox.invoice_id = invoices.id
+                          AND outbox.status = 'permanently_failed'
+                      ) THEN 'failed'
+                      WHEN COUNT(outbox.id) FILTER (WHERE outbox.status = 'delivered') = 2
+                        THEN 'delivered'
+                      WHEN COUNT(outbox.id) = 2
+                        AND COUNT(outbox.id) FILTER (
+                          WHERE outbox.status IN
+                            ('prepared', 'queued', 'leased', 'retryable', 'handed_off')
+                        ) = 2
+                        THEN 'pending_delivery'
+                      ELSE 'contract_error'
+                    END
+             FROM invoices
+             JOIN creators ON creators.id = invoices.creator_id
+             LEFT JOIN outbox ON outbox.invoice_id = invoices.id
+             WHERE creators.creator_lookup_hash = $1
+               AND invoices.bundle_lookup_hash = $2
+             GROUP BY invoices.id, invoices.delivery_revision, invoices.baseline_state",
+        )
+        .bind(creator_hash.as_bytes().as_slice())
+        .bind(bundle_hash.as_bytes().as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?
+        .map(|(generation, revision, state)| DeliveryStatus {
+            generation,
+            revision,
+            state: match state.as_str() {
+                "cancelled" => "cancelled",
+                "failed" => "failed",
+                "delivered" => "delivered",
+                "pending_delivery" => "pending_delivery",
+                _ => "contract_error",
+            },
+        }))
     }
 
     /// W1.14 sentinel admission plan, delegated to the creator store so the

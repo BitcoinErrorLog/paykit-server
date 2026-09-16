@@ -158,7 +158,7 @@ async fn known_unobserved_status_is_exactly_undetected() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response_body(response).await,
-        r#"{"status":"undetected","confirmations":0,"amount_matched":false,"late_settlement":false,"allocation_mode":"exclusive","contract_version":"paykit.bitcoin_status/v2"}"#
+        r#"{"status":"undetected","confirmations":0,"amount_matched":false,"late_settlement":false,"allocation_mode":"exclusive","contract_version":"paykit.bitcoin_status/v2","delivery_generation":"00000000-0000-0000-0000-000000000000","delivery_revision":0,"paykit_delivery_state":"pending_delivery"}"#
     );
 }
 
@@ -172,7 +172,7 @@ async fn known_observed_statuses_serialize_only_factual_fields() {
                 late_settlement: false,
                 allocation_mode: AllocationMode::Exclusive,
             },
-            r#"{"status":"detected","confirmations":0,"amount_matched":false,"late_settlement":false,"allocation_mode":"exclusive","contract_version":"paykit.bitcoin_status/v2"}"#,
+            r#"{"status":"detected","confirmations":0,"amount_matched":false,"late_settlement":false,"allocation_mode":"exclusive","contract_version":"paykit.bitcoin_status/v2","delivery_generation":"00000000-0000-0000-0000-000000000000","delivery_revision":0,"paykit_delivery_state":"pending_delivery"}"#,
         ),
         (
             PersistedPaymentStatus::Confirmed {
@@ -181,7 +181,7 @@ async fn known_observed_statuses_serialize_only_factual_fields() {
                 late_settlement: false,
                 allocation_mode: AllocationMode::Exclusive,
             },
-            r#"{"status":"confirmed","confirmations":3,"amount_matched":true,"late_settlement":false,"allocation_mode":"exclusive","contract_version":"paykit.bitcoin_status/v2"}"#,
+            r#"{"status":"confirmed","confirmations":3,"amount_matched":true,"late_settlement":false,"allocation_mode":"exclusive","contract_version":"paykit.bitcoin_status/v2","delivery_generation":"00000000-0000-0000-0000-000000000000","delivery_revision":0,"paykit_delivery_state":"pending_delivery"}"#,
         ),
     ] {
         let key = SigningKey::from_bytes(&[7; 32]);

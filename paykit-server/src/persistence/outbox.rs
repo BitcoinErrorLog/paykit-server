@@ -122,6 +122,7 @@ impl ClaimedOutbox {
 pub struct ClaimedHandoff {
     id: Uuid,
     creator_id: Uuid,
+    invoice_id: Option<Uuid>,
     attempt_count: i32,
     claim_token: Uuid,
     sdk_outbound_message_id: String,
@@ -418,7 +419,7 @@ impl OutboxStore {
                  lease_expires_at = NOW() + ($3 * INTERVAL '1 second'), \
                  attempt_count = o.attempt_count + 1, updated_at = NOW() \
              FROM candidates WHERE o.id = candidates.id \
-             RETURNING o.id, o.creator_id, o.attempt_count, o.claim_token, \
+             RETURNING o.id, o.creator_id, o.invoice_id, o.attempt_count, o.claim_token, \
                  o.sdk_outbound_message_id",
         )
         .bind(limit)
@@ -474,6 +475,9 @@ impl OutboxStore {
         .execute(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        if changed.rows_affected() == 1 {
+            self.bump_delivery_revision(claim.invoice_id).await?;
+        }
         Ok(changed.rows_affected() == 1)
     }
 
@@ -558,6 +562,9 @@ impl OutboxStore {
         .execute(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        if changed.rows_affected() == 1 {
+            self.bump_delivery_revision(claim.invoice_id).await?;
+        }
         Ok(changed.rows_affected() == 1)
     }
 
@@ -584,7 +591,27 @@ impl OutboxStore {
         .execute(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        if changed.rows_affected() == 1 {
+            self.bump_delivery_revision(claim.invoice_id).await?;
+        }
         Ok(changed.rows_affected() == 1)
+    }
+
+    async fn bump_delivery_revision(
+        &self,
+        invoice_id: Option<Uuid>,
+    ) -> Result<(), PersistenceError> {
+        if let Some(invoice_id) = invoice_id {
+            sqlx::query(
+                "UPDATE invoices SET delivery_revision = delivery_revision + 1,
+                 updated_at = NOW() WHERE id = $1",
+            )
+            .bind(invoice_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
+        Ok(())
     }
 }
 
@@ -647,6 +674,7 @@ mod tests {
         let claim = ClaimedHandoff {
             id: claim_id,
             creator_id,
+            invoice_id: Some(Uuid::new_v4()),
             attempt_count: 8,
             claim_token: Uuid::new_v4(),
             sdk_outbound_message_id: outbound_id.into(),
