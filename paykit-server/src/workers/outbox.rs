@@ -154,10 +154,19 @@ pub async fn process_claim(
     adapter: &dyn Adapter,
     claim: &ClaimedOutbox,
     retry_delay: Duration,
+    link_establishment_max_attempts: i32,
+    link_establishment_max_age: Duration,
 ) -> Result<bool, PersistenceError> {
-    process_claim_with_health(store, adapter, claim, retry_delay)
-        .await
-        .map(|(transitioned, _)| transitioned)
+    process_claim_with_health(
+        store,
+        adapter,
+        claim,
+        retry_delay,
+        link_establishment_max_attempts,
+        link_establishment_max_age,
+    )
+    .await
+    .map(|(transitioned, _)| transitioned)
 }
 
 pub async fn process_claim_with_health(
@@ -165,9 +174,15 @@ pub async fn process_claim_with_health(
     adapter: &dyn Adapter,
     claim: &ClaimedOutbox,
     retry_delay: Duration,
+    link_establishment_max_attempts: i32,
+    link_establishment_max_age: Duration,
 ) -> Result<(bool, ProcessingHealth), PersistenceError> {
     if store
-        .exhaust_claim_if_due(claim, 20, Duration::from_secs(60 * 60))
+        .exhaust_claim_if_due(
+            claim,
+            link_establishment_max_attempts,
+            link_establishment_max_age,
+        )
         .await?
     {
         return Ok((true, ProcessingHealth::PermanentFailure));

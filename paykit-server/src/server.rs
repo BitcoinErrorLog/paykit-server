@@ -594,7 +594,15 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                 }
                 match creator_adapter(&workers, claim.creator_id()).await {
                     Ok(adapter) => {
-                        process_claim_with_health(&workers.outbox, &adapter, &claim, delay).await
+                        process_claim_with_health(
+                            &workers.outbox,
+                            &adapter,
+                            &claim,
+                            delay,
+                            workers.link_establishment_max_attempts,
+                            workers.link_establishment_max_age,
+                        )
+                        .await
                     }
                     Err(AdapterBuildError::Permanent) => workers
                         .outbox

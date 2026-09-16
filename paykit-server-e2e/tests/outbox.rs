@@ -247,6 +247,8 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             &retry_adapter,
             &endpoint_claims[0],
             Duration::from_secs(5),
+            20,
+            Duration::from_secs(60 * 60),
         )
         .await
         .unwrap()
@@ -511,6 +513,8 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             &retry_adapter,
             &corrupt_claim[0],
             Duration::from_secs(5),
+            20,
+            Duration::from_secs(60 * 60),
         )
         .await
         .unwrap()
