@@ -27,6 +27,9 @@ struct ReadyResponse {
     electrum_tip_age_seconds: Option<u64>,
     paykit_delivery: &'static str,
     outbox: &'static str,
+    outbox_terminal_failure_count: i64,
+    outbox_oldest_terminal_failure_age_seconds: Option<i64>,
+    outbox_terminal_failures_by_class: std::collections::BTreeMap<String, i64>,
 }
 
 #[derive(Serialize)]
@@ -75,6 +78,10 @@ async fn ready(State(runtime): State<Arc<Runtime>>) -> impl IntoResponse {
         electrum_tip_age_seconds: report.electrum_probe.tip_age_secs,
         paykit_delivery: report.paykit_delivery.as_str(),
         outbox: report.outbox.as_str(),
+        outbox_terminal_failure_count: report.outbox_terminal_failure_count,
+        outbox_oldest_terminal_failure_age_seconds: report
+            .outbox_oldest_terminal_failure_age_seconds,
+        outbox_terminal_failures_by_class: report.outbox_terminal_failures_by_class,
     });
     let code = if report.status == ComponentState::NotReady {
         StatusCode::SERVICE_UNAVAILABLE

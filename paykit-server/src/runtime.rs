@@ -1,6 +1,7 @@
 //! Process lifecycle, dependency readiness, capacity admission, and server shutdown.
 
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
@@ -294,6 +295,16 @@ pub struct Readiness {
     pub bitcoin_creation_enabled: bool,
     pub paykit_delivery: ComponentState,
     pub outbox: ComponentState,
+    pub outbox_terminal_failure_count: i64,
+    pub outbox_oldest_terminal_failure_age_seconds: Option<i64>,
+    pub outbox_terminal_failures_by_class: BTreeMap<String, i64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OutboxTerminalHealth {
+    pub count: i64,
+    pub oldest_age_seconds: Option<i64>,
+    pub by_class: BTreeMap<String, i64>,
 }
 
 #[async_trait]
@@ -355,6 +366,7 @@ pub struct Runtime {
     paykit_reconciliation: AtomicU8,
     outbox_enqueue: AtomicU8,
     outbox_reconciliation: AtomicU8,
+    outbox_terminal_health: Mutex<OutboxTerminalHealth>,
     metrics: Arc<Metrics>,
     electrum_request_limiter: Mutex<RequestLimiter>,
 }
@@ -384,6 +396,7 @@ impl Runtime {
             paykit_reconciliation: AtomicU8::new(NOT_READY),
             outbox_enqueue: AtomicU8::new(NOT_READY),
             outbox_reconciliation: AtomicU8::new(NOT_READY),
+            outbox_terminal_health: Mutex::new(OutboxTerminalHealth::default()),
             metrics,
             // Fail-closed until startup installs the configured limiter: an
             // empty, non-refilling bucket admits nothing, so no caller can
@@ -526,6 +539,12 @@ impl Runtime {
         self.set_outbox_enqueue_available(available);
         self.set_outbox_reconciliation_available(available);
     }
+    pub fn set_outbox_terminal_health(&self, health: OutboxTerminalHealth) {
+        *self
+            .outbox_terminal_health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = health;
+    }
     pub(crate) fn set_paykit_enqueue_available(&self, available: bool) {
         self.paykit_enqueue
             .store(if available { READY } else { DEGRADED }, Ordering::Release);
@@ -595,6 +614,11 @@ impl Runtime {
             ComponentState::from_atomic(self.outbox_enqueue.load(Ordering::Acquire)),
             ComponentState::from_atomic(self.outbox_reconciliation.load(Ordering::Acquire)),
         );
+        let terminal_health = self
+            .outbox_terminal_health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
         let status = if postgres == ComponentState::NotReady
             || [electrum, paykit_delivery, outbox]
                 .into_iter()
@@ -626,6 +650,9 @@ impl Runtime {
                 && postgres == ComponentState::Ready,
             paykit_delivery,
             outbox,
+            outbox_terminal_failure_count: terminal_health.count,
+            outbox_oldest_terminal_failure_age_seconds: terminal_health.oldest_age_seconds,
+            outbox_terminal_failures_by_class: terminal_health.by_class,
         }
     }
     pub(crate) async fn wait_for_idle(&self) {

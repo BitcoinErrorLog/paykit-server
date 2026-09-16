@@ -23,7 +23,7 @@ use crate::{
         PostgresStorageAdapter, SdkStateStore, StackIdentity,
     },
     real_setup::RealSetupCompleter,
-    runtime::{PostgresDependency, Runtime, operational_router},
+    runtime::{OutboxTerminalHealth, PostgresDependency, Runtime, operational_router},
     setup::{SetupLimits, SetupService, SystemClock},
     setup_orchestration::PubkyCompanionRelay,
     workers::{
@@ -644,6 +644,13 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                 delivery_available = false;
                 outbox_available = false;
             }
+        }
+        if let Ok(health) = workers.outbox.terminal_failure_health().await {
+            runtime.set_outbox_terminal_health(OutboxTerminalHealth {
+                count: health.count,
+                oldest_age_seconds: health.oldest_age_seconds,
+                by_class: health.by_class,
+            });
         }
         runtime.set_paykit_enqueue_available(delivery_available);
         runtime.set_outbox_enqueue_available(outbox_available);

@@ -6,7 +6,7 @@ use crate::{
     persistence::PersistenceError,
 };
 use sqlx::PgPool;
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,6 +164,13 @@ pub struct OutboxStore {
     crypto: std::sync::Arc<Crypto>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct TerminalFailureHealth {
+    pub count: i64,
+    pub oldest_age_seconds: Option<i64>,
+    pub by_class: BTreeMap<String, i64>,
+}
+
 impl OutboxStore {
     pub fn new(pool: &PgPool, crypto: std::sync::Arc<Crypto>) -> Self {
         Self {
@@ -183,6 +190,30 @@ impl OutboxStore {
         .fetch_one(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)
+    }
+
+    pub async fn terminal_failure_health(&self) -> Result<TerminalFailureHealth, PersistenceError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT event_class, COUNT(*)::BIGINT
+             FROM outbox_terminal_events
+             GROUP BY event_class",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let count = rows.iter().map(|(_, count)| *count).sum();
+        let oldest_age_seconds = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))::BIGINT
+             FROM outbox_terminal_events",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(TerminalFailureHealth {
+            count,
+            oldest_age_seconds,
+            by_class: rows.into_iter().collect(),
+        })
     }
 
     /// Claims eligible rows while preserving endpoint-publication dependencies.
