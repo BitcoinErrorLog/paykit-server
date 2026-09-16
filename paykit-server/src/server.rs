@@ -646,6 +646,9 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
             }
         }
         if let Ok(health) = workers.outbox.terminal_failure_health().await {
+            runtime
+                .metrics()
+                .set_outbox_terminal_health(health.count, health.oldest_age_seconds);
             runtime.set_outbox_terminal_health(OutboxTerminalHealth {
                 count: health.count,
                 oldest_age_seconds: health.oldest_age_seconds,

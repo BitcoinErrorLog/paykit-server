@@ -21,6 +21,12 @@ pub struct AddressFailureLabels {
     reason: &'static str,
 }
 
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct OutboxTransitionLabels {
+    class: &'static str,
+    reason: &'static str,
+}
+
 /// Metrics intentionally carry no route, identifier, or caller-input
 /// labels: the only label anywhere is the closed failure-reason enum above,
 /// so caller input can never become metric cardinality or a data-exposure
@@ -44,6 +50,11 @@ pub struct Metrics {
     payment_states: Gauge,
     runtime_active: Gauge,
     session_validation_results: Counter,
+    outbox_terminal_transitions: Family<OutboxTransitionLabels, Counter>,
+    outbox_terminal_failure_count: Gauge,
+    outbox_terminal_oldest_age_seconds: Gauge,
+    outbox_reader_saturated: Counter,
+    outbox_active_partitions: Gauge,
 }
 
 impl Metrics {
@@ -66,6 +77,11 @@ impl Metrics {
         let payment_states = Gauge::default();
         let runtime_active = Gauge::default();
         let session_validation_results = Counter::default();
+        let outbox_terminal_transitions = Family::default();
+        let outbox_terminal_failure_count = Gauge::default();
+        let outbox_terminal_oldest_age_seconds = Gauge::default();
+        let outbox_reader_saturated = Counter::default();
+        let outbox_active_partitions = Gauge::default();
         registry.register(
             "paykit_http_requests",
             "Completed HTTP requests.",
@@ -154,6 +170,31 @@ impl Metrics {
             "Session validation result count.",
             session_validation_results.clone(),
         );
+        registry.register(
+            "paykit_outbox_terminal_transitions",
+            "Terminal outbox transitions by closed class and reason.",
+            outbox_terminal_transitions.clone(),
+        );
+        registry.register(
+            "paykit_outbox_terminal_failure_count",
+            "Current retained terminal outbox failure count.",
+            outbox_terminal_failure_count.clone(),
+        );
+        registry.register(
+            "paykit_outbox_terminal_oldest_age_seconds",
+            "Age of the oldest retained terminal outbox failure.",
+            outbox_terminal_oldest_age_seconds.clone(),
+        );
+        registry.register(
+            "paykit_outbox_reader_saturated",
+            "Claim passes that encountered a saturated reader partition.",
+            outbox_reader_saturated.clone(),
+        );
+        registry.register(
+            "paykit_outbox_active_partitions",
+            "Current number of reader partitions with an unexpired lease.",
+            outbox_active_partitions.clone(),
+        );
         Self {
             registry: Mutex::new(registry),
             http_requests,
@@ -173,6 +214,11 @@ impl Metrics {
             payment_states,
             runtime_active,
             session_validation_results,
+            outbox_terminal_transitions,
+            outbox_terminal_failure_count,
+            outbox_terminal_oldest_age_seconds,
+            outbox_reader_saturated,
+            outbox_active_partitions,
         }
     }
 
@@ -227,6 +273,22 @@ impl Metrics {
     }
     pub fn session_validation_result(&self) {
         self.session_validation_results.inc();
+    }
+    pub fn outbox_terminal_transition(&self, class: &'static str, reason: &'static str) {
+        self.outbox_terminal_transitions
+            .get_or_create(&OutboxTransitionLabels { class, reason })
+            .inc();
+    }
+    pub fn set_outbox_terminal_health(&self, count: i64, oldest_age_seconds: Option<i64>) {
+        self.outbox_terminal_failure_count.set(count);
+        self.outbox_terminal_oldest_age_seconds
+            .set(oldest_age_seconds.unwrap_or_default().max(0));
+    }
+    pub fn outbox_reader_saturated(&self) {
+        self.outbox_reader_saturated.inc();
+    }
+    pub fn set_outbox_active_partitions(&self, value: i64) {
+        self.outbox_active_partitions.set(value.max(0));
     }
     pub fn encode(&self) -> Result<String, std::fmt::Error> {
         let mut text = String::new();

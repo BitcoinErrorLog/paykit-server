@@ -225,9 +225,40 @@ impl OutboxStore {
     ) -> Result<Vec<ClaimedOutbox>, PersistenceError> {
         let seconds = lease_seconds(lease)?;
         sqlx::query_as(
-            "WITH candidates AS ( \
-                 SELECT o.id \
+            "WITH RECURSIVE eligible AS ( \
+                 SELECT o.id, o.creator_id, o.reader_assignment_id AS root_reader_assignment_id, \
+                        o.depends_on_id, o.status, o.next_attempt_at \
                  FROM outbox o \
+                 WHERE o.depends_on_id IS NULL \
+                 UNION ALL \
+                 SELECT child.id, child.creator_id, eligible.root_reader_assignment_id, \
+                        child.depends_on_id, child.status, child.next_attempt_at \
+                 FROM outbox child \
+                 JOIN eligible ON eligible.id = child.depends_on_id \
+             ), \
+             roots AS ( \
+                 SELECT DISTINCT ON (id) id, root_reader_assignment_id \
+                 FROM eligible \
+                 ORDER BY id \
+             ), \
+             active AS ( \
+                 SELECT o.creator_id, r.root_reader_assignment_id, COUNT(*) AS active_count \
+                 FROM outbox o \
+                 JOIN roots r ON r.id = o.id \
+                 WHERE o.status = 'leased' AND o.lease_expires_at > NOW() \
+                 GROUP BY o.creator_id, r.root_reader_assignment_id \
+             ), \
+             ranked AS ( \
+                 SELECT o.id, \
+                        ROW_NUMBER() OVER ( \
+                            PARTITION BY o.creator_id, r.root_reader_assignment_id \
+                            ORDER BY o.next_attempt_at, o.id \
+                        ) AS partition_rank, \
+                        COALESCE(active.active_count, 0) AS active_count \
+                 FROM outbox o \
+                 JOIN roots r ON r.id = o.id \
+                 LEFT JOIN active ON active.creator_id = o.creator_id \
+                    AND active.root_reader_assignment_id = r.root_reader_assignment_id \
                  LEFT JOIN outbox dependency ON dependency.id = o.depends_on_id \
                  LEFT JOIN invoices invoice ON invoice.id = o.invoice_id \
                  WHERE ( \
@@ -240,7 +271,13 @@ impl OutboxStore {
                      'void_cancelled', 'resolved_paid_manually', 'resolved_closed' \
                  )) \
                  AND (o.depends_on_id IS NULL OR dependency.status = 'delivered') \
-                 ORDER BY o.next_attempt_at, o.id \
+             ), \
+             candidates AS ( \
+                 SELECT ranked.id \
+                 FROM outbox o \
+                 JOIN ranked ON ranked.id = o.id \
+                 WHERE ranked.partition_rank = 1 AND ranked.active_count = 0 \
+                 ORDER BY ranked.id \
                  FOR UPDATE OF o SKIP LOCKED \
                  LIMIT $1 \
              ) \
@@ -322,17 +359,23 @@ impl OutboxStore {
                  SELECT child.id
                  FROM outbox child
                  JOIN descendants parent ON child.depends_on_id = parent.id
+             ), changed AS (
+                 UPDATE outbox
+                 SET status = 'permanently_failed',
+                     error_class = 'dependency_failed',
+                     failure_reason = 'parent_link_establishment_exhausted',
+                     lease_owner = NULL,
+                     claim_token = NULL,
+                     lease_expires_at = NULL,
+                     updated_at = NOW()
+                 WHERE id IN (SELECT id FROM descendants)
+                   AND status IN ('prepared', 'queued', 'leased', 'retryable')
+                 RETURNING creator_id, invoice_id, id, error_class, failure_reason
              )
-             UPDATE outbox
-             SET status = 'permanently_failed',
-                 error_class = 'dependency_failed',
-                 failure_reason = 'parent_link_establishment_exhausted',
-                 lease_owner = NULL,
-                 claim_token = NULL,
-                 lease_expires_at = NULL,
-                 updated_at = NOW()
-             WHERE id IN (SELECT id FROM descendants)
-               AND status IN ('prepared', 'queued', 'leased', 'retryable')",
+             INSERT INTO outbox_terminal_events
+                 (creator_id, invoice_id, outbox_id, event_class, reason)
+             SELECT creator_id, invoice_id, id, error_class, failure_reason
+             FROM changed",
         )
         .bind(&parent_id)
         .execute(&mut *tx)
@@ -506,9 +549,6 @@ impl OutboxStore {
         .execute(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        if changed.rows_affected() == 1 {
-            self.bump_delivery_revision(claim.invoice_id).await?;
-        }
         Ok(changed.rows_affected() == 1)
     }
 
@@ -578,6 +618,11 @@ impl OutboxStore {
         error_class: Option<&str>,
         delay: Option<i64>,
     ) -> Result<bool, PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         let changed = sqlx::query(
             "UPDATE outbox \
              SET status = $1, error_class = $2, \
@@ -590,12 +635,25 @@ impl OutboxStore {
         .bind(delay)
         .bind(claim.id)
         .bind(claim.claim_token)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        if changed.rows_affected() == 1 {
-            self.bump_delivery_revision(claim.invoice_id).await?;
+        if changed.rows_affected() == 1 && status == "permanently_failed" {
+            sqlx::query(
+                "INSERT INTO outbox_terminal_events
+                     (creator_id, invoice_id, outbox_id, event_class, reason)
+                 SELECT creator_id, invoice_id, id, COALESCE(error_class, 'permanent'),
+                        COALESCE(failure_reason, 'permanent')
+                 FROM outbox WHERE id = $1",
+            )
+            .bind(claim.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         Ok(changed.rows_affected() == 1)
     }
 
@@ -622,27 +680,7 @@ impl OutboxStore {
         .execute(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        if changed.rows_affected() == 1 {
-            self.bump_delivery_revision(claim.invoice_id).await?;
-        }
         Ok(changed.rows_affected() == 1)
-    }
-
-    async fn bump_delivery_revision(
-        &self,
-        invoice_id: Option<Uuid>,
-    ) -> Result<(), PersistenceError> {
-        if let Some(invoice_id) = invoice_id {
-            sqlx::query(
-                "UPDATE invoices SET delivery_revision = delivery_revision + 1,
-                 updated_at = NOW() WHERE id = $1",
-            )
-            .bind(invoice_id)
-            .execute(&self.pool)
-            .await
-            .map_err(|_| PersistenceError::Unavailable)?;
-        }
-        Ok(())
     }
 }
 

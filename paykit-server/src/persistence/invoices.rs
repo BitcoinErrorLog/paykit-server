@@ -991,9 +991,28 @@ impl InvoiceStore {
                         WHERE outbox.invoice_id = invoices.id
                           AND outbox.status = 'permanently_failed'
                       ) THEN 'failed'
-                      WHEN COUNT(outbox.id) FILTER (WHERE outbox.status = 'delivered') = 2
+                      WHEN COUNT(outbox.id) = 2
+                        AND COUNT(outbox.id) FILTER (WHERE outbox.depends_on_id IS NULL) = 1
+                        AND COUNT(outbox.id) FILTER (
+                          WHERE outbox.depends_on_id IS NOT NULL
+                            AND EXISTS (
+                              SELECT 1 FROM outbox dependency
+                              WHERE dependency.id = outbox.depends_on_id
+                                AND dependency.invoice_id = invoices.id
+                            )
+                        ) = 1
+                        AND COUNT(outbox.id) FILTER (WHERE outbox.status = 'delivered') = 2
                         THEN 'delivered'
                       WHEN COUNT(outbox.id) = 2
+                        AND COUNT(outbox.id) FILTER (WHERE outbox.depends_on_id IS NULL) = 1
+                        AND COUNT(outbox.id) FILTER (
+                          WHERE outbox.depends_on_id IS NOT NULL
+                            AND EXISTS (
+                              SELECT 1 FROM outbox dependency
+                              WHERE dependency.id = outbox.depends_on_id
+                                AND dependency.invoice_id = invoices.id
+                            )
+                        ) = 1
                         AND COUNT(outbox.id) FILTER (
                           WHERE outbox.status IN
                             ('prepared', 'queued', 'leased', 'retryable', 'handed_off')
