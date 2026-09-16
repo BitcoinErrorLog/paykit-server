@@ -318,7 +318,7 @@ impl OutboxStore {
             .begin()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
-        let parent = sqlx::query_scalar::<_, String>(
+        let parent = sqlx::query_scalar::<_, Uuid>(
             "UPDATE outbox
              SET status = 'permanently_failed',
                  error_class = 'link_establishment_exhausted',
@@ -377,7 +377,7 @@ impl OutboxStore {
              SELECT creator_id, invoice_id, id, error_class, failure_reason
              FROM changed",
         )
-        .bind(&parent_id)
+        .bind(parent_id)
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
@@ -390,7 +390,7 @@ impl OutboxStore {
              FROM outbox
              WHERE id = $1",
         )
-        .bind(&parent_id)
+        .bind(parent_id)
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;

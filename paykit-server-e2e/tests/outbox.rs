@@ -242,6 +242,59 @@ async fn create_activated_invoice(
     )
 }
 
+async fn create_prepared_invoice(
+    database: &TestDatabase,
+    crypto: Arc<Crypto>,
+    bundle: &str,
+) -> (InvoiceStore, Uuid, Uuid, Uuid) {
+    let creator = creator();
+    let reader = reader();
+    CreatorStore::new(database.pool(), crypto.clone())
+        .create(
+            &CreatorCredentials::new(
+                creator.clone(),
+                "session-secret".into(),
+                ReceiverNoiseSecretKey::new([9; 32]),
+                "xpub-secret".into(),
+                0,
+            ),
+            &StorageState::default(),
+            &key_tail(51),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
+        )
+        .await
+        .unwrap();
+    let invoices = InvoiceStore::new(database.pool(), crypto);
+    let invoice = invoices
+        .create_awaiting_baseline(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: bundle.as_bytes(),
+            payment_request_binding: b"prepared-outbox-payment-request",
+            new_reader_payloads: &Payloads {
+                reader: reader.clone(),
+            },
+            payment_request_intent: common::payment_intent(&reader),
+            required_sats: 100,
+            nonce_sats: 1,
+            prepare_ttl: Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        })
+        .await
+        .unwrap();
+    invoices
+        .complete_creation_baseline(invoice.invoice_id(), 0, &[], &[])
+        .await
+        .unwrap();
+    (
+        invoices,
+        invoice.invoice_id(),
+        invoice.endpoint_publication_outbox_id().unwrap(),
+        invoice.payment_request_outbox_id(),
+    )
+}
+
 async fn delivery_status(
     invoices: &InvoiceStore,
     creator: &CreatorPubky,
@@ -252,6 +305,19 @@ async fn delivery_status(
         .await
         .unwrap()
         .unwrap()
+}
+
+async fn outbox_row(
+    database: &TestDatabase,
+    id: Uuid,
+) -> (String, Option<String>, Option<String>, Option<Uuid>) {
+    sqlx::query_as(
+        "SELECT status, error_class, failure_reason, claim_token FROM outbox WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap()
 }
 
 struct CountingAdapter {
@@ -515,6 +581,337 @@ async fn finality_between_preflight_and_handoff_yields_zero_sdk_calls() {
         .await
         .unwrap();
     assert_ne!(status, "handed_off");
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn link_establishment_attempt_19_proceeds_and_20_exhausts() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[44; 32]).unwrap());
+    let (_creator, _bundle, _invoices, _invoice_id, endpoint_id, _request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+
+    sqlx::query(
+        "UPDATE outbox SET attempt_count = 18, error_class = 'link_establishment' WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let claim_19 = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim_19.attempt_count(), 19);
+    assert!(
+        !outbox
+            .exhaust_claim_if_due(&claim_19, 20, Duration::from_secs(60 * 60))
+            .await
+            .unwrap()
+    );
+
+    sqlx::query(
+        "UPDATE outbox SET status = 'retryable', lease_owner = NULL, claim_token = NULL, \
+         lease_expires_at = NULL, next_attempt_at = NOW(), attempt_count = 19, \
+         error_class = 'link_establishment' WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let claim_20 = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim_20.attempt_count(), 20);
+    assert!(
+        outbox
+            .exhaust_claim_if_due(&claim_20, 20, Duration::from_secs(60 * 60))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        outbox_row(&database, endpoint_id).await,
+        (
+            "permanently_failed".into(),
+            Some("link_establishment_exhausted".into()),
+            Some("attempt_ceiling".into()),
+            None,
+        )
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn link_establishment_age_just_before_proceeds_and_at_bound_exhausts() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[45; 32]).unwrap());
+    let (_creator, _bundle, _invoices, _invoice_id, endpoint_id, _request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+
+    sqlx::query(
+        "UPDATE outbox SET created_at = NOW() - INTERVAL '59 minutes 59 seconds', \
+         error_class = 'link_establishment' WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let before = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        !outbox
+            .exhaust_claim_if_due(&before, 20, Duration::from_secs(60 * 60))
+            .await
+            .unwrap()
+    );
+
+    sqlx::query(
+        "UPDATE outbox SET created_at = NOW() - INTERVAL '60 minutes', \
+         error_class = 'link_establishment' WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        outbox
+            .exhaust_claim_if_due(&before, 20, Duration::from_secs(60 * 60))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        outbox_row(&database, endpoint_id).await.2.as_deref(),
+        Some("age_ceiling")
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn exhaust_claim_if_due_is_noop_with_stale_token() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[46; 32]).unwrap());
+    let (_creator, _bundle, _invoices, _invoice_id, endpoint_id, _request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    sqlx::query(
+        "UPDATE outbox SET attempt_count = 19, error_class = 'link_establishment' WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    sqlx::query("UPDATE outbox SET claim_token = gen_random_uuid() WHERE id = $1")
+        .bind(endpoint_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(
+        !outbox
+            .exhaust_claim_if_due(&claim, 20, Duration::from_secs(60 * 60))
+            .await
+            .unwrap()
+    );
+    assert_eq!(outbox_row(&database, endpoint_id).await.0, "leased");
+    let events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM outbox_terminal_events WHERE outbox_id = $1")
+            .bind(endpoint_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(events, 0);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn exhaustion_makes_zero_adapter_constructions_and_calls() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[47; 32]).unwrap());
+    let (_creator, _bundle, _invoices, _invoice_id, endpoint_id, _request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    sqlx::query(
+        "UPDATE outbox SET attempt_count = 19, error_class = 'link_establishment' WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let adapter = CountingAdapter {
+        sdk_calls: AtomicUsize::new(0),
+    };
+    assert!(
+        process_claim(
+            &outbox,
+            &adapter,
+            &claim,
+            Duration::ZERO,
+            20,
+            Duration::from_secs(60 * 60)
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(adapter.sdk_calls.load(Ordering::SeqCst), 0);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn exhaustion_cascades_descendants_with_exactly_one_terminal_event() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[48; 32]).unwrap());
+    let (_creator, _bundle, _invoices, _invoice_id, endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    sqlx::query(
+        "UPDATE outbox SET attempt_count = 19, error_class = 'link_establishment' WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        outbox
+            .exhaust_claim_if_due(&claim, 20, Duration::from_secs(60 * 60))
+            .await
+            .unwrap()
+    );
+    for id in [endpoint_id, request_id] {
+        assert_eq!(outbox_row(&database, id).await.0, "permanently_failed");
+        let events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM outbox_terminal_events WHERE outbox_id = $1")
+                .bind(id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(events, 1);
+    }
+    assert_eq!(
+        outbox_row(&database, request_id).await.1.as_deref(),
+        Some("dependency_failed")
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn final_invoice_rows_are_never_claimed() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[49; 32]).unwrap());
+    let (_creator, _bundle, invoices, invoice_id, _endpoint_id, _request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    assert!(
+        invoices
+            .resolve_invoice(invoice_id, "abandoned", time::OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        OutboxStore::new(database.pool(), crypto)
+            .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn void_and_abandoned_terminalize_non_handed_off_rows() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[50; 32]).unwrap());
+    let (prepared_invoices, prepared_id, prepared_endpoint_id, prepared_request_id) =
+        create_prepared_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    assert!(
+        prepared_invoices
+            .void_invoice(prepared_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    for id in [prepared_endpoint_id, prepared_request_id] {
+        assert_eq!(outbox_row(&database, id).await.0, "permanently_failed");
+        assert_eq!(
+            outbox_row(&database, id).await.1.as_deref(),
+            Some("invoice_voided")
+        );
+    }
+    database.cleanup().await;
+
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[51; 32]).unwrap());
+    let (_creator, _bundle, invoices, invoice_id, endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    let endpoint_claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        outbox
+            .mark_handed_off(
+                &endpoint_claim,
+                &HandoffResult::EndpointPublication {
+                    outbound_message_id: 99,
+                },
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        invoices
+            .resolve_invoice(invoice_id, "abandoned", time::OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(outbox_row(&database, endpoint_id).await.0, "handed_off");
+    assert_eq!(
+        outbox_row(&database, request_id).await.0,
+        "permanently_failed"
+    );
+    assert_eq!(
+        outbox_row(&database, request_id).await.1.as_deref(),
+        Some("invoice_abandoned")
+    );
     database.cleanup().await;
 }
 
