@@ -68,7 +68,7 @@ fn migration_catalog_has_one_contiguous_canonical_version_per_file() {
     let mut versions = migration_versions(names).unwrap();
     versions.sort_unstable();
 
-    assert_eq!(versions, (1..=18).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=19).collect::<Vec<_>>());
     assert_eq!(
         versions.len(),
         versions.iter().collect::<HashSet<_>>().len()
@@ -120,7 +120,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
     assert_eq!(
         applied_versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
         ]
     );
 
@@ -590,7 +590,7 @@ async fn outbox_sdk_identifier_constraints_reject_unattributable_terminal_rows()
 }
 
 #[tokio::test]
-async fn terminal_outbox_rows_reject_resurrection_and_linkage_repair() {
+async fn terminal_rows_reject_generation_id_edits() {
     let _migration_test_guard = migration_test_lock().lock().await;
     let database = TestDatabase::create().await;
     let pool = database.pool();
@@ -665,6 +665,13 @@ async fn terminal_outbox_rows_reject_resurrection_and_linkage_repair() {
     assert_trigger_violation(
         "generation",
         sqlx::query("UPDATE outbox SET generation = 8 WHERE id = $1")
+            .bind(first_id)
+            .execute(pool)
+            .await,
+    );
+    assert_trigger_violation(
+        "generation id",
+        sqlx::query("UPDATE outbox SET generation_id = gen_random_uuid() WHERE id = $1")
             .bind(first_id)
             .execute(pool)
             .await,

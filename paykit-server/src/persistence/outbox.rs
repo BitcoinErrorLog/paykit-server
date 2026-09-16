@@ -352,35 +352,12 @@ impl OutboxStore {
             return Ok(false);
         };
 
-        sqlx::query(
-            "WITH RECURSIVE descendants AS (
-                 SELECT id FROM outbox WHERE depends_on_id = $1
-                 UNION ALL
-                 SELECT child.id
-                 FROM outbox child
-                 JOIN descendants parent ON child.depends_on_id = parent.id
-             ), changed AS (
-                 UPDATE outbox
-                 SET status = 'permanently_failed',
-                     error_class = 'dependency_failed',
-                     failure_reason = 'parent_link_establishment_exhausted',
-                     lease_owner = NULL,
-                     claim_token = NULL,
-                     lease_expires_at = NULL,
-                     updated_at = NOW()
-                 WHERE id IN (SELECT id FROM descendants)
-                   AND status IN ('prepared', 'queued', 'leased', 'retryable')
-                 RETURNING creator_id, invoice_id, id, error_class, failure_reason
-             )
-             INSERT INTO outbox_terminal_events
-                 (creator_id, invoice_id, outbox_id, event_class, reason)
-             SELECT creator_id, invoice_id, id, error_class, failure_reason
-             FROM changed",
+        Self::cascade_terminal_descendants(
+            &mut tx,
+            parent_id,
+            "parent_link_establishment_exhausted",
         )
-        .bind(parent_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|_| PersistenceError::Unavailable)?;
+        .await?;
 
         sqlx::query(
             "INSERT INTO outbox_terminal_events
@@ -647,6 +624,8 @@ impl OutboxStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         if changed.rows_affected() == 1 && status == "permanently_failed" {
+            Self::cascade_terminal_descendants(&mut tx, claim.id, "parent_permanently_failed")
+                .await?;
             sqlx::query(
                 "INSERT INTO outbox_terminal_events
                      (creator_id, invoice_id, outbox_id, event_class, reason)
@@ -663,6 +642,44 @@ impl OutboxStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         Ok(changed.rows_affected() == 1)
+    }
+
+    async fn cascade_terminal_descendants(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        parent_id: Uuid,
+        reason: &'static str,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query(
+            "WITH RECURSIVE descendants AS (
+                 SELECT id FROM outbox WHERE depends_on_id = $1
+                 UNION ALL
+                 SELECT child.id
+                 FROM outbox child
+                 JOIN descendants parent ON child.depends_on_id = parent.id
+             ), changed AS (
+                 UPDATE outbox
+                 SET status = 'permanently_failed',
+                     error_class = 'dependency_failed',
+                     failure_reason = $2,
+                     lease_owner = NULL,
+                     claim_token = NULL,
+                     lease_expires_at = NULL,
+                     updated_at = NOW()
+                 WHERE id IN (SELECT id FROM descendants)
+                   AND status IN ('prepared', 'queued', 'leased', 'retryable')
+                 RETURNING creator_id, invoice_id, id, error_class, failure_reason
+             )
+             INSERT INTO outbox_terminal_events
+                 (creator_id, invoice_id, outbox_id, event_class, reason)
+             SELECT creator_id, invoice_id, id, error_class, failure_reason
+             FROM changed",
+        )
+        .bind(parent_id)
+        .bind(reason)
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(())
     }
 
     async fn reconciliation_transition(

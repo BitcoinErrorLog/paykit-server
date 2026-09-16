@@ -469,18 +469,21 @@ async fn delivery_aggregate_precedence_and_malformed_shape() {
     .await
     .unwrap();
     sqlx::query(
-        "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = '5', generation = 1 WHERE id = $1",
+        "UPDATE outbox
+         SET status = 'delivered', sdk_outbound_message_id = '5', generation_id = gen_random_uuid()
+         WHERE id = $1",
     )
-        .bind(request_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
+    .bind(request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
     assert_eq!(
         delivery_status(&invoices, &creator, &bundle).await.state,
         "contract_error"
     );
 
-    sqlx::query("UPDATE outbox SET generation = 0 WHERE id = $1")
+    sqlx::query("UPDATE outbox SET generation_id = $1 WHERE id = $2")
+        .bind(invoice_id)
         .bind(request_id)
         .execute(database.pool())
         .await
@@ -823,6 +826,94 @@ async fn exhaustion_cascades_descendants_with_exactly_one_terminal_event() {
         outbox_row(&database, request_id).await.1.as_deref(),
         Some("dependency_failed")
     );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn permanent_failure_cascades_dependents_and_reports_failed() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[52; 32]).unwrap());
+    let (creator, bundle, invoices, _invoice_id, endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.id(), endpoint_id);
+    assert!(outbox.mark_permanently_failed(&claim).await.unwrap());
+
+    for id in [endpoint_id, request_id] {
+        assert_eq!(outbox_row(&database, id).await.0, "permanently_failed");
+        let events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM outbox_terminal_events WHERE outbox_id = $1")
+                .bind(id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(events, 1);
+    }
+    assert_eq!(
+        outbox_row(&database, request_id).await.1.as_deref(),
+        Some("dependency_failed")
+    );
+    assert_eq!(
+        delivery_status(&invoices, &creator, &bundle).await.state,
+        "failed"
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn generation_id_matches_invoice_for_ordinary_invoices() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[53; 32]).unwrap());
+    let (_creator, _bundle, _invoices, invoice_id, endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto, "000G40R40M30E209185GR38E1W").await;
+    let generation_ids: Vec<Option<Uuid>> =
+        sqlx::query_scalar("SELECT generation_id FROM outbox WHERE id = ANY($1) ORDER BY id")
+            .bind(vec![endpoint_id, request_id])
+            .fetch_all(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(generation_ids, vec![Some(invoice_id), Some(invoice_id)]);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn abandonment_first_keeps_resolution_immutable_under_later_observation() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[54; 32]).unwrap());
+    let (_creator, _bundle, invoices, invoice_id, _endpoint_id, _request_id) =
+        create_activated_invoice(&database, crypto, "000G40R40M30E209185GR38E1W").await;
+    assert!(
+        invoices
+            .resolve_invoice(invoice_id, "abandoned", time::OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    sqlx::query(
+        "UPDATE invoices
+         SET payment_status = 'confirmed', confirmation_count = 1, amount_matched = TRUE
+         WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let resolution: Option<String> =
+        sqlx::query_scalar("SELECT resolution FROM invoices WHERE id = $1")
+            .bind(invoice_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(resolution.as_deref(), Some("abandoned"));
     database.cleanup().await;
 }
 

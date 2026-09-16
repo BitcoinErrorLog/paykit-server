@@ -992,7 +992,7 @@ impl InvoiceStore {
                         JOIN outbox endpoint ON endpoint.id = request.depends_on_id
                         WHERE request.invoice_id = invoices.id
                           AND endpoint.invoice_id = invoices.id
-                          AND endpoint.generation = request.generation
+                          AND endpoint.generation_id = request.generation_id
                           AND request.status = 'permanently_failed'
                       ) OR EXISTS (
                         SELECT 1
@@ -1000,7 +1000,7 @@ impl InvoiceStore {
                         JOIN outbox endpoint ON endpoint.id = request.depends_on_id
                         WHERE request.invoice_id = invoices.id
                           AND endpoint.invoice_id = invoices.id
-                          AND endpoint.generation = request.generation
+                          AND endpoint.generation_id = request.generation_id
                           AND endpoint.status = 'permanently_failed'
                       ) THEN 'failed'
                       WHEN (
@@ -1009,15 +1009,19 @@ impl InvoiceStore {
                         JOIN outbox endpoint ON endpoint.id = request.depends_on_id
                         WHERE request.invoice_id = invoices.id
                           AND endpoint.invoice_id = invoices.id
-                          AND endpoint.generation = request.generation
+                          AND endpoint.generation_id = request.generation_id
                       ) = 1
+                        AND (
+                          SELECT COUNT(*) FROM outbox
+                          WHERE invoice_id = invoices.id
+                        ) = 2
                         AND (
                           SELECT COUNT(*)
                           FROM outbox request
                           JOIN outbox endpoint ON endpoint.id = request.depends_on_id
                           WHERE request.invoice_id = invoices.id
                           AND endpoint.invoice_id = invoices.id
-                          AND endpoint.generation = request.generation
+                          AND endpoint.generation_id = request.generation_id
                             AND request.status = 'delivered'
                             AND endpoint.status = 'delivered'
                         ) = 1 THEN 'delivered'
@@ -1027,15 +1031,19 @@ impl InvoiceStore {
                         JOIN outbox endpoint ON endpoint.id = request.depends_on_id
                         WHERE request.invoice_id = invoices.id
                           AND endpoint.invoice_id = invoices.id
-                          AND endpoint.generation = request.generation
+                          AND endpoint.generation_id = request.generation_id
                       ) = 1
+                        AND (
+                          SELECT COUNT(*) FROM outbox
+                          WHERE invoice_id = invoices.id
+                        ) = 2
                         AND (
                           SELECT COUNT(*)
                           FROM outbox request
                           JOIN outbox endpoint ON endpoint.id = request.depends_on_id
                         WHERE request.invoice_id = invoices.id
                           AND endpoint.invoice_id = invoices.id
-                          AND endpoint.generation = request.generation
+                          AND endpoint.generation_id = request.generation_id
                           AND request.status IN
                             ('prepared', 'queued', 'leased', 'retryable', 'handed_off', 'delivered')
                           AND endpoint.status IN
@@ -2581,6 +2589,7 @@ impl InvoiceStore {
                         depends_on_id: None,
                         reader_assignment_id: Some(assignment_id),
                         status: outbox_status,
+                        generation_id: None,
                     },
                 )
                 .await?;
@@ -2660,7 +2669,7 @@ impl InvoiceStore {
         .await
         .map_err(|_| PersistenceError::Conflict)?;
         // Endpoint publication is invoice-scoped, not a reusable reader assignment.
-        sqlx::query("UPDATE outbox SET invoice_id = $1 WHERE id = $2")
+        sqlx::query("UPDATE outbox SET invoice_id = $1, generation_id = $1 WHERE id = $2")
             .bind(invoice_id)
             .bind(endpoint_publication_outbox_id)
             .execute(&mut *tx)
@@ -2686,6 +2695,7 @@ impl InvoiceStore {
                 depends_on_id: endpoint_publication_outbox_id,
                 reader_assignment_id: None,
                 status: outbox_status,
+                generation_id: Some(invoice_id),
             },
         )
         .await?;
@@ -2772,6 +2782,7 @@ struct OutboxInsert<'a> {
     depends_on_id: Option<Uuid>,
     reader_assignment_id: Option<Uuid>,
     status: &'static str,
+    generation_id: Option<Uuid>,
 }
 
 async fn terminalize_invoice_outbox(
@@ -2812,8 +2823,8 @@ async fn insert_outbox(
 ) -> Result<(), PersistenceError> {
     sqlx::query(
         "INSERT INTO outbox \
-         (id, creator_id, invoice_id, intent_envelope, status, depends_on_id, reader_assignment_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+         (id, creator_id, invoice_id, intent_envelope, status, depends_on_id, reader_assignment_id, generation_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(row.id)
     .bind(row.creator_id)
@@ -2822,6 +2833,7 @@ async fn insert_outbox(
     .bind(row.status)
     .bind(row.depends_on_id)
     .bind(row.reader_assignment_id)
+    .bind(row.generation_id)
     .execute(&mut **tx)
     .await
     .map_err(|_| PersistenceError::Unavailable)?;
