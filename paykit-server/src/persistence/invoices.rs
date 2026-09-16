@@ -991,14 +991,16 @@ impl InvoiceStore {
                         FROM outbox request
                         JOIN outbox endpoint ON endpoint.id = request.depends_on_id
                         WHERE request.invoice_id = invoices.id
-                          AND endpoint.invoice_id IS NULL
+                          AND endpoint.invoice_id = invoices.id
+                          AND endpoint.generation = request.generation
                           AND request.status = 'permanently_failed'
                       ) OR EXISTS (
                         SELECT 1
                         FROM outbox request
                         JOIN outbox endpoint ON endpoint.id = request.depends_on_id
                         WHERE request.invoice_id = invoices.id
-                          AND endpoint.invoice_id IS NULL
+                          AND endpoint.invoice_id = invoices.id
+                          AND endpoint.generation = request.generation
                           AND endpoint.status = 'permanently_failed'
                       ) THEN 'failed'
                       WHEN (
@@ -1006,14 +1008,16 @@ impl InvoiceStore {
                         FROM outbox request
                         JOIN outbox endpoint ON endpoint.id = request.depends_on_id
                         WHERE request.invoice_id = invoices.id
-                          AND endpoint.invoice_id IS NULL
+                          AND endpoint.invoice_id = invoices.id
+                          AND endpoint.generation = request.generation
                       ) = 1
                         AND (
                           SELECT COUNT(*)
                           FROM outbox request
                           JOIN outbox endpoint ON endpoint.id = request.depends_on_id
                           WHERE request.invoice_id = invoices.id
-                            AND endpoint.invoice_id IS NULL
+                          AND endpoint.invoice_id = invoices.id
+                          AND endpoint.generation = request.generation
                             AND request.status = 'delivered'
                             AND endpoint.status = 'delivered'
                         ) = 1 THEN 'delivered'
@@ -1022,18 +1026,20 @@ impl InvoiceStore {
                         FROM outbox request
                         JOIN outbox endpoint ON endpoint.id = request.depends_on_id
                         WHERE request.invoice_id = invoices.id
-                          AND endpoint.invoice_id IS NULL
+                          AND endpoint.invoice_id = invoices.id
+                          AND endpoint.generation = request.generation
                       ) = 1
                         AND (
                           SELECT COUNT(*)
                           FROM outbox request
                           JOIN outbox endpoint ON endpoint.id = request.depends_on_id
                         WHERE request.invoice_id = invoices.id
-                          AND endpoint.invoice_id IS NULL
+                          AND endpoint.invoice_id = invoices.id
+                          AND endpoint.generation = request.generation
                           AND request.status IN
-                            ('prepared', 'queued', 'leased', 'retryable', 'handed_off')
+                            ('prepared', 'queued', 'leased', 'retryable', 'handed_off', 'delivered')
                           AND endpoint.status IN
-                            ('prepared', 'queued', 'leased', 'retryable', 'handed_off')
+                            ('prepared', 'queued', 'leased', 'retryable', 'handed_off', 'delivered')
                         ) = 1 THEN 'pending_delivery'
                       ELSE 'contract_error'
                     END

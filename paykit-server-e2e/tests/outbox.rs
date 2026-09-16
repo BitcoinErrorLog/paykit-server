@@ -1,6 +1,10 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     time::Duration,
 };
 
@@ -17,7 +21,9 @@ use paykit_sdk::{
 use paykit_server::{
     application::semantic_intent::DeliveryOperationV1,
     crypto::Crypto,
-    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    domain::locks::{
+        BundleId, CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader,
+    },
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
         NewReaderPayloadFactory, NewReaderPayloads, OutboxStore, PersistenceError,
@@ -179,6 +185,337 @@ async fn assert_reconciliation_status(
 /// by every create/reauthenticate never collides within a test database.
 fn key_tail(seed: u8) -> [u8; 65] {
     [seed; 65]
+}
+
+async fn create_activated_invoice(
+    database: &TestDatabase,
+    crypto: Arc<Crypto>,
+    bundle: &str,
+) -> (CreatorPubky, BundleId, InvoiceStore, Uuid, Uuid, Uuid) {
+    let creator = creator();
+    let reader = reader();
+    CreatorStore::new(database.pool(), crypto.clone())
+        .create(
+            &CreatorCredentials::new(
+                creator.clone(),
+                "session-secret".into(),
+                ReceiverNoiseSecretKey::new([9; 32]),
+                "xpub-secret".into(),
+                0,
+            ),
+            &StorageState::default(),
+            &key_tail(40),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
+        )
+        .await
+        .unwrap();
+    let invoices = InvoiceStore::new(database.pool(), crypto);
+    let invoice = invoices
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: bundle.as_bytes(),
+            payment_request_binding: b"delivery-status-payment-request",
+            new_reader_payloads: &Payloads {
+                reader: reader.clone(),
+            },
+            payment_request_intent: common::payment_intent(&reader),
+            required_sats: 100,
+            nonce_sats: 1,
+            prepare_ttl: Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        })
+        .await
+        .unwrap();
+    invoices
+        .activate_invoice(invoice.invoice_id(), &[], &[])
+        .await
+        .unwrap();
+    (
+        creator,
+        parse_bundle_id(bundle).unwrap(),
+        invoices,
+        invoice.invoice_id(),
+        invoice.endpoint_publication_outbox_id().unwrap(),
+        invoice.payment_request_outbox_id(),
+    )
+}
+
+async fn delivery_status(
+    invoices: &InvoiceStore,
+    creator: &CreatorPubky,
+    bundle: &BundleId,
+) -> paykit_server::application::payment_status::DeliveryStatus {
+    invoices
+        .delivery_status(creator, bundle)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+struct CountingAdapter {
+    sdk_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl Adapter for CountingAdapter {
+    async fn fetch_marker(
+        &self,
+        _reader: &str,
+        _path: &str,
+    ) -> Result<Option<PaykitReceiverMarker>, HandoffError> {
+        self.sdk_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
+    }
+
+    async fn ensure_link_with_peer(&self, _reader: &str, _path: &str) -> Result<(), HandoffError> {
+        self.sdk_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn enqueue_private_payment_list_with_receiving_details(
+        &self,
+        _reader: &str,
+        _path: &str,
+        _details: &[paykit_server::application::semantic_intent::ReceivingDetailV1],
+    ) -> Result<HandoffResult, HandoffError> {
+        self.sdk_calls.fetch_add(1, Ordering::SeqCst);
+        Err(HandoffError::Permanent)
+    }
+
+    async fn propose_payment_request(
+        &self,
+        _reader: &str,
+        _path: &str,
+        _terms: &paykit_server::application::semantic_intent::PaymentTermsV1,
+    ) -> Result<HandoffResult, HandoffError> {
+        self.sdk_calls.fetch_add(1, Ordering::SeqCst);
+        Err(HandoffError::Permanent)
+    }
+
+    async fn outbound_status(
+        &self,
+        _outbound_message_id: u64,
+    ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError> {
+        self.sdk_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
+    }
+}
+
+#[tokio::test]
+async fn delivery_aggregate_reports_pending_then_delivered_for_ordinary_invoice() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[41; 32]).unwrap());
+    let (creator, bundle, invoices, _invoice_id, endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto, "000G40R40M30E209185GR38E1W").await;
+
+    let pending = delivery_status(&invoices, &creator, &bundle).await;
+    let rows: Vec<(Option<Uuid>, Option<Uuid>, i64, String)> = sqlx::query_as(
+        "SELECT invoice_id, depends_on_id, generation, status FROM outbox ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .filter(|(invoice_id, _, _, _)| invoice_id.is_some())
+            .count(),
+        2,
+        "rows: {rows:?}"
+    );
+    let pairs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox request \
+         JOIN outbox endpoint ON endpoint.id = request.depends_on_id \
+         WHERE request.invoice_id = $1 AND endpoint.invoice_id = $1",
+    )
+    .bind(_invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(pairs, 1, "rows: {rows:?}");
+    assert!(
+        pending.state == "pending_delivery",
+        "state={}, rows={rows:?}",
+        pending.state
+    );
+    assert_eq!(pending.generation, _invoice_id);
+
+    sqlx::query(
+        "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = '1' WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let endpoint_delivered = delivery_status(&invoices, &creator, &bundle).await;
+    assert_eq!(endpoint_delivered.state, "pending_delivery");
+    assert!(endpoint_delivered.revision > pending.revision);
+
+    sqlx::query(
+        "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = '2' WHERE id = $1",
+    )
+    .bind(request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let delivered = delivery_status(&invoices, &creator, &bundle).await;
+    assert_eq!(delivered.state, "delivered");
+    assert!(delivered.revision > endpoint_delivered.revision);
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn delivery_aggregate_precedence_and_malformed_shape() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[42; 32]).unwrap());
+    let (creator, bundle, invoices, invoice_id, endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto, "000G40R40M30E209185GR38E1W").await;
+
+    sqlx::query(
+        "INSERT INTO outbox (creator_id, invoice_id, intent_envelope, status, depends_on_id) \
+         SELECT creator_id, invoice_id, intent_envelope, 'queued', depends_on_id FROM outbox WHERE id = $1",
+    )
+    .bind(request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        delivery_status(&invoices, &creator, &bundle).await.state,
+        "contract_error"
+    );
+
+    sqlx::query("DELETE FROM outbox WHERE invoice_id = $1 AND id != $2 AND id != $3")
+        .bind(invoice_id)
+        .bind(endpoint_id)
+        .bind(request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = '4' WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = '5', generation = 1 WHERE id = $1",
+    )
+        .bind(request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        delivery_status(&invoices, &creator, &bundle).await.state,
+        "contract_error"
+    );
+
+    sqlx::query("UPDATE outbox SET generation = 0 WHERE id = $1")
+        .bind(request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("ALTER TABLE outbox DROP CONSTRAINT outbox_status_check")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE outbox SET status = 'unknown' WHERE id = $1")
+        .bind(request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        delivery_status(&invoices, &creator, &bundle).await.state,
+        "contract_error"
+    );
+
+    sqlx::query("UPDATE outbox SET status = 'queued' WHERE id = $1")
+        .bind(request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = '3' WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE outbox SET status = 'permanently_failed' WHERE id = $1")
+        .bind(request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        delivery_status(&invoices, &creator, &bundle).await.state,
+        "failed"
+    );
+    assert!(
+        invoices
+            .resolve_invoice(invoice_id, "abandoned", time::OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        delivery_status(&invoices, &creator, &bundle).await.state,
+        "cancelled"
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn finality_between_preflight_and_handoff_yields_zero_sdk_calls() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[43; 32]).unwrap());
+    let (_creator, _bundle, invoices, invoice_id, endpoint_id, _request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.id(), endpoint_id);
+    assert!(!outbox.invoice_is_final(claim.invoice_id()).await.unwrap());
+    assert!(
+        invoices
+            .resolve_invoice(invoice_id, "abandoned", time::OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let adapter = CountingAdapter {
+        sdk_calls: AtomicUsize::new(0),
+    };
+    assert!(
+        !process_claim(
+            &outbox,
+            &adapter,
+            &claim,
+            Duration::from_secs(1),
+            20,
+            Duration::from_secs(60 * 60),
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(adapter.sdk_calls.load(Ordering::SeqCst), 0);
+    let status: String = sqlx::query_scalar("SELECT status FROM outbox WHERE id = $1")
+        .bind(endpoint_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_ne!(status, "handed_off");
+    database.cleanup().await;
 }
 
 #[tokio::test]
