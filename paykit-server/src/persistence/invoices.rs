@@ -987,42 +987,58 @@ impl InvoiceStore {
                          'resolved_paid_manually', 'resolved_closed')
                         THEN 'cancelled'
                       WHEN EXISTS (
-                        SELECT 1 FROM outbox
-                        WHERE outbox.invoice_id = invoices.id
-                          AND outbox.status = 'permanently_failed'
+                        SELECT 1
+                        FROM outbox request
+                        JOIN outbox endpoint ON endpoint.id = request.depends_on_id
+                        WHERE request.invoice_id = invoices.id
+                          AND endpoint.invoice_id IS NULL
+                          AND request.status = 'permanently_failed'
+                      ) OR EXISTS (
+                        SELECT 1
+                        FROM outbox request
+                        JOIN outbox endpoint ON endpoint.id = request.depends_on_id
+                        WHERE request.invoice_id = invoices.id
+                          AND endpoint.invoice_id IS NULL
+                          AND endpoint.status = 'permanently_failed'
                       ) THEN 'failed'
-                      WHEN COUNT(outbox.id) = 2
-                        AND COUNT(outbox.id) FILTER (WHERE outbox.depends_on_id IS NULL) = 1
-                        AND COUNT(outbox.id) FILTER (
-                          WHERE outbox.depends_on_id IS NOT NULL
-                            AND EXISTS (
-                              SELECT 1 FROM outbox dependency
-                              WHERE dependency.id = outbox.depends_on_id
-                                AND dependency.invoice_id = invoices.id
-                            )
-                        ) = 1
-                        AND COUNT(outbox.id) FILTER (WHERE outbox.status = 'delivered') = 2
-                        THEN 'delivered'
-                      WHEN COUNT(outbox.id) = 2
-                        AND COUNT(outbox.id) FILTER (WHERE outbox.depends_on_id IS NULL) = 1
-                        AND COUNT(outbox.id) FILTER (
-                          WHERE outbox.depends_on_id IS NOT NULL
-                            AND EXISTS (
-                              SELECT 1 FROM outbox dependency
-                              WHERE dependency.id = outbox.depends_on_id
-                                AND dependency.invoice_id = invoices.id
-                            )
-                        ) = 1
-                        AND COUNT(outbox.id) FILTER (
-                          WHERE outbox.status IN
+                      WHEN (
+                        SELECT COUNT(*)
+                        FROM outbox request
+                        JOIN outbox endpoint ON endpoint.id = request.depends_on_id
+                        WHERE request.invoice_id = invoices.id
+                          AND endpoint.invoice_id IS NULL
+                      ) = 1
+                        AND (
+                          SELECT COUNT(*)
+                          FROM outbox request
+                          JOIN outbox endpoint ON endpoint.id = request.depends_on_id
+                          WHERE request.invoice_id = invoices.id
+                            AND endpoint.invoice_id IS NULL
+                            AND request.status = 'delivered'
+                            AND endpoint.status = 'delivered'
+                        ) = 1 THEN 'delivered'
+                      WHEN (
+                        SELECT COUNT(*)
+                        FROM outbox request
+                        JOIN outbox endpoint ON endpoint.id = request.depends_on_id
+                        WHERE request.invoice_id = invoices.id
+                          AND endpoint.invoice_id IS NULL
+                      ) = 1
+                        AND (
+                          SELECT COUNT(*)
+                          FROM outbox request
+                          JOIN outbox endpoint ON endpoint.id = request.depends_on_id
+                        WHERE request.invoice_id = invoices.id
+                          AND endpoint.invoice_id IS NULL
+                          AND request.status IN
                             ('prepared', 'queued', 'leased', 'retryable', 'handed_off')
-                        ) = 2
-                        THEN 'pending_delivery'
+                          AND endpoint.status IN
+                            ('prepared', 'queued', 'leased', 'retryable', 'handed_off')
+                        ) = 1 THEN 'pending_delivery'
                       ELSE 'contract_error'
                     END
              FROM invoices
              JOIN creators ON creators.id = invoices.creator_id
-             LEFT JOIN outbox ON outbox.invoice_id = invoices.id
              WHERE creators.creator_lookup_hash = $1
                AND invoices.bundle_lookup_hash = $2
              GROUP BY invoices.id, invoices.delivery_revision, invoices.baseline_state",
