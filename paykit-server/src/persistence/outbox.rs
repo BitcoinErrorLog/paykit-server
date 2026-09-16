@@ -539,7 +539,15 @@ impl OutboxStore {
             "UPDATE outbox SET status = 'handed_off', sdk_outbound_message_id = $1, \
                  sdk_event_id = $2, sdk_payment_request_id = $3, error_class = NULL, \
                  lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = NOW() \
-             WHERE id = $4 AND status = 'leased' AND claim_token = $5 AND lease_expires_at > NOW()",
+             WHERE id = $4 AND status = 'leased' AND claim_token = $5 AND lease_expires_at > NOW() \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM invoices \
+                   WHERE invoices.id = outbox.invoice_id \
+                     AND invoices.baseline_state IN ( \
+                       'expired_final', 'void_baseline_failed', 'void_prepare_expired', \
+                       'void_cancelled', 'resolved_paid_manually', 'resolved_closed' \
+                     ) \
+               )",
         )
         .bind(outbound)
         .bind(event_id)
