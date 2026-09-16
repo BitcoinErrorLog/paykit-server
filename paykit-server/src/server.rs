@@ -592,6 +592,13 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                 {
                     return Ok((true, ProcessingHealth::PermanentFailure));
                 }
+                if workers.outbox.invoice_is_final(claim.invoice_id()).await? {
+                    return workers
+                        .outbox
+                        .mark_final_invoice_failed(&claim)
+                        .await
+                        .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
+                }
                 match creator_adapter(&workers, claim.creator_id()).await {
                     Ok(adapter) => {
                         process_claim_with_health(

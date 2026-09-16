@@ -187,6 +187,12 @@ pub async fn process_claim_with_health(
     {
         return Ok((true, ProcessingHealth::PermanentFailure));
     }
+    if store.invoice_is_final(claim.invoice_id()).await? {
+        return store
+            .mark_final_invoice_failed(claim)
+            .await
+            .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
+    }
     let intent = match store.delivery_intent(claim) {
         Ok(intent) => intent,
         Err(_) => {

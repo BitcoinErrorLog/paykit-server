@@ -586,6 +586,90 @@ async fn outbox_sdk_identifier_constraints_reject_unattributable_terminal_rows()
 }
 
 #[tokio::test]
+async fn terminal_outbox_rows_reject_resurrection_and_linkage_repair() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    run_migrations(pool).await.unwrap();
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(pool, creator_id, b"bundle-terminal", b"request-terminal").await;
+    let invoice_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM invoices WHERE creator_id = $1 AND bundle_lookup_hash = $2",
+    )
+    .bind(creator_id)
+    .bind(b"bundle-terminal".as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let first_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO outbox (creator_id, invoice_id, intent_envelope, status, generation)
+         VALUES ($1, $2, $3, 'permanently_failed', 7)
+         RETURNING id",
+    )
+    .bind(creator_id)
+    .bind(invoice_id)
+    .bind(b"encrypted-intent".as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let second_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO outbox (creator_id, intent_envelope, status)
+         VALUES ($1, $2, 'queued')
+         RETURNING id",
+    )
+    .bind(creator_id)
+    .bind(b"encrypted-intent-2".as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let first_status: String = sqlx::query_scalar("SELECT status FROM outbox WHERE id = $1")
+        .bind(first_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(first_status, "permanently_failed");
+    let trigger_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_trigger WHERE tgname = 'outbox_terminal_repair_barrier'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(trigger_count, 1);
+
+    assert_trigger_violation(
+        "resurrection",
+        sqlx::query("UPDATE outbox SET status = 'queued' WHERE id = $1")
+            .bind(first_id)
+            .execute(pool)
+            .await,
+    );
+    assert_trigger_violation(
+        "invoice linkage",
+        sqlx::query("UPDATE outbox SET invoice_id = NULL WHERE id = $1")
+            .bind(first_id)
+            .execute(pool)
+            .await,
+    );
+    assert_trigger_violation(
+        "dependency linkage",
+        sqlx::query("UPDATE outbox SET depends_on_id = $1 WHERE id = $2")
+            .bind(second_id)
+            .bind(first_id)
+            .execute(pool)
+            .await,
+    );
+    assert_trigger_violation(
+        "generation",
+        sqlx::query("UPDATE outbox SET generation = 8 WHERE id = $1")
+            .bind(first_id)
+            .execute(pool)
+            .await,
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn enum_like_status_columns_allow_unexpected_text_for_read_time_validation() {
     let _migration_test_guard = migration_test_lock().lock().await;
     let database = TestDatabase::create().await;
@@ -1194,6 +1278,20 @@ fn assert_check_violation(result: Result<sqlx::postgres::PgQueryResult, sqlx::Er
     assert_eq!(
         error.as_database_error().unwrap().code().as_deref(),
         Some("23514")
+    );
+}
+
+fn assert_trigger_violation(
+    label: &str,
+    result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
+) {
+    let error = match result {
+        Ok(_) => panic!("expected terminal-row trigger violation: {label}"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("P0001")
     );
 }
 

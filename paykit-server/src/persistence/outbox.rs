@@ -197,11 +197,16 @@ impl OutboxStore {
                  SELECT o.id \
                  FROM outbox o \
                  LEFT JOIN outbox dependency ON dependency.id = o.depends_on_id \
+                 LEFT JOIN invoices invoice ON invoice.id = o.invoice_id \
                  WHERE ( \
                      (o.status = 'queued' AND o.next_attempt_at <= NOW()) \
                      OR (o.status = 'leased' AND o.lease_expires_at <= NOW()) \
                      OR (o.status = 'retryable' AND o.next_attempt_at <= NOW()) \
                  ) \
+                 AND (o.invoice_id IS NULL OR invoice.baseline_state NOT IN ( \
+                     'expired_final', 'void_baseline_failed', 'void_prepare_expired', \
+                     'void_cancelled', 'resolved_paid_manually', 'resolved_closed' \
+                 )) \
                  AND (o.depends_on_id IS NULL OR dependency.status = 'delivered') \
                  ORDER BY o.next_attempt_at, o.id \
                  FOR UPDATE OF o SKIP LOCKED \
@@ -318,6 +323,75 @@ impl OutboxStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         Ok(true)
+    }
+
+    pub async fn invoice_is_final(
+        &self,
+        invoice_id: Option<Uuid>,
+    ) -> Result<bool, PersistenceError> {
+        let Some(invoice_id) = invoice_id else {
+            return Ok(false);
+        };
+        sqlx::query_scalar(
+            "SELECT baseline_state IN (
+                 'expired_final', 'void_baseline_failed', 'void_prepare_expired',
+                 'void_cancelled', 'resolved_paid_manually', 'resolved_closed'
+             )
+             FROM invoices
+             WHERE id = $1",
+        )
+        .bind(invoice_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?
+        .ok_or(PersistenceError::CorruptOrMissing)
+    }
+
+    pub async fn mark_final_invoice_failed(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<bool, PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let changed = sqlx::query(
+            "UPDATE outbox
+             SET status = 'permanently_failed',
+                 error_class = 'invoice_finalized',
+                 failure_reason = 'invoice_finalized',
+                 lease_owner = NULL,
+                 claim_token = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = NOW()
+             WHERE id = $1
+               AND status = 'leased'
+               AND claim_token = $2
+               AND lease_expires_at > NOW()",
+        )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if changed.rows_affected() == 1 {
+            sqlx::query(
+                "INSERT INTO outbox_terminal_events
+                     (creator_id, invoice_id, outbox_id, event_class, reason)
+                 SELECT creator_id, invoice_id, id, 'invoice_finalized', 'invoice_finalized'
+                 FROM outbox
+                 WHERE id = $1",
+            )
+            .bind(claim.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(changed.rows_affected() == 1)
     }
 
     /// Claims attributable handed-off rows independently from enqueue work.
