@@ -1030,20 +1030,24 @@ impl InvoiceStore {
                     CASE
                       -- Shape validation precedes every precedence rule: any
                       -- malformed shape (missing/extra invoice-scoped row,
-                      -- mixed generation, malformed dependency link, unknown
-                      -- status) fails closed as contract_error even when a
-                      -- valid failed pair exists.
+                      -- mixed or non-invoice generation, malformed dependency
+                      -- link, unknown status) fails closed as contract_error
+                      -- even when a valid failed pair exists. The current
+                      -- generation IS the invoice id: a same-wrong-UUID pair
+                      -- whose generation_id values equal each other but not
+                      -- invoices.id is malformed.
                       WHEN (
                         SELECT COUNT(*) FROM outbox
                         WHERE invoice_id = invoices.id
                       ) <> 2 THEN 'contract_error'
-                      WHEN (
+                       WHEN (
                         SELECT COUNT(*)
                         FROM outbox request
                         JOIN outbox endpoint ON endpoint.id = request.depends_on_id
                         WHERE request.invoice_id = invoices.id
                           AND endpoint.invoice_id = invoices.id
                           AND endpoint.generation_id = request.generation_id
+                          AND request.generation_id = invoices.id
                       ) <> 1 THEN 'contract_error'
                       WHEN EXISTS (
                         SELECT 1 FROM outbox

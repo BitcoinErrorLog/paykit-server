@@ -702,6 +702,62 @@ async fn failed_pair_with_mixed_generation_reports_contract_error() {
     database.cleanup().await;
 }
 
+/// A pair whose endpoint and request generation_id values equal EACH OTHER
+/// but not the invoice id is malformed in every precedence shape: the
+/// current generation IS the invoice id, so a same-wrong-UUID pair fails
+/// closed as contract_error (failed, delivered, and pending shapes).
+#[tokio::test]
+async fn same_wrong_generation_pair_reports_contract_error_for_failed_delivered_and_pending_shapes()
+{
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[72; 32]).unwrap());
+    let (creator, bundle, invoices, invoice_id, endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto, "000G40R40M30E209185GR38E1W").await;
+
+    let wrong_generation = Uuid::new_v4();
+    assert_ne!(wrong_generation, invoice_id);
+    sqlx::query("UPDATE outbox SET generation_id = $1 WHERE invoice_id = $2")
+        .bind(wrong_generation)
+        .bind(invoice_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    // Pending shape: both rows active with a same-wrong-UUID generation.
+    assert_eq!(
+        delivery_status(&invoices, &creator, &bundle).await.state,
+        "contract_error",
+        "a pending same-wrong-UUID generation pair is malformed"
+    );
+    // Delivered shape (terminal delivered rows must carry attribution).
+    sqlx::query(
+        "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = '900' \
+         WHERE invoice_id = $1",
+    )
+    .bind(invoice_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        delivery_status(&invoices, &creator, &bundle).await.state,
+        "contract_error",
+        "a delivered same-wrong-UUID generation pair is malformed"
+    );
+    // Failed shape.
+    sqlx::query("UPDATE outbox SET status = 'permanently_failed' WHERE id = $1")
+        .bind(request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        delivery_status(&invoices, &creator, &bundle).await.state,
+        "contract_error",
+        "a failed same-wrong-UUID generation pair is malformed"
+    );
+    let _ = endpoint_id;
+    database.cleanup().await;
+}
+
 #[tokio::test]
 async fn failed_pair_with_malformed_link_reports_contract_error() {
     let database = TestDatabase::create().await;
