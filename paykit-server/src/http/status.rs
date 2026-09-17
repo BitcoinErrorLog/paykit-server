@@ -38,6 +38,9 @@ struct StatusResponse {
     /// auto-confirm MUST fail closed on any other (or missing) version —
     /// see [`crate::application::payment_status::BITCOIN_STATUS_CONTRACT_V2`].
     contract_version: &'static str,
+    delivery_generation: String,
+    delivery_revision: i64,
+    paykit_delivery_state: &'static str,
 }
 
 pub fn status_router(service: Arc<PaymentStatusService>) -> Router {
@@ -74,6 +77,9 @@ impl From<PaymentStatusResponse> for StatusResponse {
             late_settlement: value.late_settlement(),
             allocation_mode: value.allocation_mode().as_str(),
             contract_version: crate::application::payment_status::BITCOIN_STATUS_CONTRACT_V2,
+            delivery_generation: value.delivery_generation().to_string(),
+            delivery_revision: value.delivery_revision(),
+            paykit_delivery_state: value.paykit_delivery_state(),
         }
     }
 }

@@ -14,7 +14,7 @@ use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
 use uuid::Uuid;
 
-const REQUIRED_TABLES: [&str; 13] = [
+const REQUIRED_TABLES: [&str; 14] = [
     "deployment_metadata",
     "creators",
     "sdk_states",
@@ -28,7 +28,10 @@ const REQUIRED_TABLES: [&str; 13] = [
     "claimed_key_fingerprints",
     "sentinel_outpoints",
     "sentinel_events",
+    "outbox_terminal_events",
 ];
+
+const ACCOUNT_RETENTION_REGISTRY: [&str; 14] = REQUIRED_TABLES;
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
 /// migration tests deliberately use the production migration lock key, so
@@ -65,7 +68,7 @@ fn migration_catalog_has_one_contiguous_canonical_version_per_file() {
     let mut versions = migration_versions(names).unwrap();
     versions.sort_unstable();
 
-    assert_eq!(versions, (1..=16).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=23).collect::<Vec<_>>());
     assert_eq!(
         versions.len(),
         versions.iter().collect::<HashSet<_>>().len()
@@ -116,7 +119,9 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .unwrap();
     assert_eq!(
         applied_versions,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
+        ]
     );
 
     let retired_observation_budget_columns: Vec<String> = sqlx::query_scalar(
@@ -581,6 +586,160 @@ async fn outbox_sdk_identifier_constraints_reject_unattributable_terminal_rows()
         .await,
     );
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn terminal_rows_reject_generation_id_edits() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    run_migrations(pool).await.unwrap();
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(pool, creator_id, b"bundle-terminal", b"request-terminal").await;
+    let invoice_id: Uuid = sqlx::query_scalar(
+        "SELECT id FROM invoices WHERE creator_id = $1 AND bundle_lookup_hash = $2",
+    )
+    .bind(creator_id)
+    .bind(b"bundle-terminal".as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let first_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO outbox (creator_id, invoice_id, intent_envelope, status, generation)
+         VALUES ($1, $2, $3, 'permanently_failed', 7)
+         RETURNING id",
+    )
+    .bind(creator_id)
+    .bind(invoice_id)
+    .bind(b"encrypted-intent".as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let second_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO outbox (creator_id, intent_envelope, status)
+         VALUES ($1, $2, 'queued')
+         RETURNING id",
+    )
+    .bind(creator_id)
+    .bind(b"encrypted-intent-2".as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let first_status: String = sqlx::query_scalar("SELECT status FROM outbox WHERE id = $1")
+        .bind(first_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(first_status, "permanently_failed");
+    let trigger_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_trigger WHERE tgname = 'outbox_terminal_repair_barrier'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(trigger_count, 1);
+
+    assert_trigger_violation(
+        "resurrection",
+        sqlx::query("UPDATE outbox SET status = 'queued' WHERE id = $1")
+            .bind(first_id)
+            .execute(pool)
+            .await,
+    );
+    assert_trigger_violation(
+        "invoice linkage",
+        sqlx::query("UPDATE outbox SET invoice_id = NULL WHERE id = $1")
+            .bind(first_id)
+            .execute(pool)
+            .await,
+    );
+    assert_trigger_violation(
+        "dependency linkage",
+        sqlx::query("UPDATE outbox SET depends_on_id = $1 WHERE id = $2")
+            .bind(second_id)
+            .bind(first_id)
+            .execute(pool)
+            .await,
+    );
+    assert_trigger_violation(
+        "generation",
+        sqlx::query("UPDATE outbox SET generation = 8 WHERE id = $1")
+            .bind(first_id)
+            .execute(pool)
+            .await,
+    );
+    assert_trigger_violation(
+        "generation id",
+        sqlx::query("UPDATE outbox SET generation_id = gen_random_uuid() WHERE id = $1")
+            .bind(first_id)
+            .execute(pool)
+            .await,
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn runtime_role_cannot_disable_terminal_trigger() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    run_migrations(pool).await.unwrap();
+    let role = format!("paykit_runtime_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE ROLE {role} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    let mut connection = database.acquire_connection().await;
+    sqlx::query(&format!("SET ROLE {role}"))
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    let disable = sqlx::query("ALTER TABLE outbox DISABLE TRIGGER outbox_terminal_repair_barrier")
+        .execute(&mut *connection)
+        .await;
+    assert!(disable.is_err(), "runtime role disabled terminal trigger");
+    sqlx::query("RESET ROLE")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+    sqlx::query(&format!("DROP ROLE {role}"))
+        .execute(pool)
+        .await
+        .unwrap();
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn creator_and_invoice_children_are_in_account_retention_registry() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    run_migrations(pool).await.unwrap();
+    let child_tables: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT table_name
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND column_name IN ('creator_id', 'invoice_id')
+         ORDER BY table_name",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    for table in child_tables {
+        assert!(
+            ACCOUNT_RETENTION_REGISTRY.contains(&table.as_str()),
+            "retention registry is missing child table {table}"
+        );
+    }
+    assert!(
+        ACCOUNT_RETENTION_REGISTRY.contains(&"outbox_terminal_events"),
+        "terminal evidence must be classified for retention"
+    );
     database.cleanup().await;
 }
 
@@ -1193,6 +1352,20 @@ fn assert_check_violation(result: Result<sqlx::postgres::PgQueryResult, sqlx::Er
     assert_eq!(
         error.as_database_error().unwrap().code().as_deref(),
         Some("23514")
+    );
+}
+
+fn assert_trigger_violation(
+    label: &str,
+    result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
+) {
+    let error = match result {
+        Ok(_) => panic!("expected terminal-row trigger violation: {label}"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("P0001")
     );
 }
 

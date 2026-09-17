@@ -765,7 +765,7 @@ async fn resolve_table_covers_all_twelve_b9_rows() {
             state: "observing",
             observation: Some((0, 1)), // confirmed, amount_matched
             resolution: "abandoned",
-            outcome: Ok("resolved_closed"),
+            outcome: Err("payment_observed"),
             in_plan_before: true,
             locks_family: false,
         },

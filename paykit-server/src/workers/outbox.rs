@@ -154,10 +154,19 @@ pub async fn process_claim(
     adapter: &dyn Adapter,
     claim: &ClaimedOutbox,
     retry_delay: Duration,
+    link_establishment_max_attempts: i32,
+    link_establishment_max_age: Duration,
 ) -> Result<bool, PersistenceError> {
-    process_claim_with_health(store, adapter, claim, retry_delay)
-        .await
-        .map(|(transitioned, _)| transitioned)
+    process_claim_with_health(
+        store,
+        adapter,
+        claim,
+        retry_delay,
+        link_establishment_max_attempts,
+        link_establishment_max_age,
+    )
+    .await
+    .map(|(transitioned, _)| transitioned)
 }
 
 pub async fn process_claim_with_health(
@@ -165,7 +174,25 @@ pub async fn process_claim_with_health(
     adapter: &dyn Adapter,
     claim: &ClaimedOutbox,
     retry_delay: Duration,
+    link_establishment_max_attempts: i32,
+    link_establishment_max_age: Duration,
 ) -> Result<(bool, ProcessingHealth), PersistenceError> {
+    if store
+        .exhaust_claim_if_due(
+            claim,
+            link_establishment_max_attempts,
+            link_establishment_max_age,
+        )
+        .await?
+    {
+        return Ok((true, ProcessingHealth::PermanentFailure));
+    }
+    if store.invoice_is_final(claim.invoice_id()).await? {
+        return store
+            .mark_final_invoice_failed(claim)
+            .await
+            .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
+    }
     let intent = match store.delivery_intent(claim) {
         Ok(intent) => intent,
         Err(_) => {
@@ -175,20 +202,103 @@ pub async fn process_claim_with_health(
                 .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
         }
     };
+    store.seam().run_after_preflight().await;
+    // The persisted pre-SDK fence is the finality/handoff linearization
+    // point: a cancellation committed first makes this CAS match zero rows
+    // and no SDK call happens below; a committed fence is preserved by
+    // cancellation exactly like `handed_off`, so the SDK effect is either
+    // prevented or attributed — never orphaned.
+    if !store.begin_handoff(claim).await? {
+        return store
+            .mark_final_invoice_failed(claim)
+            .await
+            .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
+    }
+    store.seam().run_after_fence().await;
+    // Durable pre-SDK invocation marker (migration 0023 rule 1): committed
+    // under the live fence in its own transaction BEFORE the SDK call, so a
+    // crash leaves evidence distinguishing "SDK never invoked" (provably no
+    // effect) from "SDK possibly emitted" (recovery terminalizes the row as
+    // `sdk_invoked_unattributed` for manual operator reconciliation; it
+    // never resolves or attributes the effect). A lost fence means no SDK
+    // call below.
+    if !store.mark_handoff_invocation_started(claim).await? {
+        return Ok((false, ProcessingHealth::Retryable));
+    }
     match handoff(adapter, &intent).await {
         Ok(result) => store
             .mark_handed_off(claim, &result)
             .await
             .map(|transitioned| (transitioned, ProcessingHealth::Available)),
         Err(HandoffFailure::Retryable(stage)) => store
-            .mark_retryable(claim, retry_delay, stage)
+            .release_handoff_retryable(claim, retry_delay, stage)
             .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+            .map(|release| match release {
+                crate::persistence::HandoffRelease::Retryable => {
+                    (true, ProcessingHealth::Retryable)
+                }
+                crate::persistence::HandoffRelease::Unresolved => {
+                    (true, ProcessingHealth::PermanentFailure)
+                }
+                crate::persistence::HandoffRelease::Stale => (false, ProcessingHealth::Retryable),
+            }),
         Err(HandoffFailure::Permanent) => store
             .mark_permanently_failed(claim)
             .await
             .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
     }
+}
+
+/// The dedicated fenced-recovery path (migration 0023 rules 2-3). It never
+/// re-runs the SDK effect and never resolves or attributes anything: EVERY
+/// recovered fenced row terminalizes as `handoff_unresolved` with exactly
+/// one durable terminal event and zero SDK calls. The durable invocation
+/// marker only selects the static terminal reason recorded by
+/// `mark_handoff_unresolved` — `sdk_not_invoked` (marker FALSE: the SDK
+/// provably never ran) or `sdk_invoked_unattributed` (marker TRUE: an
+/// effect may exist in durable SDK state but is never attributed
+/// automatically, because endpoint identifier sets are not invoice-unique
+/// and attribution could false-match another invoice's publication; an
+/// operator reconciles the row by hand). Recovery can therefore never mark
+/// a parent delivered from another invoice's publication. The adapter is
+/// accepted and ignored so tests can prove no adapter method is ever
+/// invoked on this path.
+pub async fn process_fence_recovery(
+    store: &OutboxStore,
+    adapter: &dyn Adapter,
+    claim: &ClaimedOutbox,
+) -> Result<bool, PersistenceError> {
+    process_fence_recovery_with_health(store, adapter, claim)
+        .await
+        .map(|(transitioned, _)| transitioned)
+}
+
+pub async fn process_fence_recovery_with_health(
+    store: &OutboxStore,
+    _adapter: &dyn Adapter,
+    claim: &ClaimedOutbox,
+) -> Result<(bool, ProcessingHealth), PersistenceError> {
+    store
+        .mark_handoff_unresolved(claim)
+        .await
+        .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure))
+}
+
+/// Publishes claim-pass fairness telemetry exactly as the enqueue loop
+/// does: `paykit_outbox_reader_saturated_total` increments by the number of
+/// flooded reader partitions (reader-partition flooding: more due rows in
+/// one partition than one pass can admit), and the gauge reports the
+/// partitions currently holding an unexpired lease.
+pub async fn publish_claim_fairness_metrics(
+    store: &OutboxStore,
+    metrics: &crate::metrics::Metrics,
+) -> Result<(), PersistenceError> {
+    let (flooded_partitions, active_partitions) = store.claim_metrics().await?;
+    if flooded_partitions > 0 {
+        metrics.outbox_reader_saturated(u64::try_from(flooded_partitions).unwrap_or_default());
+    }
+    metrics.set_outbox_active_partitions(active_partitions);
+    Ok(())
 }
 
 /// Reconciles one exact persisted SDK outbound record. Only durable `Sent`

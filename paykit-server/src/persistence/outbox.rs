@@ -6,7 +6,7 @@ use crate::{
     persistence::PersistenceError,
 };
 use sqlx::PgPool;
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +36,33 @@ impl OutboxRetryClass {
             Self::Reconciliation => "reconciliation",
         }
     }
+}
+
+/// Static terminal reason for a recovered fence whose durable invocation
+/// marker is FALSE (migration 0023 rule 3): the SDK provably never ran, so
+/// no effect can exist; the row terminalizes with zero SDK calls.
+pub const HANDOFF_UNRESOLVED_SDK_NOT_INVOKED: &str = "sdk_not_invoked";
+
+/// Static terminal reason for a recovered fence whose durable invocation
+/// marker is TRUE (migration 0023 rule 3): the SDK may have emitted an
+/// effect, but recovery never resolves or attributes it (endpoint
+/// identifier sets are not invoice-unique, so attribution could
+/// false-match another invoice's publication). The row terminalizes with
+/// zero SDK calls and an operator reconciles it by hand.
+pub const HANDOFF_UNRESOLVED_SDK_INVOKED_UNATTRIBUTED: &str = "sdk_invoked_unattributed";
+
+/// Outcome of the finality-checked retryable release of a fenced handoff
+/// (migration 0023 rule 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HandoffRelease {
+    /// The invoice is live; the row became ordinary bounded `retryable` work.
+    Retryable,
+    /// The invoice is final; the row terminalized as `handoff_unresolved`
+    /// with exactly one durable terminal event.
+    Unresolved,
+    /// The fence was no longer live (stale token/expired lease); no
+    /// transition was written and fence recovery owns the row.
+    Stale,
 }
 
 /// Exact public-SDK identifiers returned after one durable local enqueue.
@@ -87,6 +114,7 @@ pub struct ClaimedOutbox {
     claim_token: Uuid,
     creator_lookup_hash: Vec<u8>,
     intent_envelope: Vec<u8>,
+    handoff_sdk_invocation_started: bool,
 }
 
 impl std::fmt::Debug for ClaimedOutbox {
@@ -115,6 +143,13 @@ impl ClaimedOutbox {
     pub fn claim_token(&self) -> Uuid {
         self.claim_token
     }
+
+    /// Whether the durable pre-SDK invocation marker was committed for this
+    /// fenced row (migration 0023 rule 1): `false` proves the SDK was never
+    /// invoked for the current fence, so no remote effect can exist.
+    pub fn sdk_invocation_started(&self) -> bool {
+        self.handoff_sdk_invocation_started
+    }
 }
 
 /// A separately fenced claim over an attributable `handed_off` row.
@@ -122,6 +157,7 @@ impl ClaimedOutbox {
 pub struct ClaimedHandoff {
     id: Uuid,
     creator_id: Uuid,
+    invoice_id: Option<Uuid>,
     attempt_count: i32,
     claim_token: Uuid,
     sdk_outbound_message_id: String,
@@ -157,10 +193,56 @@ impl ClaimedHandoff {
     }
 }
 
+/// Test seam around the production preflight/fence/SDK sequence. Production
+/// never installs hooks, so both points are no-ops there; tests install them
+/// to serialize a concurrent cancellation against the fence commit.
+#[derive(Clone, Default)]
+pub struct HandoffFenceSeam {
+    pub after_preflight: Option<SeamHook>,
+    pub after_fence: Option<SeamHook>,
+}
+
+pub type SeamHook = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
+impl std::fmt::Debug for HandoffFenceSeam {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HandoffFenceSeam")
+            .field("after_preflight", &self.after_preflight.is_some())
+            .field("after_fence", &self.after_fence.is_some())
+            .finish()
+    }
+}
+
+impl HandoffFenceSeam {
+    pub(crate) async fn run_after_preflight(&self) {
+        if let Some(hook) = &self.after_preflight {
+            hook().await;
+        }
+    }
+
+    pub(crate) async fn run_after_fence(&self) {
+        if let Some(hook) = &self.after_fence {
+            hook().await;
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OutboxStore {
     pool: PgPool,
     crypto: std::sync::Arc<Crypto>,
+    seam: HandoffFenceSeam,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TerminalFailureHealth {
+    pub count: i64,
+    pub oldest_age_seconds: Option<i64>,
+    pub by_class: BTreeMap<String, i64>,
+    pub transitions: Vec<(String, String, i64)>,
 }
 
 impl OutboxStore {
@@ -168,15 +250,37 @@ impl OutboxStore {
         Self {
             pool: pool.clone(),
             crypto,
+            seam: HandoffFenceSeam::default(),
         }
     }
 
-    /// Reports aggregate delivery availability without exposing row or Creator identifiers.
+    /// Installs the test-only fence seam; production never calls this, so
+    /// both seam points stay no-ops there.
+    pub fn with_handoff_fence_seam(mut self, seam: HandoffFenceSeam) -> Self {
+        self.seam = seam;
+        self
+    }
+
+    pub(crate) fn seam(&self) -> &HandoffFenceSeam {
+        &self.seam
+    }
+
+    /// Reports aggregate delivery availability without exposing row or
+    /// Creator identifiers. A final-invoice `handoff_started`/`retryable`
+    /// row is never active work (migration 0023 rule 5): it is either
+    /// already terminal or awaits the dedicated fenced-recovery path, so it
+    /// must not degrade readiness while recovery is pending.
     pub async fn delivery_available(&self) -> Result<bool, PersistenceError> {
         sqlx::query_scalar(
             "SELECT NOT EXISTS ( \
-                 SELECT 1 FROM outbox \
-                 WHERE status IN ('retryable', 'handed_off', 'permanently_failed') \
+                 SELECT 1 FROM outbox o \
+                 LEFT JOIN invoices invoice ON invoice.id = o.invoice_id \
+                 WHERE o.status = 'handed_off' \
+                    OR (o.status IN ('retryable', 'handoff_started') \
+                        AND (o.invoice_id IS NULL OR invoice.baseline_state NOT IN ( \
+                            'expired_final', 'void_baseline_failed', 'void_prepare_expired', \
+                            'void_cancelled', 'resolved_paid_manually', 'resolved_closed' \
+                        ))) \
              )",
         )
         .fetch_one(&self.pool)
@@ -184,7 +288,99 @@ impl OutboxStore {
         .map_err(|_| PersistenceError::Unavailable)
     }
 
-    /// Claims eligible rows while preserving endpoint-publication dependencies.
+    /// Terminal-failure health for the alert contract. `count`,
+    /// `oldest_age_seconds`, and `by_class` cover only UNACKNOWLEDGED
+    /// events, so operator acknowledgement (docs/outbox-terminal-acknowledgement.md)
+    /// clears the critical signal; `transitions` remains the monotonic
+    /// per-class/reason transition census feeding the counter.
+    pub async fn terminal_failure_health(&self) -> Result<TerminalFailureHealth, PersistenceError> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT event_class, COUNT(*)::BIGINT
+             FROM outbox_terminal_events
+             WHERE acknowledged_at IS NULL
+             GROUP BY event_class",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let count = rows.iter().map(|(_, count)| *count).sum();
+        let oldest_age_seconds = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))::BIGINT
+             FROM outbox_terminal_events
+             WHERE acknowledged_at IS NULL",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let transitions = sqlx::query_as(
+            "SELECT event_class, reason, COUNT(*)::BIGINT
+             FROM outbox_terminal_events
+             GROUP BY event_class, reason",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(TerminalFailureHealth {
+            count,
+            oldest_age_seconds,
+            by_class: rows.into_iter().collect(),
+            transitions,
+        })
+    }
+
+    /// Claim-pass fairness telemetry. A reader partition is FLOODED when its
+    /// due eligible rows exceed what one claim pass can admit from it: one
+    /// row when the partition holds no unexpired lease, zero when it does.
+    /// Returns `(flooded_partitions, active_partitions)`, where active means
+    /// holding an unexpired lease.
+    pub async fn claim_metrics(&self) -> Result<(i64, i64), PersistenceError> {
+        let (flooded_partitions, active_partitions): (i64, i64) = sqlx::query_as(
+            "WITH RECURSIVE eligible AS (
+                 SELECT id, creator_id, reader_assignment_id AS root_reader_assignment_id, depends_on_id
+                 FROM outbox WHERE depends_on_id IS NULL
+                 UNION ALL
+                 SELECT child.id, child.creator_id, eligible.root_reader_assignment_id, child.depends_on_id
+                 FROM outbox child JOIN eligible ON eligible.id = child.depends_on_id
+             ), roots AS (
+                 SELECT DISTINCT ON (id) id, root_reader_assignment_id FROM eligible ORDER BY id
+             ), active AS (
+                 SELECT o.creator_id, roots.root_reader_assignment_id
+                 FROM outbox o JOIN roots ON roots.id = o.id
+                 WHERE o.status IN ('leased', 'handoff_started') AND o.lease_expires_at > NOW()
+                 GROUP BY o.creator_id, roots.root_reader_assignment_id
+             ), due_partitions AS (
+                 SELECT o.creator_id, roots.root_reader_assignment_id, COUNT(*) AS due_count
+                 FROM outbox o JOIN roots ON roots.id = o.id
+                 LEFT JOIN outbox dependency ON dependency.id = o.depends_on_id
+                 LEFT JOIN invoices invoice ON invoice.id = o.invoice_id
+                 WHERE ((o.status = 'queued' AND o.next_attempt_at <= NOW())
+                     OR (o.status = 'leased' AND o.lease_expires_at <= NOW())
+                     OR (o.status = 'retryable' AND o.next_attempt_at <= NOW()))
+                   AND (o.invoice_id IS NULL OR invoice.baseline_state NOT IN (
+                     'expired_final', 'void_baseline_failed', 'void_prepare_expired',
+                     'void_cancelled', 'resolved_paid_manually', 'resolved_closed'))
+                   AND (o.depends_on_id IS NULL OR dependency.status = 'delivered')
+                 GROUP BY o.creator_id, roots.root_reader_assignment_id
+             )
+             SELECT (SELECT COUNT(*) FROM due_partitions
+                     LEFT JOIN active
+                       ON active.creator_id = due_partitions.creator_id
+                      AND active.root_reader_assignment_id = due_partitions.root_reader_assignment_id
+                     WHERE due_partitions.due_count >
+                           CASE WHEN active.creator_id IS NULL THEN 1 ELSE 0 END),
+                    (SELECT COUNT(*) FROM active)",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok((flooded_partitions, active_partitions))
+    }
+
+    /// Claims eligible rows while preserving endpoint-publication
+    /// dependencies. Expired `handoff_started` rows are deliberately NOT
+    /// re-admitted here (migration 0023 rule 2): only the dedicated
+    /// [`Self::claim_fence_recovery`] path claims fenced rows, so a crashed
+    /// handoff is never silently re-executed as ordinary work.
     pub async fn claim(
         &self,
         owner: Uuid,
@@ -193,17 +389,65 @@ impl OutboxStore {
     ) -> Result<Vec<ClaimedOutbox>, PersistenceError> {
         let seconds = lease_seconds(lease)?;
         sqlx::query_as(
-            "WITH candidates AS ( \
-                 SELECT o.id \
+            "WITH RECURSIVE eligible AS ( \
+                 SELECT o.id, o.creator_id, o.reader_assignment_id AS root_reader_assignment_id, \
+                        o.depends_on_id, o.status, o.next_attempt_at \
                  FROM outbox o \
+                 WHERE o.depends_on_id IS NULL \
+                 UNION ALL \
+                 SELECT child.id, child.creator_id, eligible.root_reader_assignment_id, \
+                        child.depends_on_id, child.status, child.next_attempt_at \
+                 FROM outbox child \
+                 JOIN eligible ON eligible.id = child.depends_on_id \
+             ), \
+             roots AS ( \
+                 SELECT DISTINCT ON (id) id, root_reader_assignment_id \
+                 FROM eligible \
+                 ORDER BY id \
+             ), \
+             active AS ( \
+                 SELECT o.creator_id, r.root_reader_assignment_id, COUNT(*) AS active_count \
+                 FROM outbox o \
+                 JOIN roots r ON r.id = o.id \
+                 WHERE o.status IN ('leased', 'handoff_started') AND o.lease_expires_at > NOW() \
+                 GROUP BY o.creator_id, r.root_reader_assignment_id \
+             ), \
+             ranked AS ( \
+                 SELECT o.id, \
+                        o.next_attempt_at, \
+                        ROW_NUMBER() OVER ( \
+                            PARTITION BY o.creator_id, r.root_reader_assignment_id \
+                            ORDER BY o.next_attempt_at, o.id \
+                        ) AS partition_rank, \
+                        COALESCE(active.active_count, 0) AS active_count \
+                 FROM outbox o \
+                 JOIN roots r ON r.id = o.id \
+                 LEFT JOIN active ON active.creator_id = o.creator_id \
+                    AND active.root_reader_assignment_id = r.root_reader_assignment_id \
                  LEFT JOIN outbox dependency ON dependency.id = o.depends_on_id \
+                 LEFT JOIN invoices invoice ON invoice.id = o.invoice_id \
                  WHERE ( \
                      (o.status = 'queued' AND o.next_attempt_at <= NOW()) \
                      OR (o.status = 'leased' AND o.lease_expires_at <= NOW()) \
                      OR (o.status = 'retryable' AND o.next_attempt_at <= NOW()) \
                  ) \
+                 AND (o.invoice_id IS NULL OR invoice.baseline_state NOT IN ( \
+                     'expired_final', 'void_baseline_failed', 'void_prepare_expired', \
+                     'void_cancelled', 'resolved_paid_manually', 'resolved_closed' \
+                 )) \
                  AND (o.depends_on_id IS NULL OR dependency.status = 'delivered') \
-                 ORDER BY o.next_attempt_at, o.id \
+             ), \
+             candidates AS ( \
+                 SELECT ranked.id \
+                 FROM outbox o \
+                 JOIN ranked ON ranked.id = o.id \
+                 WHERE ranked.partition_rank = 1 AND ranked.active_count = 0 \
+                 AND ( \
+                     (o.status = 'queued' AND o.next_attempt_at <= NOW()) \
+                     OR (o.status = 'leased' AND o.lease_expires_at <= NOW()) \
+                     OR (o.status = 'retryable' AND o.next_attempt_at <= NOW()) \
+                 ) \
+                 ORDER BY ranked.next_attempt_at, ranked.id \
                  FOR UPDATE OF o SKIP LOCKED \
                  LIMIT $1 \
              ) \
@@ -216,9 +460,9 @@ impl OutboxStore {
                  updated_at = NOW() \
              FROM candidates \
              WHERE o.id = candidates.id \
-             RETURNING o.id, o.creator_id, o.invoice_id, o.attempt_count, o.claim_token, \
-                 (SELECT creator_lookup_hash FROM creators WHERE id = o.creator_id) AS creator_lookup_hash, \
-                 o.intent_envelope",
+              RETURNING o.id, o.creator_id, o.invoice_id, o.attempt_count, o.claim_token, \
+                  (SELECT creator_lookup_hash FROM creators WHERE id = o.creator_id) AS creator_lookup_hash, \
+                  o.intent_envelope, o.handoff_sdk_invocation_started",
         )
         .bind(limit)
         .bind(owner)
@@ -226,6 +470,477 @@ impl OutboxStore {
         .fetch_all(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)
+    }
+
+    /// Atomically closes a leased link-establishment claim at either delivery
+    /// ceiling. This runs before decrypting the intent or constructing an
+    /// adapter, so a bounded claim cannot reach the public SDK.
+    pub async fn exhaust_claim_if_due(
+        &self,
+        claim: &ClaimedOutbox,
+        max_attempts: i32,
+        max_age: Duration,
+    ) -> Result<bool, PersistenceError> {
+        let max_age_seconds =
+            i64::try_from(max_age.as_secs()).map_err(|_| PersistenceError::Unavailable)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let parent = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE outbox
+             SET status = 'permanently_failed',
+                 error_class = 'link_establishment_exhausted',
+                 failure_reason = CASE
+                     WHEN attempt_count >= $1 THEN 'attempt_ceiling'
+                     ELSE 'age_ceiling'
+                 END,
+                 lease_owner = NULL,
+                 claim_token = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = NOW()
+             WHERE id = $2
+               AND status = 'leased'
+               AND claim_token = $3
+               AND lease_expires_at > NOW()
+               AND error_class = 'link_establishment'
+               AND (attempt_count >= $1 OR NOW() >= created_at + ($4 * INTERVAL '1 second'))
+             RETURNING id",
+        )
+        .bind(max_attempts)
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .bind(max_age_seconds)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some(parent_id) = parent else {
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(false);
+        };
+
+        Self::cascade_terminal_descendants(
+            &mut tx,
+            parent_id,
+            "parent_link_establishment_exhausted",
+        )
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO outbox_terminal_events
+                 (creator_id, invoice_id, outbox_id, event_class, reason)
+             SELECT creator_id, invoice_id, id, 'link_establishment_exhausted',
+                    failure_reason
+             FROM outbox
+             WHERE id = $1",
+        )
+        .bind(parent_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(true)
+    }
+
+    pub async fn invoice_is_final(
+        &self,
+        invoice_id: Option<Uuid>,
+    ) -> Result<bool, PersistenceError> {
+        let Some(invoice_id) = invoice_id else {
+            return Ok(false);
+        };
+        sqlx::query_scalar(
+            "SELECT baseline_state IN (
+                 'expired_final', 'void_baseline_failed', 'void_prepare_expired',
+                 'void_cancelled', 'resolved_paid_manually', 'resolved_closed'
+             )
+             FROM invoices
+             WHERE id = $1",
+        )
+        .bind(invoice_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?
+        .ok_or(PersistenceError::CorruptOrMissing)
+    }
+
+    pub async fn mark_final_invoice_failed(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<bool, PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let changed = sqlx::query(
+            "UPDATE outbox
+             SET status = 'permanently_failed',
+                 error_class = 'invoice_finalized',
+                 failure_reason = 'invoice_finalized',
+                 lease_owner = NULL,
+                 claim_token = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = NOW()
+             WHERE id = $1
+               AND status = 'leased'
+               AND claim_token = $2
+               AND lease_expires_at > NOW()",
+        )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if changed.rows_affected() == 1 {
+            sqlx::query(
+                "INSERT INTO outbox_terminal_events
+                     (creator_id, invoice_id, outbox_id, event_class, reason)
+                 SELECT creator_id, invoice_id, id, 'invoice_finalized', 'invoice_finalized'
+                 FROM outbox
+                 WHERE id = $1",
+            )
+            .bind(claim.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(changed.rows_affected() == 1)
+    }
+
+    /// The pre-SDK finality/handoff linearization fence. Under the invoice
+    /// row lock (the same lock void/abandonment hold while terminalizing
+    /// outbox rows) this commits the closed `handoff_started` state with the
+    /// exact claim token, an unexpired lease, and a non-final invoice —
+    /// BEFORE any SDK call. Cancellation committed first makes the CAS match
+    /// zero rows (the leased row was terminalized or the invoice is final),
+    /// so the worker performs no SDK call; a committed fence is preserved by
+    /// cancellation exactly like `handed_off`, and `mark_handed_off` then
+    /// attributes the in-flight SDK effect on completion. Returns false when
+    /// the fence was not taken (stale token/expired lease/final invoice);
+    /// the caller then resolves the row through the final-invoice path,
+    /// which is a no-op when a competing claim reclaimed the token.
+    pub async fn begin_handoff(&self, claim: &ClaimedOutbox) -> Result<bool, PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        if let Some(invoice_id) = claim.invoice_id {
+            let baseline_state = sqlx::query_scalar::<_, String>(
+                "SELECT baseline_state FROM invoices WHERE id = $1 FOR UPDATE",
+            )
+            .bind(invoice_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            match baseline_state {
+                None => return Err(PersistenceError::CorruptOrMissing),
+                Some(state)
+                    if matches!(
+                        state.as_str(),
+                        "expired_final"
+                            | "void_baseline_failed"
+                            | "void_prepare_expired"
+                            | "void_cancelled"
+                            | "resolved_paid_manually"
+                            | "resolved_closed"
+                    ) =>
+                {
+                    tx.commit()
+                        .await
+                        .map_err(|_| PersistenceError::Unavailable)?;
+                    return Ok(false);
+                }
+                Some(_) => {}
+            }
+        }
+        let changed = sqlx::query(
+            "UPDATE outbox \
+             SET status = 'handoff_started', updated_at = NOW() \
+             WHERE id = $1 AND status = 'leased' AND claim_token = $2 AND lease_expires_at > NOW()",
+        )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(changed.rows_affected() == 1)
+    }
+
+    /// The durable pre-SDK invocation marker (migration 0023 rule 1). The
+    /// worker commits this under the live fence in its own transaction AFTER
+    /// `begin_handoff` and BEFORE the SDK call. Because the SDK mints all
+    /// outbound identifiers internally and accepts no caller idempotency
+    /// key (paykit-sdk/src/runtime/payment_requests.rs:313-314;
+    /// paykit-sdk/src/storage/records.rs:336), this marker is the only
+    /// durable pre-effect identity available: a fenced row recovered with
+    /// the marker FALSE provably never reached the SDK. Returns false when
+    /// the fence is no longer live (stale token/expired lease); the caller
+    /// must then NOT invoke the SDK and leave the row to fence recovery.
+    pub async fn mark_handoff_invocation_started(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<bool, PersistenceError> {
+        let changed = sqlx::query(
+            "UPDATE outbox \
+             SET handoff_sdk_invocation_started = TRUE, updated_at = NOW() \
+             WHERE id = $1 AND status = 'handoff_started' AND claim_token = $2 \
+               AND lease_expires_at > NOW()",
+        )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(changed.rows_affected() == 1)
+    }
+
+    /// The dedicated fenced-recovery claim (migration 0023 rule 2). Claims
+    /// expired `handoff_started` rows REGARDLESS of invoice finality — the
+    /// final-invoice exclusion of the ordinary claim path must not apply to
+    /// fenced rows — and keeps the row in `handoff_started` under a fresh
+    /// token/lease so `mark_handoff_unresolved` terminalization stays
+    /// fenced by the exact token. Recovery never re-runs the SDK effect and
+    /// never resolves or attributes durable SDK state (rule 3).
+    pub async fn claim_fence_recovery(
+        &self,
+        owner: Uuid,
+        limit: i64,
+        lease: Duration,
+    ) -> Result<Vec<ClaimedOutbox>, PersistenceError> {
+        let seconds = lease_seconds(lease)?;
+        sqlx::query_as(
+            "WITH candidates AS ( \
+                 SELECT id FROM outbox \
+                 WHERE status = 'handoff_started' AND lease_expires_at <= NOW() \
+                 ORDER BY next_attempt_at, id \
+                 FOR UPDATE SKIP LOCKED \
+                 LIMIT $1 \
+             ) \
+             UPDATE outbox o \
+             SET lease_owner = $2, claim_token = gen_random_uuid(), \
+                 lease_expires_at = NOW() + ($3 * INTERVAL '1 second'), \
+                 attempt_count = o.attempt_count + 1, updated_at = NOW() \
+             FROM candidates WHERE o.id = candidates.id \
+             RETURNING o.id, o.creator_id, o.invoice_id, o.attempt_count, o.claim_token, \
+                 (SELECT creator_lookup_hash FROM creators WHERE id = o.creator_id) AS creator_lookup_hash, \
+                 o.intent_envelope, o.handoff_sdk_invocation_started",
+        )
+        .bind(limit)
+        .bind(owner)
+        .bind(seconds)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)
+    }
+
+    /// Terminalizes a recovered fenced row (migration 0023 rule 3):
+    /// `handoff_unresolved` is the closed terminal class for a
+    /// `handoff_started` row that can neither be attributed nor safely
+    /// re-executed. Recovery NEVER resolves or attributes an SDK effect, so
+    /// both marker states take the same closed transition with zero SDK
+    /// calls; only the static reason differs —
+    /// [`HANDOFF_UNRESOLVED_SDK_NOT_INVOKED`] when the durable invocation
+    /// marker is FALSE (the SDK provably never ran) and
+    /// [`HANDOFF_UNRESOLVED_SDK_INVOKED_UNATTRIBUTED`] when it is TRUE (an
+    /// effect may exist in durable SDK state and an operator reconciles it
+    /// by hand). The transition, descendant cascade, and exactly one
+    /// durable terminal event commit together; a replayed CAS matches zero
+    /// rows and inserts no second event. The SDK is never re-run for the
+    /// row afterwards.
+    pub async fn mark_handoff_unresolved(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<bool, PersistenceError> {
+        let reason = if claim.sdk_invocation_started() {
+            HANDOFF_UNRESOLVED_SDK_INVOKED_UNATTRIBUTED
+        } else {
+            HANDOFF_UNRESOLVED_SDK_NOT_INVOKED
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let changed = sqlx::query(
+            "UPDATE outbox \
+             SET status = 'permanently_failed', \
+                 error_class = 'handoff_unresolved', \
+                 failure_reason = $3, \
+                 lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, \
+                 updated_at = NOW() \
+             WHERE id = $1 AND status = 'handoff_started' AND claim_token = $2 \
+               AND lease_expires_at > NOW()",
+        )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if changed.rows_affected() == 1 {
+            Self::cascade_terminal_descendants(&mut tx, claim.id, "parent_handoff_unresolved")
+                .await?;
+            sqlx::query(
+                "INSERT INTO outbox_terminal_events
+                     (creator_id, invoice_id, outbox_id, event_class, reason)
+                 SELECT creator_id, invoice_id, id, 'handoff_unresolved', $2
+                 FROM outbox WHERE id = $1",
+            )
+            .bind(claim.id)
+            .bind(reason)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(changed.rows_affected() == 1)
+    }
+
+    /// Releases a fenced-recovery claim the worker could not process (the
+    /// per-creator adapter was unavailable): the row stays
+    /// `handoff_started` (never re-executed as ordinary work) and becomes
+    /// claimable by [`Self::claim_fence_recovery`] again after the bounded
+    /// delay.
+    pub async fn retry_fence_recovery(
+        &self,
+        claim: &ClaimedOutbox,
+        delay: Duration,
+    ) -> Result<bool, PersistenceError> {
+        let seconds = lease_seconds(delay)?;
+        let changed = sqlx::query(
+            "UPDATE outbox \
+             SET lease_owner = NULL, claim_token = NULL, \
+                 lease_expires_at = NOW() + ($1 * INTERVAL '1 second'), updated_at = NOW() \
+             WHERE id = $2 AND status = 'handoff_started' AND claim_token = $3 \
+               AND lease_expires_at > NOW()",
+        )
+        .bind(seconds)
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(changed.rows_affected() == 1)
+    }
+
+    /// The retryable-error branch of a fenced handoff (migration 0023 rule
+    /// 4). `handoff_started -> retryable` is forbidden when the invoice is
+    /// final at transition time: finality is checked under the invoice row
+    /// lock (the same lock cancellation holds while terminalizing outbox
+    /// rows) and, when final, the row terminalizes as `handoff_unresolved`
+    /// with one durable terminal event and a descendant cascade instead of
+    /// becoming ordinary retryable work that final-invoice exclusion would
+    /// strand forever. When the invoice is still live, the row becomes
+    /// ordinary bounded `retryable` work as before.
+    pub async fn release_handoff_retryable(
+        &self,
+        claim: &ClaimedOutbox,
+        delay: Duration,
+        error_class: OutboxRetryClass,
+    ) -> Result<HandoffRelease, PersistenceError> {
+        let seconds = lease_seconds(delay)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        if let Some(invoice_id) = claim.invoice_id {
+            let final_invoice = sqlx::query_scalar::<_, bool>(
+                "SELECT baseline_state IN (
+                     'expired_final', 'void_baseline_failed', 'void_prepare_expired',
+                     'void_cancelled', 'resolved_paid_manually', 'resolved_closed'
+                 )
+                 FROM invoices WHERE id = $1 FOR UPDATE",
+            )
+            .bind(invoice_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?
+            .ok_or(PersistenceError::CorruptOrMissing)?;
+            if final_invoice {
+                let changed = sqlx::query(
+                    "UPDATE outbox \
+                     SET status = 'permanently_failed', \
+                         error_class = 'handoff_unresolved', \
+                         failure_reason = 'handoff_unresolved', \
+                         lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, \
+                         updated_at = NOW() \
+                     WHERE id = $1 AND status = 'handoff_started' AND claim_token = $2 \
+                       AND lease_expires_at > NOW()",
+                )
+                .bind(claim.id)
+                .bind(claim.claim_token)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                if changed.rows_affected() == 1 {
+                    Self::cascade_terminal_descendants(
+                        &mut tx,
+                        claim.id,
+                        "parent_handoff_unresolved",
+                    )
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO outbox_terminal_events
+                             (creator_id, invoice_id, outbox_id, event_class, reason)
+                         SELECT creator_id, invoice_id, id, 'handoff_unresolved',
+                                'handoff_unresolved'
+                         FROM outbox WHERE id = $1",
+                    )
+                    .bind(claim.id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)?;
+                }
+                tx.commit()
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)?;
+                return Ok(if changed.rows_affected() == 1 {
+                    HandoffRelease::Unresolved
+                } else {
+                    HandoffRelease::Stale
+                });
+            }
+        }
+        let changed = sqlx::query(
+            "UPDATE outbox \
+             SET status = 'retryable', error_class = $1, \
+                 next_attempt_at = NOW() + ($2 * INTERVAL '1 second'), \
+                 lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, \
+                 updated_at = NOW() \
+             WHERE id = $3 AND status = 'handoff_started' AND claim_token = $4 \
+               AND lease_expires_at > NOW()",
+        )
+        .bind(error_class.as_str())
+        .bind(seconds)
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(if changed.rows_affected() == 1 {
+            HandoffRelease::Retryable
+        } else {
+            HandoffRelease::Stale
+        })
     }
 
     /// Claims attributable handed-off rows independently from enqueue work.
@@ -252,7 +967,7 @@ impl OutboxStore {
                  lease_expires_at = NOW() + ($3 * INTERVAL '1 second'), \
                  attempt_count = o.attempt_count + 1, updated_at = NOW() \
              FROM candidates WHERE o.id = candidates.id \
-             RETURNING o.id, o.creator_id, o.attempt_count, o.claim_token, \
+             RETURNING o.id, o.creator_id, o.invoice_id, o.attempt_count, o.claim_token, \
                  o.sdk_outbound_message_id",
         )
         .bind(limit)
@@ -279,7 +994,13 @@ impl OutboxStore {
         DeliveryIntentV1::decode(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)
     }
 
-    /// Atomically associates the exact public-SDK result while the enqueue fence is live.
+    /// Atomically associates the exact public-SDK result while the handoff
+    /// fence is live. The fence (`handoff_started`) is the linearization
+    /// point: cancellation deliberately preserves fenced rows, so this
+    /// transition intentionally does not re-check invoice finality — an
+    /// SDK effect emitted after a committed fence is attributed here even
+    /// when the invoice finalized afterwards, keeping the externally visible
+    /// effect auditable instead of orphaned.
     pub async fn mark_handed_off(
         &self,
         claim: &ClaimedOutbox,
@@ -298,7 +1019,8 @@ impl OutboxStore {
             "UPDATE outbox SET status = 'handed_off', sdk_outbound_message_id = $1, \
                  sdk_event_id = $2, sdk_payment_request_id = $3, error_class = NULL, \
                  lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = NOW() \
-             WHERE id = $4 AND status = 'leased' AND claim_token = $5 AND lease_expires_at > NOW()",
+             WHERE id = $4 AND status = 'handoff_started' AND claim_token = $5 \
+               AND lease_expires_at > NOW()",
         )
         .bind(outbound)
         .bind(event_id)
@@ -318,17 +1040,50 @@ impl OutboxStore {
     }
 
     /// Retains an attributable handoff whose SDK state cannot be reconciled safely.
+    /// The transition and its durable terminal event commit in one
+    /// transaction, so permanent reconciliation failure carries the same
+    /// retained evidence as every other terminal transition; a replayed CAS
+    /// matches zero rows and inserts no second event.
     pub async fn mark_reconciliation_permanently_failed(
         &self,
         claim: &ClaimedHandoff,
     ) -> Result<bool, PersistenceError> {
-        self.reconciliation_transition(
-            claim,
-            "permanently_failed",
-            Some("permanent_sdk_reconciliation"),
-            None,
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let changed = sqlx::query(
+            "UPDATE outbox SET status = 'permanently_failed', \
+                 error_class = 'permanent_sdk_reconciliation', \
+                 failure_reason = 'permanent_sdk_reconciliation', \
+                 lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = NOW() \
+             WHERE id = $1 AND status = 'handed_off' \
+               AND sdk_outbound_message_id = $2 AND claim_token = $3 AND lease_expires_at > NOW()",
         )
+        .bind(claim.id)
+        .bind(&claim.sdk_outbound_message_id)
+        .bind(claim.claim_token)
+        .execute(&mut *tx)
         .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if changed.rows_affected() == 1 {
+            sqlx::query(
+                "INSERT INTO outbox_terminal_events
+                     (creator_id, invoice_id, outbox_id, event_class, reason)
+                 SELECT creator_id, invoice_id, id, 'permanent_sdk_reconciliation',
+                        'permanent_sdk_reconciliation'
+                 FROM outbox WHERE id = $1",
+            )
+            .bind(claim.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(changed.rows_affected() == 1)
     }
 
     /// Releases a still-pending reconciliation claim with bounded retry delay.
@@ -377,22 +1132,84 @@ impl OutboxStore {
         error_class: Option<&str>,
         delay: Option<i64>,
     ) -> Result<bool, PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         let changed = sqlx::query(
             "UPDATE outbox \
              SET status = $1, error_class = $2, \
                  next_attempt_at = CASE WHEN $3::BIGINT IS NULL THEN next_attempt_at ELSE NOW() + ($3 * INTERVAL '1 second') END, \
                  lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = NOW() \
-             WHERE id = $4 AND status = 'leased' AND claim_token = $5 AND lease_expires_at > NOW()",
+             WHERE id = $4 AND status IN ('leased', 'handoff_started') \
+               AND claim_token = $5 AND lease_expires_at > NOW()",
         )
         .bind(status)
         .bind(error_class)
         .bind(delay)
         .bind(claim.id)
         .bind(claim.claim_token)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        if changed.rows_affected() == 1 && status == "permanently_failed" {
+            Self::cascade_terminal_descendants(&mut tx, claim.id, "parent_permanently_failed")
+                .await?;
+            sqlx::query(
+                "INSERT INTO outbox_terminal_events
+                     (creator_id, invoice_id, outbox_id, event_class, reason)
+                 SELECT creator_id, invoice_id, id, COALESCE(error_class, 'permanent'),
+                        COALESCE(failure_reason, 'permanent')
+                 FROM outbox WHERE id = $1",
+            )
+            .bind(claim.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         Ok(changed.rows_affected() == 1)
+    }
+
+    async fn cascade_terminal_descendants(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        parent_id: Uuid,
+        reason: &'static str,
+    ) -> Result<(), PersistenceError> {
+        sqlx::query(
+            "WITH RECURSIVE descendants AS (
+                 SELECT id FROM outbox WHERE depends_on_id = $1
+                 UNION ALL
+                 SELECT child.id
+                 FROM outbox child
+                 JOIN descendants parent ON child.depends_on_id = parent.id
+             ), changed AS (
+                 UPDATE outbox
+                 SET status = 'permanently_failed',
+                     error_class = 'dependency_failed',
+                     failure_reason = $2,
+                     lease_owner = NULL,
+                     claim_token = NULL,
+                     lease_expires_at = NULL,
+                     updated_at = NOW()
+                 WHERE id IN (SELECT id FROM descendants)
+                   AND status IN ('prepared', 'queued', 'leased', 'retryable')
+                 RETURNING creator_id, invoice_id, id, error_class, failure_reason
+             )
+             INSERT INTO outbox_terminal_events
+                 (creator_id, invoice_id, outbox_id, event_class, reason)
+             SELECT creator_id, invoice_id, id, error_class, failure_reason
+             FROM changed",
+        )
+        .bind(parent_id)
+        .bind(reason)
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(())
     }
 
     async fn reconciliation_transition(
@@ -481,6 +1298,7 @@ mod tests {
         let claim = ClaimedHandoff {
             id: claim_id,
             creator_id,
+            invoice_id: Some(Uuid::new_v4()),
             attempt_count: 8,
             claim_token: Uuid::new_v4(),
             sdk_outbound_message_id: outbound_id.into(),
@@ -493,6 +1311,7 @@ mod tests {
             claim_token: Uuid::new_v4(),
             creator_lookup_hash: vec![3; 32],
             intent_envelope: vec![4; 64],
+            handoff_sdk_invocation_started: false,
         };
 
         let result_debug = format!("{result:?}");

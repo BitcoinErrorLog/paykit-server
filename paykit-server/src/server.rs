@@ -23,7 +23,7 @@ use crate::{
         PostgresStorageAdapter, SdkStateStore, StackIdentity,
     },
     real_setup::RealSetupCompleter,
-    runtime::{PostgresDependency, Runtime, operational_router},
+    runtime::{OutboxTerminalHealth, PostgresDependency, Runtime, operational_router},
     setup::{SetupLimits, SetupService, SystemClock},
     setup_orchestration::PubkyCompanionRelay,
     workers::{
@@ -31,7 +31,10 @@ use crate::{
             ElectrumAdapter, ElectrumPort, ObservationBackend, ObserverError, ObserverLeadership,
             ObserverPolicy, RequestLimiter, observation_loop,
         },
-        outbox::{ProcessingHealth, process_claim_with_health, process_reconciliation_with_health},
+        outbox::{
+            ProcessingHealth, process_claim_with_health, process_fence_recovery_with_health,
+            process_reconciliation_with_health,
+        },
     },
 };
 use async_trait::async_trait;
@@ -79,6 +82,8 @@ struct WorkerComponents {
     outbox_lease_duration: Duration,
     outbox_retry_initial: Duration,
     outbox_retry_max: Duration,
+    link_establishment_max_attempts: i32,
+    link_establishment_max_age: Duration,
     electrum_policy: ObserverPolicy,
     sentinel_policy: crate::sentinel::SentinelPolicy,
 }
@@ -199,6 +204,16 @@ impl Server {
             Arc::new(PostgresDependency::new(pool.clone())),
             64,
         ));
+        // The creation-facing store alarms (non-secret, telemetry only) when
+        // a new invoice's remaining request lifetime is shorter than the
+        // configured link-establishment max age; the exact ceiling values are
+        // exposed on /health/ready for the parent's deployment preflight.
+        let invoices = invoices
+            .with_outbox_ceiling_alarm(config.outbox.link_establishment_max_age, runtime.metrics());
+        runtime.set_outbox_link_establishment_ceiling(
+            config.outbox.link_establishment_max_attempts,
+            config.outbox.link_establishment_max_age,
+        );
         let invoice_service = Arc::new(
             CreateInvoiceService::new(
                 Arc::new(CreatorSessionValidator {
@@ -375,6 +390,11 @@ impl Server {
             outbox_lease_duration: config.outbox.lease_duration,
             outbox_retry_initial: config.outbox.retry_initial,
             outbox_retry_max: config.outbox.retry_max,
+            link_establishment_max_attempts: i32::try_from(
+                config.outbox.link_establishment_max_attempts,
+            )
+            .expect("validated link-establishment attempt ceiling fits i32"),
+            link_establishment_max_age: config.outbox.link_establishment_max_age,
             electrum_policy: ObserverPolicy {
                 poll_interval: config.electrum.poll_interval,
                 max_requests_per_tick: config.electrum.max_requests_per_tick,
@@ -547,6 +567,15 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
         if !runtime.may_start_worker_claim() {
             break;
         }
+        if crate::workers::outbox::publish_claim_fairness_metrics(
+            &workers.outbox,
+            &runtime.metrics(),
+        )
+        .await
+        .is_err()
+        {
+            runtime.set_outbox_enqueue_available(false);
+        }
         let claims = match workers
             .outbox
             .claim(
@@ -574,9 +603,35 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                     workers.outbox_retry_max,
                     claim.attempt_count(),
                 );
+                if workers
+                    .outbox
+                    .exhaust_claim_if_due(
+                        &claim,
+                        workers.link_establishment_max_attempts,
+                        workers.link_establishment_max_age,
+                    )
+                    .await?
+                {
+                    return Ok((true, ProcessingHealth::PermanentFailure));
+                }
+                if workers.outbox.invoice_is_final(claim.invoice_id()).await? {
+                    return workers
+                        .outbox
+                        .mark_final_invoice_failed(&claim)
+                        .await
+                        .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
+                }
                 match creator_adapter(&workers, claim.creator_id()).await {
                     Ok(adapter) => {
-                        process_claim_with_health(&workers.outbox, &adapter, &claim, delay).await
+                        process_claim_with_health(
+                            &workers.outbox,
+                            &adapter,
+                            &claim,
+                            delay,
+                            workers.link_establishment_max_attempts,
+                            workers.link_establishment_max_age,
+                        )
+                        .await
                     }
                     Err(AdapterBuildError::Permanent) => workers
                         .outbox
@@ -603,6 +658,61 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                 Err(_) => panic!("owned outbox claim task exited unexpectedly"),
             }
         }
+        // Dedicated fenced-recovery pass (migration 0023 rule 2): expired
+        // `handoff_started` rows are claimed regardless of invoice finality
+        // and terminalize as `handoff_unresolved` without ever re-running
+        // the SDK effect or resolving/attributing durable SDK state.
+        let recovery_claims = match workers
+            .outbox
+            .claim_fence_recovery(
+                owner,
+                workers.outbox_batch_size,
+                workers.outbox_lease_duration,
+            )
+            .await
+        {
+            Ok(claims) => claims,
+            Err(_) => {
+                outbox_available = false;
+                Vec::new()
+            }
+        };
+        let mut recovery_batch = JoinSet::new();
+        for claim in recovery_claims {
+            let workers = workers.clone();
+            recovery_batch.spawn(async move {
+                let delay = retry_delay(
+                    workers.outbox_retry_initial,
+                    workers.outbox_retry_max,
+                    claim.attempt_count(),
+                );
+                match creator_adapter(&workers, claim.creator_id()).await {
+                    Ok(adapter) => {
+                        process_fence_recovery_with_health(&workers.outbox, &adapter, &claim).await
+                    }
+                    Err(AdapterBuildError::Permanent) => workers
+                        .outbox
+                        .mark_handoff_unresolved(&claim)
+                        .await
+                        .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
+                    Err(AdapterBuildError::Unavailable) => workers
+                        .outbox
+                        .retry_fence_recovery(&claim, delay)
+                        .await
+                        .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+                }
+            });
+        }
+        while let Some(result) = recovery_batch.join_next().await {
+            match result {
+                Ok(Ok((_, ProcessingHealth::Available))) => {}
+                Ok(Ok((_, ProcessingHealth::Retryable | ProcessingHealth::PermanentFailure))) => {
+                    delivery_available = false;
+                }
+                Ok(Err(_)) => outbox_available = false,
+                Err(_) => panic!("owned outbox fence-recovery task exited unexpectedly"),
+            }
+        }
         match workers.outbox.delivery_available().await {
             Ok(persisted_available) => {
                 delivery_available &= persisted_available;
@@ -611,6 +721,19 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                 delivery_available = false;
                 outbox_available = false;
             }
+        }
+        if let Ok(health) = workers.outbox.terminal_failure_health().await {
+            runtime
+                .metrics()
+                .set_outbox_terminal_health(health.count, health.oldest_age_seconds);
+            runtime
+                .metrics()
+                .observe_outbox_terminal_transitions(health.transitions);
+            runtime.set_outbox_terminal_health(OutboxTerminalHealth {
+                count: health.count,
+                oldest_age_seconds: health.oldest_age_seconds,
+                by_class: health.by_class,
+            });
         }
         runtime.set_paykit_enqueue_available(delivery_available);
         runtime.set_outbox_enqueue_available(outbox_available);

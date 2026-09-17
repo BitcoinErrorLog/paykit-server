@@ -1,6 +1,7 @@
 //! Process lifecycle, dependency readiness, capacity admission, and server shutdown.
 
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
@@ -294,6 +295,22 @@ pub struct Readiness {
     pub bitcoin_creation_enabled: bool,
     pub paykit_delivery: ComponentState,
     pub outbox: ComponentState,
+    pub outbox_terminal_failure_count: i64,
+    pub outbox_oldest_terminal_failure_age_seconds: Option<i64>,
+    pub outbox_terminal_failures_by_class: BTreeMap<String, i64>,
+    /// The active configured link-establishment ceilings. This server has no
+    /// fiat payment window setting, so the deployment relation
+    /// `link_establishment_max_age <= FIAT_PAYMENT_WINDOW_SECONDS` is proven
+    /// mechanically by the parent reading these exact values here.
+    pub outbox_link_establishment_max_attempts: u32,
+    pub outbox_link_establishment_max_age_seconds: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct OutboxTerminalHealth {
+    pub count: i64,
+    pub oldest_age_seconds: Option<i64>,
+    pub by_class: BTreeMap<String, i64>,
 }
 
 #[async_trait]
@@ -355,6 +372,8 @@ pub struct Runtime {
     paykit_reconciliation: AtomicU8,
     outbox_enqueue: AtomicU8,
     outbox_reconciliation: AtomicU8,
+    outbox_terminal_health: Mutex<OutboxTerminalHealth>,
+    outbox_link_establishment_ceiling: Mutex<(u32, u64)>,
     metrics: Arc<Metrics>,
     electrum_request_limiter: Mutex<RequestLimiter>,
 }
@@ -384,6 +403,8 @@ impl Runtime {
             paykit_reconciliation: AtomicU8::new(NOT_READY),
             outbox_enqueue: AtomicU8::new(NOT_READY),
             outbox_reconciliation: AtomicU8::new(NOT_READY),
+            outbox_terminal_health: Mutex::new(OutboxTerminalHealth::default()),
+            outbox_link_establishment_ceiling: Mutex::new((0, 0)),
             metrics,
             // Fail-closed until startup installs the configured limiter: an
             // empty, non-refilling bucket admits nothing, so no caller can
@@ -526,6 +547,21 @@ impl Runtime {
         self.set_outbox_enqueue_available(available);
         self.set_outbox_reconciliation_available(available);
     }
+    pub fn set_outbox_terminal_health(&self, health: OutboxTerminalHealth) {
+        *self
+            .outbox_terminal_health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = health;
+    }
+    /// Publishes the exact configured link-establishment ceilings so the
+    /// parent's deployment preflight can prove the lifetime relation against
+    /// its own fiat payment window mechanically.
+    pub fn set_outbox_link_establishment_ceiling(&self, max_attempts: u32, max_age: Duration) {
+        *self
+            .outbox_link_establishment_ceiling
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = (max_attempts, max_age.as_secs());
+    }
     pub(crate) fn set_paykit_enqueue_available(&self, available: bool) {
         self.paykit_enqueue
             .store(if available { READY } else { DEGRADED }, Ordering::Release);
@@ -595,6 +631,15 @@ impl Runtime {
             ComponentState::from_atomic(self.outbox_enqueue.load(Ordering::Acquire)),
             ComponentState::from_atomic(self.outbox_reconciliation.load(Ordering::Acquire)),
         );
+        let terminal_health = self
+            .outbox_terminal_health
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let (link_establishment_max_attempts, link_establishment_max_age_seconds) = *self
+            .outbox_link_establishment_ceiling
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let status = if postgres == ComponentState::NotReady
             || [electrum, paykit_delivery, outbox]
                 .into_iter()
@@ -626,6 +671,11 @@ impl Runtime {
                 && postgres == ComponentState::Ready,
             paykit_delivery,
             outbox,
+            outbox_terminal_failure_count: terminal_health.count,
+            outbox_oldest_terminal_failure_age_seconds: terminal_health.oldest_age_seconds,
+            outbox_terminal_failures_by_class: terminal_health.by_class,
+            outbox_link_establishment_max_attempts: link_establishment_max_attempts,
+            outbox_link_establishment_max_age_seconds: link_establishment_max_age_seconds,
         }
     }
     pub(crate) async fn wait_for_idle(&self) {

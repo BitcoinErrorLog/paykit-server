@@ -282,4 +282,7 @@ pub enum PersistenceError {
     /// resolution. A replay of the SAME resolution is not an error.
     #[error("invoice is already resolved with a different resolution")]
     InvoiceAlreadyResolved,
+    /// An abandoned resolution lost the invoice-row payment observation race.
+    #[error("payment was observed before abandonment could commit")]
+    PaymentObserved,
 }

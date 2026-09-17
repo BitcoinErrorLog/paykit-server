@@ -192,6 +192,8 @@ batch_size = 16
 lease_duration = "30s"
 retry_initial = "1s"
 retry_max = "5m"
+link_establishment_max_attempts = 20
+link_establishment_max_age = "1h"
 
 [limits]
 request_body_bytes = 16384

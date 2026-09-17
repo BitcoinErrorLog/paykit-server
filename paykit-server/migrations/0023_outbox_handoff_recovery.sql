@@ -1,0 +1,41 @@
+-- Closed recovery rule for `handoff_started` (HF-1). The SDK mints every
+-- outbound identifier inside its own storage transaction and accepts no
+-- caller-supplied idempotency key: `propose_payment_request` generates
+-- `EventId::new_v4()`/`PaymentRequestId::new_v4()`
+-- (paykit-sdk/src/runtime/payment_requests.rs:313-314) and both enqueue
+-- entrypoints assign `outbound_message_id` from a storage-internal counter
+-- (paykit-sdk/src/storage/records.rs:336, `OutboundPrivateMessageRecord::
+-- from_new`; paykit-sdk/src/runtime/private_lists.rs:60 and
+-- paykit-sdk/src/runtime/payment_requests.rs:308 take no idempotency
+-- parameter), so identifiers cannot be pre-minted or derived from
+-- (invoice_id, generation_id, attempt). Recovery therefore never re-runs
+-- the SDK effect and never resolves or attributes durable SDK state:
+--
+-- 1. The worker commits `handoff_sdk_invocation_started = TRUE` under the
+--    live fence (exact claim token, unexpired lease) in its own transaction
+--    AFTER the fence and BEFORE the SDK call. This is the durable
+--    pre-effect identity the SDK API permits.
+-- 2. An expired `handoff_started` row is claimable ONLY by the dedicated
+--    fenced-recovery path (`claim_fence_recovery`), regardless of invoice
+--    finality; the ordinary claim path never re-admits a fenced row.
+-- 3. Recovery never resolves, attributes, or re-runs an SDK effect. BOTH
+--    marker states terminalize the row as `handoff_unresolved` with
+--    exactly one durable terminal event and zero SDK calls; the static
+--    event/failure reason distinguishes them: `sdk_not_invoked` when the
+--    marker is FALSE (the effect is provably absent) and
+--    `sdk_invoked_unattributed` when it is TRUE (an effect may exist in
+--    durable SDK state but is never attributed automatically — endpoint
+--    identifier sets are not invoice-unique, so automatic attribution
+--    could false-match another invoice's publication; an operator
+--    reconciles the row by hand via
+--    docs/outbox-terminal-acknowledgement.md). The marker write itself is
+--    retained as that operator's evidence.
+-- 4. `handoff_started -> retryable` is forbidden when the invoice is final
+--    at transition time: the retryable branch checks finality under the
+--    invoice row lock and, when final, terminalizes as `handoff_unresolved`
+--    (one terminal event, descendants cascaded) instead.
+-- 5. `delivery_available()` never counts a final-invoice
+--    `handoff_started`/`retryable` row as active work.
+
+ALTER TABLE outbox
+    ADD COLUMN handoff_sdk_invocation_started BOOLEAN NOT NULL DEFAULT FALSE;

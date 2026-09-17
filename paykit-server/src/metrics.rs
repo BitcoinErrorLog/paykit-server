@@ -1,6 +1,6 @@
 //! Identifier-free Prometheus metrics for the process runtime.
 
-use std::sync::Mutex;
+use std::{collections::BTreeMap, sync::Mutex};
 
 use prometheus_client::{
     encoding::{EncodeLabelSet, text::encode},
@@ -18,6 +18,12 @@ use prometheus_client::{
 /// never caller input — so cardinality is bounded at three series.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
 pub struct AddressFailureLabels {
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct OutboxTransitionLabels {
+    class: &'static str,
     reason: &'static str,
 }
 
@@ -44,6 +50,13 @@ pub struct Metrics {
     payment_states: Gauge,
     runtime_active: Gauge,
     session_validation_results: Counter,
+    outbox_terminal_transitions: Family<OutboxTransitionLabels, Counter>,
+    outbox_terminal_transition_counts: Mutex<BTreeMap<(String, String), i64>>,
+    outbox_terminal_failure_count: Gauge,
+    outbox_terminal_oldest_age_seconds: Gauge,
+    outbox_reader_saturated: Counter,
+    outbox_active_partitions: Gauge,
+    outbox_ceiling_exceeds_invoice: Counter,
 }
 
 impl Metrics {
@@ -66,6 +79,12 @@ impl Metrics {
         let payment_states = Gauge::default();
         let runtime_active = Gauge::default();
         let session_validation_results = Counter::default();
+        let outbox_terminal_transitions = Family::default();
+        let outbox_terminal_failure_count = Gauge::default();
+        let outbox_terminal_oldest_age_seconds = Gauge::default();
+        let outbox_reader_saturated = Counter::default();
+        let outbox_active_partitions = Gauge::default();
+        let outbox_ceiling_exceeds_invoice = Counter::default();
         registry.register(
             "paykit_http_requests",
             "Completed HTTP requests.",
@@ -154,6 +173,39 @@ impl Metrics {
             "Session validation result count.",
             session_validation_results.clone(),
         );
+        registry.register(
+            "paykit_outbox_terminal_transitions",
+            "Terminal outbox transitions by closed class and reason.",
+            outbox_terminal_transitions.clone(),
+        );
+        registry.register(
+            "paykit_outbox_terminal_failure_count",
+            "Current retained terminal outbox failure count.",
+            outbox_terminal_failure_count.clone(),
+        );
+        registry.register(
+            "paykit_outbox_terminal_oldest_age_seconds",
+            "Age of the oldest retained terminal outbox failure.",
+            outbox_terminal_oldest_age_seconds.clone(),
+        );
+        registry.register(
+            "paykit_outbox_reader_saturated",
+            "Reader-partition flooding observations: partitions whose due \
+             eligible rows exceeded what one claim pass could admit (one row \
+             per partition without an unexpired lease, zero with one).",
+            outbox_reader_saturated.clone(),
+        );
+        registry.register(
+            "paykit_outbox_active_partitions",
+            "Current number of reader partitions with an unexpired lease.",
+            outbox_active_partitions.clone(),
+        );
+        registry.register(
+            "paykit_outbox_ceiling_exceeds_invoice",
+            "Invoices whose remaining request lifetime at creation was shorter \
+             than the configured link-establishment max age.",
+            outbox_ceiling_exceeds_invoice.clone(),
+        );
         Self {
             registry: Mutex::new(registry),
             http_requests,
@@ -173,6 +225,13 @@ impl Metrics {
             payment_states,
             runtime_active,
             session_validation_results,
+            outbox_terminal_transitions,
+            outbox_terminal_transition_counts: Mutex::new(BTreeMap::new()),
+            outbox_terminal_failure_count,
+            outbox_terminal_oldest_age_seconds,
+            outbox_reader_saturated,
+            outbox_active_partitions,
+            outbox_ceiling_exceeds_invoice,
         }
     }
 
@@ -228,6 +287,39 @@ impl Metrics {
     pub fn session_validation_result(&self) {
         self.session_validation_results.inc();
     }
+    pub fn observe_outbox_terminal_transitions(&self, counts: Vec<(String, String, i64)>) {
+        let mut observed = self
+            .outbox_terminal_transition_counts
+            .lock()
+            .expect("terminal transition counts mutex is not poisoned");
+        for (class, reason, count) in counts {
+            let previous = observed.entry((class.clone(), reason.clone())).or_default();
+            let delta = count.saturating_sub(*previous);
+            if delta > 0 {
+                self.outbox_terminal_transitions
+                    .get_or_create(&OutboxTransitionLabels {
+                        class: terminal_class_label(&class),
+                        reason: terminal_reason_label(&reason),
+                    })
+                    .inc_by(u64::try_from(delta).expect("positive terminal count fits u64"));
+                *previous = count;
+            }
+        }
+    }
+    pub fn set_outbox_terminal_health(&self, count: i64, oldest_age_seconds: Option<i64>) {
+        self.outbox_terminal_failure_count.set(count);
+        self.outbox_terminal_oldest_age_seconds
+            .set(oldest_age_seconds.unwrap_or_default().max(0));
+    }
+    pub fn outbox_reader_saturated(&self, flooded_partitions: u64) {
+        self.outbox_reader_saturated.inc_by(flooded_partitions);
+    }
+    pub fn set_outbox_active_partitions(&self, value: i64) {
+        self.outbox_active_partitions.set(value.max(0));
+    }
+    pub fn outbox_ceiling_exceeds_invoice(&self) {
+        self.outbox_ceiling_exceeds_invoice.inc();
+    }
     pub fn encode(&self) -> Result<String, std::fmt::Error> {
         let mut text = String::new();
         encode(
@@ -241,8 +333,119 @@ impl Metrics {
     }
 }
 
+/// The terminal-failure alert contract (design §4), pinned here so the
+/// exported values and the alerting expressions cannot drift apart:
+/// warning on `increase(paykit_outbox_terminal_transitions_total[5m]) > 0`;
+/// critical when the oldest UNACKNOWLEDGED terminal failure is older than
+/// fifteen minutes or five transitions occur within five minutes.
+pub const TERMINAL_ALERT_WINDOW: &str = "5m";
+pub const TERMINAL_ALERT_CRITICAL_AGE_SECONDS: i64 = 15 * 60;
+pub const TERMINAL_ALERT_CRITICAL_TRANSITIONS_PER_WINDOW: u64 = 5;
+
+/// Warning: any terminal transition inside the alert window.
+pub fn terminal_alert_warning(transitions_in_window: u64) -> bool {
+    transitions_in_window > 0
+}
+
+/// Critical: an unacknowledged terminal failure is older than the critical
+/// age, or the window saw at least the critical number of transitions.
+/// `oldest_unacknowledged_age_seconds` is `None` when every terminal event
+/// is acknowledged, which clears the age leg.
+pub fn terminal_alert_critical(
+    oldest_unacknowledged_age_seconds: Option<i64>,
+    transitions_in_window: u64,
+) -> bool {
+    oldest_unacknowledged_age_seconds.is_some_and(|age| age > TERMINAL_ALERT_CRITICAL_AGE_SECONDS)
+        || transitions_in_window >= TERMINAL_ALERT_CRITICAL_TRANSITIONS_PER_WINDOW
+}
+
+fn terminal_class_label(class: &str) -> &'static str {
+    match class {
+        "link_establishment_exhausted" => "link_establishment_exhausted",
+        "dependency_failed" => "dependency_failed",
+        "permanent" => "permanent",
+        "invoice_finalized" => "invoice_finalized",
+        "invoice_voided" => "invoice_voided",
+        "invoice_abandoned" => "invoice_abandoned",
+        "permanent_sdk_reconciliation" => "permanent_sdk_reconciliation",
+        "handoff_unresolved" => "handoff_unresolved",
+        _ => "unknown",
+    }
+}
+
+fn terminal_reason_label(reason: &str) -> &'static str {
+    match reason {
+        "attempt_ceiling" => "attempt_ceiling",
+        "age_ceiling" => "age_ceiling",
+        "parent_link_establishment_exhausted" => "parent_link_establishment_exhausted",
+        "parent_permanently_failed" => "parent_permanently_failed",
+        "permanent" => "permanent",
+        "invoice_finalized" => "invoice_finalized",
+        "invoice_voided" => "invoice_voided",
+        "invoice_abandoned" => "invoice_abandoned",
+        "permanent_sdk_reconciliation" => "permanent_sdk_reconciliation",
+        "handoff_unresolved" => "handoff_unresolved",
+        "parent_handoff_unresolved" => "parent_handoff_unresolved",
+        "sdk_not_invoked" => "sdk_not_invoked",
+        "sdk_invoked_unattributed" => "sdk_invoked_unattributed",
+        _ => "unknown",
+    }
+}
+
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_alert_warning_is_any_transition_in_window() {
+        assert!(!terminal_alert_warning(0));
+        assert!(terminal_alert_warning(1));
+        assert!(terminal_alert_warning(4));
+        assert!(terminal_alert_warning(5));
+    }
+
+    #[test]
+    fn terminal_alert_critical_uses_unacknowledged_age_and_window_count() {
+        // Nothing unacknowledged and a quiet window: no critical signal.
+        assert!(!terminal_alert_critical(None, 0));
+        assert!(!terminal_alert_critical(None, 4));
+        // Age leg: only an unacknowledged oldest age beyond fifteen minutes.
+        assert!(!terminal_alert_critical(
+            Some(TERMINAL_ALERT_CRITICAL_AGE_SECONDS),
+            0
+        ));
+        assert!(terminal_alert_critical(
+            Some(TERMINAL_ALERT_CRITICAL_AGE_SECONDS + 1),
+            0
+        ));
+        // Count leg: five transitions in five minutes.
+        assert!(terminal_alert_critical(None, 5));
+        assert!(terminal_alert_critical(Some(0), 5));
+    }
+
+    #[test]
+    fn terminal_labels_cover_the_handoff_unresolved_vocabulary() {
+        // `handoff_unresolved` appears in the alert contract with its own
+        // class label, never folded into `unknown`.
+        assert_eq!(
+            terminal_class_label("handoff_unresolved"),
+            "handoff_unresolved"
+        );
+        for reason in [
+            "handoff_unresolved",
+            "parent_handoff_unresolved",
+            "sdk_not_invoked",
+            "sdk_invoked_unattributed",
+        ] {
+            assert_eq!(terminal_reason_label(reason), reason);
+        }
+        assert_eq!(terminal_class_label("unlisted_class"), "unknown");
+        assert_eq!(terminal_reason_label("unlisted_reason"), "unknown");
     }
 }

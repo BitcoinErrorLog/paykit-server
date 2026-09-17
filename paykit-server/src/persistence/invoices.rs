@@ -13,7 +13,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    application::payment_status::PersistedPaymentStatus,
+    application::payment_status::{DeliveryStatus, PersistedPaymentStatus},
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     bitcoin::{
         DirectBinding, ObservationAction, ObservationTarget, PlannedObservation, TrackedOutput,
@@ -505,6 +505,29 @@ impl PgObserverLeadership {
 pub struct InvoiceStore {
     pool: PgPool,
     crypto: Arc<Crypto>,
+    outbox_ceiling_alarm: Option<OutboxCeilingAlarm>,
+}
+
+/// Non-secret creation-time alarm: the configured link-establishment max age
+/// is compared against each new invoice's remaining request lifetime, and
+/// `paykit_outbox_ceiling_exceeds_invoice_total` increments when the ceiling
+/// exceeds it. Telemetry only — the exhaustion predicate is unchanged.
+#[derive(Clone)]
+struct OutboxCeilingAlarm {
+    link_establishment_max_age: std::time::Duration,
+    metrics: Arc<crate::metrics::Metrics>,
+}
+
+impl std::fmt::Debug for OutboxCeilingAlarm {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OutboxCeilingAlarm")
+            .field(
+                "link_establishment_max_age",
+                &self.link_establishment_max_age,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl InvoiceStore {
@@ -512,6 +535,30 @@ impl InvoiceStore {
         Self {
             pool: pool.clone(),
             crypto,
+            outbox_ceiling_alarm: None,
+        }
+    }
+
+    /// Installs the creation-time ceiling alarm with the exact configured
+    /// link-establishment max age.
+    pub fn with_outbox_ceiling_alarm(
+        mut self,
+        link_establishment_max_age: std::time::Duration,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Self {
+        self.outbox_ceiling_alarm = Some(OutboxCeilingAlarm {
+            link_establishment_max_age,
+            metrics,
+        });
+        self
+    }
+
+    fn observe_ceiling_against_lifetime(&self, expires_at: time::OffsetDateTime) {
+        if let Some(alarm) = &self.outbox_ceiling_alarm {
+            let remaining_seconds = (expires_at - time::OffsetDateTime::now_utc()).whole_seconds();
+            if remaining_seconds < alarm.link_establishment_max_age.as_secs() as i64 {
+                alarm.metrics.outbox_ceiling_exceeds_invoice();
+            }
         }
     }
 
@@ -971,6 +1018,109 @@ impl InvoiceStore {
         row.map(PersistedPaymentStatus::try_from).transpose()
     }
 
+    pub async fn delivery_status(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &crate::domain::locks::BundleId,
+    ) -> Result<Option<DeliveryStatus>, PersistenceError> {
+        let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        let bundle_hash = self.crypto.lookup_hash(bundle_id.to_string().as_bytes());
+        Ok(sqlx::query_as::<_, (Uuid, i64, String)>(
+            "SELECT invoices.id, invoices.delivery_revision,
+                    CASE
+                      -- Shape validation precedes every precedence rule: any
+                      -- malformed shape (missing/extra invoice-scoped row,
+                      -- mixed or non-invoice generation, malformed dependency
+                      -- link, unknown status) fails closed as contract_error
+                      -- even when a valid failed pair exists. The current
+                      -- generation IS the invoice id: a same-wrong-UUID pair
+                      -- whose generation_id values equal each other but not
+                      -- invoices.id is malformed.
+                      WHEN (
+                        SELECT COUNT(*) FROM outbox
+                        WHERE invoice_id = invoices.id
+                      ) <> 2 THEN 'contract_error'
+                       WHEN (
+                        SELECT COUNT(*)
+                        FROM outbox request
+                        JOIN outbox endpoint ON endpoint.id = request.depends_on_id
+                        WHERE request.invoice_id = invoices.id
+                          AND endpoint.invoice_id = invoices.id
+                          AND endpoint.generation_id = request.generation_id
+                          AND request.generation_id = invoices.id
+                      ) <> 1 THEN 'contract_error'
+                      WHEN EXISTS (
+                        SELECT 1 FROM outbox
+                        WHERE invoice_id = invoices.id
+                          AND status NOT IN
+                            ('prepared', 'queued', 'leased', 'handoff_started',
+                             'retryable', 'handed_off', 'delivered', 'permanently_failed')
+                      ) THEN 'contract_error'
+                      WHEN invoices.baseline_state IN
+                        ('void_baseline_failed', 'void_prepare_expired',
+                         'void_cancelled', 'expired_final',
+                         'resolved_paid_manually', 'resolved_closed')
+                        THEN 'cancelled'
+                      WHEN EXISTS (
+                        SELECT 1
+                        FROM outbox request
+                        JOIN outbox endpoint ON endpoint.id = request.depends_on_id
+                        WHERE request.invoice_id = invoices.id
+                          AND endpoint.invoice_id = invoices.id
+                          AND endpoint.generation_id = request.generation_id
+                          AND (request.status = 'permanently_failed'
+                               OR endpoint.status = 'permanently_failed')
+                      ) THEN 'failed'
+                      WHEN EXISTS (
+                        SELECT 1
+                        FROM outbox request
+                        JOIN outbox endpoint ON endpoint.id = request.depends_on_id
+                        WHERE request.invoice_id = invoices.id
+                          AND endpoint.invoice_id = invoices.id
+                          AND endpoint.generation_id = request.generation_id
+                          AND request.status = 'delivered'
+                          AND endpoint.status = 'delivered'
+                      ) THEN 'delivered'
+                      WHEN EXISTS (
+                        SELECT 1
+                        FROM outbox request
+                        JOIN outbox endpoint ON endpoint.id = request.depends_on_id
+                        WHERE request.invoice_id = invoices.id
+                          AND endpoint.invoice_id = invoices.id
+                          AND endpoint.generation_id = request.generation_id
+                          AND request.status IN
+                            ('prepared', 'queued', 'leased', 'handoff_started',
+                             'retryable', 'handed_off', 'delivered')
+                          AND endpoint.status IN
+                            ('prepared', 'queued', 'leased', 'handoff_started',
+                             'retryable', 'handed_off', 'delivered')
+                      ) THEN 'pending_delivery'
+                      ELSE 'contract_error'
+                    END
+             FROM invoices
+             JOIN creators ON creators.id = invoices.creator_id
+             WHERE creators.creator_lookup_hash = $1
+               AND invoices.bundle_lookup_hash = $2
+             GROUP BY invoices.id, invoices.delivery_revision, invoices.baseline_state",
+        )
+        .bind(creator_hash.as_bytes().as_slice())
+        .bind(bundle_hash.as_bytes().as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?
+        .map(|(generation, revision, state)| DeliveryStatus {
+            generation,
+            revision,
+            state: match state.as_str() {
+                "cancelled" => "cancelled",
+                "failed" => "failed",
+                "delivered" => "delivered",
+                "pending_delivery" => "pending_delivery",
+                _ => "contract_error",
+            },
+        }))
+    }
+
     /// W1.14 sentinel admission plan, delegated to the creator store so the
     /// observer tick's single `ObservationBackend` covers invoice
     /// observation and sentinel work. See
@@ -1366,6 +1516,7 @@ impl InvoiceStore {
                 if flipped.rows_affected() != 1 {
                     return Err(PersistenceError::CorruptOrMissing);
                 }
+                terminalize_invoice_outbox(&mut tx, invoice_id, "invoice_voided").await?;
                 VoidWrite::Voided
             }
             "void_cancelled" | "void_prepare_expired" => VoidWrite::AlreadyVoid,
@@ -1411,19 +1562,23 @@ impl InvoiceStore {
             .begin()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
-        let row = sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT baseline_state, resolution FROM invoices WHERE id = $1 FOR UPDATE",
+        let row = sqlx::query_as::<_, (String, Option<String>, String)>(
+            "SELECT baseline_state, resolution, payment_status
+             FROM invoices WHERE id = $1 FOR UPDATE",
         )
         .bind(invoice_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        let Some((baseline_state, existing_resolution)) = row else {
+        let Some((baseline_state, existing_resolution, payment_status)) = row else {
             tx.commit()
                 .await
                 .map_err(|_| PersistenceError::Unavailable)?;
             return Ok(None);
         };
+        if resolution == "abandoned" && payment_status != "undetected" {
+            return Err(PersistenceError::PaymentObserved);
+        }
         // Idempotency on (invoice_id, resolution), covering both resolved
         // states and a metadata-only `expired_final` record: the same
         // resolution returns the existing record with zero writes; a
@@ -1460,6 +1615,9 @@ impl InvoiceStore {
                 .map_err(|_| PersistenceError::Unavailable)?;
                 if flipped.rows_affected() != 1 {
                     return Err(PersistenceError::CorruptOrMissing);
+                }
+                if resolution == "abandoned" {
+                    terminalize_invoice_outbox(&mut tx, invoice_id, "invoice_abandoned").await?;
                 }
                 ResolveWrite::Finalized
             }
@@ -2477,6 +2635,7 @@ impl InvoiceStore {
                         depends_on_id: None,
                         reader_assignment_id: Some(assignment_id),
                         status: outbox_status,
+                        generation_id: None,
                     },
                 )
                 .await?;
@@ -2556,7 +2715,7 @@ impl InvoiceStore {
         .await
         .map_err(|_| PersistenceError::Conflict)?;
         // Endpoint publication is invoice-scoped, not a reusable reader assignment.
-        sqlx::query("UPDATE outbox SET invoice_id = $1 WHERE id = $2")
+        sqlx::query("UPDATE outbox SET invoice_id = $1, generation_id = $1 WHERE id = $2")
             .bind(invoice_id)
             .bind(endpoint_publication_outbox_id)
             .execute(&mut *tx)
@@ -2582,6 +2741,7 @@ impl InvoiceStore {
                 depends_on_id: endpoint_publication_outbox_id,
                 reader_assignment_id: None,
                 status: outbox_status,
+                generation_id: Some(invoice_id),
             },
         )
         .await?;
@@ -2589,6 +2749,7 @@ impl InvoiceStore {
         tx.commit()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
+        self.observe_ceiling_against_lifetime(input.expires_at);
         Ok(AtomicInvoiceResult {
             invoice_id,
             payment_request_outbox_id,
@@ -2668,6 +2829,39 @@ struct OutboxInsert<'a> {
     depends_on_id: Option<Uuid>,
     reader_assignment_id: Option<Uuid>,
     status: &'static str,
+    generation_id: Option<Uuid>,
+}
+
+async fn terminalize_invoice_outbox(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    invoice_id: Uuid,
+    reason: &'static str,
+) -> Result<(), PersistenceError> {
+    sqlx::query(
+        "WITH terminalized AS (
+             UPDATE outbox
+             SET status = 'permanently_failed',
+                 error_class = $2,
+                 failure_reason = $2,
+                 lease_owner = NULL,
+                 claim_token = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = NOW()
+             WHERE invoice_id = $1
+               AND status IN ('prepared', 'queued', 'leased', 'retryable')
+             RETURNING creator_id, invoice_id, id
+         )
+         INSERT INTO outbox_terminal_events
+             (creator_id, invoice_id, outbox_id, event_class, reason)
+         SELECT creator_id, invoice_id, id, $2, $2
+         FROM terminalized",
+    )
+    .bind(invoice_id)
+    .bind(reason)
+    .execute(&mut **tx)
+    .await
+    .map_err(|_| PersistenceError::Unavailable)?;
+    Ok(())
 }
 
 async fn insert_outbox(
@@ -2676,8 +2870,8 @@ async fn insert_outbox(
 ) -> Result<(), PersistenceError> {
     sqlx::query(
         "INSERT INTO outbox \
-         (id, creator_id, invoice_id, intent_envelope, status, depends_on_id, reader_assignment_id) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+         (id, creator_id, invoice_id, intent_envelope, status, depends_on_id, reader_assignment_id, generation_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(row.id)
     .bind(row.creator_id)
@@ -2686,6 +2880,7 @@ async fn insert_outbox(
     .bind(row.status)
     .bind(row.depends_on_id)
     .bind(row.reader_assignment_id)
+    .bind(row.generation_id)
     .execute(&mut **tx)
     .await
     .map_err(|_| PersistenceError::Unavailable)?;

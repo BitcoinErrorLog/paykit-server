@@ -19,5 +19,9 @@ pub use invoices::{
     OBSERVER_LEADERSHIP_LOCK_KEY, PendingCandidate, PgObserverLeadership, ResolveWrite, VoidWrite,
 };
 pub use migrations::{MIGRATION_ADVISORY_LOCK_KEY, MigrationLock, run_migrations};
-pub use outbox::{ClaimedHandoff, ClaimedOutbox, HandoffResult, OutboxRetryClass, OutboxStore};
+pub use outbox::{
+    ClaimedHandoff, ClaimedOutbox, HANDOFF_UNRESOLVED_SDK_INVOKED_UNATTRIBUTED,
+    HANDOFF_UNRESOLVED_SDK_NOT_INVOKED, HandoffFenceSeam, HandoffRelease, HandoffResult,
+    OutboxRetryClass, OutboxStore, SeamHook,
+};
 pub use sdk_state::{PostgresStorageAdapter, SdkStateStore};
