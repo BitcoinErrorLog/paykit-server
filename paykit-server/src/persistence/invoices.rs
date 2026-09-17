@@ -1678,6 +1678,16 @@ impl InvoiceStore {
     /// `expired_final` and leaves `observation_plan()` for good. Exactly at
     /// `expires_at` the invoice is still `observing` (`now > expires_at`
     /// is the guard, not `>=`).
+    ///
+    /// Every invoice that reaches `expired_final` has its non-handed-off
+    /// outbox rows terminalized in the SAME transaction with the closed
+    /// `invoice_expired` reason — the same semantics as void/abandon:
+    /// only `prepared`/`queued`/`leased`/`retryable` rows transition,
+    /// leases are cleared, exactly one durable `outbox_terminal_events`
+    /// row is written per transitioned row, and `handed_off`/
+    /// `handoff_started` rows are preserved. A second pass finalizes zero
+    /// rows (the guard requires `expired_tail`), so it writes no second
+    /// event.
     pub async fn apply_expiry_transitions(
         &self,
         tail: std::time::Duration,
@@ -1697,23 +1707,27 @@ impl InvoiceStore {
         .execute(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        let finalized = sqlx::query(
+        let finalized_ids = sqlx::query_scalar::<_, Uuid>(
             "UPDATE invoices
              SET baseline_state = 'expired_final', expired_final_at = NOW(), updated_at = NOW()
              WHERE baseline_state = 'expired_tail'
-               AND expires_at + make_interval(secs => $1) < NOW()",
+               AND expires_at + make_interval(secs => $1) < NOW()
+             RETURNING id",
         )
         .bind(tail_seconds)
-        .execute(&mut *transaction)
+        .fetch_all(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        for invoice_id in &finalized_ids {
+            terminalize_invoice_outbox(&mut transaction, *invoice_id, "invoice_expired").await?;
+        }
         transaction
             .commit()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         Ok(ExpiryTransitions {
             tailed: tailed.rows_affected(),
-            finalized: finalized.rows_affected(),
+            finalized: u64::try_from(finalized_ids.len()).unwrap_or(u64::MAX),
         })
     }
 

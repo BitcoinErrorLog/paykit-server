@@ -54,6 +54,10 @@ mod sdk_fixtures;
 use sdk_fixtures::{TestPaymentAdapter, TestSessionProvider};
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+/// The §B.9 observation tail used by the expiry-transition seam here
+/// (`24 h`, matching the production default); the clock itself is injected
+/// through SQL timestamp moves, never by sleeping.
+const EXPIRY_TAIL: Duration = Duration::from_secs(24 * 60 * 60);
 
 async fn build_pubky_testnet() -> EphemeralTestnet {
     let postgres = std::env::var("TEST_DATABASE_URL").unwrap();
@@ -2139,6 +2143,230 @@ async fn void_and_abandoned_terminalize_non_handed_off_rows() {
     assert_eq!(
         outbox_row(&database, request_id).await.1.as_deref(),
         Some("invoice_abandoned")
+    );
+    database.cleanup().await;
+}
+
+/// Drives an activated (`observing`) invoice through both §B.9 expiry
+/// transitions to `expired_final`, injecting the clock through SQL
+/// timestamp moves (never sleeping): first `observing → expired_tail` at
+/// `expires_at`, then `expired_tail → expired_final` at `expires_at +
+/// tail`.
+async fn expire_invoice(database: &TestDatabase, invoices: &InvoiceStore, invoice_id: Uuid) {
+    sqlx::query("UPDATE invoices SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(invoice_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let first = invoices
+        .apply_expiry_transitions(EXPIRY_TAIL)
+        .await
+        .unwrap();
+    assert_eq!((first.tailed, first.finalized), (1, 0));
+    sqlx::query("UPDATE invoices SET expires_at = NOW() - INTERVAL '25 hours' WHERE id = $1")
+        .bind(invoice_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let second = invoices
+        .apply_expiry_transitions(EXPIRY_TAIL)
+        .await
+        .unwrap();
+    assert_eq!((second.tailed, second.finalized), (0, 1));
+    let baseline: String = sqlx::query_scalar("SELECT baseline_state FROM invoices WHERE id = $1")
+        .bind(invoice_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(baseline, "expired_final");
+}
+
+/// The production residue shape: an `expired_final` invoice whose endpoint
+/// parent is `retryable` after unbounded pre-bound attempts and whose
+/// payment-request child is still `queued`. The expiry transition itself
+/// terminalizes both rows in the same transaction with the closed
+/// `invoice_expired` reason, clears every lease field, writes exactly one
+/// durable terminal event per row, and readiness is ready.
+#[tokio::test]
+async fn expiry_terminalizes_retryable_parent_and_queued_child_with_one_event_each() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[59; 32]).unwrap());
+    let (_creator, _bundle, invoices, invoice_id, endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    sqlx::query(
+        "UPDATE outbox
+         SET status = 'retryable', attempt_count = 1100,
+             lease_owner = gen_random_uuid(), claim_token = gen_random_uuid(),
+             lease_expires_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(outbox_row(&database, request_id).await.0, "queued");
+
+    expire_invoice(&database, &invoices, invoice_id).await;
+
+    for id in [endpoint_id, request_id] {
+        assert_eq!(
+            outbox_row(&database, id).await,
+            (
+                "permanently_failed".into(),
+                Some("invoice_expired".into()),
+                Some("invoice_expired".into()),
+                None,
+            )
+        );
+        let lease: (Option<Uuid>, Option<time::OffsetDateTime>) =
+            sqlx::query_as("SELECT lease_owner, lease_expires_at FROM outbox WHERE id = $1")
+                .bind(id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(lease, (None, None), "terminalization clears the lease");
+    }
+    let events: Vec<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT outbox_id, event_class, reason FROM outbox_terminal_events
+         WHERE invoice_id = $1 ORDER BY outbox_id",
+    )
+    .bind(invoice_id)
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    let mut expected = [endpoint_id, request_id];
+    expected.sort();
+    assert_eq!(
+        events,
+        expected
+            .iter()
+            .map(|id| (
+                *id,
+                "invoice_expired".to_string(),
+                "invoice_expired".to_string()
+            ))
+            .collect::<Vec<_>>(),
+        "exactly one terminal event per transitioned row, closed invoice_expired reason"
+    );
+    // Readiness is ready: the terminalized pair leaves no active-work residue.
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    assert!(outbox.delivery_available().await.unwrap());
+    let runtime = health_runtime(database.pool());
+    let app = operational_router(Router::new(), runtime.clone());
+    publish_outbox_health(&outbox, &runtime).await;
+    let (status, ready) = ready_json(&app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ready["status"], "ready");
+    assert_eq!(ready["paykit_delivery"], "ready");
+    assert_eq!(
+        ready["outbox_terminal_failures_by_class"]["invoice_expired"],
+        2
+    );
+    database.cleanup().await;
+}
+
+/// Expiry preserves `handed_off` rows exactly like void/abandon do: only
+/// the never-handed-off child terminalizes, with one `invoice_expired`
+/// event; the attributed parent's SDK identifiers stay intact.
+#[tokio::test]
+async fn expiry_preserves_handed_off_rows() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[60; 32]).unwrap());
+    let (_creator, _bundle, invoices, invoice_id, endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    let endpoint_claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(outbox.begin_handoff(&endpoint_claim).await.unwrap());
+    assert!(
+        outbox
+            .mark_handed_off(
+                &endpoint_claim,
+                &HandoffResult::EndpointPublication {
+                    outbound_message_id: 77,
+                },
+            )
+            .await
+            .unwrap()
+    );
+
+    expire_invoice(&database, &invoices, invoice_id).await;
+
+    let attributed: (String, Option<String>) =
+        sqlx::query_as("SELECT status, sdk_outbound_message_id FROM outbox WHERE id = $1")
+            .bind(endpoint_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(attributed, ("handed_off".into(), Some("77".into())));
+    let endpoint_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM outbox_terminal_events WHERE outbox_id = $1")
+            .bind(endpoint_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(endpoint_events, 0, "a handed_off row is never terminalized");
+    assert_eq!(
+        outbox_row(&database, request_id).await,
+        (
+            "permanently_failed".into(),
+            Some("invoice_expired".into()),
+            Some("invoice_expired".into()),
+            None,
+        )
+    );
+    let child_events: Vec<(String, String)> = sqlx::query_as(
+        "SELECT event_class, reason FROM outbox_terminal_events WHERE outbox_id = $1",
+    )
+    .bind(request_id)
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        child_events,
+        vec![("invoice_expired".to_string(), "invoice_expired".to_string())]
+    );
+    database.cleanup().await;
+}
+
+/// A second expiry pass is a no-op: the `expired_tail → expired_final`
+/// guard matches zero rows for an already-final invoice, so no second
+/// terminal event is ever written.
+#[tokio::test]
+async fn expiry_terminalization_is_idempotent_on_a_second_pass() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[61; 32]).unwrap());
+    let (_creator, _bundle, invoices, invoice_id, _endpoint_id, _request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    expire_invoice(&database, &invoices, invoice_id).await;
+    let events_after_first: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM outbox_terminal_events WHERE invoice_id = $1")
+            .bind(invoice_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(events_after_first, 2);
+    let second = invoices
+        .apply_expiry_transitions(EXPIRY_TAIL)
+        .await
+        .unwrap();
+    assert_eq!((second.tailed, second.finalized), (0, 0));
+    let events_after_second: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM outbox_terminal_events WHERE invoice_id = $1")
+            .bind(invoice_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        events_after_second, events_after_first,
+        "a replayed expiry pass writes no second terminal event"
     );
     database.cleanup().await;
 }
