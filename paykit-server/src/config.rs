@@ -318,6 +318,14 @@ impl Config {
         if self.outbox.retry_max > self.outbox.link_establishment_max_age {
             return Err(ConfigError::InconsistentLinkEstablishmentCeiling);
         }
+        // Deployment lifetime relation: this server has no fiat payment
+        // window setting, so the relation
+        // `link_establishment_max_age <= FIAT_PAYMENT_WINDOW_SECONDS`
+        // cannot be refused here; the exact configured ceilings are exposed
+        // on /health/ready and the parent's preflight must prove the
+        // relation before release. The creation-time
+        // `paykit_outbox_ceiling_exceeds_invoice_total` alarm covers any
+        // invoice whose remaining lifetime slips below the ceiling.
         // Every tick reserves PROBE_REQUESTS_PER_TICK requests for the
         // active probe before admitting observation targets, so the
         // effective per-tick budget —

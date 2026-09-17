@@ -201,6 +201,16 @@ impl Server {
             Arc::new(PostgresDependency::new(pool.clone())),
             64,
         ));
+        // The creation-facing store alarms (non-secret, telemetry only) when
+        // a new invoice's remaining request lifetime is shorter than the
+        // configured link-establishment max age; the exact ceiling values are
+        // exposed on /health/ready for the parent's deployment preflight.
+        let invoices = invoices
+            .with_outbox_ceiling_alarm(config.outbox.link_establishment_max_age, runtime.metrics());
+        runtime.set_outbox_link_establishment_ceiling(
+            config.outbox.link_establishment_max_attempts,
+            config.outbox.link_establishment_max_age,
+        );
         let invoice_service = Arc::new(
             CreateInvoiceService::new(
                 Arc::new(CreatorSessionValidator {

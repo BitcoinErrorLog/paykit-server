@@ -30,6 +30,8 @@ struct ReadyResponse {
     outbox_terminal_failure_count: i64,
     outbox_oldest_terminal_failure_age_seconds: Option<i64>,
     outbox_terminal_failures_by_class: std::collections::BTreeMap<String, i64>,
+    outbox_link_establishment_max_attempts: u32,
+    outbox_link_establishment_max_age_seconds: u64,
 }
 
 #[derive(Serialize)]
@@ -82,6 +84,8 @@ async fn ready(State(runtime): State<Arc<Runtime>>) -> impl IntoResponse {
         outbox_oldest_terminal_failure_age_seconds: report
             .outbox_oldest_terminal_failure_age_seconds,
         outbox_terminal_failures_by_class: report.outbox_terminal_failures_by_class,
+        outbox_link_establishment_max_attempts: report.outbox_link_establishment_max_attempts,
+        outbox_link_establishment_max_age_seconds: report.outbox_link_establishment_max_age_seconds,
     });
     let code = if report.status == ComponentState::NotReady {
         StatusCode::SERVICE_UNAVAILABLE

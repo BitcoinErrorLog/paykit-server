@@ -505,6 +505,29 @@ impl PgObserverLeadership {
 pub struct InvoiceStore {
     pool: PgPool,
     crypto: Arc<Crypto>,
+    outbox_ceiling_alarm: Option<OutboxCeilingAlarm>,
+}
+
+/// Non-secret creation-time alarm: the configured link-establishment max age
+/// is compared against each new invoice's remaining request lifetime, and
+/// `paykit_outbox_ceiling_exceeds_invoice_total` increments when the ceiling
+/// exceeds it. Telemetry only — the exhaustion predicate is unchanged.
+#[derive(Clone)]
+struct OutboxCeilingAlarm {
+    link_establishment_max_age: std::time::Duration,
+    metrics: Arc<crate::metrics::Metrics>,
+}
+
+impl std::fmt::Debug for OutboxCeilingAlarm {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OutboxCeilingAlarm")
+            .field(
+                "link_establishment_max_age",
+                &self.link_establishment_max_age,
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl InvoiceStore {
@@ -512,6 +535,30 @@ impl InvoiceStore {
         Self {
             pool: pool.clone(),
             crypto,
+            outbox_ceiling_alarm: None,
+        }
+    }
+
+    /// Installs the creation-time ceiling alarm with the exact configured
+    /// link-establishment max age.
+    pub fn with_outbox_ceiling_alarm(
+        mut self,
+        link_establishment_max_age: std::time::Duration,
+        metrics: Arc<crate::metrics::Metrics>,
+    ) -> Self {
+        self.outbox_ceiling_alarm = Some(OutboxCeilingAlarm {
+            link_establishment_max_age,
+            metrics,
+        });
+        self
+    }
+
+    fn observe_ceiling_against_lifetime(&self, expires_at: time::OffsetDateTime) {
+        if let Some(alarm) = &self.outbox_ceiling_alarm {
+            let remaining_seconds = (expires_at - time::OffsetDateTime::now_utc()).whole_seconds();
+            if remaining_seconds < alarm.link_establishment_max_age.as_secs() as i64 {
+                alarm.metrics.outbox_ceiling_exceeds_invoice();
+            }
         }
     }
 
@@ -2698,6 +2745,7 @@ impl InvoiceStore {
         tx.commit()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
+        self.observe_ceiling_against_lifetime(input.expires_at);
         Ok(AtomicInvoiceResult {
             invoice_id,
             payment_request_outbox_id,

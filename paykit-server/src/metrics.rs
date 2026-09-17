@@ -56,6 +56,7 @@ pub struct Metrics {
     outbox_terminal_oldest_age_seconds: Gauge,
     outbox_reader_saturated: Counter,
     outbox_active_partitions: Gauge,
+    outbox_ceiling_exceeds_invoice: Counter,
 }
 
 impl Metrics {
@@ -83,6 +84,7 @@ impl Metrics {
         let outbox_terminal_oldest_age_seconds = Gauge::default();
         let outbox_reader_saturated = Counter::default();
         let outbox_active_partitions = Gauge::default();
+        let outbox_ceiling_exceeds_invoice = Counter::default();
         registry.register(
             "paykit_http_requests",
             "Completed HTTP requests.",
@@ -196,6 +198,12 @@ impl Metrics {
             "Current number of reader partitions with an unexpired lease.",
             outbox_active_partitions.clone(),
         );
+        registry.register(
+            "paykit_outbox_ceiling_exceeds_invoice",
+            "Invoices whose remaining request lifetime at creation was shorter \
+             than the configured link-establishment max age.",
+            outbox_ceiling_exceeds_invoice.clone(),
+        );
         Self {
             registry: Mutex::new(registry),
             http_requests,
@@ -221,6 +229,7 @@ impl Metrics {
             outbox_terminal_oldest_age_seconds,
             outbox_reader_saturated,
             outbox_active_partitions,
+            outbox_ceiling_exceeds_invoice,
         }
     }
 
@@ -310,6 +319,9 @@ impl Metrics {
     }
     pub fn set_outbox_active_partitions(&self, value: i64) {
         self.outbox_active_partitions.set(value.max(0));
+    }
+    pub fn outbox_ceiling_exceeds_invoice(&self) {
+        self.outbox_ceiling_exceeds_invoice.inc();
     }
     pub fn encode(&self) -> Result<String, std::fmt::Error> {
         let mut text = String::new();

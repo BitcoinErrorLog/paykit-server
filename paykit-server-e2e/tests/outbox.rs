@@ -554,6 +554,80 @@ async fn delivery_aggregate_precedence_and_malformed_shape() {
 }
 
 #[tokio::test]
+async fn creation_ceiling_alarm_and_health_expose_exact_configured_values() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[70; 32]).unwrap());
+    // The exact configured production ceilings: 20 attempts and one hour.
+    let link_establishment_max_attempts = 20;
+    let link_establishment_max_age = Duration::from_secs(60 * 60);
+    let metrics = Arc::new(paykit_server::metrics::Metrics::new());
+    let invoices = InvoiceStore::new(database.pool(), crypto.clone())
+        .with_outbox_ceiling_alarm(link_establishment_max_age, metrics.clone());
+    create_creator_once(&database, crypto, 70).await;
+
+    let runtime = health_runtime(database.pool());
+    runtime.set_paykit_delivery_available(true);
+    runtime.set_outbox_available(true);
+    runtime.set_outbox_link_establishment_ceiling(
+        link_establishment_max_attempts,
+        link_establishment_max_age,
+    );
+    let app = operational_router(Router::new(), runtime.clone());
+
+    // An invoice whose remaining request lifetime exceeds the ceiling does
+    // not alarm.
+    let reader = reader();
+    invoices
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator(),
+            reader: &reader,
+            bundle_binding: b"ceiling-long-bundle",
+            payment_request_binding: b"ceiling-long-request",
+            new_reader_payloads: &Payloads {
+                reader: reader.clone(),
+            },
+            payment_request_intent: common::payment_intent(&reader),
+            required_sats: 100,
+            nonce_sats: 1,
+            prepare_ttl: Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(2),
+        })
+        .await
+        .unwrap();
+    // An invoice whose remaining request lifetime is shorter than the exact
+    // configured ceiling increments the relationship alarm.
+    invoices
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator(),
+            reader: &reader,
+            bundle_binding: b"ceiling-short-bundle",
+            payment_request_binding: b"ceiling-short-request",
+            new_reader_payloads: &Payloads {
+                reader: reader.clone(),
+            },
+            payment_request_intent: common::payment_intent(&reader),
+            required_sats: 100,
+            nonce_sats: 1,
+            prepare_ttl: Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::minutes(30),
+        })
+        .await
+        .unwrap();
+    let encoded = metrics.encode().unwrap();
+    assert!(
+        encoded.contains("paykit_outbox_ceiling_exceeds_invoice_total 1"),
+        "metrics: {encoded}"
+    );
+
+    let (status, ready) = ready_json(&app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ready["outbox_link_establishment_max_attempts"], 20);
+    assert_eq!(ready["outbox_link_establishment_max_age_seconds"], 3600);
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn failed_pair_with_extra_invoice_row_reports_contract_error() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
