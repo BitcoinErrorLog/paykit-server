@@ -516,6 +516,7 @@ async fn invalid_and_unknown_setup_queries_are_rejected_without_a_flow_or_comple
         "/setup?return_to=https://evil.example&state=ok&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
         "/setup?return_to=https://app.example&state=ok&delivery=redirect&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
         "/setup?return_to=https://app.example&state=ok&extra=x&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+        "/setup?return_to=https://app.example&state=ok&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy&embed=1",
         "/setup?return_to=https://app.example&state=ok&state=twice&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
         "/setup?return_to=https://app.example&state=ok&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy&creator=7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
         "/setup?return_to=https://user:pass@app.example&state=ok&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
@@ -1360,6 +1361,38 @@ async fn setup_page_renders_exact_claim_as_deep_link_and_qr() {
             "page contained forbidden value {forbidden}"
         );
     }
+}
+
+#[tokio::test]
+async fn setup_page_includes_fragment_embed_toggle_and_inline_dark_styles() {
+    let response = request(
+        setup_router(service(
+            Arc::new(InstructionCompleter),
+            Arc::new(ManualClock::default()),
+        )),
+        Method::GET,
+        "/setup?return_to=https://app.example/callback&state=opaque&creator=tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+    )
+    .await;
+
+    let page = body(response).await;
+    assert!(page.contains("<h1 id=\"setup-title\">Connect Bitkit</h1>"));
+    assert!(page.contains("<p id=\"setup-instructions\">Scan this code with Bitkit"));
+    assert!(page.contains("window.location.hash==='#embed'"));
+    assert!(page.contains("getElementById('setup-title')?.classList.add('is-embedded')"));
+    assert!(page.contains("getElementById('setup-instructions')?.classList.add('is-embedded')"));
+    assert!(page.contains(
+        "restart.href=window.location.pathname+window.location.search+window.location.hash"
+    ));
+    assert_eq!(page.matches("<style>").count(), 1);
+    let style = page
+        .split_once("<style>")
+        .and_then(|(_, rest)| rest.split_once("</style>"))
+        .map(|(style, _)| style)
+        .expect("setup page contains inline stylesheet");
+    assert!(style.contains("background:#0b0b0b"));
+    assert!(style.contains(".is-embedded{display:none}"));
+    assert!(!style.contains("http"));
 }
 
 #[tokio::test]
