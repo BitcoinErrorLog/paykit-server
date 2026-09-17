@@ -1294,6 +1294,64 @@ async fn generation_id_matches_invoice_for_ordinary_invoices() {
 }
 
 #[tokio::test]
+async fn public_status_never_reads_legacy_bigint_generation() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[72; 32]).unwrap());
+    let (creator, bundle, invoices, invoice_id, endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto, "000G40R40M30E209185GR38E1W").await;
+
+    // Arbitrary, mutually inconsistent legacy BIGINT values must not move
+    // the public status: it is derived from generation_id and invoices.id.
+    sqlx::query("UPDATE outbox SET generation = 7 WHERE id = $1")
+        .bind(endpoint_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE outbox SET generation = 9 WHERE id = $1")
+        .bind(request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let pending = delivery_status(&invoices, &creator, &bundle).await;
+    assert_eq!(pending.state, "pending_delivery");
+    assert_eq!(pending.generation, invoice_id);
+
+    sqlx::query(
+        "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = '6' WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = '7' WHERE id = $1",
+    )
+    .bind(request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let delivered = delivery_status(&invoices, &creator, &bundle).await;
+    assert_eq!(delivered.state, "delivered");
+    assert_eq!(delivered.generation, invoice_id);
+
+    let legacy_comment: Option<String> = sqlx::query_scalar(
+        "SELECT col_description('outbox'::regclass, attnum) \
+         FROM pg_attribute \
+         WHERE attrelid = 'outbox'::regclass AND attname = 'generation'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let legacy_comment = legacy_comment.unwrap_or_default();
+    assert!(
+        legacy_comment.contains("LEGACY non-authoritative"),
+        "the legacy column must carry its schema doc comment: {legacy_comment:?}"
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn abandonment_first_keeps_resolution_immutable_under_later_observation() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
