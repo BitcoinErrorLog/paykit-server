@@ -287,11 +287,6 @@ impl Metrics {
     pub fn session_validation_result(&self) {
         self.session_validation_results.inc();
     }
-    pub fn outbox_terminal_transition(&self, class: &'static str, reason: &'static str) {
-        self.outbox_terminal_transitions
-            .get_or_create(&OutboxTransitionLabels { class, reason })
-            .inc();
-    }
     pub fn observe_outbox_terminal_transitions(&self, counts: Vec<(String, String, i64)>) {
         let mut observed = self
             .outbox_terminal_transition_counts
