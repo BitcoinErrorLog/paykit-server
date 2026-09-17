@@ -393,6 +393,11 @@ impl OutboxStore {
                  FROM outbox o \
                  JOIN ranked ON ranked.id = o.id \
                  WHERE ranked.partition_rank = 1 AND ranked.active_count = 0 \
+                 AND ( \
+                     (o.status = 'queued' AND o.next_attempt_at <= NOW()) \
+                     OR (o.status IN ('leased', 'handoff_started') AND o.lease_expires_at <= NOW()) \
+                     OR (o.status = 'retryable' AND o.next_attempt_at <= NOW()) \
+                 ) \
                  ORDER BY ranked.next_attempt_at, ranked.id \
                  FOR UPDATE OF o SKIP LOCKED \
                  LIMIT $1 \
