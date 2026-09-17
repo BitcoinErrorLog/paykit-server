@@ -268,8 +268,11 @@ impl OutboxStore {
     /// Reports aggregate delivery availability without exposing row or
     /// Creator identifiers. A final-invoice `handoff_started`/`retryable`
     /// row is never active work (migration 0023 rule 5): it is either
-    /// already terminal or awaits the dedicated fenced-recovery path, so it
-    /// must not degrade readiness while recovery is pending.
+    /// already terminal, awaiting the dedicated fenced-recovery path
+    /// (`handoff_started`), or awaiting the bounded final-invoice backfill
+    /// sweep (`retryable` residue from before transition-time
+    /// terminalization shipped), so it must not degrade readiness while
+    /// recovery or the sweep is pending.
     pub async fn delivery_available(&self) -> Result<bool, PersistenceError> {
         sqlx::query_scalar(
             "SELECT NOT EXISTS ( \
@@ -545,6 +548,59 @@ impl OutboxStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         Ok(true)
+    }
+
+    /// One bounded pass of the one-time legacy backfill: terminalizes up to
+    /// `limit` non-handed-off outbox rows whose invoice already sits in a
+    /// final baseline state (the same closed set the claim path excludes),
+    /// oldest `created_at` first, with the closed `invoice_final_backfill`
+    /// reason and exactly one durable terminal event per transitioned row.
+    /// These are rows left inert by invoices that reached a final state
+    /// before transition-time terminalization shipped: never claimed
+    /// (final-invoice exclusion) and never terminal. Rows holding a LIVE
+    /// lease are never touched — their claim's final-invoice branch owns
+    /// them — and `handed_off`/`handoff_started` rows are preserved. The
+    /// batch is taken under the same `FOR UPDATE SKIP LOCKED` row-lock
+    /// discipline as the ordinary claim path, and the transition is
+    /// idempotent: a replayed pass matches zero rows and writes no second
+    /// event.
+    pub async fn sweep_final_invoice_backfill(&self, limit: i64) -> Result<u64, PersistenceError> {
+        let changed = sqlx::query(
+            "WITH candidates AS (
+                 SELECT o.id
+                 FROM outbox o
+                 JOIN invoices invoice ON invoice.id = o.invoice_id
+                 WHERE (o.status IN ('prepared', 'queued', 'retryable')
+                        OR (o.status = 'leased' AND o.lease_expires_at <= NOW()))
+                   AND invoice.baseline_state IN (
+                       'expired_final', 'void_baseline_failed', 'void_prepare_expired',
+                       'void_cancelled', 'resolved_paid_manually', 'resolved_closed')
+                 ORDER BY o.created_at, o.id
+                 FOR UPDATE OF o SKIP LOCKED
+                 LIMIT $1
+             ), changed AS (
+                 UPDATE outbox
+                 SET status = 'permanently_failed',
+                     error_class = 'invoice_final_backfill',
+                     failure_reason = 'invoice_final_backfill',
+                     lease_owner = NULL,
+                     claim_token = NULL,
+                     lease_expires_at = NULL,
+                     updated_at = NOW()
+                 WHERE id IN (SELECT id FROM candidates)
+                 RETURNING creator_id, invoice_id, id
+             )
+             INSERT INTO outbox_terminal_events
+                 (creator_id, invoice_id, outbox_id, event_class, reason)
+             SELECT creator_id, invoice_id, id, 'invoice_final_backfill',
+                    'invoice_final_backfill'
+             FROM changed",
+        )
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(changed.rows_affected())
     }
 
     pub async fn invoice_is_final(

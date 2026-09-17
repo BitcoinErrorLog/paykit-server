@@ -41,6 +41,20 @@ The alert contract is pinned in `paykit-server/src/metrics.rs`:
 - critical: oldest unacknowledged age > 900 seconds, or >= 5 transitions in 5
   minutes
 
+## Closed event classes
+
+The closed invoice-lifecycle classes are `invoice_voided`,
+`invoice_abandoned`, `invoice_expired` (the `expired_tail → expired_final`
+transition terminalizes the invoice's non-handed-off outbox rows in the same
+transaction), and `invoice_final_backfill` (the bounded one-time backfill
+sweep for rows left inert by invoices that reached a final state before
+transition-time terminalization shipped). The remaining classes are
+`link_establishment_exhausted`, `dependency_failed`, `permanent`,
+`invoice_finalized`, `permanent_sdk_reconciliation`, and
+`handoff_unresolved`. Every class writes exactly one event per transitioned
+row; `handed_off` and `handoff_started` rows are never terminalized by any
+of them.
+
 ## Reconciling an `sdk_invoked_unattributed` row
 
 A `handoff_unresolved` event with reason `sdk_invoked_unattributed` means

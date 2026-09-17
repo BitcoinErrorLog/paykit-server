@@ -713,6 +713,19 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                 Err(_) => panic!("owned outbox fence-recovery task exited unexpectedly"),
             }
         }
+        // One bounded pass of the one-time legacy final-invoice backfill
+        // per loop tick, under the same worker cadence as ordinary claims:
+        // rows left inert by invoices that reached a final baseline state
+        // before transition-time terminalization shipped terminalize,
+        // oldest first, with zero SDK calls.
+        if workers
+            .outbox
+            .sweep_final_invoice_backfill(crate::workers::outbox::FINAL_INVOICE_SWEEP_LIMIT)
+            .await
+            .is_err()
+        {
+            outbox_available = false;
+        }
         match workers.outbox.delivery_available().await {
             Ok(persisted_available) => {
                 delivery_available &= persisted_available;

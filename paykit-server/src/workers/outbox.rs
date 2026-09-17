@@ -284,8 +284,30 @@ pub async fn process_fence_recovery_with_health(
         .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure))
 }
 
-/// Publishes claim-pass fairness telemetry exactly as the enqueue loop
-/// does: `paykit_outbox_reader_saturated_total` increments by the number of
+/// The per-pass bound of the one-time legacy final-invoice backfill: at
+/// most this many inert rows terminalize per sweep pass, so the sweep
+/// drains a large backlog incrementally and never starves ordinary claims.
+pub const FINAL_INVOICE_SWEEP_LIMIT: i64 = 100;
+
+/// One bounded pass of the one-time legacy final-invoice backfill. Rows of
+/// invoices that reached a final baseline state before transition-time
+/// terminalization shipped were left inert — never claimed (final-invoice
+/// exclusion) and never terminal. Each pass terminalizes up to
+/// [`FINAL_INVOICE_SWEEP_LIMIT`] such rows, oldest first, with the closed
+/// `invoice_final_backfill` reason and exactly one durable terminal event
+/// per row, never touching `handed_off`/`handoff_started` rows or rows
+/// holding a live lease. The adapter is accepted and ignored so tests can
+/// prove no adapter method is ever invoked on this path.
+pub async fn process_final_invoice_sweep(
+    store: &OutboxStore,
+    _adapter: &dyn Adapter,
+) -> Result<u64, PersistenceError> {
+    store
+        .sweep_final_invoice_backfill(FINAL_INVOICE_SWEEP_LIMIT)
+        .await
+}
+
+/// Publishes claim-pass fairness telemetry exactly as the enqueue loop/// does: `paykit_outbox_reader_saturated_total` increments by the number of
 /// flooded reader partitions (reader-partition flooding: more due rows in
 /// one partition than one pass can admit), and the gauge reports the
 /// partitions currently holding an unexpired lease.
