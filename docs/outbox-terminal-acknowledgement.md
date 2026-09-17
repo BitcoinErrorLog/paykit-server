@@ -53,7 +53,8 @@ transition-time terminalization shipped). The remaining classes are
 `invoice_finalized`, `permanent_sdk_reconciliation`, and
 `handoff_unresolved`. Every class writes exactly one event per transitioned
 row; `handed_off` and `handoff_started` rows are never terminalized by any
-of them.
+of them. The backfill is bounded to 100 rows per pass and processes the
+oldest `created_at` rows first.
 
 ## Reconciling an `sdk_invoked_unattributed` row
 
