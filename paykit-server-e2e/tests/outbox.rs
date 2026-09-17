@@ -554,6 +554,92 @@ async fn delivery_aggregate_precedence_and_malformed_shape() {
 }
 
 #[tokio::test]
+async fn failed_pair_with_extra_invoice_row_reports_contract_error() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[67; 32]).unwrap());
+    let (creator, bundle, invoices, invoice_id, _endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto, "000G40R40M30E209185GR38E1W").await;
+
+    sqlx::query("UPDATE outbox SET status = 'permanently_failed' WHERE id = $1")
+        .bind(request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        delivery_status(&invoices, &creator, &bundle).await.state,
+        "failed"
+    );
+    sqlx::query(
+        "INSERT INTO outbox (creator_id, invoice_id, intent_envelope, status, depends_on_id) \
+         SELECT creator_id, invoice_id, intent_envelope, 'queued', depends_on_id FROM outbox WHERE id = $1",
+    )
+    .bind(request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        delivery_status(&invoices, &creator, &bundle).await.state,
+        "contract_error",
+        "a valid failed pair plus an extra invoice-scoped row is malformed"
+    );
+    let _ = invoice_id;
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn failed_pair_with_mixed_generation_reports_contract_error() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[68; 32]).unwrap());
+    let (creator, bundle, invoices, _invoice_id, _endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto, "000G40R40M30E209185GR38E1W").await;
+
+    sqlx::query("UPDATE outbox SET generation_id = gen_random_uuid() WHERE id = $1")
+        .bind(request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE outbox SET status = 'permanently_failed' WHERE id = $1")
+        .bind(request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        delivery_status(&invoices, &creator, &bundle).await.state,
+        "contract_error",
+        "a failed pair split across generations is malformed"
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn failed_pair_with_malformed_link_reports_contract_error() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[69; 32]).unwrap());
+    let (creator, bundle, invoices, _invoice_id, _endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto, "000G40R40M30E209185GR38E1W").await;
+
+    sqlx::query("UPDATE outbox SET depends_on_id = NULL WHERE id = $1")
+        .bind(request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE outbox SET status = 'permanently_failed' WHERE id = $1")
+        .bind(request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        delivery_status(&invoices, &creator, &bundle).await.state,
+        "contract_error",
+        "a failed row without its endpoint dependency link is malformed"
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn finality_before_worker_preflight_yields_zero_sdk_calls() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();

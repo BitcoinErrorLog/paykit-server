@@ -981,6 +981,30 @@ impl InvoiceStore {
         Ok(sqlx::query_as::<_, (Uuid, i64, String)>(
             "SELECT invoices.id, invoices.delivery_revision,
                     CASE
+                      -- Shape validation precedes every precedence rule: any
+                      -- malformed shape (missing/extra invoice-scoped row,
+                      -- mixed generation, malformed dependency link, unknown
+                      -- status) fails closed as contract_error even when a
+                      -- valid failed pair exists.
+                      WHEN (
+                        SELECT COUNT(*) FROM outbox
+                        WHERE invoice_id = invoices.id
+                      ) <> 2 THEN 'contract_error'
+                      WHEN (
+                        SELECT COUNT(*)
+                        FROM outbox request
+                        JOIN outbox endpoint ON endpoint.id = request.depends_on_id
+                        WHERE request.invoice_id = invoices.id
+                          AND endpoint.invoice_id = invoices.id
+                          AND endpoint.generation_id = request.generation_id
+                      ) <> 1 THEN 'contract_error'
+                      WHEN EXISTS (
+                        SELECT 1 FROM outbox
+                        WHERE invoice_id = invoices.id
+                          AND status NOT IN
+                            ('prepared', 'queued', 'leased', 'handoff_started',
+                             'retryable', 'handed_off', 'delivered', 'permanently_failed')
+                      ) THEN 'contract_error'
                       WHEN invoices.baseline_state IN
                         ('void_baseline_failed', 'void_prepare_expired',
                          'void_cancelled', 'expired_final',
@@ -993,54 +1017,23 @@ impl InvoiceStore {
                         WHERE request.invoice_id = invoices.id
                           AND endpoint.invoice_id = invoices.id
                           AND endpoint.generation_id = request.generation_id
-                          AND request.status = 'permanently_failed'
-                      ) OR EXISTS (
+                          AND (request.status = 'permanently_failed'
+                               OR endpoint.status = 'permanently_failed')
+                      ) THEN 'failed'
+                      WHEN EXISTS (
                         SELECT 1
                         FROM outbox request
                         JOIN outbox endpoint ON endpoint.id = request.depends_on_id
                         WHERE request.invoice_id = invoices.id
                           AND endpoint.invoice_id = invoices.id
                           AND endpoint.generation_id = request.generation_id
-                          AND endpoint.status = 'permanently_failed'
-                      ) THEN 'failed'
-                      WHEN (
-                        SELECT COUNT(*)
+                          AND request.status = 'delivered'
+                          AND endpoint.status = 'delivered'
+                      ) THEN 'delivered'
+                      WHEN EXISTS (
+                        SELECT 1
                         FROM outbox request
                         JOIN outbox endpoint ON endpoint.id = request.depends_on_id
-                        WHERE request.invoice_id = invoices.id
-                          AND endpoint.invoice_id = invoices.id
-                          AND endpoint.generation_id = request.generation_id
-                      ) = 1
-                        AND (
-                          SELECT COUNT(*) FROM outbox
-                          WHERE invoice_id = invoices.id
-                        ) = 2
-                        AND (
-                          SELECT COUNT(*)
-                          FROM outbox request
-                          JOIN outbox endpoint ON endpoint.id = request.depends_on_id
-                          WHERE request.invoice_id = invoices.id
-                          AND endpoint.invoice_id = invoices.id
-                          AND endpoint.generation_id = request.generation_id
-                            AND request.status = 'delivered'
-                            AND endpoint.status = 'delivered'
-                        ) = 1 THEN 'delivered'
-                      WHEN (
-                        SELECT COUNT(*)
-                        FROM outbox request
-                        JOIN outbox endpoint ON endpoint.id = request.depends_on_id
-                        WHERE request.invoice_id = invoices.id
-                          AND endpoint.invoice_id = invoices.id
-                          AND endpoint.generation_id = request.generation_id
-                      ) = 1
-                        AND (
-                          SELECT COUNT(*) FROM outbox
-                          WHERE invoice_id = invoices.id
-                        ) = 2
-                        AND (
-                          SELECT COUNT(*)
-                          FROM outbox request
-                          JOIN outbox endpoint ON endpoint.id = request.depends_on_id
                         WHERE request.invoice_id = invoices.id
                           AND endpoint.invoice_id = invoices.id
                           AND endpoint.generation_id = request.generation_id
@@ -1050,7 +1043,7 @@ impl InvoiceStore {
                           AND endpoint.status IN
                             ('prepared', 'queued', 'leased', 'handoff_started',
                              'retryable', 'handed_off', 'delivered')
-                        ) = 1 THEN 'pending_delivery'
+                      ) THEN 'pending_delivery'
                       ELSE 'contract_error'
                     END
              FROM invoices
