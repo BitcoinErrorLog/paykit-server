@@ -9,6 +9,11 @@ use std::{
 };
 
 use async_trait::async_trait;
+use axum::{
+    Router,
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
+};
 use paykit_lib::{
     PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier,
     PaymentReference, PaymentRequestTerms,
@@ -29,12 +34,17 @@ use paykit_server::{
         NewReaderPayloadFactory, NewReaderPayloads, OutboxStore, PersistenceError,
         PostgresStorageAdapter, SdkStateStore, run_migrations,
     },
+    runtime::{
+        ElectrumProbe, OutboxTerminalHealth, PostgresDependency, Runtime, operational_router,
+    },
     workers::outbox::{
-        Adapter, HandoffError, HandoffResult, process_claim, process_reconciliation,
+        Adapter, HandoffError, HandoffResult, RetryableHandoffStage, process_claim,
+        process_reconciliation,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
+use tower::ServiceExt;
 use uuid::Uuid;
 
 mod common;
@@ -1821,5 +1831,482 @@ async fn postgres_sdk_transactions_are_durable_and_creator_isolated() {
         "callback error committed mutated SDK state"
     );
 
+    database.cleanup().await;
+}
+
+fn fresh_tip_time() -> u32 {
+    u32::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+    .unwrap()
+}
+
+/// A runtime whose non-outbox dependencies report ready, so `/health/ready`
+/// reflects only the persisted outbox evidence under test.
+fn health_runtime(pool: &sqlx::PgPool) -> Arc<Runtime> {
+    let runtime = Arc::new(Runtime::new(
+        Arc::new(PostgresDependency::new(pool.clone())),
+        8,
+    ));
+    runtime.set_electrum_available(true);
+    for _ in 0..3 {
+        runtime.record_electrum_probe(ElectrumProbe::success(800_000, fresh_tip_time()));
+    }
+    runtime
+}
+
+/// Publishes exactly what the enqueue loop publishes after a claim pass:
+/// persisted active-work availability plus durable terminal health into the
+/// runtime and metrics surfaces.
+async fn publish_outbox_health(outbox: &OutboxStore, runtime: &Runtime) {
+    let available = outbox.delivery_available().await.unwrap();
+    runtime.set_paykit_delivery_available(available);
+    runtime.set_outbox_available(true);
+    let health = outbox.terminal_failure_health().await.unwrap();
+    runtime
+        .metrics()
+        .set_outbox_terminal_health(health.count, health.oldest_age_seconds);
+    runtime
+        .metrics()
+        .observe_outbox_terminal_transitions(health.transitions);
+    runtime.set_outbox_terminal_health(OutboxTerminalHealth {
+        count: health.count,
+        oldest_age_seconds: health.oldest_age_seconds,
+        by_class: health.by_class,
+    });
+}
+
+async fn ready_json(app: &Router) -> (StatusCode, serde_json::Value) {
+    let response = app
+        .clone()
+        .oneshot(Request::get("/health/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = to_bytes(response.into_body(), 4096).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+async fn metrics_text(app: &Router) -> String {
+    let response = app
+        .clone()
+        .oneshot(Request::get("/metrics").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    String::from_utf8(
+        to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+/// Persists the shared test creator once so one test can bind several
+/// invoices (and therefore several claimable rows) to it.
+async fn create_creator_once(database: &TestDatabase, crypto: Arc<Crypto>, tail: u8) {
+    CreatorStore::new(database.pool(), crypto)
+        .create(
+            &CreatorCredentials::new(
+                creator(),
+                "session-secret".into(),
+                ReceiverNoiseSecretKey::new([9; 32]),
+                "xpub-secret".into(),
+                0,
+            ),
+            &StorageState::default(),
+            &key_tail(tail),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
+        )
+        .await
+        .unwrap();
+}
+
+/// Creates and activates one invoice for an already-persisted creator,
+/// returning the (endpoint parent, payment-request child) outbox ids.
+async fn create_activated_invoice_for(
+    database: &TestDatabase,
+    crypto: Arc<Crypto>,
+    reader: &ReaderPubky,
+    binding_seed: &str,
+) -> (Uuid, Uuid) {
+    let bundle_binding = format!("partition-bundle-{binding_seed}").into_bytes();
+    let request_binding = format!("partition-request-{binding_seed}").into_bytes();
+    let invoices = InvoiceStore::new(database.pool(), crypto);
+    let invoice = invoices
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator(),
+            reader,
+            bundle_binding: &bundle_binding,
+            payment_request_binding: &request_binding,
+            new_reader_payloads: &Payloads {
+                reader: reader.clone(),
+            },
+            payment_request_intent: common::payment_intent(reader),
+            required_sats: 100,
+            nonce_sats: 1,
+            prepare_ttl: Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        })
+        .await
+        .unwrap();
+    invoices
+        .activate_invoice(invoice.invoice_id(), &[], &[])
+        .await
+        .unwrap();
+    (
+        invoice.endpoint_publication_outbox_id().unwrap(),
+        invoice.payment_request_outbox_id(),
+    )
+}
+
+fn distinct_readers() -> Vec<ReaderPubky> {
+    let mut readers: Vec<ReaderPubky> = Vec::new();
+    for replacement in "ybndrfg8ejkmcpqxot1uwisza345h769".chars() {
+        let mut candidate = CREATOR.to_owned();
+        candidate.replace_range(5..6, &replacement.to_string());
+        if let Ok(reader) = parse_reader(&candidate)
+            && !readers.contains(&reader)
+        {
+            readers.push(reader);
+        }
+    }
+    readers
+}
+
+#[tokio::test]
+async fn terminal_transition_increments_counter_while_readiness_is_ready() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[61; 32]).unwrap());
+    let (_creator, _bundle, _invoices, _invoice_id, endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    sqlx::query(
+        "UPDATE outbox SET attempt_count = 19, error_class = 'link_establishment' WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        outbox
+            .exhaust_claim_if_due(&claim, 20, Duration::from_secs(60 * 60))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        outbox_row(&database, endpoint_id).await,
+        (
+            "permanently_failed".into(),
+            Some("link_establishment_exhausted".into()),
+            Some("attempt_ceiling".into()),
+            None,
+        )
+    );
+    assert_eq!(
+        outbox_row(&database, request_id).await.0,
+        "permanently_failed"
+    );
+
+    // Permanently failed rows are retained evidence, not active work.
+    assert!(outbox.delivery_available().await.unwrap());
+    let runtime = health_runtime(database.pool());
+    let app = operational_router(Router::new(), runtime.clone());
+    publish_outbox_health(&outbox, &runtime).await;
+    // A second publication must not double-count the durable transition.
+    publish_outbox_health(&outbox, &runtime).await;
+
+    let (status, ready) = ready_json(&app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ready["status"], "ready");
+    assert_eq!(ready["paykit_delivery"], "ready");
+    assert_eq!(ready["outbox_terminal_failure_count"], 2);
+    assert!(
+        ready["outbox_oldest_terminal_failure_age_seconds"]
+            .as_i64()
+            .is_some_and(|age| age >= 0)
+    );
+    assert_eq!(
+        ready["outbox_terminal_failures_by_class"]["link_establishment_exhausted"],
+        1
+    );
+    assert_eq!(
+        ready["outbox_terminal_failures_by_class"]["dependency_failed"],
+        1
+    );
+
+    let metrics = metrics_text(&app).await;
+    assert!(
+        metrics.contains(
+            "paykit_outbox_terminal_transitions_total{class=\"link_establishment_exhausted\",reason=\"attempt_ceiling\"} 1"
+        ),
+        "metrics: {metrics}"
+    );
+    assert!(
+        metrics.contains(
+            "paykit_outbox_terminal_transitions_total{class=\"dependency_failed\",reason=\"parent_link_establishment_exhausted\"} 1"
+        ),
+        "metrics: {metrics}"
+    );
+    assert!(
+        metrics.contains("paykit_outbox_terminal_failure_count 2"),
+        "metrics: {metrics}"
+    );
+    let oldest = metrics
+        .lines()
+        .find(|line| line.starts_with("paykit_outbox_terminal_oldest_age_seconds "))
+        .expect("oldest terminal age gauge is exported");
+    let age: i64 = oldest.rsplit(' ').next().unwrap().parse().unwrap();
+    assert!(age >= 0);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn active_retryable_row_still_degrades_readiness() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[62; 32]).unwrap());
+    let (_creator, _bundle, _invoices, _invoice_id, endpoint_id, _request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    let runtime = health_runtime(database.pool());
+    let app = operational_router(Router::new(), runtime.clone());
+
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.id(), endpoint_id);
+    assert!(
+        outbox
+            .mark_retryable(
+                &claim,
+                Duration::from_secs(300),
+                RetryableHandoffStage::LinkEstablishment,
+            )
+            .await
+            .unwrap()
+    );
+    let retryable: (String, bool) =
+        sqlx::query_as("SELECT status, next_attempt_at > NOW() FROM outbox WHERE id = $1")
+            .bind(endpoint_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(retryable, ("retryable".into(), true));
+
+    // A retryable row whose next attempt is still in the future is active
+    // work, so readiness degrades even though nothing is leased right now.
+    assert!(!outbox.delivery_available().await.unwrap());
+    publish_outbox_health(&outbox, &runtime).await;
+    let (status, ready) = ready_json(&app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ready["status"], "degraded");
+    assert_eq!(ready["paykit_delivery"], "degraded");
+    assert_eq!(ready["outbox_terminal_failure_count"], 0);
+
+    // The same row, once exhausted at the attempt ceiling, is retained
+    // terminal evidence and no longer degrades readiness.
+    sqlx::query("UPDATE outbox SET attempt_count = 19, next_attempt_at = NOW() WHERE id = $1")
+        .bind(endpoint_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let exhausted_claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(exhausted_claim.id(), endpoint_id);
+    assert!(
+        outbox
+            .exhaust_claim_if_due(&exhausted_claim, 20, Duration::from_secs(60 * 60))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        outbox_row(&database, endpoint_id).await.0,
+        "permanently_failed"
+    );
+    assert!(outbox.delivery_available().await.unwrap());
+    publish_outbox_health(&outbox, &runtime).await;
+    let (status, ready) = ready_json(&app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ready["status"], "ready");
+    assert_eq!(ready["paykit_delivery"], "ready");
+    assert_eq!(ready["outbox_terminal_failure_count"], 2);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn flooded_reader_partition_cannot_starve_unrelated_pair() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[63; 32]).unwrap());
+    create_creator_once(&database, crypto.clone(), 63).await;
+    let readers = distinct_readers();
+    assert!(readers.len() >= 2, "reader fixture must yield two readers");
+    let (flooded_parent, _) =
+        create_activated_invoice_for(&database, crypto.clone(), &readers[0], "flooded").await;
+    let (unrelated_parent, _) =
+        create_activated_invoice_for(&database, crypto.clone(), &readers[1], "unrelated").await;
+
+    let flooded_assignment: Option<Uuid> =
+        sqlx::query_scalar("SELECT reader_assignment_id FROM outbox WHERE id = $1")
+            .bind(flooded_parent)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    let unrelated_assignment: Option<Uuid> =
+        sqlx::query_scalar("SELECT reader_assignment_id FROM outbox WHERE id = $1")
+            .bind(unrelated_parent)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert!(flooded_assignment.is_some());
+    assert_ne!(
+        flooded_assignment, unrelated_assignment,
+        "distinct readers must form distinct claim partitions"
+    );
+
+    // Flood the first reader partition with claimable rows that share its
+    // root reader assignment.
+    for _ in 0..4 {
+        sqlx::query(
+            "INSERT INTO outbox (creator_id, reader_assignment_id, intent_envelope, status) \
+             SELECT creator_id, reader_assignment_id, intent_envelope, 'queued' \
+             FROM outbox WHERE id = $1",
+        )
+        .bind(flooded_parent)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    }
+    let flooded_parents: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM outbox WHERE reader_assignment_id = $1 AND depends_on_id IS NULL",
+    )
+    .bind(flooded_assignment.unwrap())
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(flooded_parents.len(), 5);
+
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    let claims = outbox
+        .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(
+        claims.len(),
+        2,
+        "one fair pass admits at most one new claim per partition: {claims:?}"
+    );
+    assert!(
+        claims.iter().any(|claim| claim.id() == unrelated_parent),
+        "the flooded partition starved the unrelated pair"
+    );
+    let flooded_claimed = claims
+        .iter()
+        .filter(|claim| flooded_parents.contains(&claim.id()))
+        .count();
+    assert_eq!(flooded_claimed, 1);
+    let still_queued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox \
+         WHERE reader_assignment_id = $1 AND depends_on_id IS NULL AND status = 'queued'",
+    )
+    .bind(flooded_assignment.unwrap())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        still_queued, 4,
+        "the flooded partition consumed extra batch slots"
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partition_lease_cap_holds_across_replicas() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[64; 32]).unwrap());
+    let (_creator, _bundle, _invoices, _invoice_id, endpoint_id, _request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    // A second claimable row in the same (creator, root reader) partition.
+    sqlx::query(
+        "INSERT INTO outbox (creator_id, reader_assignment_id, intent_envelope, status) \
+         SELECT creator_id, reader_assignment_id, intent_envelope, 'queued' \
+         FROM outbox WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    // Two independent pools simulate two replicas claiming concurrently.
+    let replica_b_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(database.database_url())
+        .await
+        .unwrap();
+    let replica_a = OutboxStore::new(database.pool(), crypto.clone());
+    let replica_b = OutboxStore::new(&replica_b_pool, crypto);
+    let lease = Duration::from_secs(30);
+
+    let (first, second) = tokio::join!(
+        replica_a.claim(Uuid::new_v4(), 10, lease),
+        replica_b.claim(Uuid::new_v4(), 10, lease),
+    );
+    let admitted = [first.unwrap(), second.unwrap()].concat();
+    assert_eq!(
+        admitted.len(),
+        1,
+        "concurrent replicas leased more than one row in one partition"
+    );
+
+    // While that lease is unexpired, neither replica is admitted again.
+    let (first, second) = tokio::join!(
+        replica_a.claim(Uuid::new_v4(), 10, lease),
+        replica_b.claim(Uuid::new_v4(), 10, lease),
+    );
+    assert_eq!(
+        first.unwrap().len() + second.unwrap().len(),
+        0,
+        "a partition with an unexpired lease admitted another claim"
+    );
+
+    // After expiry the partition admits exactly one new claim.
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(admitted[0].id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let (first, second) = tokio::join!(
+        replica_a.claim(Uuid::new_v4(), 10, lease),
+        replica_b.claim(Uuid::new_v4(), 10, lease),
+    );
+    let readmitted = [first.unwrap(), second.unwrap()].concat();
+    assert_eq!(
+        readmitted.len(),
+        1,
+        "an expired partition lease did not admit exactly one new claim"
+    );
+
+    drop(replica_b_pool);
     database.cleanup().await;
 }
