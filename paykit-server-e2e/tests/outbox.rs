@@ -184,6 +184,11 @@ async fn assert_reconciliation_status(
     if expected_status == "handed_off" {
         assert!(actual.1, "retryable SDK status did not receive backoff");
     }
+    sqlx::query("DELETE FROM outbox_terminal_events WHERE outbox_id = $1")
+        .bind(row_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM outbox WHERE id = $1")
         .bind(row_id)
         .execute(database.pool())
@@ -2308,6 +2313,119 @@ async fn terminal_transition_increments_counter_while_readiness_is_ready() {
         .expect("oldest terminal age gauge is exported");
     let age: i64 = oldest.rsplit(' ').next().unwrap().parse().unwrap();
     assert!(age >= 0);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn reconciliation_permanent_failure_writes_exactly_one_terminal_event() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[65; 32]).unwrap());
+    let (_creator, _bundle, _invoices, _invoice_id, endpoint_id, _request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(outbox.begin_handoff(&claim).await.unwrap());
+    assert!(
+        outbox
+            .mark_handed_off(
+                &claim,
+                &HandoffResult::EndpointPublication {
+                    outbound_message_id: 77,
+                },
+            )
+            .await
+            .unwrap()
+    );
+    let reconciliation = outbox
+        .claim_reconciliation(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(reconciliation.len(), 1);
+    let adapter = ReconciliationAdapter {
+        statuses: Mutex::new(VecDeque::from([OutboundPrivateMessageStatus::Invalid])),
+    };
+    assert!(
+        process_reconciliation(
+            &outbox,
+            &adapter,
+            &reconciliation[0],
+            Duration::from_secs(5)
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        outbox_row(&database, endpoint_id).await,
+        (
+            "permanently_failed".into(),
+            Some("permanent_sdk_reconciliation".into()),
+            Some("permanent_sdk_reconciliation".into()),
+            None,
+        )
+    );
+    let events: Vec<(String, String)> = sqlx::query_as(
+        "SELECT event_class, reason FROM outbox_terminal_events WHERE outbox_id = $1",
+    )
+    .bind(endpoint_id)
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        events,
+        vec![(
+            "permanent_sdk_reconciliation".to_owned(),
+            "permanent_sdk_reconciliation".to_owned(),
+        )],
+        "one permanent reconciliation CAS writes exactly one terminal event"
+    );
+
+    // A replayed transition with the same claim matches zero rows and
+    // inserts no second event.
+    assert!(
+        !outbox
+            .mark_reconciliation_permanently_failed(&reconciliation[0])
+            .await
+            .unwrap()
+    );
+    let event_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM outbox_terminal_events WHERE outbox_id = $1")
+            .bind(endpoint_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(event_count, 1);
+
+    // Health and metrics expose the durable event without double-counting
+    // across repeated publications.
+    let runtime = health_runtime(database.pool());
+    let app = operational_router(Router::new(), runtime.clone());
+    publish_outbox_health(&outbox, &runtime).await;
+    publish_outbox_health(&outbox, &runtime).await;
+    let (status, ready) = ready_json(&app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ready["status"], "ready");
+    assert_eq!(ready["outbox_terminal_failure_count"], 1);
+    assert_eq!(
+        ready["outbox_terminal_failures_by_class"]["permanent_sdk_reconciliation"],
+        1
+    );
+    let metrics = metrics_text(&app).await;
+    assert!(
+        metrics.contains(
+            "paykit_outbox_terminal_transitions_total{class=\"permanent_sdk_reconciliation\",reason=\"permanent_sdk_reconciliation\"} 1"
+        ),
+        "metrics: {metrics}"
+    );
+    assert!(
+        metrics.contains("paykit_outbox_terminal_failure_count 1"),
+        "metrics: {metrics}"
+    );
     database.cleanup().await;
 }
 

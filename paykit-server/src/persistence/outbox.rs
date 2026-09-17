@@ -705,17 +705,50 @@ impl OutboxStore {
     }
 
     /// Retains an attributable handoff whose SDK state cannot be reconciled safely.
+    /// The transition and its durable terminal event commit in one
+    /// transaction, so permanent reconciliation failure carries the same
+    /// retained evidence as every other terminal transition; a replayed CAS
+    /// matches zero rows and inserts no second event.
     pub async fn mark_reconciliation_permanently_failed(
         &self,
         claim: &ClaimedHandoff,
     ) -> Result<bool, PersistenceError> {
-        self.reconciliation_transition(
-            claim,
-            "permanently_failed",
-            Some("permanent_sdk_reconciliation"),
-            None,
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let changed = sqlx::query(
+            "UPDATE outbox SET status = 'permanently_failed', \
+                 error_class = 'permanent_sdk_reconciliation', \
+                 failure_reason = 'permanent_sdk_reconciliation', \
+                 lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = NOW() \
+             WHERE id = $1 AND status = 'handed_off' \
+               AND sdk_outbound_message_id = $2 AND claim_token = $3 AND lease_expires_at > NOW()",
         )
+        .bind(claim.id)
+        .bind(&claim.sdk_outbound_message_id)
+        .bind(claim.claim_token)
+        .execute(&mut *tx)
         .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if changed.rows_affected() == 1 {
+            sqlx::query(
+                "INSERT INTO outbox_terminal_events
+                     (creator_id, invoice_id, outbox_id, event_class, reason)
+                 SELECT creator_id, invoice_id, id, 'permanent_sdk_reconciliation',
+                        'permanent_sdk_reconciliation'
+                 FROM outbox WHERE id = $1",
+            )
+            .bind(claim.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(changed.rows_affected() == 1)
     }
 
     /// Releases a still-pending reconciliation claim with bounded retry delay.
