@@ -5,14 +5,7 @@
 -- `prepared|queued|leased|retryable` rows, so a committed fence is preserved
 -- exactly like `handed_off` (in-flight, auditable, never terminalized),
 -- while a cancellation committed first makes the fence CAS match zero rows
--- and the worker performs no SDK call. The `expired_tail → expired_final`
--- transition later gained the same terminalization (reason
--- `invoice_expired`, in the state-flip transaction); invoices that reached
--- `expired_final` before that shipped left such rows inert — never claimed
--- (final-invoice exclusion) and never terminal — and are drained by the
--- bounded one-time backfill sweep (`OutboxStore::sweep_final_invoice_backfill`,
--- reason `invoice_final_backfill`, at most 100 rows per pass, oldest
--- `created_at` first). A crash after the fence with no SDK
+-- and the worker performs no SDK call. A crash after the fence with no SDK
 -- completion is recovered by the DEDICATED fenced-recovery path added in
 -- migration 0023 (never the ordinary claim path, which does not re-admit
 -- fenced rows): an expired `handoff_started` row is claimable by
