@@ -2596,6 +2596,104 @@ async fn flooded_reader_partition_cannot_starve_unrelated_pair() {
     database.cleanup().await;
 }
 
+#[tokio::test]
+async fn single_slot_passes_claim_oldest_due_partition_before_lower_id_flood() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[66; 32]).unwrap());
+    create_creator_once(&database, crypto.clone(), 66).await;
+    let readers = distinct_readers();
+    assert!(readers.len() >= 2, "reader fixture must yield two readers");
+    let (flooded_parent, _) =
+        create_activated_invoice_for(&database, crypto.clone(), &readers[0], "pass-flooded").await;
+    let (_oldest_parent, _) =
+        create_activated_invoice_for(&database, crypto.clone(), &readers[1], "pass-oldest").await;
+    let flooded_assignment: Option<Uuid> =
+        sqlx::query_scalar("SELECT reader_assignment_id FROM outbox WHERE id = $1")
+            .bind(flooded_parent)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    let oldest_assignment: Option<Uuid> =
+        sqlx::query_scalar("SELECT reader_assignment_id FROM outbox WHERE id = $1")
+            .bind(_oldest_parent)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert!(flooded_assignment.is_some());
+    assert!(oldest_assignment.is_some());
+    assert_ne!(flooded_assignment, oldest_assignment);
+
+    // The flooded partition holds every lexicographically smaller due row
+    // id, so id ordering would admit it ahead of the older due partition on
+    // every single-slot pass.
+    for index in 1..=3u128 {
+        sqlx::query(
+            "INSERT INTO outbox \
+             (id, creator_id, reader_assignment_id, intent_envelope, status, next_attempt_at) \
+             SELECT $1, creator_id, $2, decode('00', 'hex'), 'queued', NOW() - INTERVAL '1 minute' \
+             FROM outbox WHERE id = $3",
+        )
+        .bind(Uuid::from_u128(index))
+        .bind(flooded_assignment.unwrap())
+        .bind(flooded_parent)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    }
+    let oldest_due = Uuid::from_u128(u128::MAX);
+    sqlx::query(
+        "INSERT INTO outbox \
+         (id, creator_id, reader_assignment_id, intent_envelope, status, next_attempt_at) \
+         SELECT $1, creator_id, $2, decode('00', 'hex'), 'queued', NOW() - INTERVAL '2 minutes' \
+         FROM outbox WHERE id = $3",
+    )
+    .bind(oldest_due)
+    .bind(oldest_assignment.unwrap())
+    .bind(_oldest_parent)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    // Pass one with a single batch slot: the oldest due unrelated partition
+    // wins even though the flooded partition owns every smaller row id.
+    let pass_one = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(pass_one.len(), 1);
+    assert_eq!(
+        pass_one[0].id(),
+        oldest_due,
+        "the oldest due partition must win a single-slot pass"
+    );
+
+    // Complete the winner so its partition is lease-free; the next pass
+    // admits the flooded partition's oldest row.
+    sqlx::query(
+        "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = '1', \
+         lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL WHERE id = $1",
+    )
+    .bind(oldest_due)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let pass_two = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(pass_two.len(), 1);
+    let pass_two_assignment: Option<Uuid> =
+        sqlx::query_scalar("SELECT reader_assignment_id FROM outbox WHERE id = $1")
+            .bind(pass_two[0].id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(pass_two_assignment, flooded_assignment);
+    database.cleanup().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn partition_lease_cap_holds_across_replicas() {
     let database = TestDatabase::create().await;

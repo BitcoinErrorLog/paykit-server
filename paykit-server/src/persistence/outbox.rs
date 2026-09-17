@@ -349,6 +349,7 @@ impl OutboxStore {
              ), \
              ranked AS ( \
                  SELECT o.id, \
+                        o.next_attempt_at, \
                         ROW_NUMBER() OVER ( \
                             PARTITION BY o.creator_id, r.root_reader_assignment_id \
                             ORDER BY o.next_attempt_at, o.id \
@@ -376,7 +377,7 @@ impl OutboxStore {
                  FROM outbox o \
                  JOIN ranked ON ranked.id = o.id \
                  WHERE ranked.partition_rank = 1 AND ranked.active_count = 0 \
-                 ORDER BY ranked.id \
+                 ORDER BY ranked.next_attempt_at, ranked.id \
                  FOR UPDATE OF o SKIP LOCKED \
                  LIMIT $1 \
              ) \
