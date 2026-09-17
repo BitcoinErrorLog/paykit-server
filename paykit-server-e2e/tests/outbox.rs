@@ -2933,6 +2933,23 @@ async fn flooded_reader_partition_cannot_starve_unrelated_pair() {
     assert_eq!(flooded_parents.len(), 5);
 
     let outbox = OutboxStore::new(database.pool(), crypto);
+    // Fairness telemetry before the pass: exactly one flooded reader
+    // partition (five due rows, one admissible per pass) and no active
+    // partition leases.
+    let metrics = paykit_server::metrics::Metrics::new();
+    paykit_server::workers::outbox::publish_claim_fairness_metrics(&outbox, &metrics)
+        .await
+        .unwrap();
+    let encoded = metrics.encode().unwrap();
+    assert!(
+        encoded.contains("paykit_outbox_reader_saturated_total 1"),
+        "metrics: {encoded}"
+    );
+    assert!(
+        encoded.contains("paykit_outbox_active_partitions 0"),
+        "metrics: {encoded}"
+    );
+
     let claims = outbox
         .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
         .await
@@ -2962,6 +2979,22 @@ async fn flooded_reader_partition_cannot_starve_unrelated_pair() {
     assert_eq!(
         still_queued, 4,
         "the flooded partition consumed extra batch slots"
+    );
+
+    // After the pass, both partitions hold an unexpired lease and the
+    // flooded partition is still flooded (four due rows, zero admissible
+    // while leased), so the monotonic counter advances by one again.
+    paykit_server::workers::outbox::publish_claim_fairness_metrics(&outbox, &metrics)
+        .await
+        .unwrap();
+    let encoded = metrics.encode().unwrap();
+    assert!(
+        encoded.contains("paykit_outbox_reader_saturated_total 2"),
+        "metrics: {encoded}"
+    );
+    assert!(
+        encoded.contains("paykit_outbox_active_partitions 2"),
+        "metrics: {encoded}"
     );
     database.cleanup().await;
 }

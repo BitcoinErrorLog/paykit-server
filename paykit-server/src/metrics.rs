@@ -190,7 +190,9 @@ impl Metrics {
         );
         registry.register(
             "paykit_outbox_reader_saturated",
-            "Claim passes that encountered a saturated reader partition.",
+            "Reader-partition flooding observations: partitions whose due \
+             eligible rows exceeded what one claim pass could admit (one row \
+             per partition without an unexpired lease, zero with one).",
             outbox_reader_saturated.clone(),
         );
         registry.register(
@@ -314,8 +316,8 @@ impl Metrics {
         self.outbox_terminal_oldest_age_seconds
             .set(oldest_age_seconds.unwrap_or_default().max(0));
     }
-    pub fn outbox_reader_saturated(&self) {
-        self.outbox_reader_saturated.inc();
+    pub fn outbox_reader_saturated(&self, flooded_partitions: u64) {
+        self.outbox_reader_saturated.inc_by(flooded_partitions);
     }
     pub fn set_outbox_active_partitions(&self, value: i64) {
         self.outbox_active_partitions.set(value.max(0));

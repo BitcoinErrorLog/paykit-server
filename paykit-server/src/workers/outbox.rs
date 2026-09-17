@@ -231,6 +231,23 @@ pub async fn process_claim_with_health(
     }
 }
 
+/// Publishes claim-pass fairness telemetry exactly as the enqueue loop
+/// does: `paykit_outbox_reader_saturated_total` increments by the number of
+/// flooded reader partitions (reader-partition flooding: more due rows in
+/// one partition than one pass can admit), and the gauge reports the
+/// partitions currently holding an unexpired lease.
+pub async fn publish_claim_fairness_metrics(
+    store: &OutboxStore,
+    metrics: &crate::metrics::Metrics,
+) -> Result<(), PersistenceError> {
+    let (flooded_partitions, active_partitions) = store.claim_metrics().await?;
+    if flooded_partitions > 0 {
+        metrics.outbox_reader_saturated(u64::try_from(flooded_partitions).unwrap_or_default());
+    }
+    metrics.set_outbox_active_partitions(active_partitions);
+    Ok(())
+}
+
 /// Reconciles one exact persisted SDK outbound record. Only durable `Sent`
 /// unlocks dependencies. Recoverable states remain `handed_off`; exact
 /// `Invalid`, `RecoveryRequired`, or `Superseded` records become retained

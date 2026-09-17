@@ -283,8 +283,13 @@ impl OutboxStore {
         })
     }
 
-    pub async fn claim_metrics(&self, limit: i64) -> Result<(bool, i64), PersistenceError> {
-        let (saturated, active_partitions): (bool, i64) = sqlx::query_as(
+    /// Claim-pass fairness telemetry. A reader partition is FLOODED when its
+    /// due eligible rows exceed what one claim pass can admit from it: one
+    /// row when the partition holds no unexpired lease, zero when it does.
+    /// Returns `(flooded_partitions, active_partitions)`, where active means
+    /// holding an unexpired lease.
+    pub async fn claim_metrics(&self) -> Result<(i64, i64), PersistenceError> {
+        let (flooded_partitions, active_partitions): (i64, i64) = sqlx::query_as(
             "WITH RECURSIVE eligible AS (
                  SELECT id, creator_id, reader_assignment_id AS root_reader_assignment_id, depends_on_id
                  FROM outbox WHERE depends_on_id IS NULL
@@ -293,13 +298,13 @@ impl OutboxStore {
                  FROM outbox child JOIN eligible ON eligible.id = child.depends_on_id
              ), roots AS (
                  SELECT DISTINCT ON (id) id, root_reader_assignment_id FROM eligible ORDER BY id
-              ), active AS (
+             ), active AS (
                  SELECT o.creator_id, roots.root_reader_assignment_id
                  FROM outbox o JOIN roots ON roots.id = o.id
                  WHERE o.status IN ('leased', 'handoff_started') AND o.lease_expires_at > NOW()
                  GROUP BY o.creator_id, roots.root_reader_assignment_id
              ), due_partitions AS (
-                 SELECT o.creator_id, roots.root_reader_assignment_id
+                 SELECT o.creator_id, roots.root_reader_assignment_id, COUNT(*) AS due_count
                  FROM outbox o JOIN roots ON roots.id = o.id
                  LEFT JOIN outbox dependency ON dependency.id = o.depends_on_id
                  LEFT JOIN invoices invoice ON invoice.id = o.invoice_id
@@ -312,14 +317,18 @@ impl OutboxStore {
                    AND (o.depends_on_id IS NULL OR dependency.status = 'delivered')
                  GROUP BY o.creator_id, roots.root_reader_assignment_id
              )
-             SELECT (SELECT COUNT(*) FROM due_partitions) > $1,
+             SELECT (SELECT COUNT(*) FROM due_partitions
+                     LEFT JOIN active
+                       ON active.creator_id = due_partitions.creator_id
+                      AND active.root_reader_assignment_id = due_partitions.root_reader_assignment_id
+                     WHERE due_partitions.due_count >
+                           CASE WHEN active.creator_id IS NULL THEN 1 ELSE 0 END),
                     (SELECT COUNT(*) FROM active)",
         )
-        .bind(limit)
         .fetch_one(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        Ok((saturated, active_partitions))
+        Ok((flooded_partitions, active_partitions))
     }
 
     /// Claims eligible rows while preserving endpoint-publication dependencies.

@@ -564,20 +564,14 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
         if !runtime.may_start_worker_claim() {
             break;
         }
-        match workers
-            .outbox
-            .claim_metrics(workers.outbox_batch_size)
-            .await
+        if crate::workers::outbox::publish_claim_fairness_metrics(
+            &workers.outbox,
+            &runtime.metrics(),
+        )
+        .await
+        .is_err()
         {
-            Ok((saturated, active_partitions)) => {
-                if saturated {
-                    runtime.metrics().outbox_reader_saturated();
-                }
-                runtime
-                    .metrics()
-                    .set_outbox_active_partitions(active_partitions);
-            }
-            Err(_) => runtime.set_outbox_enqueue_available(false),
+            runtime.set_outbox_enqueue_available(false);
         }
         let claims = match workers
             .outbox
