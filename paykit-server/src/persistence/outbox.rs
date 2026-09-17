@@ -243,10 +243,16 @@ impl OutboxStore {
         .map_err(|_| PersistenceError::Unavailable)
     }
 
+    /// Terminal-failure health for the alert contract. `count`,
+    /// `oldest_age_seconds`, and `by_class` cover only UNACKNOWLEDGED
+    /// events, so operator acknowledgement (docs/outbox-terminal-acknowledgement.md)
+    /// clears the critical signal; `transitions` remains the monotonic
+    /// per-class/reason transition census feeding the counter.
     pub async fn terminal_failure_health(&self) -> Result<TerminalFailureHealth, PersistenceError> {
         let rows: Vec<(String, i64)> = sqlx::query_as(
             "SELECT event_class, COUNT(*)::BIGINT
              FROM outbox_terminal_events
+             WHERE acknowledged_at IS NULL
              GROUP BY event_class",
         )
         .fetch_all(&self.pool)
@@ -255,7 +261,8 @@ impl OutboxStore {
         let count = rows.iter().map(|(_, count)| *count).sum();
         let oldest_age_seconds = sqlx::query_scalar::<_, Option<i64>>(
             "SELECT EXTRACT(EPOCH FROM (NOW() - MIN(created_at)))::BIGINT
-             FROM outbox_terminal_events",
+             FROM outbox_terminal_events
+             WHERE acknowledged_at IS NULL",
         )
         .fetch_one(&self.pool)
         .await

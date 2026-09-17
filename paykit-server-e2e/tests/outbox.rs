@@ -2590,6 +2590,158 @@ async fn reconciliation_permanent_failure_writes_exactly_one_terminal_event() {
 }
 
 #[tokio::test]
+async fn terminal_acknowledgement_clears_unacknowledged_alert_values() {
+    use paykit_server::metrics::{terminal_alert_critical, terminal_alert_warning};
+
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[71; 32]).unwrap());
+    let (_creator, _bundle, _invoices, _invoice_id, endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    sqlx::query(
+        "UPDATE outbox SET attempt_count = 19, error_class = 'link_establishment' WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        outbox
+            .exhaust_claim_if_due(&claim, 20, Duration::from_secs(60 * 60))
+            .await
+            .unwrap()
+    );
+    // Age the two retained events deterministically: the parent's oldest
+    // unacknowledged age crosses the fifteen-minute critical leg; the
+    // child's does not.
+    sqlx::query(
+        "UPDATE outbox_terminal_events SET created_at = NOW() - INTERVAL '20 minutes' \
+         WHERE outbox_id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE outbox_terminal_events SET created_at = NOW() - INTERVAL '5 minutes' \
+         WHERE outbox_id = $1",
+    )
+    .bind(request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let runtime = health_runtime(database.pool());
+    let app = operational_router(Router::new(), runtime.clone());
+    publish_outbox_health(&outbox, &runtime).await;
+    let (status, ready) = ready_json(&app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ready["outbox_terminal_failure_count"], 2);
+    let oldest_before = ready["outbox_oldest_terminal_failure_age_seconds"]
+        .as_i64()
+        .expect("two unacknowledged events must report an oldest age");
+    assert!(oldest_before >= 15 * 60, "oldest age: {oldest_before}");
+    // The pinned alert contract, evaluated on the exported values: warning
+    // and critical both fire.
+    let metrics_before = metrics_text(&app).await;
+    assert!(
+        metrics_before
+            .contains("paykit_outbox_terminal_transitions_total{class=\"link_establishment_exhausted\",reason=\"attempt_ceiling\"} 1"),
+        "metrics: {metrics_before}"
+    );
+    assert!(
+        metrics_before
+            .contains("paykit_outbox_terminal_transitions_total{class=\"dependency_failed\",reason=\"parent_link_establishment_exhausted\"} 1"),
+        "metrics: {metrics_before}"
+    );
+    let transitions_in_window = 2;
+    assert!(terminal_alert_warning(transitions_in_window));
+    assert!(terminal_alert_critical(
+        Some(oldest_before),
+        transitions_in_window
+    ));
+
+    // The exact documented operator acknowledgement statement
+    // (docs/outbox-terminal-acknowledgement.md) clears the oldest event.
+    let parent_event: Uuid =
+        sqlx::query_scalar("SELECT id FROM outbox_terminal_events WHERE outbox_id = $1")
+            .bind(endpoint_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    let acknowledged = sqlx::query(
+        "UPDATE outbox_terminal_events
+         SET acknowledged_at = NOW(),
+             acknowledged_by = $1
+         WHERE id = $2
+           AND acknowledged_at IS NULL",
+    )
+    .bind("deployment-operator")
+    .bind(parent_event)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(acknowledged.rows_affected(), 1);
+    let replayed = sqlx::query(
+        "UPDATE outbox_terminal_events
+         SET acknowledged_at = NOW(),
+             acknowledged_by = $1
+         WHERE id = $2
+           AND acknowledged_at IS NULL",
+    )
+    .bind("deployment-operator")
+    .bind(parent_event)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(replayed.rows_affected(), 0, "acknowledgement is idempotent");
+
+    publish_outbox_health(&outbox, &runtime).await;
+    let (status, ready) = ready_json(&app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ready["outbox_terminal_failure_count"], 1);
+    assert_eq!(
+        ready["outbox_terminal_failures_by_class"]["dependency_failed"],
+        1
+    );
+    assert!(
+        ready["outbox_terminal_failures_by_class"]
+            .get("link_establishment_exhausted")
+            .is_none(),
+        "acknowledged classes leave the unacknowledged breakdown: {ready}"
+    );
+    let oldest_after = ready["outbox_oldest_terminal_failure_age_seconds"]
+        .as_i64()
+        .expect("one unacknowledged event remains");
+    assert!(oldest_after < 15 * 60, "oldest age: {oldest_after}");
+    // On the computed values the warning still fires (transitions are
+    // monotonic) while the critical signal has cleared.
+    assert!(terminal_alert_warning(transitions_in_window));
+    assert!(!terminal_alert_critical(
+        Some(oldest_after),
+        transitions_in_window
+    ));
+    let metrics_after = metrics_text(&app).await;
+    assert!(
+        metrics_after.contains("paykit_outbox_terminal_failure_count 1"),
+        "metrics: {metrics_after}"
+    );
+    assert!(
+        metrics_after
+            .contains("paykit_outbox_terminal_transitions_total{class=\"link_establishment_exhausted\",reason=\"attempt_ceiling\"} 1"),
+        "acknowledgement never rewinds the monotonic counter: {metrics_after}"
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn active_retryable_row_still_degrades_readiness() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();

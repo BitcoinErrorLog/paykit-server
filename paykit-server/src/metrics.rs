@@ -336,6 +336,32 @@ impl Metrics {
     }
 }
 
+/// The terminal-failure alert contract (design §4), pinned here so the
+/// exported values and the alerting expressions cannot drift apart:
+/// warning on `increase(paykit_outbox_terminal_transitions_total[5m]) > 0`;
+/// critical when the oldest UNACKNOWLEDGED terminal failure is older than
+/// fifteen minutes or five transitions occur within five minutes.
+pub const TERMINAL_ALERT_WINDOW: &str = "5m";
+pub const TERMINAL_ALERT_CRITICAL_AGE_SECONDS: i64 = 15 * 60;
+pub const TERMINAL_ALERT_CRITICAL_TRANSITIONS_PER_WINDOW: u64 = 5;
+
+/// Warning: any terminal transition inside the alert window.
+pub fn terminal_alert_warning(transitions_in_window: u64) -> bool {
+    transitions_in_window > 0
+}
+
+/// Critical: an unacknowledged terminal failure is older than the critical
+/// age, or the window saw at least the critical number of transitions.
+/// `oldest_unacknowledged_age_seconds` is `None` when every terminal event
+/// is acknowledged, which clears the age leg.
+pub fn terminal_alert_critical(
+    oldest_unacknowledged_age_seconds: Option<i64>,
+    transitions_in_window: u64,
+) -> bool {
+    oldest_unacknowledged_age_seconds.is_some_and(|age| age > TERMINAL_ALERT_CRITICAL_AGE_SECONDS)
+        || transitions_in_window >= TERMINAL_ALERT_CRITICAL_TRANSITIONS_PER_WINDOW
+}
+
 fn terminal_class_label(class: &str) -> &'static str {
     match class {
         "link_establishment_exhausted" => "link_establishment_exhausted",
@@ -367,5 +393,37 @@ fn terminal_reason_label(reason: &str) -> &'static str {
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_alert_warning_is_any_transition_in_window() {
+        assert!(!terminal_alert_warning(0));
+        assert!(terminal_alert_warning(1));
+        assert!(terminal_alert_warning(4));
+        assert!(terminal_alert_warning(5));
+    }
+
+    #[test]
+    fn terminal_alert_critical_uses_unacknowledged_age_and_window_count() {
+        // Nothing unacknowledged and a quiet window: no critical signal.
+        assert!(!terminal_alert_critical(None, 0));
+        assert!(!terminal_alert_critical(None, 4));
+        // Age leg: only an unacknowledged oldest age beyond fifteen minutes.
+        assert!(!terminal_alert_critical(
+            Some(TERMINAL_ALERT_CRITICAL_AGE_SECONDS),
+            0
+        ));
+        assert!(terminal_alert_critical(
+            Some(TERMINAL_ALERT_CRITICAL_AGE_SECONDS + 1),
+            0
+        ));
+        // Count leg: five transitions in five minutes.
+        assert!(terminal_alert_critical(None, 5));
+        assert!(terminal_alert_critical(Some(0), 5));
     }
 }
