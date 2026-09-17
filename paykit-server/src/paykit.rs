@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use paykit_lib::{
     PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier, PaymentReference,
-    PaymentRequestTerms,
+    PaymentRequestTerms, PrivateMessageKind, parse_private_payment_list_json,
 };
 use paykit_sdk::{
     LinkedPeerState, OutboundPrivateMessageStatus, PaykitSdk, PaykitSdkConfig, PaykitSdkError,
@@ -20,7 +20,9 @@ use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use crate::{
-    application::semantic_intent::{DeliveryIntentV1, PaymentTermsV1, ReceivingDetailV1},
+    application::semantic_intent::{
+        DeliveryIntentV1, DeliveryOperationV1, PaymentTermsV1, ReceivingDetailV1,
+    },
     config::PaykitConfig,
     domain::locks::CreatorPubky,
     persistence::{CreatorStore, PostgresStorageAdapter},
@@ -299,6 +301,99 @@ impl Adapter for PaykitAdapter {
             event_id: record.proposal_event_id.ok_or(HandoffError::Permanent)?,
             payment_request_id: record.payment_request_id,
         })
+    }
+
+    /// Pure durable-state read for fenced recovery (migration 0023 rule 3):
+    /// matches already-enqueued outbound records by counterparty, receiver
+    /// path, message kind, and the invoice-unique content the intent carries
+    /// (the complete receiving-detail identifier set for an endpoint
+    /// publication, the payment reference for a payment request). It
+    /// enqueues nothing; the earliest matching record is the attributed
+    /// effect.
+    async fn resolve_unattributed_effect(
+        &self,
+        intent: &DeliveryIntentV1,
+    ) -> Result<Option<HandoffResult>, HandoffError> {
+        let _guard = self.mutation_lock.lock().await;
+        let selected_path = intent
+            .selected_reader_path()
+            .map_err(|_| HandoffError::Permanent)?;
+        let (reader, path) = parse_peer(intent.reader_pubky(), selected_path.as_str())?;
+        let records = self
+            .storage
+            .transaction(move |transaction| {
+                Ok(transaction.export_storage_state().outbound_private_messages)
+            })
+            .await
+            .map_err(classify)?;
+        match intent.operation() {
+            DeliveryOperationV1::EndpointPublication { receiving_details } => {
+                let expected: std::collections::BTreeSet<&str> = receiving_details
+                    .iter()
+                    .map(|detail| detail.identifier.as_str())
+                    .collect();
+                let mut matches: Vec<u64> = records
+                    .iter()
+                    .filter(|record| {
+                        record.counterparty == reader
+                            && record.counterparty_receiver_path == path
+                            && record.kind == PrivateMessageKind::PrivatePaymentList.as_str()
+                    })
+                    .filter(|record| {
+                        parse_private_payment_list_json(&record.raw_json)
+                            .map(|list| {
+                                list.payment_endpoints
+                                    .keys()
+                                    .map(PaymentEndpointIdentifier::as_str)
+                                    .collect::<std::collections::BTreeSet<&str>>()
+                                    == expected
+                            })
+                            .unwrap_or(false)
+                    })
+                    .map(|record| record.outbound_message_id)
+                    .collect();
+                matches.sort_unstable();
+                Ok(matches
+                    .first()
+                    .map(|outbound_message_id| HandoffResult::EndpointPublication {
+                        outbound_message_id: *outbound_message_id,
+                    }))
+            }
+            DeliveryOperationV1::PaymentRequestProposal { terms } => {
+                let mut matches: Vec<(u64, String, String)> = records
+                    .iter()
+                    .filter(|record| {
+                        record.counterparty == reader
+                            && record.counterparty_receiver_path == path
+                            && record.kind == PrivateMessageKind::PaymentRequest.as_str()
+                    })
+                    .filter_map(|record| {
+                        let raw: serde_json::Value = serde_json::from_str(&record.raw_json).ok()?;
+                        let request = raw.get("request")?;
+                        if request.get("payment_reference")?.as_str()?
+                            != terms.payment_reference.as_str()
+                        {
+                            return None;
+                        }
+                        Some((
+                            record.outbound_message_id,
+                            raw.get("event_id")?.as_str()?.to_owned(),
+                            raw.get("payment_request_id")?.as_str()?.to_owned(),
+                        ))
+                    })
+                    .collect();
+                matches.sort_by_key(|(outbound_message_id, _, _)| *outbound_message_id);
+                Ok(matches
+                    .first()
+                    .map(|(outbound_message_id, event_id, payment_request_id)| {
+                        HandoffResult::PaymentRequestProposal {
+                            outbound_message_id: *outbound_message_id,
+                            event_id: event_id.clone(),
+                            payment_request_id: payment_request_id.clone(),
+                        }
+                    }))
+            }
+        }
     }
 
     async fn outbound_status(

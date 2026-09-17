@@ -78,6 +78,13 @@ impl Adapter for FakeAdapter {
     ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError> {
         Ok(Some(OutboundPrivateMessageStatus::Sent))
     }
+
+    async fn resolve_unattributed_effect(
+        &self,
+        _intent: &DeliveryIntentV1,
+    ) -> Result<Option<HandoffResult>, HandoffError> {
+        Ok(None)
+    }
 }
 
 fn payment_intent(marker: &PaykitReceiverMarker) -> DeliveryIntentV1 {

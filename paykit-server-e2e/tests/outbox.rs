@@ -39,7 +39,7 @@ use paykit_server::{
     },
     workers::outbox::{
         Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffStage, process_claim,
-        process_reconciliation,
+        process_fence_recovery, process_reconciliation,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -135,6 +135,13 @@ impl Adapter for ReconciliationAdapter {
         _outbound_message_id: u64,
     ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError> {
         Ok(self.statuses.lock().unwrap().pop_front())
+    }
+
+    async fn resolve_unattributed_effect(
+        &self,
+        _intent: &DeliveryIntentV1,
+    ) -> Result<Option<HandoffResult>, HandoffError> {
+        Ok(None)
     }
 }
 
@@ -379,6 +386,14 @@ impl Adapter for CountingAdapter {
         &self,
         _outbound_message_id: u64,
     ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError> {
+        self.sdk_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(None)
+    }
+
+    async fn resolve_unattributed_effect(
+        &self,
+        _intent: &DeliveryIntentV1,
+    ) -> Result<Option<HandoffResult>, HandoffError> {
         self.sdk_calls.fetch_add(1, Ordering::SeqCst);
         Ok(None)
     }
@@ -763,10 +778,11 @@ async fn finality_before_worker_preflight_yields_zero_sdk_calls() {
 }
 
 /// Counts complete SDK handoffs through the production `execute_handoff`
-/// entrypoint and always succeeds with one fixed attributable result.
+/// entrypoint and returns one fixed result — success or failure — so the
+/// fence-first barrier covers non-success SDK results too.
 struct FencedHandoffAdapter {
     handoffs: AtomicUsize,
-    result: HandoffResult,
+    result: Result<HandoffResult, HandoffFailure>,
 }
 
 #[async_trait]
@@ -776,7 +792,7 @@ impl Adapter for FencedHandoffAdapter {
         _intent: &DeliveryIntentV1,
     ) -> Result<HandoffResult, HandoffFailure> {
         self.handoffs.fetch_add(1, Ordering::SeqCst);
-        Ok(self.result.clone())
+        self.result.clone()
     }
 
     async fn fetch_marker(
@@ -814,6 +830,78 @@ impl Adapter for FencedHandoffAdapter {
         _outbound_message_id: u64,
     ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError> {
         panic!("execute_handoff is overridden; reconciliation never runs")
+    }
+
+    async fn resolve_unattributed_effect(
+        &self,
+        _intent: &DeliveryIntentV1,
+    ) -> Result<Option<HandoffResult>, HandoffError> {
+        panic!("fence recovery never runs in the live-fence barrier")
+    }
+}
+
+/// Fenced-recovery evidence adapter: any attempt to re-run the SDK effect
+/// panics (recovery never re-executes), while the durable-evidence query
+/// returns one fixed resolution.
+struct FenceRecoveryAdapter {
+    handoffs: AtomicUsize,
+    resolutions: AtomicUsize,
+    resolution: Option<HandoffResult>,
+}
+
+#[async_trait]
+impl Adapter for FenceRecoveryAdapter {
+    async fn execute_handoff(
+        &self,
+        _intent: &DeliveryIntentV1,
+    ) -> Result<HandoffResult, HandoffFailure> {
+        self.handoffs.fetch_add(1, Ordering::SeqCst);
+        panic!("fence recovery never re-runs the SDK effect")
+    }
+
+    async fn fetch_marker(
+        &self,
+        _reader: &str,
+        _path: &str,
+    ) -> Result<Option<PaykitReceiverMarker>, HandoffError> {
+        panic!("fence recovery never runs preflight")
+    }
+
+    async fn ensure_link_with_peer(&self, _reader: &str, _path: &str) -> Result<(), HandoffError> {
+        panic!("fence recovery never runs preflight")
+    }
+
+    async fn enqueue_private_payment_list_with_receiving_details(
+        &self,
+        _reader: &str,
+        _path: &str,
+        _details: &[paykit_server::application::semantic_intent::ReceivingDetailV1],
+    ) -> Result<HandoffResult, HandoffError> {
+        panic!("fence recovery never re-runs the SDK effect")
+    }
+
+    async fn propose_payment_request(
+        &self,
+        _reader: &str,
+        _path: &str,
+        _terms: &paykit_server::application::semantic_intent::PaymentTermsV1,
+    ) -> Result<HandoffResult, HandoffError> {
+        panic!("fence recovery never re-runs the SDK effect")
+    }
+
+    async fn outbound_status(
+        &self,
+        _outbound_message_id: u64,
+    ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError> {
+        panic!("fence recovery never runs reconciliation")
+    }
+
+    async fn resolve_unattributed_effect(
+        &self,
+        _intent: &DeliveryIntentV1,
+    ) -> Result<Option<HandoffResult>, HandoffError> {
+        self.resolutions.fetch_add(1, Ordering::SeqCst);
+        Ok(self.resolution.clone())
     }
 }
 
@@ -854,9 +942,9 @@ async fn handoff_fence_committed_before_cancellation_attributes_sdk_effect() {
     assert_eq!(claim.id(), endpoint_id);
     let adapter = Arc::new(FencedHandoffAdapter {
         handoffs: AtomicUsize::new(0),
-        result: HandoffResult::EndpointPublication {
+        result: Ok(HandoffResult::EndpointPublication {
             outbound_message_id: 42,
-        },
+        }),
     });
     let worker = {
         let outbox = outbox.clone();
@@ -952,9 +1040,9 @@ async fn cancellation_committed_before_handoff_fence_yields_zero_sdk_calls() {
     assert_eq!(claim.id(), endpoint_id);
     let adapter = Arc::new(FencedHandoffAdapter {
         handoffs: AtomicUsize::new(0),
-        result: HandoffResult::EndpointPublication {
+        result: Ok(HandoffResult::EndpointPublication {
             outbound_message_id: 43,
-        },
+        }),
     });
     let worker = {
         let outbox = outbox.clone();
@@ -992,6 +1080,420 @@ async fn cancellation_committed_before_handoff_fence_yields_zero_sdk_calls() {
             Some("invoice_abandoned".into()),
             None,
         )
+    );
+    database.cleanup().await;
+}
+
+/// Barrier (a): crash/lease expiry BEFORE the SDK effect on a finalized
+/// invoice. The fenced row carries no durable invocation marker, so the
+/// dedicated fenced-recovery path proves the effect absent and terminalizes
+/// the row as `handoff_unresolved` with exactly one terminal event and zero
+/// SDK calls; readiness is ready.
+#[tokio::test]
+async fn finalized_fence_crash_before_sdk_effect_terminalizes_with_zero_sdk_calls() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[57; 32]).unwrap());
+    let (_creator, _bundle, invoices, invoice_id, endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.id(), endpoint_id);
+    assert!(outbox.begin_handoff(&claim).await.unwrap());
+    // Cancellation finalizes the invoice and preserves the fenced row.
+    assert!(
+        invoices
+            .resolve_invoice(invoice_id, "abandoned", time::OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        outbox_row(&database, endpoint_id).await.0,
+        "handoff_started"
+    );
+    // A final-invoice fenced row is never active work (migration 0023 rule 5).
+    assert!(outbox.delivery_available().await.unwrap());
+    // The process dies before the invocation marker and the SDK call; the
+    // lease expires. The ordinary claim path never re-admits a fenced row.
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(endpoint_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(
+        outbox
+            .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_empty(),
+        "the ordinary claim path must never re-admit an expired fenced row"
+    );
+    // The dedicated recovery path claims it regardless of invoice finality.
+    let recovery = outbox
+        .claim_fence_recovery(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(recovery.len(), 1);
+    assert!(
+        !recovery[0].sdk_invocation_started(),
+        "the crash happened before the invocation marker committed"
+    );
+    let adapter = CountingAdapter {
+        sdk_calls: AtomicUsize::new(0),
+    };
+    assert!(
+        process_fence_recovery(&outbox, &adapter, &recovery[0], Duration::from_secs(5))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        adapter.sdk_calls.load(Ordering::SeqCst),
+        0,
+        "no invocation marker proves the effect absent: zero SDK calls"
+    );
+    assert_eq!(
+        outbox_row(&database, endpoint_id).await,
+        (
+            "permanently_failed".into(),
+            Some("handoff_unresolved".into()),
+            Some("handoff_unresolved".into()),
+            None,
+        )
+    );
+    let events: Vec<(String, String)> = sqlx::query_as(
+        "SELECT event_class, reason FROM outbox_terminal_events WHERE outbox_id = $1",
+    )
+    .bind(endpoint_id)
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        events,
+        vec![(
+            "handoff_unresolved".to_string(),
+            "handoff_unresolved".to_string()
+        )],
+        "exactly one terminal event of the closed handoff_unresolved class"
+    );
+    assert_eq!(
+        outbox_row(&database, request_id).await.0,
+        "permanently_failed",
+        "cancellation already terminalized the dependent child"
+    );
+    // Readiness is ready: the terminalized fence leaves no active-work residue.
+    assert!(outbox.delivery_available().await.unwrap());
+    let runtime = health_runtime(database.pool());
+    let app = operational_router(Router::new(), runtime.clone());
+    publish_outbox_health(&outbox, &runtime).await;
+    let (status, ready) = ready_json(&app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ready["status"], "ready");
+    assert_eq!(ready["paykit_delivery"], "ready");
+    assert_eq!(
+        ready["outbox_terminal_failures_by_class"]["handoff_unresolved"],
+        1
+    );
+    database.cleanup().await;
+}
+
+/// Barrier (b), effect present: crash AFTER the SDK effect on a finalized
+/// invoice. The durable invocation marker is set, recovery resolves the
+/// already-enqueued effect from durable SDK evidence, attributes it, and
+/// completes `handed_off` through the ordinary fenced result path: exactly
+/// one durable record, zero duplicate SDK calls.
+#[tokio::test]
+async fn finalized_fence_crash_after_sdk_effect_attributes_resolved_effect() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[58; 32]).unwrap());
+    let (_creator, _bundle, invoices, invoice_id, endpoint_id, _request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.id(), endpoint_id);
+    assert!(outbox.begin_handoff(&claim).await.unwrap());
+    // The production pre-SDK marker commits before the SDK call; the process
+    // dies after the SDK effect but before `mark_handed_off` persists it.
+    assert!(
+        outbox
+            .mark_handoff_invocation_started(&claim)
+            .await
+            .unwrap()
+    );
+    assert!(
+        invoices
+            .resolve_invoice(invoice_id, "abandoned", time::OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(endpoint_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(
+        outbox
+            .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let recovery = outbox
+        .claim_fence_recovery(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(recovery.len(), 1);
+    assert!(recovery[0].sdk_invocation_started());
+    let adapter = FenceRecoveryAdapter {
+        handoffs: AtomicUsize::new(0),
+        resolutions: AtomicUsize::new(0),
+        resolution: Some(HandoffResult::EndpointPublication {
+            outbound_message_id: 77,
+        }),
+    };
+    assert!(
+        process_fence_recovery(&outbox, &adapter, &recovery[0], Duration::from_secs(5))
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        adapter.handoffs.load(Ordering::SeqCst),
+        0,
+        "recovery never re-runs the SDK effect"
+    );
+    assert_eq!(adapter.resolutions.load(Ordering::SeqCst), 1);
+    let attributed: (String, Option<String>) =
+        sqlx::query_as("SELECT status, sdk_outbound_message_id FROM outbox WHERE id = $1")
+            .bind(endpoint_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        attributed,
+        ("handed_off".into(), Some("77".into())),
+        "exactly one durable attribution record for the resolved effect"
+    );
+    let events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM outbox_terminal_events WHERE outbox_id = $1")
+            .bind(endpoint_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(events, 0, "an attributed fence is never terminalized");
+    // Nothing remains for recovery: the row is ordinary attributable
+    // `handed_off` reconciliation work now.
+    assert!(
+        outbox
+            .claim_fence_recovery(Uuid::new_v4(), 10, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    database.cleanup().await;
+}
+
+/// Barrier (b), effect absent: crash AFTER the invocation marker on a
+/// finalized invoice, but durable SDK evidence resolves no matching effect.
+/// Recovery terminalizes the row as `handoff_unresolved` with exactly one
+/// terminal event and zero duplicate SDK calls.
+#[tokio::test]
+async fn finalized_fence_crash_after_sdk_effect_without_resolvable_effect_terminalizes() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[59; 32]).unwrap());
+    let (_creator, _bundle, invoices, invoice_id, endpoint_id, _request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(outbox.begin_handoff(&claim).await.unwrap());
+    assert!(
+        outbox
+            .mark_handoff_invocation_started(&claim)
+            .await
+            .unwrap()
+    );
+    assert!(
+        invoices
+            .resolve_invoice(invoice_id, "abandoned", time::OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(endpoint_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let recovery = outbox
+        .claim_fence_recovery(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(recovery.len(), 1);
+    assert!(recovery[0].sdk_invocation_started());
+    let adapter = FenceRecoveryAdapter {
+        handoffs: AtomicUsize::new(0),
+        resolutions: AtomicUsize::new(0),
+        resolution: None,
+    };
+    assert!(
+        process_fence_recovery(&outbox, &adapter, &recovery[0], Duration::from_secs(5))
+            .await
+            .unwrap()
+    );
+    assert_eq!(adapter.handoffs.load(Ordering::SeqCst), 0);
+    assert_eq!(adapter.resolutions.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        outbox_row(&database, endpoint_id).await,
+        (
+            "permanently_failed".into(),
+            Some("handoff_unresolved".into()),
+            Some("handoff_unresolved".into()),
+            None,
+        )
+    );
+    let events: Vec<(String, String)> = sqlx::query_as(
+        "SELECT event_class, reason FROM outbox_terminal_events WHERE outbox_id = $1",
+    )
+    .bind(endpoint_id)
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        events,
+        vec![(
+            "handoff_unresolved".to_string(),
+            "handoff_unresolved".to_string()
+        )]
+    );
+    assert!(outbox.delivery_available().await.unwrap());
+    database.cleanup().await;
+}
+
+/// Barrier (c): the fence commits first, cancellation finalizes the invoice,
+/// and the SDK then returns a RETRYABLE error. `handoff_started ->
+/// retryable` is forbidden for a final invoice (migration 0023 rule 4): the
+/// retryable branch checks finality under the invoice lock and terminalizes
+/// the row as `handoff_unresolved` with exactly one terminal event instead;
+/// readiness is ready.
+#[tokio::test]
+async fn retryable_sdk_failure_after_cancellation_terminalizes_final_fence() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[60; 32]).unwrap());
+    let (_creator, _bundle, invoices, invoice_id, endpoint_id, _request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let fence_committed = Arc::new(tokio::sync::Notify::new());
+    let release_worker = Arc::new(tokio::sync::Notify::new());
+    let outbox =
+        OutboxStore::new(database.pool(), crypto).with_handoff_fence_seam(HandoffFenceSeam {
+            after_preflight: None,
+            after_fence: Some(Arc::new({
+                let fence_committed = fence_committed.clone();
+                let release_worker = release_worker.clone();
+                move || {
+                    let fence_committed = fence_committed.clone();
+                    let release_worker = release_worker.clone();
+                    Box::pin(async move {
+                        fence_committed.notify_one();
+                        release_worker.notified().await;
+                    })
+                }
+            })),
+        });
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.id(), endpoint_id);
+    let adapter = Arc::new(FencedHandoffAdapter {
+        handoffs: AtomicUsize::new(0),
+        result: Err(HandoffFailure::Retryable(
+            RetryableHandoffStage::EndpointPublication,
+        )),
+    });
+    let worker = {
+        let outbox = outbox.clone();
+        let adapter = adapter.clone();
+        tokio::spawn(async move {
+            process_claim(
+                &outbox,
+                adapter.as_ref(),
+                &claim,
+                Duration::from_secs(1),
+                20,
+                Duration::from_secs(60 * 60),
+            )
+            .await
+        })
+    };
+    // The production fence is committed; cancellation commits second and
+    // finalizes the invoice before the SDK returns its retryable failure.
+    fence_committed.notified().await;
+    assert!(
+        invoices
+            .resolve_invoice(invoice_id, "abandoned", time::OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    release_worker.notify_one();
+    assert!(worker.await.unwrap().unwrap());
+    assert_eq!(adapter.handoffs.load(Ordering::SeqCst), 1);
+    // No `retryable` row exists for a final invoice: the fenced row
+    // terminalized as `handoff_unresolved` with exactly one terminal event.
+    assert_eq!(
+        outbox_row(&database, endpoint_id).await,
+        (
+            "permanently_failed".into(),
+            Some("handoff_unresolved".into()),
+            Some("handoff_unresolved".into()),
+            None,
+        )
+    );
+    let events: Vec<(String, String)> = sqlx::query_as(
+        "SELECT event_class, reason FROM outbox_terminal_events WHERE outbox_id = $1",
+    )
+    .bind(endpoint_id)
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        events,
+        vec![(
+            "handoff_unresolved".to_string(),
+            "handoff_unresolved".to_string()
+        )]
+    );
+    assert!(outbox.delivery_available().await.unwrap());
+    let runtime = health_runtime(database.pool());
+    let app = operational_router(Router::new(), runtime.clone());
+    publish_outbox_health(&outbox, &runtime).await;
+    let (status, ready) = ready_json(&app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ready["status"], "ready");
+    assert_eq!(ready["paykit_delivery"], "ready");
+    assert_eq!(
+        ready["outbox_terminal_failures_by_class"]["handoff_unresolved"],
+        1
     );
     database.cleanup().await;
 }

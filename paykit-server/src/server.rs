@@ -31,7 +31,10 @@ use crate::{
             ElectrumAdapter, ElectrumPort, ObservationBackend, ObserverError, ObserverLeadership,
             ObserverPolicy, RequestLimiter, observation_loop,
         },
-        outbox::{ProcessingHealth, process_claim_with_health, process_reconciliation_with_health},
+        outbox::{
+            ProcessingHealth, process_claim_with_health, process_fence_recovery_with_health,
+            process_reconciliation_with_health,
+        },
     },
 };
 use async_trait::async_trait;
@@ -653,6 +656,62 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                 }
                 Ok(Err(_)) => outbox_available = false,
                 Err(_) => panic!("owned outbox claim task exited unexpectedly"),
+            }
+        }
+        // Dedicated fenced-recovery pass (migration 0023 rule 2): expired
+        // `handoff_started` rows are claimed regardless of invoice finality
+        // and resolved to attribution or `handoff_unresolved` without ever
+        // re-running the SDK effect.
+        let recovery_claims = match workers
+            .outbox
+            .claim_fence_recovery(
+                owner,
+                workers.outbox_batch_size,
+                workers.outbox_lease_duration,
+            )
+            .await
+        {
+            Ok(claims) => claims,
+            Err(_) => {
+                outbox_available = false;
+                Vec::new()
+            }
+        };
+        let mut recovery_batch = JoinSet::new();
+        for claim in recovery_claims {
+            let workers = workers.clone();
+            recovery_batch.spawn(async move {
+                let delay = retry_delay(
+                    workers.outbox_retry_initial,
+                    workers.outbox_retry_max,
+                    claim.attempt_count(),
+                );
+                match creator_adapter(&workers, claim.creator_id()).await {
+                    Ok(adapter) => {
+                        process_fence_recovery_with_health(&workers.outbox, &adapter, &claim, delay)
+                            .await
+                    }
+                    Err(AdapterBuildError::Permanent) => workers
+                        .outbox
+                        .mark_handoff_unresolved(&claim)
+                        .await
+                        .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
+                    Err(AdapterBuildError::Unavailable) => workers
+                        .outbox
+                        .retry_fence_recovery(&claim, delay)
+                        .await
+                        .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+                }
+            });
+        }
+        while let Some(result) = recovery_batch.join_next().await {
+            match result {
+                Ok(Ok((_, ProcessingHealth::Available))) => {}
+                Ok(Ok((_, ProcessingHealth::Retryable | ProcessingHealth::PermanentFailure))) => {
+                    delivery_available = false;
+                }
+                Ok(Err(_)) => outbox_available = false,
+                Err(_) => panic!("owned outbox fence-recovery task exited unexpectedly"),
             }
         }
         match workers.outbox.delivery_available().await {
