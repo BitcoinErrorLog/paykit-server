@@ -301,7 +301,9 @@ pub trait ObservationBackend: Send + Sync {
     /// The §B.9 expiry transitions: one pair of conditional UPDATEs per
     /// tick moving `observing → expired_tail` at `expires_at` and
     /// `expired_tail → expired_final` at `expires_at + tail`, both
-    /// timestamp-derived from `expires_at` on the server clock.
+    /// timestamp-derived from `expires_at` on the server clock. Every
+    /// invoice reaching `expired_final` has its non-handed-off outbox
+    /// rows terminalized in the same transaction (`invoice_expired`).
     async fn apply_expiry_transitions(
         &self,
         _tail: Duration,
