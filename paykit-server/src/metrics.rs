@@ -368,6 +368,7 @@ fn terminal_class_label(class: &str) -> &'static str {
         "invoice_voided" => "invoice_voided",
         "invoice_abandoned" => "invoice_abandoned",
         "invoice_expired" => "invoice_expired",
+        "invoice_final_backfill" => "invoice_final_backfill",
         "permanent_sdk_reconciliation" => "permanent_sdk_reconciliation",
         "handoff_unresolved" => "handoff_unresolved",
         _ => "unknown",
@@ -385,6 +386,7 @@ fn terminal_reason_label(reason: &str) -> &'static str {
         "invoice_voided" => "invoice_voided",
         "invoice_abandoned" => "invoice_abandoned",
         "invoice_expired" => "invoice_expired",
+        "invoice_final_backfill" => "invoice_final_backfill",
         "permanent_sdk_reconciliation" => "permanent_sdk_reconciliation",
         "handoff_unresolved" => "handoff_unresolved",
         "parent_handoff_unresolved" => "parent_handoff_unresolved",
@@ -456,7 +458,12 @@ mod tests {
         // Every closed invoice-lifecycle terminal class/reason appears in
         // the alert contract with its own label, never folded into
         // `unknown`.
-        for label in ["invoice_voided", "invoice_abandoned", "invoice_expired"] {
+        for label in [
+            "invoice_voided",
+            "invoice_abandoned",
+            "invoice_expired",
+            "invoice_final_backfill",
+        ] {
             assert_eq!(terminal_class_label(label), label);
             assert_eq!(terminal_reason_label(label), label);
         }
