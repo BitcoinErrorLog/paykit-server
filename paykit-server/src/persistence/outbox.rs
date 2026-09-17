@@ -38,6 +38,19 @@ impl OutboxRetryClass {
     }
 }
 
+/// Static terminal reason for a recovered fence whose durable invocation
+/// marker is FALSE (migration 0023 rule 3): the SDK provably never ran, so
+/// no effect can exist; the row terminalizes with zero SDK calls.
+pub const HANDOFF_UNRESOLVED_SDK_NOT_INVOKED: &str = "sdk_not_invoked";
+
+/// Static terminal reason for a recovered fence whose durable invocation
+/// marker is TRUE (migration 0023 rule 3): the SDK may have emitted an
+/// effect, but recovery never resolves or attributes it (endpoint
+/// identifier sets are not invoice-unique, so attribution could
+/// false-match another invoice's publication). The row terminalizes with
+/// zero SDK calls and an operator reconciles it by hand.
+pub const HANDOFF_UNRESOLVED_SDK_INVOKED_UNATTRIBUTED: &str = "sdk_invoked_unattributed";
+
 /// Outcome of the finality-checked retryable release of a fenced handoff
 /// (migration 0023 rule 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -698,10 +711,9 @@ impl OutboxStore {
     /// expired `handoff_started` rows REGARDLESS of invoice finality — the
     /// final-invoice exclusion of the ordinary claim path must not apply to
     /// fenced rows — and keeps the row in `handoff_started` under a fresh
-    /// token/lease so `mark_handed_off` attribution and
-    /// `mark_handoff_unresolved` terminalization stay fenced by the exact
-    /// token. Recovery never re-runs the SDK effect: it resolves durable
-    /// evidence only (rule 3).
+    /// token/lease so `mark_handoff_unresolved` terminalization stays
+    /// fenced by the exact token. Recovery never re-runs the SDK effect and
+    /// never resolves or attributes durable SDK state (rule 3).
     pub async fn claim_fence_recovery(
         &self,
         owner: Uuid,
@@ -734,17 +746,29 @@ impl OutboxStore {
         .map_err(|_| PersistenceError::Unavailable)
     }
 
-    /// Terminalizes a fenced row whose SDK effect is provably absent or
-    /// unresolvable (migration 0023 rule 3): `handoff_unresolved` is the
-    /// closed terminal class for a `handoff_started` row that can neither be
-    /// attributed nor safely re-executed. The transition, descendant
-    /// cascade, and exactly one durable terminal event commit together; a
-    /// replayed CAS matches zero rows and inserts no second event. The SDK
-    /// is never re-run for the row afterwards.
+    /// Terminalizes a recovered fenced row (migration 0023 rule 3):
+    /// `handoff_unresolved` is the closed terminal class for a
+    /// `handoff_started` row that can neither be attributed nor safely
+    /// re-executed. Recovery NEVER resolves or attributes an SDK effect, so
+    /// both marker states take the same closed transition with zero SDK
+    /// calls; only the static reason differs —
+    /// [`HANDOFF_UNRESOLVED_SDK_NOT_INVOKED`] when the durable invocation
+    /// marker is FALSE (the SDK provably never ran) and
+    /// [`HANDOFF_UNRESOLVED_SDK_INVOKED_UNATTRIBUTED`] when it is TRUE (an
+    /// effect may exist in durable SDK state and an operator reconciles it
+    /// by hand). The transition, descendant cascade, and exactly one
+    /// durable terminal event commit together; a replayed CAS matches zero
+    /// rows and inserts no second event. The SDK is never re-run for the
+    /// row afterwards.
     pub async fn mark_handoff_unresolved(
         &self,
         claim: &ClaimedOutbox,
     ) -> Result<bool, PersistenceError> {
+        let reason = if claim.sdk_invocation_started() {
+            HANDOFF_UNRESOLVED_SDK_INVOKED_UNATTRIBUTED
+        } else {
+            HANDOFF_UNRESOLVED_SDK_NOT_INVOKED
+        };
         let mut tx = self
             .pool
             .begin()
@@ -754,7 +778,7 @@ impl OutboxStore {
             "UPDATE outbox \
              SET status = 'permanently_failed', \
                  error_class = 'handoff_unresolved', \
-                 failure_reason = 'handoff_unresolved', \
+                 failure_reason = $3, \
                  lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, \
                  updated_at = NOW() \
              WHERE id = $1 AND status = 'handoff_started' AND claim_token = $2 \
@@ -762,6 +786,7 @@ impl OutboxStore {
         )
         .bind(claim.id)
         .bind(claim.claim_token)
+        .bind(reason)
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
@@ -771,11 +796,11 @@ impl OutboxStore {
             sqlx::query(
                 "INSERT INTO outbox_terminal_events
                      (creator_id, invoice_id, outbox_id, event_class, reason)
-                 SELECT creator_id, invoice_id, id, 'handoff_unresolved',
-                        'handoff_unresolved'
+                 SELECT creator_id, invoice_id, id, 'handoff_unresolved', $2
                  FROM outbox WHERE id = $1",
             )
             .bind(claim.id)
+            .bind(reason)
             .execute(&mut *tx)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
@@ -786,10 +811,11 @@ impl OutboxStore {
         Ok(changed.rows_affected() == 1)
     }
 
-    /// Releases a fenced-recovery claim whose evidence resolution failed
-    /// retryably: the row stays `handoff_started` (never re-executed as
-    /// ordinary work) and becomes claimable by [`Self::claim_fence_recovery`]
-    /// again after the bounded delay.
+    /// Releases a fenced-recovery claim the worker could not process (the
+    /// per-creator adapter was unavailable): the row stays
+    /// `handoff_started` (never re-executed as ordinary work) and becomes
+    /// claimable by [`Self::claim_fence_recovery`] again after the bounded
+    /// delay.
     pub async fn retry_fence_recovery(
         &self,
         claim: &ClaimedOutbox,

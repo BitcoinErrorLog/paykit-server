@@ -660,8 +660,8 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
         }
         // Dedicated fenced-recovery pass (migration 0023 rule 2): expired
         // `handoff_started` rows are claimed regardless of invoice finality
-        // and resolved to attribution or `handoff_unresolved` without ever
-        // re-running the SDK effect.
+        // and terminalize as `handoff_unresolved` without ever re-running
+        // the SDK effect or resolving/attributing durable SDK state.
         let recovery_claims = match workers
             .outbox
             .claim_fence_recovery(
@@ -688,8 +688,7 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                 );
                 match creator_adapter(&workers, claim.creator_id()).await {
                     Ok(adapter) => {
-                        process_fence_recovery_with_health(&workers.outbox, &adapter, &claim, delay)
-                            .await
+                        process_fence_recovery_with_health(&workers.outbox, &adapter, &claim).await
                     }
                     Err(AdapterBuildError::Permanent) => workers
                         .outbox

@@ -368,6 +368,7 @@ fn terminal_class_label(class: &str) -> &'static str {
         "invoice_voided" => "invoice_voided",
         "invoice_abandoned" => "invoice_abandoned",
         "permanent_sdk_reconciliation" => "permanent_sdk_reconciliation",
+        "handoff_unresolved" => "handoff_unresolved",
         _ => "unknown",
     }
 }
@@ -383,6 +384,10 @@ fn terminal_reason_label(reason: &str) -> &'static str {
         "invoice_voided" => "invoice_voided",
         "invoice_abandoned" => "invoice_abandoned",
         "permanent_sdk_reconciliation" => "permanent_sdk_reconciliation",
+        "handoff_unresolved" => "handoff_unresolved",
+        "parent_handoff_unresolved" => "parent_handoff_unresolved",
+        "sdk_not_invoked" => "sdk_not_invoked",
+        "sdk_invoked_unattributed" => "sdk_invoked_unattributed",
         _ => "unknown",
     }
 }
@@ -422,5 +427,25 @@ mod tests {
         // Count leg: five transitions in five minutes.
         assert!(terminal_alert_critical(None, 5));
         assert!(terminal_alert_critical(Some(0), 5));
+    }
+
+    #[test]
+    fn terminal_labels_cover_the_handoff_unresolved_vocabulary() {
+        // `handoff_unresolved` appears in the alert contract with its own
+        // class label, never folded into `unknown`.
+        assert_eq!(
+            terminal_class_label("handoff_unresolved"),
+            "handoff_unresolved"
+        );
+        for reason in [
+            "handoff_unresolved",
+            "parent_handoff_unresolved",
+            "sdk_not_invoked",
+            "sdk_invoked_unattributed",
+        ] {
+            assert_eq!(terminal_reason_label(reason), reason);
+        }
+        assert_eq!(terminal_class_label("unlisted_class"), "unknown");
+        assert_eq!(terminal_reason_label("unlisted_reason"), "unknown");
     }
 }

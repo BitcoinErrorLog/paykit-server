@@ -89,19 +89,6 @@ pub trait Adapter: Send + Sync {
         &self,
         outbound_message_id: u64,
     ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError>;
-
-    /// Resolves an already-enqueued SDK effect matching one fenced intent
-    /// WITHOUT enqueueing anything (migration 0023 rule 3). This is the
-    /// fenced-recovery evidence query: it runs only for a `handoff_started`
-    /// row whose durable invocation marker was committed before a crash, and
-    /// it must be a pure read of durable SDK state. `Ok(Some(_))` resolves
-    /// the exact effect for attribution; `Ok(None)` proves no matching
-    /// effect exists in durable SDK state; `Err(Retryable(_))` defers
-    /// recovery; `Err(Permanent)` makes the effect unresolvable.
-    async fn resolve_unattributed_effect(
-        &self,
-        intent: &DeliveryIntentV1,
-    ) -> Result<Option<HandoffResult>, HandoffError>;
 }
 
 /// Preflight the persisted exact path before any SDK call. Missing, changed, or
@@ -231,8 +218,10 @@ pub async fn process_claim_with_health(
     // Durable pre-SDK invocation marker (migration 0023 rule 1): committed
     // under the live fence in its own transaction BEFORE the SDK call, so a
     // crash leaves evidence distinguishing "SDK never invoked" (provably no
-    // effect) from "SDK possibly emitted" (recovery must resolve the
-    // effect). A lost fence means no SDK call below.
+    // effect) from "SDK possibly emitted" (recovery terminalizes the row as
+    // `sdk_invoked_unattributed` for manual operator reconciliation; it
+    // never resolves or attributes the effect). A lost fence means no SDK
+    // call below.
     if !store.mark_handoff_invocation_started(claim).await? {
         return Ok((false, ProcessingHealth::Retryable));
     }
@@ -261,61 +250,38 @@ pub async fn process_claim_with_health(
 }
 
 /// The dedicated fenced-recovery path (migration 0023 rules 2-3). It never
-/// re-runs the SDK effect. A fenced row recovered WITHOUT the durable
-/// invocation marker provably never reached the SDK: it terminalizes as
-/// `handoff_unresolved` with one terminal event and zero adapter calls. A
-/// row WITH the marker may have emitted: recovery resolves durable SDK
-/// evidence — a resolved effect is attributed and completes `handed_off`
-/// through the ordinary fenced result path (exactly one durable record,
-/// zero duplicate SDK calls), an unresolvable effect terminalizes as
-/// `handoff_unresolved`, and a retryable resolution error defers recovery
-/// under the bounded delay.
+/// re-runs the SDK effect and never resolves or attributes anything: EVERY
+/// recovered fenced row terminalizes as `handoff_unresolved` with exactly
+/// one durable terminal event and zero SDK calls. The durable invocation
+/// marker only selects the static terminal reason recorded by
+/// `mark_handoff_unresolved` — `sdk_not_invoked` (marker FALSE: the SDK
+/// provably never ran) or `sdk_invoked_unattributed` (marker TRUE: an
+/// effect may exist in durable SDK state but is never attributed
+/// automatically, because endpoint identifier sets are not invoice-unique
+/// and attribution could false-match another invoice's publication; an
+/// operator reconciles the row by hand). Recovery can therefore never mark
+/// a parent delivered from another invoice's publication. The adapter is
+/// accepted and ignored so tests can prove no adapter method is ever
+/// invoked on this path.
 pub async fn process_fence_recovery(
     store: &OutboxStore,
     adapter: &dyn Adapter,
     claim: &ClaimedOutbox,
-    retry_delay: Duration,
 ) -> Result<bool, PersistenceError> {
-    process_fence_recovery_with_health(store, adapter, claim, retry_delay)
+    process_fence_recovery_with_health(store, adapter, claim)
         .await
         .map(|(transitioned, _)| transitioned)
 }
 
 pub async fn process_fence_recovery_with_health(
     store: &OutboxStore,
-    adapter: &dyn Adapter,
+    _adapter: &dyn Adapter,
     claim: &ClaimedOutbox,
-    retry_delay: Duration,
 ) -> Result<(bool, ProcessingHealth), PersistenceError> {
-    if !claim.sdk_invocation_started() {
-        return store
-            .mark_handoff_unresolved(claim)
-            .await
-            .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
-    }
-    let intent = match store.delivery_intent(claim) {
-        Ok(intent) => intent,
-        Err(_) => {
-            return store
-                .mark_handoff_unresolved(claim)
-                .await
-                .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
-        }
-    };
-    match adapter.resolve_unattributed_effect(&intent).await {
-        Ok(Some(result)) => store
-            .mark_handed_off(claim, &result)
-            .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Available)),
-        Ok(None) | Err(HandoffError::Permanent) => store
-            .mark_handoff_unresolved(claim)
-            .await
-            .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
-        Err(HandoffError::Retryable(_)) => store
-            .retry_fence_recovery(claim, retry_delay)
-            .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
-    }
+    store
+        .mark_handoff_unresolved(claim)
+        .await
+        .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure))
 }
 
 /// Publishes claim-pass fairness telemetry exactly as the enqueue loop

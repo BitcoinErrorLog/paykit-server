@@ -20,7 +20,8 @@ pub use invoices::{
 };
 pub use migrations::{MIGRATION_ADVISORY_LOCK_KEY, MigrationLock, run_migrations};
 pub use outbox::{
-    ClaimedHandoff, ClaimedOutbox, HandoffFenceSeam, HandoffRelease, HandoffResult,
+    ClaimedHandoff, ClaimedOutbox, HANDOFF_UNRESOLVED_SDK_INVOKED_UNATTRIBUTED,
+    HANDOFF_UNRESOLVED_SDK_NOT_INVOKED, HandoffFenceSeam, HandoffRelease, HandoffResult,
     OutboxRetryClass, OutboxStore, SeamHook,
 };
 pub use sdk_state::{PostgresStorageAdapter, SdkStateStore};

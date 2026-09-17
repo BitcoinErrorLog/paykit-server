@@ -9,7 +9,7 @@
 -- paykit-sdk/src/runtime/payment_requests.rs:308 take no idempotency
 -- parameter), so identifiers cannot be pre-minted or derived from
 -- (invoice_id, generation_id, attempt). Recovery therefore never re-runs
--- the SDK effect and instead resolves durable evidence:
+-- the SDK effect and never resolves or attributes durable SDK state:
 --
 -- 1. The worker commits `handoff_sdk_invocation_started = TRUE` under the
 --    live fence (exact claim token, unexpired lease) in its own transaction
@@ -18,14 +18,18 @@
 -- 2. An expired `handoff_started` row is claimable ONLY by the dedicated
 --    fenced-recovery path (`claim_fence_recovery`), regardless of invoice
 --    finality; the ordinary claim path never re-admits a fenced row.
--- 3. When `handoff_sdk_invocation_started` is FALSE the effect is provably
---    absent (the SDK was never invoked): recovery terminalizes the row as
---    `handoff_unresolved` with exactly one durable terminal event and zero
---    SDK calls. When TRUE, recovery asks the adapter to resolve a matching
---    already-enqueued effect: a resolved record is attributed and the row
---    completes `handed_off` through the ordinary fenced result path; an
---    unresolvable record terminalizes as `handoff_unresolved` with one
---    terminal event. Recovery never re-runs the SDK.
+-- 3. Recovery never resolves, attributes, or re-runs an SDK effect. BOTH
+--    marker states terminalize the row as `handoff_unresolved` with
+--    exactly one durable terminal event and zero SDK calls; the static
+--    event/failure reason distinguishes them: `sdk_not_invoked` when the
+--    marker is FALSE (the effect is provably absent) and
+--    `sdk_invoked_unattributed` when it is TRUE (an effect may exist in
+--    durable SDK state but is never attributed automatically — endpoint
+--    identifier sets are not invoice-unique, so automatic attribution
+--    could false-match another invoice's publication; an operator
+--    reconciles the row by hand via
+--    docs/outbox-terminal-acknowledgement.md). The marker write itself is
+--    retained as that operator's evidence.
 -- 4. `handoff_started -> retryable` is forbidden when the invoice is final
 --    at transition time: the retryable branch checks finality under the
 --    invoice row lock and, when final, terminalizes as `handoff_unresolved`

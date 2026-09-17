@@ -40,3 +40,42 @@ The alert contract is pinned in `paykit-server/src/metrics.rs`:
 - warning: `increase(paykit_outbox_terminal_transitions_total[5m]) > 0`
 - critical: oldest unacknowledged age > 900 seconds, or >= 5 transitions in 5
   minutes
+
+## Reconciling an `sdk_invoked_unattributed` row
+
+A `handoff_unresolved` event with reason `sdk_invoked_unattributed` means
+the worker crashed after committing the durable pre-SDK invocation marker
+but before the handoff result was persisted: an endpoint publication or
+payment request MAY exist in the creator's durable SDK state, and recovery
+deliberately never attributes it automatically (endpoint identifier sets
+are not invoice-unique, so automatic attribution could false-match another
+invoice's publication). Find such rows read-only:
+
+```sql
+SELECT e.id, e.outbox_id, e.invoice_id, e.creator_id, e.created_at
+FROM outbox_terminal_events e
+WHERE e.event_class = 'handoff_unresolved'
+  AND e.reason = 'sdk_invoked_unattributed'
+  AND e.acknowledged_at IS NULL
+ORDER BY e.created_at;
+```
+
+For each row, inspect the creator's durable SDK outbound records (the
+`outbound_private_messages` collection inside the creator's encrypted SDK
+state, `sdk_states.state_envelope`, readable only through deployment
+tooling holding the master key) for a record to the same reader, receiver
+path, and message kind whose COMPLETE content — every endpoint identifier
+AND its payload, or the exact payment reference — matches the invoice's
+receiving details, and check its status (`Sent` means the effect reached
+the reader). Also check the creator's other `outbox` rows for the same
+reader carrying an `sdk_outbound_message_id` for the same endpoint
+identifier: if a sibling invoice's row already owns the matching `Sent`
+publication, that publication belongs to the sibling and this invoice's
+effect was never published. The terminal row itself is immutable (the
+repair trigger rejects edits), so reconciliation is downstream: if the
+exact-payload record is confirmed `Sent`, settle the invoice with the
+marketplace per its manual-review procedure; if no exact-payload record
+exists, treat the effect as never delivered and re-issue or refund per the
+same procedure. Only after that downstream reconciliation, acknowledge the
+event with the exact statement above (`$2` = `e.id`), which clears the
+critical signal while retaining the row as evidence.

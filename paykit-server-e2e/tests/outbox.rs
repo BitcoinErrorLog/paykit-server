@@ -94,6 +94,22 @@ impl NewReaderPayloadFactory for Payloads {
     }
 }
 
+/// Fixed-address payloads so two invoices can carry the SAME endpoint
+/// identifier with DIFFERENT payloads (the HF-2 collision shape).
+struct AddressPayloads {
+    reader: ReaderPubky,
+    address: String,
+}
+
+impl NewReaderPayloadFactory for AddressPayloads {
+    fn for_child_index(&self, _child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
+        Ok(NewReaderPayloads {
+            endpoint_intent: common::endpoint_intent(&self.reader, self.address.clone()),
+            bitcoin_address: self.address.clone(),
+        })
+    }
+}
+
 struct ReconciliationAdapter {
     statuses: Mutex<VecDeque<OutboundPrivateMessageStatus>>,
 }
@@ -135,13 +151,6 @@ impl Adapter for ReconciliationAdapter {
         _outbound_message_id: u64,
     ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError> {
         Ok(self.statuses.lock().unwrap().pop_front())
-    }
-
-    async fn resolve_unattributed_effect(
-        &self,
-        _intent: &DeliveryIntentV1,
-    ) -> Result<Option<HandoffResult>, HandoffError> {
-        Ok(None)
     }
 }
 
@@ -386,14 +395,6 @@ impl Adapter for CountingAdapter {
         &self,
         _outbound_message_id: u64,
     ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError> {
-        self.sdk_calls.fetch_add(1, Ordering::SeqCst);
-        Ok(None)
-    }
-
-    async fn resolve_unattributed_effect(
-        &self,
-        _intent: &DeliveryIntentV1,
-    ) -> Result<Option<HandoffResult>, HandoffError> {
         self.sdk_calls.fetch_add(1, Ordering::SeqCst);
         Ok(None)
     }
@@ -887,22 +888,12 @@ impl Adapter for FencedHandoffAdapter {
     ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError> {
         panic!("execute_handoff is overridden; reconciliation never runs")
     }
-
-    async fn resolve_unattributed_effect(
-        &self,
-        _intent: &DeliveryIntentV1,
-    ) -> Result<Option<HandoffResult>, HandoffError> {
-        panic!("fence recovery never runs in the live-fence barrier")
-    }
 }
 
-/// Fenced-recovery evidence adapter: any attempt to re-run the SDK effect
-/// panics (recovery never re-executes), while the durable-evidence query
-/// returns one fixed resolution.
+/// Fenced-recovery evidence adapter: any attempt to invoke the SDK from the
+/// recovery path panics (recovery terminalizes with zero SDK calls).
 struct FenceRecoveryAdapter {
     handoffs: AtomicUsize,
-    resolutions: AtomicUsize,
-    resolution: Option<HandoffResult>,
 }
 
 #[async_trait]
@@ -950,14 +941,6 @@ impl Adapter for FenceRecoveryAdapter {
         _outbound_message_id: u64,
     ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError> {
         panic!("fence recovery never runs reconciliation")
-    }
-
-    async fn resolve_unattributed_effect(
-        &self,
-        _intent: &DeliveryIntentV1,
-    ) -> Result<Option<HandoffResult>, HandoffError> {
-        self.resolutions.fetch_add(1, Ordering::SeqCst);
-        Ok(self.resolution.clone())
     }
 }
 
@@ -1142,9 +1125,9 @@ async fn cancellation_committed_before_handoff_fence_yields_zero_sdk_calls() {
 
 /// Barrier (a): crash/lease expiry BEFORE the SDK effect on a finalized
 /// invoice. The fenced row carries no durable invocation marker, so the
-/// dedicated fenced-recovery path proves the effect absent and terminalizes
-/// the row as `handoff_unresolved` with exactly one terminal event and zero
-/// SDK calls; readiness is ready.
+/// dedicated fenced-recovery path terminalizes it as `handoff_unresolved`
+/// with the static `sdk_not_invoked` reason, exactly one terminal event,
+/// and zero SDK calls; readiness is ready.
 #[tokio::test]
 async fn finalized_fence_crash_before_sdk_effect_terminalizes_with_zero_sdk_calls() {
     let database = TestDatabase::create().await;
@@ -1204,7 +1187,7 @@ async fn finalized_fence_crash_before_sdk_effect_terminalizes_with_zero_sdk_call
         sdk_calls: AtomicUsize::new(0),
     };
     assert!(
-        process_fence_recovery(&outbox, &adapter, &recovery[0], Duration::from_secs(5))
+        process_fence_recovery(&outbox, &adapter, &recovery[0])
             .await
             .unwrap()
     );
@@ -1218,7 +1201,7 @@ async fn finalized_fence_crash_before_sdk_effect_terminalizes_with_zero_sdk_call
         (
             "permanently_failed".into(),
             Some("handoff_unresolved".into()),
-            Some("handoff_unresolved".into()),
+            Some("sdk_not_invoked".into()),
             None,
         )
     );
@@ -1233,7 +1216,7 @@ async fn finalized_fence_crash_before_sdk_effect_terminalizes_with_zero_sdk_call
         events,
         vec![(
             "handoff_unresolved".to_string(),
-            "handoff_unresolved".to_string()
+            "sdk_not_invoked".to_string()
         )],
         "exactly one terminal event of the closed handoff_unresolved class"
     );
@@ -1258,17 +1241,21 @@ async fn finalized_fence_crash_before_sdk_effect_terminalizes_with_zero_sdk_call
     database.cleanup().await;
 }
 
-/// Barrier (b), effect present: crash AFTER the SDK effect on a finalized
-/// invoice. The durable invocation marker is set, recovery resolves the
-/// already-enqueued effect from durable SDK evidence, attributes it, and
-/// completes `handed_off` through the ordinary fenced result path: exactly
-/// one durable record, zero duplicate SDK calls.
+/// Barrier (b): crash AFTER the SDK effect on a finalized invoice. The
+/// durable invocation marker is set, but recovery NEVER resolves or
+/// attributes the effect (endpoint identifier sets are not invoice-unique,
+/// so attribution could false-match another invoice's publication): the
+/// row terminalizes as `handoff_unresolved` with the static
+/// `sdk_invoked_unattributed` reason, exactly one terminal event, and zero
+/// SDK calls; the parent is NOT delivered, the dependent child is never
+/// admitted, and readiness is ready. An operator reconciles the row by
+/// hand (docs/outbox-terminal-acknowledgement.md).
 #[tokio::test]
-async fn finalized_fence_crash_after_sdk_effect_attributes_resolved_effect() {
+async fn finalized_fence_crash_after_sdk_effect_terminalizes_unattributed_with_zero_sdk_calls() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let crypto = Arc::new(Crypto::from_master_key(&[58; 32]).unwrap());
-    let (_creator, _bundle, invoices, invoice_id, endpoint_id, _request_id) =
+    let (_creator, _bundle, invoices, invoice_id, endpoint_id, request_id) =
         create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
     let outbox = OutboxStore::new(database.pool(), crypto);
     let claim = outbox
@@ -1312,115 +1299,33 @@ async fn finalized_fence_crash_after_sdk_effect_attributes_resolved_effect() {
         .unwrap();
     assert_eq!(recovery.len(), 1);
     assert!(recovery[0].sdk_invocation_started());
-    let adapter = FenceRecoveryAdapter {
-        handoffs: AtomicUsize::new(0),
-        resolutions: AtomicUsize::new(0),
-        resolution: Some(HandoffResult::EndpointPublication {
-            outbound_message_id: 77,
-        }),
+    let adapter = CountingAdapter {
+        sdk_calls: AtomicUsize::new(0),
     };
     assert!(
-        process_fence_recovery(&outbox, &adapter, &recovery[0], Duration::from_secs(5))
+        process_fence_recovery(&outbox, &adapter, &recovery[0])
             .await
             .unwrap()
     );
     assert_eq!(
-        adapter.handoffs.load(Ordering::SeqCst),
+        adapter.sdk_calls.load(Ordering::SeqCst),
         0,
-        "recovery never re-runs the SDK effect"
+        "recovery never resolves, attributes, or re-runs an SDK effect"
     );
-    assert_eq!(adapter.resolutions.load(Ordering::SeqCst), 1);
-    let attributed: (String, Option<String>) =
+    // The parent is NOT delivered and never attributed.
+    let unattributed: (String, Option<String>) =
         sqlx::query_as("SELECT status, sdk_outbound_message_id FROM outbox WHERE id = $1")
             .bind(endpoint_id)
             .fetch_one(database.pool())
             .await
             .unwrap();
-    assert_eq!(
-        attributed,
-        ("handed_off".into(), Some("77".into())),
-        "exactly one durable attribution record for the resolved effect"
-    );
-    let events: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM outbox_terminal_events WHERE outbox_id = $1")
-            .bind(endpoint_id)
-            .fetch_one(database.pool())
-            .await
-            .unwrap();
-    assert_eq!(events, 0, "an attributed fence is never terminalized");
-    // Nothing remains for recovery: the row is ordinary attributable
-    // `handed_off` reconciliation work now.
-    assert!(
-        outbox
-            .claim_fence_recovery(Uuid::new_v4(), 10, Duration::from_secs(30))
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    database.cleanup().await;
-}
-
-/// Barrier (b), effect absent: crash AFTER the invocation marker on a
-/// finalized invoice, but durable SDK evidence resolves no matching effect.
-/// Recovery terminalizes the row as `handoff_unresolved` with exactly one
-/// terminal event and zero duplicate SDK calls.
-#[tokio::test]
-async fn finalized_fence_crash_after_sdk_effect_without_resolvable_effect_terminalizes() {
-    let database = TestDatabase::create().await;
-    run_migrations(database.pool()).await.unwrap();
-    let crypto = Arc::new(Crypto::from_master_key(&[59; 32]).unwrap());
-    let (_creator, _bundle, invoices, invoice_id, endpoint_id, _request_id) =
-        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
-    let outbox = OutboxStore::new(database.pool(), crypto);
-    let claim = outbox
-        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
-        .await
-        .unwrap()
-        .pop()
-        .unwrap();
-    assert!(outbox.begin_handoff(&claim).await.unwrap());
-    assert!(
-        outbox
-            .mark_handoff_invocation_started(&claim)
-            .await
-            .unwrap()
-    );
-    assert!(
-        invoices
-            .resolve_invoice(invoice_id, "abandoned", time::OffsetDateTime::now_utc())
-            .await
-            .unwrap()
-            .is_some()
-    );
-    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
-        .bind(endpoint_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
-    let recovery = outbox
-        .claim_fence_recovery(Uuid::new_v4(), 10, Duration::from_secs(30))
-        .await
-        .unwrap();
-    assert_eq!(recovery.len(), 1);
-    assert!(recovery[0].sdk_invocation_started());
-    let adapter = FenceRecoveryAdapter {
-        handoffs: AtomicUsize::new(0),
-        resolutions: AtomicUsize::new(0),
-        resolution: None,
-    };
-    assert!(
-        process_fence_recovery(&outbox, &adapter, &recovery[0], Duration::from_secs(5))
-            .await
-            .unwrap()
-    );
-    assert_eq!(adapter.handoffs.load(Ordering::SeqCst), 0);
-    assert_eq!(adapter.resolutions.load(Ordering::SeqCst), 1);
+    assert_eq!(unattributed, ("permanently_failed".into(), None));
     assert_eq!(
         outbox_row(&database, endpoint_id).await,
         (
             "permanently_failed".into(),
             Some("handoff_unresolved".into()),
-            Some("handoff_unresolved".into()),
+            Some("sdk_invoked_unattributed".into()),
             None,
         )
     );
@@ -1435,8 +1340,214 @@ async fn finalized_fence_crash_after_sdk_effect_without_resolvable_effect_termin
         events,
         vec![(
             "handoff_unresolved".to_string(),
-            "handoff_unresolved".to_string()
-        )]
+            "sdk_invoked_unattributed".to_string()
+        )],
+        "exactly one terminal event of the closed handoff_unresolved class"
+    );
+    // The dependent payment-request child is never admitted: cancellation
+    // already terminalized it and recovery never unblocks it.
+    assert_eq!(
+        outbox_row(&database, request_id).await.0,
+        "permanently_failed"
+    );
+    // Readiness is ready: the terminalized fence leaves no active-work residue.
+    assert!(outbox.delivery_available().await.unwrap());
+    let runtime = health_runtime(database.pool());
+    let app = operational_router(Router::new(), runtime.clone());
+    publish_outbox_health(&outbox, &runtime).await;
+    let (status, ready) = ready_json(&app).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(ready["status"], "ready");
+    assert_eq!(ready["paykit_delivery"], "ready");
+    assert_eq!(
+        ready["outbox_terminal_failures_by_class"]["handoff_unresolved"],
+        1
+    );
+    database.cleanup().await;
+}
+
+/// HF-2 negative: two invoices for the same creator, reader, and receiver
+/// path carry the SAME endpoint identifier (`btc-bitcoin-p2wpkh`) with
+/// DIFFERENT payloads. Invoice A's publication is delivered; invoice B
+/// commits the durable invocation marker and crashes. Recovery must NEVER
+/// attribute A's publication to B: B's fenced row terminalizes as
+/// `handoff_unresolved` with the static `sdk_invoked_unattributed` reason,
+/// exactly one terminal event, and zero SDK calls; B's parent is not
+/// delivered, B's child is never admitted, and A's rows are untouched.
+#[tokio::test]
+async fn fence_recovery_never_attributes_another_invoices_publication() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[61; 32]).unwrap());
+    let creator = creator();
+    let reader = reader();
+    CreatorStore::new(database.pool(), crypto.clone())
+        .create(
+            &CreatorCredentials::new(
+                creator.clone(),
+                "session-secret".into(),
+                ReceiverNoiseSecretKey::new([9; 32]),
+                "xpub-secret".into(),
+                0,
+            ),
+            &StorageState::default(),
+            &key_tail(62),
+            &paykit_server::allocation::ClaimAllocation::shared_manual_default(),
+            0,
+        )
+        .await
+        .unwrap();
+    let invoices = InvoiceStore::new(database.pool(), crypto.clone());
+    let create_invoice = async |bundle: &str, address: &str| {
+        let invoice = invoices
+            .create_atomic(AtomicInvoiceInput {
+                creator: &creator,
+                reader: &reader,
+                bundle_binding: bundle.as_bytes(),
+                payment_request_binding: format!("hf2-payment-request-{bundle}").as_bytes(),
+                new_reader_payloads: &AddressPayloads {
+                    reader: reader.clone(),
+                    address: address.to_owned(),
+                },
+                payment_request_intent: common::payment_intent(&reader),
+                required_sats: 100,
+                nonce_sats: 1,
+                prepare_ttl: Duration::from_secs(900),
+                expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            })
+            .await
+            .unwrap();
+        invoices
+            .activate_invoice(invoice.invoice_id(), &[], &[])
+            .await
+            .unwrap();
+        (
+            invoice.invoice_id(),
+            invoice.endpoint_publication_outbox_id().unwrap(),
+            invoice.payment_request_outbox_id(),
+        )
+    };
+    let (_a_invoice_id, a_endpoint_id, a_request_id) =
+        create_invoice("000G40R40M30E209185GR38E2A", "hf2-address-a").await;
+    let (_b_invoice_id, b_endpoint_id, b_request_id) =
+        create_invoice("000G40R40M30E209185GR38E2B", "hf2-address-b").await;
+    // Invoice A's publication reached the reader and is delivered.
+    sqlx::query(
+        "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = '900' WHERE id = $1",
+    )
+    .bind(a_endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    // Invoice B commits the fence and the durable invocation marker, then
+    // the process crashes before any SDK result is persisted.
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    let claims = outbox
+        .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let b_claim = claims
+        .iter()
+        .find(|claim| claim.id() == b_endpoint_id)
+        .expect("invoice B endpoint row was claimable");
+    assert!(outbox.begin_handoff(b_claim).await.unwrap());
+    assert!(
+        outbox
+            .mark_handoff_invocation_started(b_claim)
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(b_endpoint_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let recovery = outbox
+        .claim_fence_recovery(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap();
+    let b_recovery = recovery
+        .iter()
+        .find(|claim| claim.id() == b_endpoint_id)
+        .expect("invoice B fenced row was recoverable");
+    assert!(b_recovery.sdk_invocation_started());
+    // Any SDK invocation from recovery panics: the path is pure persistence.
+    let adapter = FenceRecoveryAdapter {
+        handoffs: AtomicUsize::new(0),
+    };
+    assert!(
+        process_fence_recovery(&outbox, &adapter, b_recovery)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        adapter.handoffs.load(Ordering::SeqCst),
+        0,
+        "recovery never re-runs the SDK effect"
+    );
+    // B's parent is NOT delivered and never attributed to A's publication.
+    let b_row: (String, Option<String>) =
+        sqlx::query_as("SELECT status, sdk_outbound_message_id FROM outbox WHERE id = $1")
+            .bind(b_endpoint_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(b_row, ("permanently_failed".into(), None));
+    assert_eq!(
+        outbox_row(&database, b_endpoint_id).await,
+        (
+            "permanently_failed".into(),
+            Some("handoff_unresolved".into()),
+            Some("sdk_invoked_unattributed".into()),
+            None,
+        )
+    );
+    let b_events: Vec<(String, String)> = sqlx::query_as(
+        "SELECT event_class, reason FROM outbox_terminal_events WHERE outbox_id = $1",
+    )
+    .bind(b_endpoint_id)
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        b_events,
+        vec![(
+            "handoff_unresolved".to_string(),
+            "sdk_invoked_unattributed".to_string()
+        )],
+        "exactly one terminal event of the closed handoff_unresolved class"
+    );
+    // B's dependent payment-request child is never admitted.
+    assert_eq!(
+        outbox_row(&database, b_request_id).await,
+        (
+            "permanently_failed".into(),
+            Some("dependency_failed".into()),
+            Some("parent_handoff_unresolved".into()),
+            None,
+        )
+    );
+    // Invoice A is untouched: its delivered publication stands, its child
+    // was never terminalized, and recovery wrote no events for it.
+    let a_row: (String, Option<String>) =
+        sqlx::query_as("SELECT status, sdk_outbound_message_id FROM outbox WHERE id = $1")
+            .bind(a_endpoint_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(a_row, ("delivered".into(), Some("900".into())));
+    let a_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox_terminal_events WHERE outbox_id IN ($1, $2)",
+    )
+    .bind(a_endpoint_id)
+    .bind(a_request_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(a_events, 0, "recovery never touches the other invoice");
+    assert_ne!(
+        outbox_row(&database, a_request_id).await.0,
+        "permanently_failed"
     );
     assert!(outbox.delivery_available().await.unwrap());
     database.cleanup().await;
