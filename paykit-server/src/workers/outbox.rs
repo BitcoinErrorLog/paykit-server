@@ -202,6 +202,19 @@ pub async fn process_claim_with_health(
                 .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
         }
     };
+    store.seam().run_after_preflight().await;
+    // The persisted pre-SDK fence is the finality/handoff linearization
+    // point: a cancellation committed first makes this CAS match zero rows
+    // and no SDK call happens below; a committed fence is preserved by
+    // cancellation exactly like `handed_off`, so the SDK effect is either
+    // prevented or attributed — never orphaned.
+    if !store.begin_handoff(claim).await? {
+        return store
+            .mark_final_invoice_failed(claim)
+            .await
+            .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
+    }
+    store.seam().run_after_fence().await;
     match handoff(adapter, &intent).await {
         Ok(result) => store
             .mark_handed_off(claim, &result)

@@ -24,13 +24,13 @@ use paykit_sdk::{
     PubkySessionBootstrap, ReceiverNoiseSecretKey, StorageAdapter, storage::StorageState,
 };
 use paykit_server::{
-    application::semantic_intent::DeliveryOperationV1,
+    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     crypto::Crypto,
     domain::locks::{
         BundleId, CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader,
     },
     persistence::{
-        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
+        AtomicInvoiceInput, CreatorCredentials, CreatorStore, HandoffFenceSeam, InvoiceStore,
         NewReaderPayloadFactory, NewReaderPayloads, OutboxStore, PersistenceError,
         PostgresStorageAdapter, SdkStateStore, run_migrations,
     },
@@ -38,7 +38,7 @@ use paykit_server::{
         ElectrumProbe, OutboxTerminalHealth, PostgresDependency, Runtime, operational_router,
     },
     workers::outbox::{
-        Adapter, HandoffError, HandoffResult, RetryableHandoffStage, process_claim,
+        Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffStage, process_claim,
         process_reconciliation,
     },
 };
@@ -549,7 +549,7 @@ async fn delivery_aggregate_precedence_and_malformed_shape() {
 }
 
 #[tokio::test]
-async fn finality_between_preflight_and_handoff_yields_zero_sdk_calls() {
+async fn finality_before_worker_preflight_yields_zero_sdk_calls() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let crypto = Arc::new(Crypto::from_master_key(&[43; 32]).unwrap());
@@ -594,6 +594,240 @@ async fn finality_between_preflight_and_handoff_yields_zero_sdk_calls() {
         .await
         .unwrap();
     assert_ne!(status, "handed_off");
+    database.cleanup().await;
+}
+
+/// Counts complete SDK handoffs through the production `execute_handoff`
+/// entrypoint and always succeeds with one fixed attributable result.
+struct FencedHandoffAdapter {
+    handoffs: AtomicUsize,
+    result: HandoffResult,
+}
+
+#[async_trait]
+impl Adapter for FencedHandoffAdapter {
+    async fn execute_handoff(
+        &self,
+        _intent: &DeliveryIntentV1,
+    ) -> Result<HandoffResult, HandoffFailure> {
+        self.handoffs.fetch_add(1, Ordering::SeqCst);
+        Ok(self.result.clone())
+    }
+
+    async fn fetch_marker(
+        &self,
+        _reader: &str,
+        _path: &str,
+    ) -> Result<Option<PaykitReceiverMarker>, HandoffError> {
+        panic!("execute_handoff is overridden; preflight never runs")
+    }
+
+    async fn ensure_link_with_peer(&self, _reader: &str, _path: &str) -> Result<(), HandoffError> {
+        panic!("execute_handoff is overridden; preflight never runs")
+    }
+
+    async fn enqueue_private_payment_list_with_receiving_details(
+        &self,
+        _reader: &str,
+        _path: &str,
+        _details: &[paykit_server::application::semantic_intent::ReceivingDetailV1],
+    ) -> Result<HandoffResult, HandoffError> {
+        panic!("execute_handoff is overridden; preflight never runs")
+    }
+
+    async fn propose_payment_request(
+        &self,
+        _reader: &str,
+        _path: &str,
+        _terms: &paykit_server::application::semantic_intent::PaymentTermsV1,
+    ) -> Result<HandoffResult, HandoffError> {
+        panic!("execute_handoff is overridden; preflight never runs")
+    }
+
+    async fn outbound_status(
+        &self,
+        _outbound_message_id: u64,
+    ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError> {
+        panic!("execute_handoff is overridden; reconciliation never runs")
+    }
+}
+
+/// Barrier winner 1: the production fence commits first. Cancellation must
+/// preserve the fenced row as in-flight (never terminalize it), and the SDK
+/// effect is attributed on completion.
+#[tokio::test]
+async fn handoff_fence_committed_before_cancellation_attributes_sdk_effect() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[55; 32]).unwrap());
+    let (_creator, _bundle, invoices, invoice_id, endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let fence_committed = Arc::new(tokio::sync::Notify::new());
+    let release_worker = Arc::new(tokio::sync::Notify::new());
+    let outbox =
+        OutboxStore::new(database.pool(), crypto).with_handoff_fence_seam(HandoffFenceSeam {
+            after_preflight: None,
+            after_fence: Some(Arc::new({
+                let fence_committed = fence_committed.clone();
+                let release_worker = release_worker.clone();
+                move || {
+                    let fence_committed = fence_committed.clone();
+                    let release_worker = release_worker.clone();
+                    Box::pin(async move {
+                        fence_committed.notify_one();
+                        release_worker.notified().await;
+                    })
+                }
+            })),
+        });
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.id(), endpoint_id);
+    let adapter = Arc::new(FencedHandoffAdapter {
+        handoffs: AtomicUsize::new(0),
+        result: HandoffResult::EndpointPublication {
+            outbound_message_id: 42,
+        },
+    });
+    let worker = {
+        let outbox = outbox.clone();
+        let adapter = adapter.clone();
+        tokio::spawn(async move {
+            process_claim(
+                &outbox,
+                adapter.as_ref(),
+                &claim,
+                Duration::from_secs(1),
+                20,
+                Duration::from_secs(60 * 60),
+            )
+            .await
+        })
+    };
+    // The production fence is committed; cancellation commits second, on
+    // another connection, and must preserve the in-flight row.
+    fence_committed.notified().await;
+    assert!(
+        invoices
+            .resolve_invoice(invoice_id, "abandoned", time::OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        outbox_row(&database, endpoint_id).await.0,
+        "handoff_started"
+    );
+    assert_eq!(
+        outbox_row(&database, request_id).await,
+        (
+            "permanently_failed".into(),
+            Some("invoice_abandoned".into()),
+            Some("invoice_abandoned".into()),
+            None,
+        )
+    );
+    release_worker.notify_one();
+    assert!(worker.await.unwrap().unwrap());
+    assert_eq!(adapter.handoffs.load(Ordering::SeqCst), 1);
+    let attributed: (String, Option<String>) =
+        sqlx::query_as("SELECT status, sdk_outbound_message_id FROM outbox WHERE id = $1")
+            .bind(endpoint_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(attributed, ("handed_off".into(), Some("42".into())));
+    let events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM outbox_terminal_events WHERE outbox_id = $1")
+            .bind(endpoint_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(events, 0, "a preserved fenced row is never terminalized");
+    database.cleanup().await;
+}
+
+/// Barrier winner 2: cancellation commits first. The production fence CAS
+/// then matches zero rows and the worker performs zero SDK calls.
+#[tokio::test]
+async fn cancellation_committed_before_handoff_fence_yields_zero_sdk_calls() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[56; 32]).unwrap());
+    let (_creator, _bundle, invoices, invoice_id, endpoint_id, _request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let preflight_done = Arc::new(tokio::sync::Notify::new());
+    let release_worker = Arc::new(tokio::sync::Notify::new());
+    let outbox =
+        OutboxStore::new(database.pool(), crypto).with_handoff_fence_seam(HandoffFenceSeam {
+            after_preflight: Some(Arc::new({
+                let preflight_done = preflight_done.clone();
+                let release_worker = release_worker.clone();
+                move || {
+                    let preflight_done = preflight_done.clone();
+                    let release_worker = release_worker.clone();
+                    Box::pin(async move {
+                        preflight_done.notify_one();
+                        release_worker.notified().await;
+                    })
+                }
+            })),
+            after_fence: None,
+        });
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.id(), endpoint_id);
+    let adapter = Arc::new(FencedHandoffAdapter {
+        handoffs: AtomicUsize::new(0),
+        result: HandoffResult::EndpointPublication {
+            outbound_message_id: 43,
+        },
+    });
+    let worker = {
+        let outbox = outbox.clone();
+        let adapter = adapter.clone();
+        tokio::spawn(async move {
+            process_claim(
+                &outbox,
+                adapter.as_ref(),
+                &claim,
+                Duration::from_secs(1),
+                20,
+                Duration::from_secs(60 * 60),
+            )
+            .await
+        })
+    };
+    // The production preflight passed against a non-final invoice;
+    // cancellation commits first, on another connection, before the fence.
+    preflight_done.notified().await;
+    assert!(
+        invoices
+            .resolve_invoice(invoice_id, "abandoned", time::OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    release_worker.notify_one();
+    assert!(!worker.await.unwrap().unwrap());
+    assert_eq!(adapter.handoffs.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        outbox_row(&database, endpoint_id).await,
+        (
+            "permanently_failed".into(),
+            Some("invoice_abandoned".into()),
+            Some("invoice_abandoned".into()),
+            None,
+        )
+    );
     database.cleanup().await;
 }
 
@@ -986,6 +1220,7 @@ async fn void_and_abandoned_terminalize_non_handed_off_rows() {
         .unwrap()
         .pop()
         .unwrap();
+    assert!(outbox.begin_handoff(&endpoint_claim).await.unwrap());
     assert!(
         outbox
             .mark_handed_off(
@@ -1131,6 +1366,7 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             .unwrap(),
         "an expired fence overwrote reclaimed work"
     );
+    assert!(outbox.begin_handoff(&reclaimed_endpoint[0]).await.unwrap());
     assert!(
         outbox
             .mark_handed_off(
@@ -1209,6 +1445,7 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             .operation(),
         DeliveryOperationV1::PaymentRequestProposal { .. }
     ));
+    assert!(outbox.begin_handoff(&payment_claims[0]).await.unwrap());
     assert!(
         outbox
             .mark_handed_off(
@@ -1658,6 +1895,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             .await
             .unwrap()
     );
+    assert!(outbox.begin_handoff(&second_claim).await.unwrap());
     assert!(
         outbox
             .mark_handed_off(&second_claim, &second_result)

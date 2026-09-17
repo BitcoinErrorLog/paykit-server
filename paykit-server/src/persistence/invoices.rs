@@ -1045,9 +1045,11 @@ impl InvoiceStore {
                           AND endpoint.invoice_id = invoices.id
                           AND endpoint.generation_id = request.generation_id
                           AND request.status IN
-                            ('prepared', 'queued', 'leased', 'retryable', 'handed_off', 'delivered')
+                            ('prepared', 'queued', 'leased', 'handoff_started',
+                             'retryable', 'handed_off', 'delivered')
                           AND endpoint.status IN
-                            ('prepared', 'queued', 'leased', 'retryable', 'handed_off', 'delivered')
+                            ('prepared', 'queued', 'leased', 'handoff_started',
+                             'retryable', 'handed_off', 'delivered')
                         ) = 1 THEN 'pending_delivery'
                       ELSE 'contract_error'
                     END

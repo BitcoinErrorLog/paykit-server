@@ -158,10 +158,48 @@ impl ClaimedHandoff {
     }
 }
 
+/// Test seam around the production preflight/fence/SDK sequence. Production
+/// never installs hooks, so both points are no-ops there; tests install them
+/// to serialize a concurrent cancellation against the fence commit.
+#[derive(Clone, Default)]
+pub struct HandoffFenceSeam {
+    pub after_preflight: Option<SeamHook>,
+    pub after_fence: Option<SeamHook>,
+}
+
+pub type SeamHook = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
+impl std::fmt::Debug for HandoffFenceSeam {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HandoffFenceSeam")
+            .field("after_preflight", &self.after_preflight.is_some())
+            .field("after_fence", &self.after_fence.is_some())
+            .finish()
+    }
+}
+
+impl HandoffFenceSeam {
+    pub(crate) async fn run_after_preflight(&self) {
+        if let Some(hook) = &self.after_preflight {
+            hook().await;
+        }
+    }
+
+    pub(crate) async fn run_after_fence(&self) {
+        if let Some(hook) = &self.after_fence {
+            hook().await;
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OutboxStore {
     pool: PgPool,
     crypto: std::sync::Arc<Crypto>,
+    seam: HandoffFenceSeam,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -177,7 +215,19 @@ impl OutboxStore {
         Self {
             pool: pool.clone(),
             crypto,
+            seam: HandoffFenceSeam::default(),
         }
+    }
+
+    /// Installs the test-only fence seam; production never calls this, so
+    /// both seam points stay no-ops there.
+    pub fn with_handoff_fence_seam(mut self, seam: HandoffFenceSeam) -> Self {
+        self.seam = seam;
+        self
+    }
+
+    pub(crate) fn seam(&self) -> &HandoffFenceSeam {
+        &self.seam
     }
 
     /// Reports aggregate delivery availability without exposing row or Creator identifiers.
@@ -185,7 +235,7 @@ impl OutboxStore {
         sqlx::query_scalar(
             "SELECT NOT EXISTS ( \
                  SELECT 1 FROM outbox \
-                 WHERE status IN ('retryable', 'handed_off') \
+                 WHERE status IN ('retryable', 'handoff_started', 'handed_off') \
              )",
         )
         .fetch_one(&self.pool)
@@ -236,10 +286,10 @@ impl OutboxStore {
                  FROM outbox child JOIN eligible ON eligible.id = child.depends_on_id
              ), roots AS (
                  SELECT DISTINCT ON (id) id, root_reader_assignment_id FROM eligible ORDER BY id
-             ), active AS (
+              ), active AS (
                  SELECT o.creator_id, roots.root_reader_assignment_id
                  FROM outbox o JOIN roots ON roots.id = o.id
-                 WHERE o.status = 'leased' AND o.lease_expires_at > NOW()
+                 WHERE o.status IN ('leased', 'handoff_started') AND o.lease_expires_at > NOW()
                  GROUP BY o.creator_id, roots.root_reader_assignment_id
              ), due_partitions AS (
                  SELECT o.creator_id, roots.root_reader_assignment_id
@@ -247,7 +297,7 @@ impl OutboxStore {
                  LEFT JOIN outbox dependency ON dependency.id = o.depends_on_id
                  LEFT JOIN invoices invoice ON invoice.id = o.invoice_id
                  WHERE ((o.status = 'queued' AND o.next_attempt_at <= NOW())
-                     OR (o.status = 'leased' AND o.lease_expires_at <= NOW())
+                     OR (o.status IN ('leased', 'handoff_started') AND o.lease_expires_at <= NOW())
                      OR (o.status = 'retryable' AND o.next_attempt_at <= NOW()))
                    AND (o.invoice_id IS NULL OR invoice.baseline_state NOT IN (
                      'expired_final', 'void_baseline_failed', 'void_prepare_expired',
@@ -294,7 +344,7 @@ impl OutboxStore {
                  SELECT o.creator_id, r.root_reader_assignment_id, COUNT(*) AS active_count \
                  FROM outbox o \
                  JOIN roots r ON r.id = o.id \
-                 WHERE o.status = 'leased' AND o.lease_expires_at > NOW() \
+                 WHERE o.status IN ('leased', 'handoff_started') AND o.lease_expires_at > NOW() \
                  GROUP BY o.creator_id, r.root_reader_assignment_id \
              ), \
              ranked AS ( \
@@ -312,7 +362,7 @@ impl OutboxStore {
                  LEFT JOIN invoices invoice ON invoice.id = o.invoice_id \
                  WHERE ( \
                      (o.status = 'queued' AND o.next_attempt_at <= NOW()) \
-                     OR (o.status = 'leased' AND o.lease_expires_at <= NOW()) \
+                     OR (o.status IN ('leased', 'handoff_started') AND o.lease_expires_at <= NOW()) \
                      OR (o.status = 'retryable' AND o.next_attempt_at <= NOW()) \
                  ) \
                  AND (o.invoice_id IS NULL OR invoice.baseline_state NOT IN ( \
@@ -495,6 +545,69 @@ impl OutboxStore {
         Ok(changed.rows_affected() == 1)
     }
 
+    /// The pre-SDK finality/handoff linearization fence. Under the invoice
+    /// row lock (the same lock void/abandonment hold while terminalizing
+    /// outbox rows) this commits the closed `handoff_started` state with the
+    /// exact claim token, an unexpired lease, and a non-final invoice —
+    /// BEFORE any SDK call. Cancellation committed first makes the CAS match
+    /// zero rows (the leased row was terminalized or the invoice is final),
+    /// so the worker performs no SDK call; a committed fence is preserved by
+    /// cancellation exactly like `handed_off`, and `mark_handed_off` then
+    /// attributes the in-flight SDK effect on completion. Returns false when
+    /// the fence was not taken (stale token/expired lease/final invoice);
+    /// the caller then resolves the row through the final-invoice path,
+    /// which is a no-op when a competing claim reclaimed the token.
+    pub async fn begin_handoff(&self, claim: &ClaimedOutbox) -> Result<bool, PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        if let Some(invoice_id) = claim.invoice_id {
+            let baseline_state = sqlx::query_scalar::<_, String>(
+                "SELECT baseline_state FROM invoices WHERE id = $1 FOR UPDATE",
+            )
+            .bind(invoice_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            match baseline_state {
+                None => return Err(PersistenceError::CorruptOrMissing),
+                Some(state)
+                    if matches!(
+                        state.as_str(),
+                        "expired_final"
+                            | "void_baseline_failed"
+                            | "void_prepare_expired"
+                            | "void_cancelled"
+                            | "resolved_paid_manually"
+                            | "resolved_closed"
+                    ) =>
+                {
+                    tx.commit()
+                        .await
+                        .map_err(|_| PersistenceError::Unavailable)?;
+                    return Ok(false);
+                }
+                Some(_) => {}
+            }
+        }
+        let changed = sqlx::query(
+            "UPDATE outbox \
+             SET status = 'handoff_started', updated_at = NOW() \
+             WHERE id = $1 AND status = 'leased' AND claim_token = $2 AND lease_expires_at > NOW()",
+        )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(changed.rows_affected() == 1)
+    }
+
     /// Claims attributable handed-off rows independently from enqueue work.
     pub async fn claim_reconciliation(
         &self,
@@ -546,7 +659,13 @@ impl OutboxStore {
         DeliveryIntentV1::decode(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)
     }
 
-    /// Atomically associates the exact public-SDK result while the enqueue fence is live.
+    /// Atomically associates the exact public-SDK result while the handoff
+    /// fence is live. The fence (`handoff_started`) is the linearization
+    /// point: cancellation deliberately preserves fenced rows, so this
+    /// transition intentionally does not re-check invoice finality — an
+    /// SDK effect emitted after a committed fence is attributed here even
+    /// when the invoice finalized afterwards, keeping the externally visible
+    /// effect auditable instead of orphaned.
     pub async fn mark_handed_off(
         &self,
         claim: &ClaimedOutbox,
@@ -565,15 +684,8 @@ impl OutboxStore {
             "UPDATE outbox SET status = 'handed_off', sdk_outbound_message_id = $1, \
                  sdk_event_id = $2, sdk_payment_request_id = $3, error_class = NULL, \
                  lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = NOW() \
-             WHERE id = $4 AND status = 'leased' AND claim_token = $5 AND lease_expires_at > NOW() \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM invoices \
-                   WHERE invoices.id = outbox.invoice_id \
-                     AND invoices.baseline_state IN ( \
-                       'expired_final', 'void_baseline_failed', 'void_prepare_expired', \
-                       'void_cancelled', 'resolved_paid_manually', 'resolved_closed' \
-                     ) \
-               )",
+             WHERE id = $4 AND status = 'handoff_started' AND claim_token = $5 \
+               AND lease_expires_at > NOW()",
         )
         .bind(outbound)
         .bind(event_id)
@@ -662,7 +774,8 @@ impl OutboxStore {
              SET status = $1, error_class = $2, \
                  next_attempt_at = CASE WHEN $3::BIGINT IS NULL THEN next_attempt_at ELSE NOW() + ($3 * INTERVAL '1 second') END, \
                  lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = NOW() \
-             WHERE id = $4 AND status = 'leased' AND claim_token = $5 AND lease_expires_at > NOW()",
+             WHERE id = $4 AND status IN ('leased', 'handoff_started') \
+               AND claim_token = $5 AND lease_expires_at > NOW()",
         )
         .bind(status)
         .bind(error_class)
