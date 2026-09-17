@@ -11,8 +11,10 @@ use paykit_server::{
     persistence::{InvoiceStore, MIGRATION_ADVISORY_LOCK_KEY, run_migrations},
 };
 use paykit_server_e2e::postgres::TestDatabase;
-use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
+use sqlx::{Connection, PgConnection, PgPool, Row, migrate::Migrator, postgres::PgConnectOptions};
 use uuid::Uuid;
+
+static MIGRATOR: Migrator = sqlx::migrate!("../paykit-server/migrations");
 
 const REQUIRED_TABLES: [&str; 14] = [
     "deployment_metadata",
@@ -84,6 +86,40 @@ fn migration_catalog_has_one_contiguous_canonical_version_per_file() {
         duplicate_versions.iter().collect::<HashSet<_>>().len(),
         "calibration: a duplicate migration number must fail the uniqueness gate"
     );
+}
+
+#[test]
+fn applied_migration_files_are_immutable() {
+    let migrations_dir = format!("{}/../paykit-server/migrations", env!("CARGO_MANIFEST_DIR"));
+    let manifest = include_str!("../../paykit-server/migrations/APPLIED_CHECKSUMS.txt");
+
+    for line in manifest.lines().filter(|line| !line.trim().is_empty()) {
+        let (version, expected_checksum) = line
+            .split_once(' ')
+            .unwrap_or_else(|| panic!("invalid applied migration checksum line: {line}"));
+        let version: i64 = version
+            .parse()
+            .unwrap_or_else(|_| panic!("invalid applied migration version: {version}"));
+        let migration = MIGRATOR
+            .iter()
+            .find(|migration| migration.version == version)
+            .unwrap_or_else(|| panic!("manifest version {version} is not a migration"));
+        let name = fs::read_dir(&migrations_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .find(|name| name.starts_with(&format!("{version:04}_")) && name.ends_with(".sql"))
+            .unwrap_or_else(|| panic!("migration file for version {version} is missing"));
+        let actual_checksum = migration
+            .checksum
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        assert_eq!(
+            actual_checksum, expected_checksum,
+            "applied migration file {name} changed; update it with a new migration instead"
+        );
+    }
 }
 
 #[tokio::test]
