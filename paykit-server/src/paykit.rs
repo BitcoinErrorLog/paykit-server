@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
 };
 
@@ -128,6 +129,15 @@ pub struct PaykitAdapter {
     sdk: CreatorSdk,
     storage: PostgresStorageAdapter,
     mutation_lock: Arc<TokioMutex<()>>,
+    handoff_invocation_token: StdMutex<Option<Uuid>>,
+}
+
+struct StorageInvocationScope(PostgresStorageAdapter);
+
+impl Drop for StorageInvocationScope {
+    fn drop(&mut self) {
+        self.0.clear_invocation_token();
+    }
 }
 
 impl std::fmt::Debug for PaykitAdapter {
@@ -152,7 +162,28 @@ impl PaykitAdapter {
             sdk,
             mutation_lock: creator_mutation_lock(storage.creator_id()),
             storage,
+            handoff_invocation_token: StdMutex::new(None),
         })
+    }
+
+    async fn with_handoff_invocation_token<T>(
+        &self,
+        callback: impl Future<Output = paykit_sdk::Result<T>>,
+    ) -> paykit_sdk::Result<T> {
+        let token = *self
+            .handoff_invocation_token
+            .lock()
+            .map_err(|_| PaykitSdkError::Storage {
+                context: "handoff invocation token is unavailable".into(),
+                source: None,
+            })?;
+        let token = token.ok_or_else(|| PaykitSdkError::Storage {
+            context: "handoff invocation token is absent".into(),
+            source: None,
+        })?;
+        self.storage.set_invocation_token(token)?;
+        let _scope = StorageInvocationScope(self.storage.clone());
+        callback.await
     }
 }
 
@@ -241,17 +272,20 @@ impl Adapter for PaykitAdapter {
         invocation_token: Uuid,
     ) -> Result<HandoffResult, HandoffFailure> {
         let _guard = self.mutation_lock.lock().await;
-        self.storage
-            .set_invocation_token(invocation_token)
-            .map_err(classify)
-            .map_err(|error| match error {
-                HandoffError::Permanent => HandoffFailure::Permanent,
-                HandoffError::Retryable(_) => HandoffFailure::Retryable(
-                    crate::persistence::OutboxRetryClass::AdapterUnavailable,
-                ),
+        {
+            let mut slot = self.handoff_invocation_token.lock().map_err(|_| {
+                HandoffFailure::Retryable(crate::persistence::OutboxRetryClass::AdapterUnavailable)
             })?;
+            if slot.replace(invocation_token).is_some() {
+                return Err(HandoffFailure::Retryable(
+                    crate::persistence::OutboxRetryClass::AdapterUnavailable,
+                ));
+            }
+        }
         let result = handoff_steps(self, intent).await;
-        self.storage.clear_invocation_token();
+        if let Ok(mut slot) = self.handoff_invocation_token.lock() {
+            *slot = None;
+        }
         result
     }
 
@@ -291,8 +325,11 @@ impl Adapter for PaykitAdapter {
             })
             .collect();
         let record = self
-            .sdk
-            .enqueue_private_payment_list_with_receiving_details(reader, path, details)
+            .with_handoff_invocation_token(async {
+                self.sdk
+                    .enqueue_private_payment_list_with_receiving_details(reader, path, details)
+                    .await
+            })
             .await
             .map_err(classify)?;
         Ok(HandoffResult::EndpointPublication {
@@ -308,8 +345,11 @@ impl Adapter for PaykitAdapter {
     ) -> Result<HandoffResult, HandoffError> {
         let (reader, path) = parse_peer(reader, path)?;
         let record = self
-            .sdk
-            .propose_payment_request(reader, path, payment_terms(terms)?)
+            .with_handoff_invocation_token(async {
+                self.sdk
+                    .propose_payment_request(reader, path, payment_terms(terms)?)
+                    .await
+            })
             .await
             .map_err(classify)?;
         Ok(HandoffResult::PaymentRequestProposal {
