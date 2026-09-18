@@ -344,11 +344,10 @@ impl Adapter for PaykitAdapter {
         terms: &PaymentTermsV1,
     ) -> Result<HandoffResult, HandoffError> {
         let (reader, path) = parse_peer(reader, path)?;
+        let terms = payment_terms(terms)?;
         let record = self
             .with_handoff_invocation_token(async {
-                self.sdk
-                    .propose_payment_request(reader, path, payment_terms(terms)?)
-                    .await
+                self.sdk.propose_payment_request(reader, path, terms).await
             })
             .await
             .map_err(classify)?;
