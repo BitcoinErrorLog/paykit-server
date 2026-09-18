@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 static MIGRATOR: Migrator = sqlx::migrate!("../paykit-server/migrations");
 
-const REQUIRED_TABLES: [&str; 14] = [
+const REQUIRED_TABLES: [&str; 15] = [
     "deployment_metadata",
     "creators",
     "sdk_states",
@@ -31,9 +31,10 @@ const REQUIRED_TABLES: [&str; 14] = [
     "sentinel_outpoints",
     "sentinel_events",
     "outbox_terminal_events",
+    "sdk_outbound_invocations",
 ];
 
-const ACCOUNT_RETENTION_REGISTRY: [&str; 14] = REQUIRED_TABLES;
+const ACCOUNT_RETENTION_REGISTRY: [&str; 15] = REQUIRED_TABLES;
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
 /// migration tests deliberately use the production migration lock key, so
@@ -70,7 +71,7 @@ fn migration_catalog_has_one_contiguous_canonical_version_per_file() {
     let mut versions = migration_versions(names).unwrap();
     versions.sort_unstable();
 
-    assert_eq!(versions, (1..=23).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=24).collect::<Vec<_>>());
     assert_eq!(
         versions.len(),
         versions.iter().collect::<HashSet<_>>().len()
@@ -86,6 +87,21 @@ fn migration_catalog_has_one_contiguous_canonical_version_per_file() {
         duplicate_versions.iter().collect::<HashSet<_>>().len(),
         "calibration: a duplicate migration number must fail the uniqueness gate"
     );
+}
+
+#[test]
+fn release_checksum_manifest_pins_unapplied_migration_0024() {
+    let manifest = include_str!("../../paykit-server/migrations/RELEASE_CHECKSUMS.txt");
+    let migration = MIGRATOR
+        .iter()
+        .find(|migration| migration.version == 24)
+        .expect("migration 0024 exists");
+    let checksum = migration
+        .checksum
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(manifest.trim(), format!("0024 {checksum}"));
 }
 
 #[test]
@@ -156,7 +172,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
     assert_eq!(
         applied_versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
         ]
     );
 
@@ -898,7 +914,10 @@ async fn two_phase_activation_migration_applies_and_constrains_states() {
         // Terminal attributable states require an outbound id (0001's
         // attributable-terminal CHECK); non-terminal states forbid nothing.
         let result = if matches!(status, "handed_off" | "delivered") {
-            insert.bind(Some("7")).execute(pool).await
+            insert
+                .bind(Some(if status == "handed_off" { "7" } else { "8" }))
+                .execute(pool)
+                .await
         } else {
             insert.bind(None::<&str>).execute(pool).await
         };
