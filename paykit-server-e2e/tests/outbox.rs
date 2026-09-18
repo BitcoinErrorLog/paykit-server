@@ -40,8 +40,9 @@ use paykit_server::{
         ElectrumProbe, OutboxTerminalHealth, PostgresDependency, Runtime, operational_router,
     },
     workers::outbox::{
-        Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffStage, process_claim,
-        process_fence_recovery, process_final_invoice_sweep, process_reconciliation,
+        Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffStage,
+        handoff_with_invocation_token, process_claim, process_fence_recovery,
+        process_final_invoice_sweep, process_reconciliation,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -3153,6 +3154,107 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
         "schema accepted an unpaired SDK Event ID"
     );
 
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fence_recovery_attributes_unique_current_token_endpoint() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[71; 32]).unwrap());
+    let LinkedPaykitFixture {
+        _testnet,
+        creator,
+        reader,
+        adapter,
+        ..
+    } = linked_paykit_fixture(&database, crypto.clone(), 71).await;
+    let invoice = InvoiceStore::new(database.pool(), crypto.clone())
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"resolver-endpoint-bundle",
+            payment_request_binding: b"resolver-endpoint-request",
+            new_reader_payloads: &Payloads {
+                reader: reader.clone(),
+            },
+            payment_request_intent: common::payment_intent(&reader),
+            required_sats: 100,
+            nonce_sats: 1,
+            prepare_ttl: Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        })
+        .await
+        .unwrap();
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        claim.id(),
+        invoice.endpoint_publication_outbox_id().unwrap()
+    );
+    assert!(outbox.begin_handoff(&claim).await.unwrap());
+    assert!(
+        outbox
+            .mark_handoff_invocation_started(&claim)
+            .await
+            .unwrap()
+    );
+    let token = outbox
+        .handoff_invocation_token(&claim)
+        .await
+        .unwrap()
+        .unwrap();
+    let intent = outbox.delivery_intent(&claim).unwrap();
+    let result = handoff_with_invocation_token(&adapter, &intent, token)
+        .await
+        .unwrap();
+    let outbound = match result {
+        HandoffResult::EndpointPublication {
+            outbound_message_id,
+        } => outbound_message_id,
+        HandoffResult::PaymentRequestProposal { .. } => panic!("endpoint intent created request"),
+    };
+    let sidecar: Uuid = sqlx::query_scalar(
+        "SELECT invocation_token FROM sdk_outbound_invocations \
+         WHERE creator_id = (SELECT creator_id FROM outbox WHERE id = $1) \
+           AND sdk_outbound_message_id = $2",
+    )
+    .bind(claim.id())
+    .bind(outbound.to_string())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(sidecar, token);
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(claim.id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let recovery = outbox
+        .claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        process_fence_recovery(&outbox, &adapter, &recovery)
+            .await
+            .unwrap()
+    );
+    assert_eq!(outbox_row(&database, claim.id()).await.0, "handed_off");
+    assert!(
+        outbox
+            .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_empty(),
+        "a handed-off parent cannot admit its child before Sent reconciliation"
+    );
     database.cleanup().await;
 }
 
