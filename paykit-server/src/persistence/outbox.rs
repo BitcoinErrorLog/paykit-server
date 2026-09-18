@@ -1172,6 +1172,41 @@ impl OutboxStore {
         delay: Duration,
     ) -> Result<bool, PersistenceError> {
         let seconds = lease_seconds(delay)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let exhausted: Option<bool> = sqlx::query_scalar(
+            "SELECT recovery_attempts >= 20
+                 OR (recovery_first_at IS NOT NULL
+                     AND NOW() >= recovery_first_at + INTERVAL '1 hour')
+             FROM outbox
+             WHERE id = $1 AND status = 'handoff_started' AND claim_token = $2
+               AND lease_expires_at > NOW()
+             FOR UPDATE",
+        )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some(exhausted) = exhausted else {
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(false);
+        };
+        if exhausted {
+            return self
+                .terminalize_fence_recovery(
+                    tx,
+                    claim.id,
+                    claim.claim_token,
+                    "sdk_recovery_infrastructure_unavailable",
+                )
+                .await;
+        }
         let changed = sqlx::query(
             "UPDATE outbox \
              SET lease_owner = NULL, claim_token = NULL, \
@@ -1182,9 +1217,12 @@ impl OutboxStore {
         .bind(seconds)
         .bind(claim.id)
         .bind(claim.claim_token)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         Ok(changed.rows_affected() == 1)
     }
 
