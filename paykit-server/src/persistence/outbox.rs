@@ -987,7 +987,25 @@ impl OutboxStore {
                 )
                 .await;
         };
-        let intent = self.delivery_intent(claim)?;
+        let intent = match self.delivery_intent(claim) {
+            Ok(intent) => intent,
+            Err(PersistenceError::Unavailable) => {
+                tx.commit()
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)?;
+                return Err(PersistenceError::Unavailable);
+            }
+            Err(_) => {
+                return self
+                    .terminalize_fence_recovery(
+                        tx,
+                        claim.id,
+                        claim.claim_token,
+                        "sdk_evidence_indeterminate",
+                    )
+                    .await;
+            }
+        };
         let envelope: Option<Vec<u8>> = sqlx::query_scalar(
             "SELECT state_envelope FROM sdk_states WHERE creator_id = $1 FOR UPDATE",
         )
@@ -1603,6 +1621,13 @@ fn exact_handoff_result(
                 return Ok(None);
             }
             let list = parse_private_payment_list_json(&record.raw_json).map_err(|_| ())?;
+            let expected_identifiers = receiving_details
+                .iter()
+                .map(|detail| detail.identifier.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            if expected_identifiers.len() != receiving_details.len() {
+                return Err(());
+            }
             let expected = receiving_details
                 .iter()
                 .map(|detail| (detail.identifier.as_str(), detail.payload.as_str()))
