@@ -717,7 +717,7 @@ async fn sdk_outbound_invocation_constraints_reject_retag_and_duplicate_ownershi
         "INSERT INTO outbox
          (creator_id, intent_envelope, status, handoff_sdk_invocation_started,
           handoff_invocation_token, sdk_outbound_message_id)
-         VALUES ($1, $2, 'handed_off', TRUE, $3, 'owned-outbound')
+         VALUES ($1, $2, 'handed_off', TRUE, $3, '1')
          RETURNING id",
     )
     .bind(creator_id)
@@ -732,7 +732,7 @@ async fn sdk_outbound_invocation_constraints_reject_retag_and_duplicate_ownershi
             "INSERT INTO outbox
              (creator_id, intent_envelope, status, handoff_sdk_invocation_started,
               handoff_invocation_token, sdk_outbound_message_id)
-             VALUES ($1, $2, 'handed_off', TRUE, $3, 'owned-outbound')",
+             VALUES ($1, $2, 'handed_off', TRUE, $3, '1')",
         )
         .bind(creator_id)
         .bind(b"another-encrypted-intent".as_slice())
