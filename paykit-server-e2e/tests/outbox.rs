@@ -736,10 +736,12 @@ async fn same_wrong_generation_pair_reports_contract_error_for_failed_delivered_
     );
     // Delivered shape (terminal delivered rows must carry attribution).
     sqlx::query(
-        "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = '900' \
+        "UPDATE outbox SET status = 'delivered', \
+         sdk_outbound_message_id = CASE WHEN id = $2 THEN '900' ELSE '901' END \
          WHERE invoice_id = $1",
     )
     .bind(invoice_id)
+    .bind(endpoint_id)
     .execute(database.pool())
     .await
     .unwrap();
@@ -1245,17 +1247,11 @@ async fn finalized_fence_crash_before_sdk_effect_terminalizes_with_zero_sdk_call
     database.cleanup().await;
 }
 
-/// Barrier (b): crash AFTER the SDK effect on a finalized invoice. The
-/// durable invocation marker is set, but recovery NEVER resolves or
-/// attributes the effect (endpoint identifier sets are not invoice-unique,
-/// so attribution could false-match another invoice's publication): the
-/// row terminalizes as `handoff_unresolved` with the static
-/// `sdk_invoked_unattributed` reason, exactly one terminal event, and zero
-/// SDK calls; the parent is NOT delivered, the dependent child is never
-/// admitted, and readiness is ready. An operator reconciles the row by
-/// hand (docs/outbox-terminal-acknowledgement.md).
+/// Barrier (b): crash after the durable token-bearing marker but before SDK
+/// storage. No current-token record exists, so recovery terminalizes
+/// `sdk_effect_not_found`; it never invokes an SDK API or unblocks the child.
 #[tokio::test]
-async fn finalized_fence_crash_after_sdk_effect_terminalizes_unattributed_with_zero_sdk_calls() {
+async fn crash_after_token_marker_before_sdk_insert_terminalizes_not_found_without_unblocking() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let crypto = Arc::new(Crypto::from_master_key(&[58; 32]).unwrap());
@@ -1270,8 +1266,7 @@ async fn finalized_fence_crash_after_sdk_effect_terminalizes_unattributed_with_z
         .unwrap();
     assert_eq!(claim.id(), endpoint_id);
     assert!(outbox.begin_handoff(&claim).await.unwrap());
-    // The production pre-SDK marker commits before the SDK call; the process
-    // dies after the SDK effect but before `mark_handed_off` persists it.
+    // The process dies after the marker commits, before any SDK callback.
     assert!(
         outbox
             .mark_handoff_invocation_started(&claim)
@@ -1329,7 +1324,7 @@ async fn finalized_fence_crash_after_sdk_effect_terminalizes_unattributed_with_z
         (
             "permanently_failed".into(),
             Some("handoff_unresolved".into()),
-            Some("sdk_invoked_unattributed".into()),
+            Some("sdk_effect_not_found".into()),
             None,
         )
     );
@@ -1344,7 +1339,7 @@ async fn finalized_fence_crash_after_sdk_effect_terminalizes_unattributed_with_z
         events,
         vec![(
             "handoff_unresolved".to_string(),
-            "sdk_invoked_unattributed".to_string()
+            "sdk_effect_not_found".to_string()
         )],
         "exactly one terminal event of the closed handoff_unresolved class"
     );
@@ -1502,7 +1497,7 @@ async fn fence_recovery_never_attributes_another_invoices_publication() {
         (
             "permanently_failed".into(),
             Some("handoff_unresolved".into()),
-            Some("sdk_invoked_unattributed".into()),
+            Some("sdk_effect_not_found".into()),
             None,
         )
     );
@@ -1517,7 +1512,7 @@ async fn fence_recovery_never_attributes_another_invoices_publication() {
         b_events,
         vec![(
             "handoff_unresolved".to_string(),
-            "sdk_invoked_unattributed".to_string()
+            "sdk_effect_not_found".to_string()
         )],
         "exactly one terminal event of the closed handoff_unresolved class"
     );
@@ -4296,5 +4291,46 @@ async fn partition_lease_cap_holds_across_replicas() {
     );
 
     drop(replica_b_pool);
+    database.cleanup().await;
+}
+
+/// Recovery has its own durable ceiling: ordinary attempt accounting does not
+/// move while twenty recovery claims are issued, and a fresh store cannot
+/// issue claim 21 after the final lease expires.
+#[tokio::test]
+async fn recovery_ceiling_survives_restart_and_never_issues_claim_twenty_one() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[91; 32]).unwrap());
+    let (_, _, _, _, endpoint_id, request_id) =
+        create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
+    let outbox = OutboxStore::new(database.pool(), crypto.clone());
+    let initial = outbox.claim(Uuid::new_v4(), 1, Duration::from_secs(30)).await.unwrap().pop().unwrap();
+    assert!(outbox.begin_handoff(&initial).await.unwrap());
+    assert!(outbox.mark_handoff_invocation_started(&initial).await.unwrap());
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(endpoint_id).execute(database.pool()).await.unwrap();
+    for attempt in 1..=20 {
+        let claim = outbox
+            .claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30))
+            .await.unwrap().pop().expect("recovery claim before ceiling");
+        assert_eq!(claim.id(), endpoint_id);
+        assert!(outbox.retry_fence_recovery(&claim, Duration::from_secs(0)).await.unwrap());
+        if attempt < 20 {
+            sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+                .bind(endpoint_id).execute(database.pool()).await.unwrap();
+        }
+    }
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(endpoint_id).execute(database.pool()).await.unwrap();
+    let restarted = OutboxStore::new(database.pool(), crypto);
+    assert!(restarted.claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30)).await.unwrap().is_empty());
+    let row: (String, i32, Option<time::OffsetDateTime>, Option<time::OffsetDateTime>) = sqlx::query_as(
+        "SELECT status, recovery_attempts, recovery_first_at, recovery_last_at FROM outbox WHERE id = $1",
+    ).bind(endpoint_id).fetch_one(database.pool()).await.unwrap();
+    assert_eq!(row.0, "permanently_failed");
+    assert_eq!(row.1, 20);
+    assert!(row.2.is_some() && row.3.is_some());
+    assert_eq!(outbox_row(&database, request_id).await.0, "permanently_failed");
     database.cleanup().await;
 }
