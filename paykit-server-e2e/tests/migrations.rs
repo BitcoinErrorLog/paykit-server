@@ -11,6 +11,7 @@ use paykit_server::{
     persistence::{InvoiceStore, MIGRATION_ADVISORY_LOCK_KEY, run_migrations},
 };
 use paykit_server_e2e::postgres::TestDatabase;
+use sha2::{Digest, Sha512};
 use sqlx::{Connection, PgConnection, PgPool, Row, migrate::Migrator, postgres::PgConnectOptions};
 use uuid::Uuid;
 
@@ -92,15 +93,8 @@ fn migration_catalog_has_one_contiguous_canonical_version_per_file() {
 #[test]
 fn release_checksum_manifest_pins_unapplied_migration_0024() {
     let manifest = include_str!("../../paykit-server/migrations/RELEASE_CHECKSUMS.txt");
-    let migration = MIGRATOR
-        .iter()
-        .find(|migration| migration.version == 24)
-        .expect("migration 0024 exists");
-    let checksum = migration
-        .checksum
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let migration = include_bytes!("../../paykit-server/migrations/0024_sdk_outbound_invocation.sql");
+    let checksum = format!("{:x}", Sha512::digest(migration));
     assert_eq!(manifest.trim(), format!("0024 {checksum}"));
 }
 
