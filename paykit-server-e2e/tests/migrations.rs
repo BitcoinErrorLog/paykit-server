@@ -636,6 +636,127 @@ async fn outbox_sdk_identifier_constraints_reject_unattributable_terminal_rows()
     database.cleanup().await;
 }
 
+/// Migration 0024's provenance evidence is append-only and cannot let one
+/// outbound SDK record or invocation token be re-used by a second handoff.
+#[tokio::test]
+async fn sdk_outbound_invocation_constraints_reject_retag_and_duplicate_ownership() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    run_migrations(pool).await.unwrap();
+    let creator_id = insert_creator(pool).await;
+    let other_creator_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO creators (creator_lookup_hash, credential_envelope, first_child_index)
+         VALUES ($1, $2, 0) RETURNING id",
+    )
+    .bind(b"other-creator".as_slice())
+    .bind(b"other-encrypted-creator".as_slice())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let token = Uuid::new_v4();
+
+    sqlx::query(
+        "INSERT INTO sdk_outbound_invocations
+         (creator_id, sdk_outbound_message_id, invocation_token)
+         VALUES ($1, 'outbound-a', $2)",
+    )
+    .bind(creator_id)
+    .bind(token)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    assert_unique_violation(
+        sqlx::query(
+            "INSERT INTO sdk_outbound_invocations
+             (creator_id, sdk_outbound_message_id, invocation_token)
+             VALUES ($1, 'outbound-a', $2)",
+        )
+        .bind(creator_id)
+        .bind(Uuid::new_v4())
+        .execute(pool)
+        .await,
+    );
+    assert_unique_violation(
+        sqlx::query(
+            "INSERT INTO sdk_outbound_invocations
+             (creator_id, sdk_outbound_message_id, invocation_token)
+             VALUES ($1, 'outbound-b', $2)",
+        )
+        .bind(other_creator_id)
+        .bind(token)
+        .execute(pool)
+        .await,
+    );
+    assert_trigger_violation(
+        "sidecar retag",
+        sqlx::query(
+            "UPDATE sdk_outbound_invocations
+             SET invocation_token = $1
+             WHERE creator_id = $2 AND sdk_outbound_message_id = 'outbound-a'",
+        )
+        .bind(Uuid::new_v4())
+        .bind(creator_id)
+        .execute(pool)
+        .await,
+    );
+    assert_trigger_violation(
+        "sidecar deletion",
+        sqlx::query(
+            "DELETE FROM sdk_outbound_invocations
+             WHERE creator_id = $1 AND sdk_outbound_message_id = 'outbound-a'",
+        )
+        .bind(creator_id)
+        .execute(pool)
+        .await,
+    );
+
+    let invocation_token = Uuid::new_v4();
+    let first_outbox: Uuid = sqlx::query_scalar(
+        "INSERT INTO outbox
+         (creator_id, intent_envelope, status, handoff_sdk_invocation_started,
+          handoff_invocation_token, sdk_outbound_message_id)
+         VALUES ($1, $2, 'handed_off', TRUE, $3, 'owned-outbound')
+         RETURNING id",
+    )
+    .bind(creator_id)
+    .bind(b"encrypted-intent".as_slice())
+    .bind(invocation_token)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_ne!(first_outbox, Uuid::nil());
+    assert_unique_violation(
+        sqlx::query(
+            "INSERT INTO outbox
+             (creator_id, intent_envelope, status, handoff_sdk_invocation_started,
+              handoff_invocation_token, sdk_outbound_message_id)
+             VALUES ($1, $2, 'handed_off', TRUE, $3, 'owned-outbound')",
+        )
+        .bind(creator_id)
+        .bind(b"another-encrypted-intent".as_slice())
+        .bind(Uuid::new_v4())
+        .execute(pool)
+        .await,
+    );
+    assert_check_violation(
+        sqlx::query(
+            "INSERT INTO outbox
+             (creator_id, intent_envelope, status, handoff_sdk_invocation_started,
+              handoff_invocation_token)
+             VALUES ($1, $2, 'handoff_started', FALSE, $3)",
+        )
+        .bind(creator_id)
+        .bind(b"marker-mismatch-intent".as_slice())
+        .bind(Uuid::new_v4())
+        .execute(pool)
+        .await,
+    );
+
+    database.cleanup().await;
+}
+
 #[tokio::test]
 async fn terminal_rows_reject_generation_id_edits() {
     let _migration_test_guard = migration_test_lock().lock().await;
