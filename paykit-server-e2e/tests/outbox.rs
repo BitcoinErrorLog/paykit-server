@@ -83,6 +83,7 @@ struct LinkedPaykitFixture {
     adapter: paykit_server::paykit::PaykitAdapter,
     peer_public_key: PubkyPublicKey,
     peer_receiver_path: PaykitReceiverPath,
+    peer_marker: PaykitReceiverMarker,
 }
 
 async fn linked_paykit_fixture(
@@ -214,6 +215,27 @@ async fn linked_paykit_fixture(
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // The handoff worker reads the peer's marker through the same public
+    // storage boundary as production.  Do not return a "linked" fixture
+    // before that independently persisted marker is visible to the creator.
+    let marker_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let peer_marker = loop {
+        if let Some(marker) = creator_sdk
+            .paykit_receiver_marker(
+                peer_bootstrap.public_key.clone(),
+                peer_receiver_path.clone(),
+            )
+            .await
+            .unwrap()
+        {
+            break marker;
+        }
+        assert!(
+            tokio::time::Instant::now() < marker_deadline,
+            "peer receiver marker did not become visible"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
 
     let reader = parse_reader(&format!("pubky{}", peer_bootstrap.public_key)).unwrap();
     let adapter = paykit_server::paykit::PaykitAdapter::new(
@@ -239,6 +261,7 @@ async fn linked_paykit_fixture(
         adapter,
         peer_public_key: peer_bootstrap.public_key,
         peer_receiver_path,
+        peer_marker,
     }
 }
 
@@ -259,6 +282,30 @@ fn reader() -> ReaderPubky {
 
 struct Payloads {
     reader: ReaderPubky,
+}
+
+struct LinkedPayloads {
+    reader: ReaderPubky,
+    marker: PaykitReceiverMarker,
+}
+
+impl NewReaderPayloadFactory for LinkedPayloads {
+    fn for_child_index(&self, child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
+        let address = format!("linked-outbox-test-address-{child_index}");
+        Ok(NewReaderPayloads {
+            endpoint_intent: DeliveryIntentV1::endpoint(
+                self.reader.to_string(),
+                &self.marker,
+                PaykitReceiverPath::new("paykit/server").unwrap(),
+                vec![(
+                    PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+                    paykit_lib::PaymentEndpointPayload::new(address.clone()),
+                )],
+            )
+            .unwrap(),
+            bitcoin_address: address,
+        })
+    }
 }
 
 impl NewReaderPayloadFactory for Payloads {
@@ -3158,7 +3205,6 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "invoice fixture uses a synthetic marker rather than the linked peer marker"]
 async fn fence_recovery_attributes_unique_current_token_endpoint() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
@@ -3168,6 +3214,7 @@ async fn fence_recovery_attributes_unique_current_token_endpoint() {
         creator,
         reader,
         adapter,
+        peer_marker,
         ..
     } = linked_paykit_fixture(&database, crypto.clone(), 71).await;
     let invoice = InvoiceStore::new(database.pool(), crypto.clone())
@@ -3176,10 +3223,26 @@ async fn fence_recovery_attributes_unique_current_token_endpoint() {
             reader: &reader,
             bundle_binding: b"resolver-endpoint-bundle",
             payment_request_binding: b"resolver-endpoint-request",
-            new_reader_payloads: &Payloads {
+            new_reader_payloads: &LinkedPayloads {
                 reader: reader.clone(),
+                marker: peer_marker.clone(),
             },
-            payment_request_intent: common::payment_intent(&reader),
+            payment_request_intent: DeliveryIntentV1::payment_request(
+                reader.to_string(),
+                &peer_marker,
+                PaykitReceiverPath::new("paykit/server").unwrap(),
+                &PaymentRequestTerms {
+                    amount: PaymentAmount::new("0.00000100", "BTC").unwrap(),
+                    payment_reference: PaymentReference::new(Uuid::new_v4().to_string()).unwrap(),
+                    proposal_expires_at: None,
+                    recurrence: None,
+                    accepted_payment_endpoint_identifiers: vec![
+                        PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+                    ],
+                    metadata: Default::default(),
+                },
+            )
+            .unwrap(),
             required_sats: 100,
             nonce_sats: 1,
             prepare_ttl: Duration::from_secs(900),
@@ -3247,7 +3310,12 @@ async fn fence_recovery_attributes_unique_current_token_endpoint() {
             .await
             .unwrap()
     );
-    assert_eq!(outbox_row(&database, claim.id()).await.0, "handed_off");
+    assert_eq!(
+        outbox_row(&database, claim.id()).await.0,
+        "handed_off",
+        "resolver outcome: {:?}",
+        outbox_row(&database, claim.id()).await
+    );
     assert!(
         outbox
             .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
@@ -3255,6 +3323,183 @@ async fn fence_recovery_attributes_unique_current_token_endpoint() {
             .unwrap()
             .is_empty(),
         "a handed-off parent cannot admit its child before Sent reconciliation"
+    );
+    database.cleanup().await;
+}
+
+/// A linked peer and the production adapter create the payment-request record
+/// in encrypted durable `StorageState`.  Recovery is then allowed to use only
+/// the sidecar carrying this claim's token; the generated SDK ids are copied
+/// exactly, while the endpoint parent remains the gate for this child.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fence_recovery_attributes_unique_current_token_payment_request() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[72; 32]).unwrap());
+    let LinkedPaykitFixture {
+        _testnet,
+        creator,
+        reader,
+        adapter,
+        peer_marker,
+        ..
+    } = linked_paykit_fixture(&database, crypto.clone(), 72).await;
+    let invoice = InvoiceStore::new(database.pool(), crypto.clone())
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"resolver-payment-bundle",
+            payment_request_binding: b"resolver-payment-request",
+            new_reader_payloads: &LinkedPayloads {
+                reader: reader.clone(),
+                marker: peer_marker.clone(),
+            },
+            payment_request_intent: DeliveryIntentV1::payment_request(
+                reader.to_string(),
+                &peer_marker,
+                PaykitReceiverPath::new("paykit/server").unwrap(),
+                &PaymentRequestTerms {
+                    amount: PaymentAmount::new("0.00000100", "BTC").unwrap(),
+                    payment_reference: PaymentReference::new(Uuid::new_v4().to_string()).unwrap(),
+                    proposal_expires_at: None,
+                    recurrence: None,
+                    accepted_payment_endpoint_identifiers: vec![
+                        PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+                    ],
+                    metadata: Default::default(),
+                },
+            )
+            .unwrap(),
+            required_sats: 100,
+            nonce_sats: 1,
+            prepare_ttl: Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        })
+        .await
+        .unwrap();
+    let outbox = OutboxStore::new(database.pool(), crypto.clone());
+
+    // Drive the real worker boundary for the parent.  A local SDK enqueue is
+    // only handed_off, so no dependent payment request may be claimed yet.
+    let endpoint_claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        endpoint_claim.id(),
+        invoice.endpoint_publication_outbox_id().unwrap()
+    );
+    assert!(
+        process_claim(
+            &outbox,
+            &adapter,
+            &endpoint_claim,
+            Duration::from_secs(1),
+            20,
+            Duration::from_secs(60 * 60),
+        )
+        .await
+        .unwrap()
+    );
+    assert!(
+        outbox
+            .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_empty(),
+        "payment-request child stays blocked until the exact endpoint is Sent"
+    );
+
+    // Model only the already-reconciled parent so the child can be fenced.
+    sqlx::query(
+        "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = '0', \
+         lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL WHERE id = $1",
+    )
+    .bind(endpoint_claim.id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let request_claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(request_claim.id(), invoice.payment_request_outbox_id());
+    assert!(outbox.begin_handoff(&request_claim).await.unwrap());
+    assert!(
+        outbox
+            .mark_handoff_invocation_started(&request_claim)
+            .await
+            .unwrap()
+    );
+    let token = outbox
+        .handoff_invocation_token(&request_claim)
+        .await
+        .unwrap()
+        .expect("fenced invocation mints its token");
+    let intent = outbox.delivery_intent(&request_claim).unwrap();
+    let result = handoff_with_invocation_token(&adapter, &intent, token)
+        .await
+        .unwrap();
+    let (outbound_id, event_id, payment_request_id) = match result {
+        HandoffResult::PaymentRequestProposal {
+            outbound_message_id,
+            event_id,
+            payment_request_id,
+        } => (outbound_message_id, event_id, payment_request_id),
+        HandoffResult::EndpointPublication { .. } => panic!("payment intent created endpoints"),
+    };
+    assert!(!event_id.is_empty());
+    assert!(!payment_request_id.is_empty());
+    let sidecar: Uuid = sqlx::query_scalar(
+        "SELECT invocation_token FROM sdk_outbound_invocations \
+         WHERE creator_id = (SELECT creator_id FROM outbox WHERE id = $1) \
+           AND sdk_outbound_message_id = $2",
+    )
+    .bind(request_claim.id())
+    .bind(outbound_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(sidecar, token, "storage sidecar is the fenced token");
+
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(request_claim.id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let recovery = outbox
+        .claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(recovery.id(), request_claim.id());
+    assert!(
+        process_fence_recovery(&outbox, &adapter, &recovery)
+            .await
+            .unwrap()
+    );
+    let attributed: (String, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT status, sdk_outbound_message_id, sdk_event_id, sdk_payment_request_id \
+         FROM outbox WHERE id = $1",
+    )
+    .bind(request_claim.id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        attributed,
+        (
+            "handed_off".into(),
+            Some(outbound_id.to_string()),
+            Some(event_id),
+            Some(payment_request_id),
+        ),
+        "recovery attributes only the exact causally-tagged SDK result"
     );
     database.cleanup().await;
 }
