@@ -93,7 +93,8 @@ fn migration_catalog_has_one_contiguous_canonical_version_per_file() {
 #[test]
 fn release_checksum_manifest_pins_unapplied_migration_0024() {
     let manifest = include_str!("../../paykit-server/migrations/RELEASE_CHECKSUMS.txt");
-    let migration = include_bytes!("../../paykit-server/migrations/0024_sdk_outbound_invocation.sql");
+    let migration =
+        include_bytes!("../../paykit-server/migrations/0024_sdk_outbound_invocation.sql");
     let checksum = format!("{:x}", Sha512::digest(migration));
     assert_eq!(manifest.trim(), format!("0024 {checksum}"));
 }

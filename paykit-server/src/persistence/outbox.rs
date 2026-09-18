@@ -6,7 +6,7 @@ use crate::{
     persistence::PersistenceError,
 };
 use paykit_lib::{
-    PrivateApplicationMessage, PrivateMessageKind, PaymentRequestEvent,
+    PaymentRequestEvent, PrivateApplicationMessage, PrivateMessageKind,
     parse_payment_request_event_message, parse_private_payment_list_json,
 };
 use paykit_sdk::storage::{OutboundPrivateMessageRecord, StorageState};
@@ -832,8 +832,15 @@ impl OutboxStore {
         .map_err(|_| PersistenceError::Unavailable)
     }
 
-    async fn terminalize_exhausted_fence_recoveries(&self, limit: i64) -> Result<(), PersistenceError> {
-        let mut tx = self.pool.begin().await.map_err(|_| PersistenceError::Unavailable)?;
+    async fn terminalize_exhausted_fence_recoveries(
+        &self,
+        limit: i64,
+    ) -> Result<(), PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         let changed: Vec<Uuid> = sqlx::query_scalar(
             "WITH candidates AS ( \
                  SELECT id FROM outbox \
@@ -939,7 +946,11 @@ impl OutboxStore {
         &self,
         claim: &ClaimedOutbox,
     ) -> Result<bool, PersistenceError> {
-        let mut tx = self.pool.begin().await.map_err(|_| PersistenceError::Unavailable)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         let marker: Option<(bool, Option<Uuid>)> = sqlx::query_as(
             "SELECT handoff_sdk_invocation_started, handoff_invocation_token FROM outbox \
              WHERE id = $1 AND status = 'handoff_started' AND claim_token = $2 \
@@ -951,17 +962,29 @@ impl OutboxStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         let Some((started, token)) = marker else {
-            tx.commit().await.map_err(|_| PersistenceError::Unavailable)?;
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
             return Ok(false);
         };
         if !started {
             return self
-                .terminalize_fence_recovery(tx, claim.id, claim.claim_token, HANDOFF_UNRESOLVED_SDK_NOT_INVOKED)
+                .terminalize_fence_recovery(
+                    tx,
+                    claim.id,
+                    claim.claim_token,
+                    HANDOFF_UNRESOLVED_SDK_NOT_INVOKED,
+                )
                 .await;
         }
         let Some(token) = token else {
             return self
-                .terminalize_fence_recovery(tx, claim.id, claim.claim_token, "sdk_evidence_indeterminate")
+                .terminalize_fence_recovery(
+                    tx,
+                    claim.id,
+                    claim.claim_token,
+                    "sdk_evidence_indeterminate",
+                )
                 .await;
         };
         let intent = self.delivery_intent(claim)?;
@@ -973,7 +996,9 @@ impl OutboxStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         let Some(envelope) = envelope else {
-            tx.commit().await.map_err(|_| PersistenceError::Unavailable)?;
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
             return Ok(false);
         };
         let state = decrypt_state_for_recovery(
@@ -989,7 +1014,12 @@ impl OutboxStore {
                 Ok(None) => {}
                 Err(()) => {
                     return self
-                        .terminalize_fence_recovery(tx, claim.id, claim.claim_token, "sdk_evidence_indeterminate")
+                        .terminalize_fence_recovery(
+                            tx,
+                            claim.id,
+                            claim.claim_token,
+                            "sdk_evidence_indeterminate",
+                        )
                         .await;
                 }
             }
@@ -1009,7 +1039,9 @@ impl OutboxStore {
         .fetch_all(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        let sidecars = sidecars.into_iter().collect::<std::collections::HashMap<_, _>>();
+        let sidecars = sidecars
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
         if exact.iter().any(|(id, _)| !sidecars.contains_key(id)) {
             return self
                 .terminalize_fence_recovery(tx, claim.id, claim.claim_token, "sdk_effect_ambiguous")
@@ -1042,14 +1074,21 @@ impl OutboxStore {
         .map_err(|_| PersistenceError::Unavailable)?;
         if owned {
             return self
-                .terminalize_fence_recovery(tx, claim.id, claim.claim_token, "sdk_effect_already_owned")
+                .terminalize_fence_recovery(
+                    tx,
+                    claim.id,
+                    claim.claim_token,
+                    "sdk_effect_already_owned",
+                )
                 .await;
         }
         let (event_id, request_id) = match result {
             HandoffResult::EndpointPublication { .. } => (None, None),
-            HandoffResult::PaymentRequestProposal { ref event_id, ref payment_request_id, .. } => {
-                (Some(event_id.as_str()), Some(payment_request_id.as_str()))
-            }
+            HandoffResult::PaymentRequestProposal {
+                ref event_id,
+                ref payment_request_id,
+                ..
+            } => (Some(event_id.as_str()), Some(payment_request_id.as_str())),
         };
         let changed = sqlx::query(
             "UPDATE outbox SET status = 'handed_off', sdk_outbound_message_id = $1, \
@@ -1066,7 +1105,9 @@ impl OutboxStore {
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        tx.commit().await.map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         Ok(changed.rows_affected() == 1)
     }
 
@@ -1083,7 +1124,11 @@ impl OutboxStore {
              updated_at = NOW() WHERE id = $1 AND status = 'handoff_started' AND claim_token = $2 \
              AND lease_expires_at > NOW()",
         )
-        .bind(id).bind(claim_token).bind(reason).execute(&mut *tx).await
+        .bind(id)
+        .bind(claim_token)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await
         .map_err(|_| PersistenceError::Unavailable)?;
         if changed.rows_affected() == 1 {
             Self::cascade_terminal_descendants(&mut tx, id, "parent_handoff_unresolved").await?;
@@ -1092,7 +1137,9 @@ impl OutboxStore {
                  SELECT creator_id, invoice_id, id, 'handoff_unresolved', $2 FROM outbox WHERE id = $1",
             ).bind(id).bind(reason).execute(&mut *tx).await.map_err(|_| PersistenceError::Unavailable)?;
         }
-        tx.commit().await.map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         Ok(changed.rows_affected() == 1)
     }
 
@@ -1545,7 +1592,8 @@ fn exact_handoff_result(
     record: &OutboundPrivateMessageRecord,
 ) -> Result<Option<HandoffResult>, ()> {
     if record.counterparty.to_string() != intent.reader_pubky()
-        || record.counterparty_receiver_path.as_str() != intent.selected_reader_path().map_err(|_| ())?.as_str()
+        || record.counterparty_receiver_path.as_str()
+            != intent.selected_reader_path().map_err(|_| ())?.as_str()
     {
         return Ok(None);
     }
@@ -1555,15 +1603,20 @@ fn exact_handoff_result(
                 return Ok(None);
             }
             let list = parse_private_payment_list_json(&record.raw_json).map_err(|_| ())?;
-            let expected = receiving_details.iter().map(|detail| {
-                (detail.identifier.as_str(), detail.payload.as_str())
-            }).collect::<std::collections::BTreeMap<_, _>>();
-            let actual = list.payment_endpoints.iter().map(|(key, value)| {
-                (key.as_str(), value.as_str())
-            }).collect::<std::collections::BTreeMap<_, _>>();
-            Ok((expected == actual).then_some(HandoffResult::EndpointPublication {
-                outbound_message_id: record.outbound_message_id,
-            }))
+            let expected = receiving_details
+                .iter()
+                .map(|detail| (detail.identifier.as_str(), detail.payload.as_str()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let actual = list
+                .payment_endpoints
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            Ok(
+                (expected == actual).then_some(HandoffResult::EndpointPublication {
+                    outbound_message_id: record.outbound_message_id,
+                }),
+            )
         }
         DeliveryOperationV1::PaymentRequestProposal { terms } => {
             if record.kind != PrivateMessageKind::PaymentRequest.as_str() {

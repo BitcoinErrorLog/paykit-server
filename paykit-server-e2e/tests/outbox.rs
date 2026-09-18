@@ -4305,32 +4305,70 @@ async fn recovery_ceiling_survives_restart_and_never_issues_claim_twenty_one() {
     let (_, _, _, _, endpoint_id, request_id) =
         create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
     let outbox = OutboxStore::new(database.pool(), crypto.clone());
-    let initial = outbox.claim(Uuid::new_v4(), 1, Duration::from_secs(30)).await.unwrap().pop().unwrap();
+    let initial = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
     assert!(outbox.begin_handoff(&initial).await.unwrap());
-    assert!(outbox.mark_handoff_invocation_started(&initial).await.unwrap());
+    assert!(
+        outbox
+            .mark_handoff_invocation_started(&initial)
+            .await
+            .unwrap()
+    );
     sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
-        .bind(endpoint_id).execute(database.pool()).await.unwrap();
+        .bind(endpoint_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
     for attempt in 1..=20 {
         let claim = outbox
             .claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30))
-            .await.unwrap().pop().expect("recovery claim before ceiling");
+            .await
+            .unwrap()
+            .pop()
+            .expect("recovery claim before ceiling");
         assert_eq!(claim.id(), endpoint_id);
-        assert!(outbox.retry_fence_recovery(&claim, Duration::from_secs(0)).await.unwrap());
+        assert!(
+            outbox
+                .retry_fence_recovery(&claim, Duration::from_secs(0))
+                .await
+                .unwrap()
+        );
         if attempt < 20 {
-            sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
-                .bind(endpoint_id).execute(database.pool()).await.unwrap();
+            sqlx::query(
+                "UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+            )
+            .bind(endpoint_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
         }
     }
     sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
-        .bind(endpoint_id).execute(database.pool()).await.unwrap();
+        .bind(endpoint_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
     let restarted = OutboxStore::new(database.pool(), crypto);
-    assert!(restarted.claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30)).await.unwrap().is_empty());
+    assert!(
+        restarted
+            .claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let row: (String, i32, Option<time::OffsetDateTime>, Option<time::OffsetDateTime>) = sqlx::query_as(
         "SELECT status, recovery_attempts, recovery_first_at, recovery_last_at FROM outbox WHERE id = $1",
     ).bind(endpoint_id).fetch_one(database.pool()).await.unwrap();
     assert_eq!(row.0, "permanently_failed");
     assert_eq!(row.1, 20);
     assert!(row.2.is_some() && row.3.is_some());
-    assert_eq!(outbox_row(&database, request_id).await.0, "permanently_failed");
+    assert_eq!(
+        outbox_row(&database, request_id).await.0,
+        "permanently_failed"
+    );
     database.cleanup().await;
 }

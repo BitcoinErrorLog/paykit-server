@@ -118,11 +118,15 @@ impl StorageAdapter for PostgresStorageAdapter {
             .map(|record| record.outbound_message_id)
             .collect::<Vec<_>>();
         if !after_outbound_ids.starts_with(&before_outbound_ids) {
-            return Err(storage_context("SDK changed existing outbound record identities"));
+            return Err(storage_context(
+                "SDK changed existing outbound record identities",
+            ));
         }
         let new_outbound_ids = &after_outbound_ids[before_outbound_ids.len()..];
         if new_outbound_ids.len() > 1 {
-            return Err(storage_context("SDK callback appended multiple outbound records"));
+            return Err(storage_context(
+                "SDK callback appended multiple outbound records",
+            ));
         }
         let encrypted =
             encrypt_state(&self.crypto, hash, creator_id, &updated).map_err(persistence_error)?;
