@@ -274,20 +274,12 @@ pub async fn process_claim_with_health(
     }
 }
 
-/// The dedicated fenced-recovery path (migration 0023 rules 2-3). It never
-/// re-runs the SDK effect and never resolves or attributes anything: EVERY
-/// recovered fenced row terminalizes as `handoff_unresolved` with exactly
-/// one durable terminal event and zero SDK calls. The durable invocation
-/// marker only selects the static terminal reason recorded by
-/// `mark_handoff_unresolved` — `sdk_not_invoked` (marker FALSE: the SDK
-/// provably never ran) or `sdk_invoked_unattributed` (marker TRUE: an
-/// effect may exist in durable SDK state but is never attributed
-/// automatically, because endpoint identifier sets are not invoice-unique
-/// and attribution could false-match another invoice's publication; an
-/// operator reconciles the row by hand). Recovery can therefore never mark
-/// a parent delivered from another invoice's publication. The adapter is
-/// accepted and ignored so tests can prove no adapter method is ever
-/// invoked on this path.
+/// The dedicated fenced-recovery path never re-runs an SDK effect. It reads
+/// durable state and can attribute only one current-token, semantically exact,
+/// unowned record to `handed_off`; later `Sent` reconciliation remains the
+/// only path to delivery or child eligibility. All other decisions terminalize
+/// with one durable event and descendant cascade. The adapter is accepted and
+/// ignored so tests can prove recovery makes no SDK call.
 pub async fn process_fence_recovery(
     store: &OutboxStore,
     adapter: &dyn Adapter,
@@ -306,7 +298,7 @@ pub async fn process_fence_recovery_with_health(
     store
         .resolve_fence_recovery(claim)
         .await
-        .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure))
+        .map(|transitioned| (transitioned, ProcessingHealth::Available))
 }
 
 /// The per-pass bound of the one-time legacy final-invoice backfill: at

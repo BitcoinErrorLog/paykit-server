@@ -48,12 +48,8 @@ impl OutboxRetryClass {
 /// no effect can exist; the row terminalizes with zero SDK calls.
 pub const HANDOFF_UNRESOLVED_SDK_NOT_INVOKED: &str = "sdk_not_invoked";
 
-/// Static terminal reason for a recovered fence whose durable invocation
-/// marker is TRUE (migration 0023 rule 3): the SDK may have emitted an
-/// effect, but recovery never resolves or attributes it (endpoint
-/// identifier sets are not invoice-unique, so attribution could
-/// false-match another invoice's publication). The row terminalizes with
-/// zero SDK calls and an operator reconciles it by hand.
+/// Legacy terminal reason retained for immutable rows created before the
+/// future-row causal resolver. It is not emitted by the current resolver.
 pub const HANDOFF_UNRESOLVED_SDK_INVOKED_UNATTRIBUTED: &str = "sdk_invoked_unattributed";
 
 /// Outcome of the finality-checked retryable release of a fenced handoff
@@ -792,9 +788,8 @@ impl OutboxStore {
     /// expired `handoff_started` rows REGARDLESS of invoice finality — the
     /// final-invoice exclusion of the ordinary claim path must not apply to
     /// fenced rows — and keeps the row in `handoff_started` under a fresh
-    /// token/lease so `mark_handoff_unresolved` terminalization stays
-    /// fenced by the exact token. Recovery never re-runs the SDK effect and
-    /// never resolves or attributes durable SDK state (rule 3).
+    /// token/lease. Recovery never re-runs the SDK effect; its resolver may
+    /// read durable state and causally attribute a uniquely proven record.
     pub async fn claim_fence_recovery(
         &self,
         owner: Uuid,
@@ -876,18 +871,10 @@ impl OutboxStore {
 
     /// Terminalizes a recovered fenced row (migration 0023 rule 3):
     /// `handoff_unresolved` is the closed terminal class for a
-    /// `handoff_started` row that can neither be attributed nor safely
-    /// re-executed. Recovery NEVER resolves or attributes an SDK effect, so
-    /// both marker states take the same closed transition with zero SDK
-    /// calls; only the static reason differs —
-    /// [`HANDOFF_UNRESOLVED_SDK_NOT_INVOKED`] when the durable invocation
-    /// marker is FALSE (the SDK provably never ran) and
-    /// [`HANDOFF_UNRESOLVED_SDK_INVOKED_UNATTRIBUTED`] when it is TRUE (an
-    /// effect may exist in durable SDK state and an operator reconciles it
-    /// by hand). The transition, descendant cascade, and exactly one
-    /// durable terminal event commit together; a replayed CAS matches zero
-    /// rows and inserts no second event. The SDK is never re-run for the
-    /// row afterwards.
+    /// `handoff_started` row that cannot be safely attributed or re-executed.
+    /// The transition, descendant cascade, and exactly one durable terminal
+    /// event commit together; a replayed CAS matches zero rows and inserts no
+    /// second event. The SDK is never re-run for the row afterwards.
     pub async fn mark_handoff_unresolved(
         &self,
         claim: &ClaimedOutbox,
