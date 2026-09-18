@@ -9,7 +9,9 @@ use std::{
 
 use paykit_server::{
     crypto::Crypto,
-    persistence::{InvoiceStore, MIGRATION_ADVISORY_LOCK_KEY, run_migrations},
+    persistence::{
+        InvoiceStore, MIGRATION_ADVISORY_LOCK_KEY, run_migrations, verify_migrations_applied,
+    },
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use sha2::{Digest, Sha512};
@@ -157,6 +159,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
 
     run_migrations(pool).await.unwrap();
     run_migrations(pool).await.unwrap();
+    verify_migrations_applied(pool).await.unwrap();
 
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename",
@@ -283,9 +286,14 @@ async fn migration_0024_upgrades_exact_deployed_0023_schema() {
             .await
             .unwrap();
     assert!(!sidecar_before);
+    assert!(
+        verify_migrations_applied(pool).await.is_err(),
+        "runtime migration verification accepted schema version 23"
+    );
     drop(connection);
 
     run_migrations(pool).await.unwrap();
+    verify_migrations_applied(pool).await.unwrap();
     let after: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(pool)
         .await

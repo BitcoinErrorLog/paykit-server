@@ -10,6 +10,59 @@ use url::Url;
 use uuid::Uuid;
 
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const RUNTIME_ROLE_BOOTSTRAP_LOCK_KEY: i64 = 6_530_737_554_105_769_809;
+
+async fn ensure_runtime_role(admin_connection: &mut PgConnection) {
+    let mut transaction = admin_connection
+        .begin()
+        .await
+        .expect("begin runtime-role bootstrap transaction");
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(RUNTIME_ROLE_BOOTSTRAP_LOCK_KEY)
+        .execute(&mut *transaction)
+        .await
+        .expect("serialize runtime-role bootstrap");
+
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = 'paykit')")
+            .fetch_one(&mut *transaction)
+            .await
+            .expect("inspect runtime role");
+    if !exists {
+        sqlx::query(
+            "CREATE ROLE paykit \
+             NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS",
+        )
+        .execute(&mut *transaction)
+        .await
+        .expect("create restricted runtime role");
+    }
+
+    let restricted: bool = sqlx::query_scalar(
+        "SELECT NOT rolsuper
+             AND NOT rolcreatedb
+             AND NOT rolcreaterole
+             AND NOT rolinherit
+             AND NOT rolreplication
+             AND NOT rolbypassrls
+             AND NOT EXISTS (
+                 SELECT 1 FROM pg_auth_members memberships WHERE memberships.member = roles.oid
+             )
+         FROM pg_roles roles
+         WHERE rolname = 'paykit'",
+    )
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("validate restricted runtime role");
+    assert!(
+        restricted,
+        "test runtime role must not inherit migrator or superuser authority"
+    );
+    transaction
+        .commit()
+        .await
+        .expect("commit runtime-role bootstrap");
+}
 
 fn isolated_database_url(database_url: &str, database_name: &str) -> String {
     let mut isolated_database_url =
@@ -44,6 +97,11 @@ impl TestDatabase {
         let mut admin_connection = PgConnection::connect_with(&admin_options)
             .await
             .expect("connect to TEST_DATABASE_URL database to create isolated E2E database");
+        // The fixed production role is a cluster object, so creating and dropping it
+        // per database would race parallel test binaries. Keep the restricted role
+        // as an idempotent cluster fixture; dropping each isolated database removes
+        // every per-test grant and dependency.
+        ensure_runtime_role(&mut admin_connection).await;
         sqlx::query(&format!("CREATE DATABASE {database_name}"))
             .execute(&mut admin_connection)
             .await
@@ -70,6 +128,7 @@ impl TestDatabase {
         let mut admin_connection = PgConnection::connect_with(&admin_options)
             .await
             .expect("connect to TEST_DATABASE_URL database to create isolated E2E database");
+        ensure_runtime_role(&mut admin_connection).await;
         let collations: Vec<String> = sqlx::query_scalar(
             "SELECT collname FROM pg_collation
              WHERE collprovider = 'c' AND collname NOT IN ('C', 'POSIX')

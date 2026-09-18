@@ -44,6 +44,9 @@ poll_interval = "5s"
 #[tokio::test]
 async fn booting_with_a_mismatched_network_or_role_fails_before_binding() {
     let database = TestDatabase::create().await;
+    paykit_server::persistence::run_migrations(database.pool())
+        .await
+        .unwrap();
     initialize_database(&config(database.database_url(), "mainnet", "proof"))
         .await
         .unwrap();
@@ -65,6 +68,9 @@ async fn booting_with_a_mismatched_network_or_role_fails_before_binding() {
 #[tokio::test]
 async fn booting_a_production_role_against_a_proof_database_fails_before_binding() {
     let database = TestDatabase::create().await;
+    paykit_server::persistence::run_migrations(database.pool())
+        .await
+        .unwrap();
     initialize_database(&config(database.database_url(), "mainnet", "proof"))
         .await
         .unwrap();
@@ -229,6 +235,9 @@ async fn concurrent_first_boots_on_an_unset_role_adopt_exactly_once() {
 #[tokio::test]
 async fn stack_identity_is_minted_once_and_byte_identical_across_reboots() {
     let database = TestDatabase::create().await;
+    paykit_server::persistence::run_migrations(database.pool())
+        .await
+        .unwrap();
     let configured = config(database.database_url(), "testnet", "proof");
 
     // The first boot mints the single-row identity inside the
@@ -278,6 +287,12 @@ async fn stack_identity_is_minted_once_and_byte_identical_across_reboots() {
 async fn two_databases_migrated_from_the_same_binary_get_different_stack_ids() {
     let first_database = TestDatabase::create().await;
     let second_database = TestDatabase::create().await;
+    paykit_server::persistence::run_migrations(first_database.pool())
+        .await
+        .unwrap();
+    paykit_server::persistence::run_migrations(second_database.pool())
+        .await
+        .unwrap();
 
     let first = initialize_database(&config(first_database.database_url(), "testnet", "proof"))
         .await

@@ -51,17 +51,20 @@ field to `true` explicitly. Do not add a second creation switch.
    dedicated PostgreSQL database.
 2. Confirm PostgreSQL PITR is enabled and a restore has been exercised before
    any creation-enabled cutover.
-3. Start the binary with the rendered config. Startup applies migrations,
-   validates deployment invariants, authenticates persisted state, and only
-   then binds HTTP.
-4. Verify `GET /health/live` and `GET /health/ready`. Record the exact image
+3. Apply the image's release-pinned migrations with the dedicated migration
+   owner. The runtime `PAYKIT_DATABASE_URL` role must remain non-owner and
+   unable to execute migration DDL.
+4. Start the binary with the rendered config. Startup verifies the exact
+   owner-applied migration set read-only, validates deployment invariants,
+   authenticates persisted state, and only then binds HTTP.
+5. Verify `GET /health/live` and `GET /health/ready`. Record the exact image
    digest, `SOURCE_SHA`, and `stack_id` from the deployment and startup
    evidence.
-5. Verify the public Electrum endpoint is exactly
+6. Verify the public Electrum endpoint is exactly
    `ssl://bitkit.to:9999`; do not place credentials in this runbook.
-6. Complete the W1.10 cutover checklist and signed `prepare`, `activate`,
+7. Complete the W1.10 cutover checklist and signed `prepare`, `activate`,
    `void`, and `resolve` gates while creation remains disabled.
-7. After parent approval, run one exclusive seller canary. Do not add a
+8. After parent approval, run one exclusive seller canary. Do not add a
    second seller or enable general creation as part of this rehearsal.
 
 ## Health interpretation

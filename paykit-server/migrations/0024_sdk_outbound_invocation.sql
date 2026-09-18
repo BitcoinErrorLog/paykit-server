@@ -48,9 +48,38 @@ CREATE TRIGGER sdk_outbound_invocations_no_truncate
 BEFORE TRUNCATE ON sdk_outbound_invocations
 FOR EACH STATEMENT EXECUTE FUNCTION reject_sdk_outbound_invocation_mutation();
 
+-- Deployment supplies the stable non-owner runtime role before migrations.
+-- The migration owner retains all DDL and trigger authority; runtime receives
+-- only the new column access and sidecar operations used by the fenced path.
+GRANT USAGE ON SCHEMA public TO paykit;
+
+-- Runtime startup may verify that the owner already applied every embedded
+-- migration, but it cannot write the ledger or execute pending DDL.
+GRANT SELECT ON TABLE _sqlx_migrations TO paykit;
+
+GRANT SELECT (
+        handoff_invocation_token,
+        recovery_attempts,
+        recovery_first_at,
+        recovery_last_at
+    ),
+    UPDATE (
+        handoff_invocation_token,
+        recovery_attempts,
+        recovery_first_at,
+        recovery_last_at
+    )
+    ON TABLE outbox TO paykit;
+
+REVOKE ALL PRIVILEGES ON TABLE sdk_outbound_invocations FROM PUBLIC, paykit;
+GRANT SELECT (creator_id, sdk_outbound_message_id, invocation_token),
+    INSERT (creator_id, sdk_outbound_message_id, invocation_token)
+    ON TABLE sdk_outbound_invocations TO paykit;
+
+REVOKE ALL PRIVILEGES
+    ON FUNCTION reject_sdk_outbound_invocation_mutation()
+    FROM PUBLIC, paykit;
+
 CREATE UNIQUE INDEX outbox_creator_outbound_owner_unique
     ON outbox (creator_id, sdk_outbound_message_id)
     WHERE sdk_outbound_message_id IS NOT NULL;
-
-CREATE INDEX sdk_outbound_invocations_creator_outbound_index
-    ON sdk_outbound_invocations (creator_id, sdk_outbound_message_id);

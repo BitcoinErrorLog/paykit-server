@@ -1001,6 +1001,9 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     parse_bundle_id(BUNDLE_B).unwrap();
     let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
     let database = TestDatabase::create().await;
+    paykit_server::persistence::run_migrations(database.pool())
+        .await
+        .unwrap();
     let signing_key = SigningKey::from_bytes(&[7; 32]);
     let first_config = config(database.database_url(), &signing_key, "1h");
     let first_initialized = initialize_database(&first_config).await.unwrap();
@@ -1434,6 +1437,9 @@ async fn a_creation_cancelled_after_commit_is_in_progress_on_retry_and_voided_by
     parse_bundle_id(BUNDLE_A).unwrap();
     let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
     let database = TestDatabase::create().await;
+    paykit_server::persistence::run_migrations(database.pool())
+        .await
+        .unwrap();
     let signing_key = SigningKey::from_bytes(&[9; 32]);
     let server_config = config(database.database_url(), &signing_key, "1h");
     let initialized = initialize_database(&server_config).await.unwrap();
@@ -1617,6 +1623,9 @@ async fn concurrent_identical_creations_run_exactly_one_baseline_snapshot() {
     parse_bundle_id(BUNDLE_A).unwrap();
     let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
     let database = TestDatabase::create().await;
+    paykit_server::persistence::run_migrations(database.pool())
+        .await
+        .unwrap();
     let signing_key = SigningKey::from_bytes(&[10; 32]);
     let server_config = config(database.database_url(), &signing_key, "1h");
     let initialized = initialize_database(&server_config).await.unwrap();

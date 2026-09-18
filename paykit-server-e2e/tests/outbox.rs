@@ -34,7 +34,7 @@ use paykit_server::{
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, HandoffFenceSeam, InvoiceStore,
         NewReaderPayloadFactory, NewReaderPayloads, OutboxStore, PersistenceError,
-        PostgresStorageAdapter, SdkStateStore, run_migrations,
+        PostgresStorageAdapter, SdkStateStore, run_migrations, verify_migrations_applied,
     },
     runtime::{
         ElectrumProbe, OutboxTerminalHealth, PostgresDependency, Runtime, operational_router,
@@ -92,7 +92,15 @@ async fn linked_paykit_fixture(
     crypto: Arc<Crypto>,
     key_tail_seed: u8,
 ) -> LinkedPaykitFixture {
-    paykit_fixture(database, crypto, key_tail_seed, true).await
+    paykit_fixture(database.pool(), crypto, key_tail_seed, true).await
+}
+
+async fn linked_paykit_fixture_on_pool(
+    pool: &sqlx::PgPool,
+    crypto: Arc<Crypto>,
+    key_tail_seed: u8,
+) -> LinkedPaykitFixture {
+    paykit_fixture(pool, crypto, key_tail_seed, true).await
 }
 
 async fn unlinked_paykit_fixture(
@@ -100,11 +108,11 @@ async fn unlinked_paykit_fixture(
     crypto: Arc<Crypto>,
     key_tail_seed: u8,
 ) -> LinkedPaykitFixture {
-    paykit_fixture(database, crypto, key_tail_seed, false).await
+    paykit_fixture(database.pool(), crypto, key_tail_seed, false).await
 }
 
 async fn paykit_fixture(
-    database: &TestDatabase,
+    pool: &sqlx::PgPool,
     crypto: Arc<Crypto>,
     key_tail_seed: u8,
     link_peer: bool,
@@ -127,7 +135,7 @@ async fn paykit_fixture(
         .await
         .unwrap();
     let creator = parse_creator(&format!("pubky{}", creator_bootstrap.public_key)).unwrap();
-    let creator_row = CreatorStore::new(database.pool(), crypto.clone())
+    let creator_row = CreatorStore::new(pool, crypto.clone())
         .create(
             &CreatorCredentials::new(
                 creator.clone(),
@@ -143,8 +151,7 @@ async fn paykit_fixture(
         )
         .await
         .unwrap();
-    let creator_storage =
-        PostgresStorageAdapter::new(database.pool(), crypto.clone(), creator_row.id());
+    let creator_storage = PostgresStorageAdapter::new(pool, crypto.clone(), creator_row.id());
     let creator_sdk = PaykitSdk::new(
         creator_storage.clone(),
         TestSessionProvider::new(creator_bootstrap.access.clone()),
@@ -260,11 +267,7 @@ async fn paykit_fixture(
     let reader = parse_reader(&format!("pubky{}", peer_bootstrap.public_key)).unwrap();
     let adapter = paykit_server::paykit::PaykitAdapter::new(
         creator_storage.clone(),
-        CreatorSessionProvider::with_pubky(
-            CreatorStore::new(database.pool(), crypto),
-            creator.clone(),
-            pubky,
-        ),
+        CreatorSessionProvider::with_pubky(CreatorStore::new(pool, crypto), creator.clone(), pubky),
         &PaykitConfig {
             receiver_path: creator_receiver_path,
             receiver_path_priority: vec![ReceiverPathPriority::parse("bitkit".into()).unwrap()],
@@ -3411,6 +3414,327 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
         "schema accepted an unpaired SDK Event ID"
     );
 
+    database.cleanup().await;
+}
+
+async fn grant_pre_0024_runtime_privileges(pool: &sqlx::PgPool) {
+    // Production already grants the runtime role access to the schema objects
+    // predating 0024. Reconstruct that boundary without granting either the
+    // migration ledger, the new sidecar, or any column added by 0024.
+    sqlx::raw_sql(
+        "DO $$
+         DECLARE
+             object_name TEXT;
+             legacy_outbox_columns TEXT;
+         BEGIN
+             FOR object_name IN
+                 SELECT tablename
+                 FROM pg_tables
+                 WHERE schemaname = 'public'
+                   AND tablename NOT IN (
+                       '_sqlx_migrations', 'outbox', 'sdk_outbound_invocations'
+                   )
+             LOOP
+                 EXECUTE format(
+                     'GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.%I TO paykit',
+                     object_name
+                 );
+             END LOOP;
+
+             SELECT string_agg(format('%I', column_name), ', ' ORDER BY ordinal_position)
+             INTO legacy_outbox_columns
+             FROM information_schema.columns
+             WHERE table_schema = 'public'
+               AND table_name = 'outbox'
+               AND column_name NOT IN (
+                   'handoff_invocation_token',
+                   'recovery_attempts',
+                   'recovery_first_at',
+                   'recovery_last_at'
+               );
+             EXECUTE format(
+                 'GRANT SELECT (%1$s), INSERT (%1$s), UPDATE (%1$s) ON TABLE public.outbox TO paykit',
+                 legacy_outbox_columns
+             );
+         END $$;
+         GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO paykit;",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn runtime_role_pool(database: &TestDatabase) -> sqlx::PgPool {
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SET ROLE paykit").execute(connection).await?;
+                Ok(())
+            })
+        })
+        .connect(database.database_url())
+        .await
+        .unwrap()
+}
+
+fn assert_insufficient_privilege(
+    operation: &str,
+    result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>,
+) {
+    let error = result.unwrap_err();
+    assert_eq!(
+        error
+            .as_database_error()
+            .and_then(|database_error| database_error.code())
+            .as_deref(),
+        Some("42501"),
+        "{operation} did not fail with insufficient privilege"
+    );
+}
+
+/// The migration owner applies 0024, while every production persistence
+/// operation below runs as the fixed non-owner `paykit` role. The real SDK
+/// adapter commits encrypted state and its invocation sidecar atomically, and
+/// the real resolver reads that evidence before completing attribution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn runtime_paykit_role_completes_fenced_resolver_without_migration_authority() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    grant_pre_0024_runtime_privileges(database.pool()).await;
+    let runtime_pool = runtime_role_pool(&database).await;
+
+    let authority_is_restricted: bool = sqlx::query_scalar(
+        "SELECT current_user = 'paykit'
+             AND session_user <> current_user
+             AND NOT roles.rolsuper
+             AND NOT roles.rolcreatedb
+             AND NOT roles.rolcreaterole
+             AND NOT roles.rolinherit
+             AND NOT roles.rolreplication
+             AND NOT roles.rolbypassrls
+             AND NOT EXISTS (
+                 SELECT 1 FROM pg_auth_members memberships WHERE memberships.member = roles.oid
+             )
+             AND (
+                 SELECT tables.relowner <> roles.oid
+                 FROM pg_class tables
+                 WHERE tables.oid = 'public.sdk_outbound_invocations'::regclass
+             )
+         FROM pg_roles roles
+         WHERE roles.rolname = current_user",
+    )
+    .fetch_one(&runtime_pool)
+    .await
+    .unwrap();
+    assert!(
+        authority_is_restricted,
+        "runtime role inherited authority or owns the sidecar"
+    );
+
+    let crypto = Arc::new(Crypto::from_master_key(&[79; 32]).unwrap());
+    let LinkedPaykitFixture {
+        _testnet,
+        creator,
+        reader,
+        adapter,
+        peer_marker,
+        ..
+    } = linked_paykit_fixture_on_pool(&runtime_pool, crypto.clone(), 79).await;
+    let invoice = InvoiceStore::new(&runtime_pool, crypto.clone())
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"runtime-role-resolver-bundle",
+            payment_request_binding: b"runtime-role-resolver-request",
+            new_reader_payloads: &LinkedPayloads {
+                reader: reader.clone(),
+                marker: peer_marker.clone(),
+            },
+            payment_request_intent: DeliveryIntentV1::payment_request(
+                reader.to_string(),
+                &peer_marker,
+                PaykitReceiverPath::new("paykit/server").unwrap(),
+                &PaymentRequestTerms {
+                    amount: PaymentAmount::new("0.00000100", "BTC").unwrap(),
+                    payment_reference: PaymentReference::new(Uuid::new_v4().to_string()).unwrap(),
+                    proposal_expires_at: None,
+                    recurrence: None,
+                    accepted_payment_endpoint_identifiers: vec![
+                        PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+                    ],
+                    metadata: Default::default(),
+                },
+            )
+            .unwrap(),
+            required_sats: 100,
+            nonce_sats: 1,
+            prepare_ttl: Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        })
+        .await
+        .unwrap();
+    let outbox = OutboxStore::new(&runtime_pool, crypto.clone());
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(
+        claim.id(),
+        invoice.endpoint_publication_outbox_id().unwrap()
+    );
+    assert!(outbox.begin_handoff(&claim).await.unwrap());
+    assert!(
+        outbox
+            .mark_handoff_invocation_started(&claim)
+            .await
+            .unwrap()
+    );
+    let token = outbox
+        .handoff_invocation_token(&claim)
+        .await
+        .unwrap()
+        .unwrap();
+    let intent = outbox.delivery_intent(&claim).unwrap();
+    let result = handoff_with_invocation_token(&adapter, &intent, token)
+        .await
+        .expect("runtime role persists SDK state and invocation sidecar");
+    let outbound = match result {
+        HandoffResult::EndpointPublication {
+            outbound_message_id,
+        } => outbound_message_id,
+        HandoffResult::PaymentRequestProposal { .. } => panic!("endpoint intent created request"),
+    };
+
+    let sidecar: Uuid = sqlx::query_scalar(
+        "SELECT invocation_token FROM sdk_outbound_invocations
+         WHERE creator_id = (SELECT creator_id FROM outbox WHERE id = $1)
+           AND sdk_outbound_message_id = $2",
+    )
+    .bind(claim.id())
+    .bind(outbound.to_string())
+    .fetch_one(&runtime_pool)
+    .await
+    .unwrap();
+    assert_eq!(sidecar, token, "runtime role reads its inserted sidecar");
+    let sdk_state = SdkStateStore::new(&runtime_pool, crypto.clone())
+        .load(&creator)
+        .await
+        .unwrap();
+    assert!(
+        sdk_state
+            .outbound_private_messages
+            .iter()
+            .any(|record| record.outbound_message_id == outbound),
+        "runtime role reads the durable SDK record"
+    );
+
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(claim.id())
+        .execute(&runtime_pool)
+        .await
+        .unwrap();
+    let recovery = outbox
+        .claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        process_fence_recovery(&outbox, &adapter, &recovery)
+            .await
+            .unwrap()
+    );
+    let attributed: (String, Option<String>) =
+        sqlx::query_as("SELECT status, sdk_outbound_message_id FROM outbox WHERE id = $1")
+            .bind(claim.id())
+            .fetch_one(&runtime_pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        attributed,
+        ("handed_off".into(), Some(outbound.to_string())),
+        "runtime resolver completes causal attribution"
+    );
+
+    assert_insufficient_privilege(
+        "sidecar update",
+        sqlx::query(
+            "UPDATE sdk_outbound_invocations SET invocation_token = gen_random_uuid()
+             WHERE creator_id = $1 AND sdk_outbound_message_id = $2",
+        )
+        .bind(recovery.creator_id())
+        .bind(outbound.to_string())
+        .execute(&runtime_pool)
+        .await,
+    );
+    assert_insufficient_privilege(
+        "sidecar delete",
+        sqlx::query(
+            "DELETE FROM sdk_outbound_invocations
+             WHERE creator_id = $1 AND sdk_outbound_message_id = $2",
+        )
+        .bind(recovery.creator_id())
+        .bind(outbound.to_string())
+        .execute(&runtime_pool)
+        .await,
+    );
+    assert_insufficient_privilege(
+        "sidecar truncate",
+        sqlx::query("TRUNCATE sdk_outbound_invocations")
+            .execute(&runtime_pool)
+            .await,
+    );
+    assert_insufficient_privilege(
+        "sidecar trigger disable",
+        sqlx::query(
+            "ALTER TABLE sdk_outbound_invocations
+             DISABLE TRIGGER sdk_outbound_invocations_immutable",
+        )
+        .execute(&runtime_pool)
+        .await,
+    );
+    assert_insufficient_privilege(
+        "sidecar trigger drop",
+        sqlx::query("DROP TRIGGER sdk_outbound_invocations_immutable ON sdk_outbound_invocations")
+            .execute(&runtime_pool)
+            .await,
+    );
+    assert_insufficient_privilege(
+        "sidecar table drop",
+        sqlx::query("DROP TABLE sdk_outbound_invocations")
+            .execute(&runtime_pool)
+            .await,
+    );
+    assert_insufficient_privilege(
+        "sidecar ownership alteration",
+        sqlx::query("ALTER TABLE sdk_outbound_invocations OWNER TO paykit")
+            .execute(&runtime_pool)
+            .await,
+    );
+    verify_migrations_applied(&runtime_pool)
+        .await
+        .expect("runtime startup verifies the owner-applied migration ledger");
+    assert!(
+        run_migrations(&runtime_pool).await.is_err(),
+        "runtime role executed the migration runner"
+    );
+    assert_insufficient_privilege(
+        "migration ledger write",
+        sqlx::query("UPDATE _sqlx_migrations SET success = success WHERE version = 24")
+            .execute(&runtime_pool)
+            .await,
+    );
+    assert_insufficient_privilege(
+        "migration DDL execution",
+        sqlx::query("CREATE TABLE runtime_migration_probe (id INTEGER)")
+            .execute(&runtime_pool)
+            .await,
+    );
+
+    runtime_pool.close().await;
     database.cleanup().await;
 }
 
