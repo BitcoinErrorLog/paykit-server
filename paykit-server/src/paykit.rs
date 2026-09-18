@@ -235,6 +235,26 @@ impl Adapter for PaykitAdapter {
         handoff_steps(self, intent).await
     }
 
+    async fn execute_handoff_with_invocation_token(
+        &self,
+        intent: &DeliveryIntentV1,
+        invocation_token: Uuid,
+    ) -> Result<HandoffResult, HandoffFailure> {
+        let _guard = self.mutation_lock.lock().await;
+        self.storage
+            .set_invocation_token(invocation_token)
+            .map_err(classify)
+            .map_err(|error| match error {
+                HandoffError::Permanent => HandoffFailure::Permanent,
+                HandoffError::Retryable(_) => HandoffFailure::Retryable(
+                    crate::persistence::OutboxRetryClass::AdapterUnavailable,
+                ),
+            })?;
+        let result = handoff_steps(self, intent).await;
+        self.storage.clear_invocation_token();
+        result
+    }
+
     async fn fetch_marker(
         &self,
         reader: &str,

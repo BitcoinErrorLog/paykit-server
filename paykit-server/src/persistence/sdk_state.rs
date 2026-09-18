@@ -1,6 +1,6 @@
 //! Encrypted full Paykit SDK state snapshots.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use paykit_sdk::{
@@ -34,6 +34,7 @@ pub struct PostgresStorageAdapter {
     pool: PgPool,
     crypto: Arc<Crypto>,
     creator_id: Uuid,
+    invocation_token: Arc<Mutex<Option<Uuid>>>,
 }
 
 impl std::fmt::Debug for PostgresStorageAdapter {
@@ -48,11 +49,32 @@ impl PostgresStorageAdapter {
             pool: pool.clone(),
             crypto,
             creator_id,
+            invocation_token: Arc::new(Mutex::new(None)),
         }
     }
 
     pub(crate) fn creator_id(&self) -> Uuid {
         self.creator_id
+    }
+
+    /// Binds exactly one fenced handoff invocation to the next SDK-created
+    /// outbound record(s). `PaykitAdapter` serializes creator mutations and
+    /// clears this scope immediately after the handoff returns.
+    pub(crate) fn set_invocation_token(&self, token: Uuid) -> paykit_sdk::Result<()> {
+        let mut slot = self
+            .invocation_token
+            .lock()
+            .map_err(|_| storage_context("invocation token scope is unavailable"))?;
+        if slot.replace(token).is_some() {
+            return Err(storage_context("invocation token scope is already active"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_invocation_token(&self) {
+        if let Ok(mut slot) = self.invocation_token.lock() {
+            *slot = None;
+        }
     }
 }
 
@@ -84,7 +106,24 @@ impl StorageAdapter for PostgresStorageAdapter {
         let hash = LookupHash::from_bytes(hash_bytes);
         let state =
             decrypt_state(&self.crypto, hash, creator_id, &envelope).map_err(persistence_error)?;
+        let before_outbound_ids = state
+            .outbound_private_messages
+            .iter()
+            .map(|record| record.outbound_message_id)
+            .collect::<Vec<_>>();
         let (updated, result) = run_storage_state_transaction(state, callback)?;
+        let after_outbound_ids = updated
+            .outbound_private_messages
+            .iter()
+            .map(|record| record.outbound_message_id)
+            .collect::<Vec<_>>();
+        if !after_outbound_ids.starts_with(&before_outbound_ids) {
+            return Err(storage_context("SDK changed existing outbound record identities"));
+        }
+        let new_outbound_ids = &after_outbound_ids[before_outbound_ids.len()..];
+        if new_outbound_ids.len() > 1 {
+            return Err(storage_context("SDK callback appended multiple outbound records"));
+        }
         let encrypted =
             encrypt_state(&self.crypto, hash, creator_id, &updated).map_err(persistence_error)?;
         let changed = sqlx::query(
@@ -97,6 +136,22 @@ impl StorageAdapter for PostgresStorageAdapter {
         .map_err(storage_error)?;
         if changed.rows_affected() != 1 {
             return Err(storage_context("creator SDK state update was lost"));
+        }
+        let invocation_token = *self
+            .invocation_token
+            .lock()
+            .map_err(|_| storage_context("invocation token scope is unavailable"))?;
+        if let (Some(token), Some(outbound_id)) = (invocation_token, new_outbound_ids.first()) {
+            sqlx::query(
+                "INSERT INTO sdk_outbound_invocations \
+                 (creator_id, sdk_outbound_message_id, invocation_token) VALUES ($1, $2, $3)",
+            )
+            .bind(self.creator_id)
+            .bind(outbound_id.to_string())
+            .bind(token)
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_error)?;
         }
         tx.commit().await.map_err(storage_error)?;
         Ok(result)

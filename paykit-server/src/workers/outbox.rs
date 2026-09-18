@@ -14,6 +14,7 @@ use crate::{
     persistence::{ClaimedHandoff, ClaimedOutbox, OutboxStore, PersistenceError},
 };
 use std::time::Duration;
+use uuid::Uuid;
 
 pub use crate::persistence::{HandoffResult, OutboxRetryClass as RetryableHandoffStage};
 
@@ -67,6 +68,17 @@ pub trait Adapter: Send + Sync {
         handoff_steps(self, intent).await
     }
 
+    /// Executes a fenced handoff with its database-minted causal witness.
+    /// Test-only adapters retain the default because they never persist SDK
+    /// state; the production adapter records the witness atomically.
+    async fn execute_handoff_with_invocation_token(
+        &self,
+        intent: &DeliveryIntentV1,
+        _invocation_token: Uuid,
+    ) -> Result<HandoffResult, HandoffFailure> {
+        self.execute_handoff(intent).await
+    }
+
     async fn fetch_marker(
         &self,
         reader: &str,
@@ -98,6 +110,16 @@ pub async fn handoff(
     intent: &DeliveryIntentV1,
 ) -> Result<HandoffResult, HandoffFailure> {
     adapter.execute_handoff(intent).await
+}
+
+pub async fn handoff_with_invocation_token(
+    adapter: &dyn Adapter,
+    intent: &DeliveryIntentV1,
+    invocation_token: Uuid,
+) -> Result<HandoffResult, HandoffFailure> {
+    adapter
+        .execute_handoff_with_invocation_token(intent, invocation_token)
+        .await
 }
 
 pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
@@ -225,7 +247,10 @@ pub async fn process_claim_with_health(
     if !store.mark_handoff_invocation_started(claim).await? {
         return Ok((false, ProcessingHealth::Retryable));
     }
-    match handoff(adapter, &intent).await {
+    let Some(invocation_token) = store.handoff_invocation_token(claim).await? else {
+        return Ok((false, ProcessingHealth::Retryable));
+    };
+    match handoff_with_invocation_token(adapter, &intent, invocation_token).await {
         Ok(result) => store
             .mark_handed_off(claim, &result)
             .await
@@ -279,7 +304,7 @@ pub async fn process_fence_recovery_with_health(
     claim: &ClaimedOutbox,
 ) -> Result<(bool, ProcessingHealth), PersistenceError> {
     store
-        .mark_handoff_unresolved(claim)
+        .resolve_fence_recovery(claim)
         .await
         .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure))
 }
