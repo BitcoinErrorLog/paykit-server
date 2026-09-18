@@ -4,7 +4,7 @@
 //! methods. They deliberately do not contain SDK-generated event, request, wire,
 //! or outbound-message identifiers.
 
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use paykit_lib::{
     PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier,
@@ -184,6 +184,12 @@ impl DeliveryIntentV1 {
                         detail.payload.is_empty()
                             || PaymentEndpointIdentifier::new(detail.identifier.clone()).is_err()
                     })
+                    || receiving_details
+                        .iter()
+                        .map(|detail| detail.identifier.as_str())
+                        .collect::<HashSet<_>>()
+                        .len()
+                        != receiving_details.len()
                 {
                     return Err(DeliveryIntentError::Invalid);
                 }
@@ -198,6 +204,13 @@ impl DeliveryIntentV1 {
                         .any(|identifier| {
                             PaymentEndpointIdentifier::new(identifier.clone()).is_err()
                         })
+                    || terms
+                        .accepted_endpoint_identifiers
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<HashSet<_>>()
+                        .len()
+                        != terms.accepted_endpoint_identifiers.len()
                 {
                     return Err(DeliveryIntentError::Invalid);
                 }
@@ -246,6 +259,45 @@ impl DeliveryIntentV1 {
 
     pub fn operation(&self) -> &DeliveryOperationV1 {
         &self.operation
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn encoded_with_unsupported_version_for_test(&self) -> Vec<u8> {
+        let mut invalid = self.clone();
+        invalid.version = invalid.version.saturating_sub(1);
+        postcard::to_allocvec(&invalid).expect("test delivery intent serializes")
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn encoded_with_invalid_path_for_test(&self) -> Vec<u8> {
+        let mut invalid = self.clone();
+        invalid.selected_reader_path = "../invalid".into();
+        postcard::to_allocvec(&invalid).expect("test delivery intent serializes")
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn encoded_with_duplicate_expected_identifier_for_test(&self) -> Vec<u8> {
+        let mut invalid = self.clone();
+        match &mut invalid.operation {
+            DeliveryOperationV1::EndpointPublication { receiving_details } => {
+                receiving_details.push(
+                    receiving_details
+                        .first()
+                        .expect("valid endpoint intent has receiving details")
+                        .clone(),
+                );
+            }
+            DeliveryOperationV1::PaymentRequestProposal { terms } => {
+                terms.accepted_endpoint_identifiers.push(
+                    terms
+                        .accepted_endpoint_identifiers
+                        .first()
+                        .expect("valid payment intent has accepted endpoints")
+                        .clone(),
+                );
+            }
+        }
+        postcard::to_allocvec(&invalid).expect("test delivery intent serializes")
     }
 }
 
@@ -380,5 +432,51 @@ mod tests {
             DeliveryIntentV1::decode(&postcard::to_allocvec(&intent).unwrap()),
             Err(DeliveryIntentError::Invalid)
         );
+    }
+
+    #[test]
+    fn duplicate_expected_endpoint_identifiers_are_invalid_evidence() {
+        let endpoint = DeliveryIntentV1 {
+            version: 2,
+            reader_pubky: "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy".into(),
+            selected_reader_path: "bitkit/wallet".into(),
+            marker_fingerprint: [4; 32],
+            local_receiver_path: "paykit/server".into(),
+            operation: DeliveryOperationV1::EndpointPublication {
+                receiving_details: vec![
+                    ReceivingDetailV1 {
+                        identifier: "btc-bitcoin-p2wpkh".into(),
+                        payload: "first".into(),
+                    },
+                    ReceivingDetailV1 {
+                        identifier: "btc-bitcoin-p2wpkh".into(),
+                        payload: "second".into(),
+                    },
+                ],
+            },
+        };
+        assert_eq!(endpoint.validate(), Err(DeliveryIntentError::Invalid));
+
+        let payment = DeliveryIntentV1 {
+            version: 2,
+            reader_pubky: "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy".into(),
+            selected_reader_path: "bitkit/wallet".into(),
+            marker_fingerprint: [5; 32],
+            local_receiver_path: "paykit/server".into(),
+            operation: DeliveryOperationV1::PaymentRequestProposal {
+                terms: PaymentTermsV1 {
+                    amount: "0.00000100".into(),
+                    asset: "BTC".into(),
+                    payment_reference: "550e8400-e29b-41d4-a716-446655440000".into(),
+                    proposal_expires_at: None,
+                    accepted_endpoint_identifiers: vec![
+                        "btc-bitcoin-p2wpkh".into(),
+                        "btc-bitcoin-p2wpkh".into(),
+                    ],
+                    metadata: Default::default(),
+                },
+            },
+        };
+        assert_eq!(payment.validate(), Err(DeliveryIntentError::Invalid));
     }
 }

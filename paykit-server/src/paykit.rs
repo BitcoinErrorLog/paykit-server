@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{Arc, Mutex as StdMutex, OnceLock, Weak},
 };
 
@@ -128,6 +129,27 @@ pub struct PaykitAdapter {
     sdk: CreatorSdk,
     storage: PostgresStorageAdapter,
     mutation_lock: Arc<TokioMutex<()>>,
+    handoff_invocation_token: StdMutex<Option<Uuid>>,
+}
+
+struct StorageInvocationScope(PostgresStorageAdapter);
+
+impl Drop for StorageInvocationScope {
+    fn drop(&mut self) {
+        self.0.clear_invocation_token();
+    }
+}
+
+struct HandoffInvocationScope<'a>(&'a StdMutex<Option<Uuid>>);
+
+impl Drop for HandoffInvocationScope<'_> {
+    fn drop(&mut self) {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = None;
+    }
 }
 
 impl std::fmt::Debug for PaykitAdapter {
@@ -152,7 +174,28 @@ impl PaykitAdapter {
             sdk,
             mutation_lock: creator_mutation_lock(storage.creator_id()),
             storage,
+            handoff_invocation_token: StdMutex::new(None),
         })
+    }
+
+    async fn with_handoff_invocation_token<T>(
+        &self,
+        callback: impl Future<Output = paykit_sdk::Result<T>>,
+    ) -> paykit_sdk::Result<T> {
+        let token = *self
+            .handoff_invocation_token
+            .lock()
+            .map_err(|_| PaykitSdkError::Storage {
+                context: "handoff invocation token is unavailable".into(),
+                source: None,
+            })?;
+        let token = token.ok_or_else(|| PaykitSdkError::Storage {
+            context: "handoff invocation token is absent".into(),
+            source: None,
+        })?;
+        self.storage.set_invocation_token(token)?;
+        let _scope = StorageInvocationScope(self.storage.clone());
+        callback.await
     }
 }
 
@@ -235,6 +278,27 @@ impl Adapter for PaykitAdapter {
         handoff_steps(self, intent).await
     }
 
+    async fn execute_handoff_with_invocation_token(
+        &self,
+        intent: &DeliveryIntentV1,
+        invocation_token: Uuid,
+    ) -> Result<HandoffResult, HandoffFailure> {
+        let _guard = self.mutation_lock.lock().await;
+        {
+            let mut slot = self.handoff_invocation_token.lock().map_err(|_| {
+                HandoffFailure::Retryable(crate::persistence::OutboxRetryClass::AdapterUnavailable)
+            })?;
+            if slot.is_some() {
+                return Err(HandoffFailure::Retryable(
+                    crate::persistence::OutboxRetryClass::AdapterUnavailable,
+                ));
+            }
+            *slot = Some(invocation_token);
+        }
+        let _scope = HandoffInvocationScope(&self.handoff_invocation_token);
+        handoff_steps(self, intent).await
+    }
+
     async fn fetch_marker(
         &self,
         reader: &str,
@@ -271,8 +335,11 @@ impl Adapter for PaykitAdapter {
             })
             .collect();
         let record = self
-            .sdk
-            .enqueue_private_payment_list_with_receiving_details(reader, path, details)
+            .with_handoff_invocation_token(async {
+                self.sdk
+                    .enqueue_private_payment_list_with_receiving_details(reader, path, details)
+                    .await
+            })
             .await
             .map_err(classify)?;
         Ok(HandoffResult::EndpointPublication {
@@ -287,9 +354,11 @@ impl Adapter for PaykitAdapter {
         terms: &PaymentTermsV1,
     ) -> Result<HandoffResult, HandoffError> {
         let (reader, path) = parse_peer(reader, path)?;
+        let terms = payment_terms(terms)?;
         let record = self
-            .sdk
-            .propose_payment_request(reader, path, payment_terms(terms)?)
+            .with_handoff_invocation_token(async {
+                self.sdk.propose_payment_request(reader, path, terms).await
+            })
             .await
             .map_err(classify)?;
         Ok(HandoffResult::PaymentRequestProposal {
@@ -389,6 +458,15 @@ mod tests {
 
         assert!(Arc::ptr_eq(&same_creator_first, &same_creator_second));
         assert!(!Arc::ptr_eq(&same_creator_first, &other_creator));
+    }
+
+    #[test]
+    fn handoff_invocation_scope_clears_token_on_every_drop_path() {
+        let token = StdMutex::new(Some(Uuid::new_v4()));
+        {
+            let _scope = HandoffInvocationScope(&token);
+        }
+        assert!(token.lock().unwrap().is_none());
     }
 
     #[test]

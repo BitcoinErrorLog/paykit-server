@@ -1,9 +1,17 @@
 //! Fenced PostgreSQL outbox claims and transitions.
 
 use crate::{
-    application::semantic_intent::DeliveryIntentV1,
+    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
     persistence::PersistenceError,
+};
+use paykit_lib::{
+    PaymentRequestEvent, PrivateApplicationMessage, PrivateMessageKind,
+    parse_payment_request_event_message, parse_private_payment_list_json,
+};
+use paykit_sdk::{
+    PubkyPublicKey,
+    storage::{OutboundPrivateMessageRecord, StorageState},
 };
 use sqlx::PgPool;
 use std::{collections::BTreeMap, time::Duration};
@@ -43,12 +51,8 @@ impl OutboxRetryClass {
 /// no effect can exist; the row terminalizes with zero SDK calls.
 pub const HANDOFF_UNRESOLVED_SDK_NOT_INVOKED: &str = "sdk_not_invoked";
 
-/// Static terminal reason for a recovered fence whose durable invocation
-/// marker is TRUE (migration 0023 rule 3): the SDK may have emitted an
-/// effect, but recovery never resolves or attributes it (endpoint
-/// identifier sets are not invoice-unique, so attribution could
-/// false-match another invoice's publication). The row terminalizes with
-/// zero SDK calls and an operator reconciles it by hand.
+/// Legacy terminal reason retained for immutable rows created before the
+/// future-row causal resolver. It is not emitted by the current resolver.
 pub const HANDOFF_UNRESOLVED_SDK_INVOKED_UNATTRIBUTED: &str = "sdk_invoked_unattributed";
 
 /// Outcome of the finality-checked retryable release of a fenced handoff
@@ -200,6 +204,8 @@ impl ClaimedHandoff {
 pub struct HandoffFenceSeam {
     pub after_preflight: Option<SeamHook>,
     pub after_fence: Option<SeamHook>,
+    pub before_resolver_commit: Option<SeamHook>,
+    pub after_resolver_commit: Option<SeamHook>,
 }
 
 pub type SeamHook = std::sync::Arc<
@@ -212,6 +218,14 @@ impl std::fmt::Debug for HandoffFenceSeam {
             .debug_struct("HandoffFenceSeam")
             .field("after_preflight", &self.after_preflight.is_some())
             .field("after_fence", &self.after_fence.is_some())
+            .field(
+                "before_resolver_commit",
+                &self.before_resolver_commit.is_some(),
+            )
+            .field(
+                "after_resolver_commit",
+                &self.after_resolver_commit.is_some(),
+            )
             .finish()
     }
 }
@@ -225,6 +239,18 @@ impl HandoffFenceSeam {
 
     pub(crate) async fn run_after_fence(&self) {
         if let Some(hook) = &self.after_fence {
+            hook().await;
+        }
+    }
+
+    async fn run_before_resolver_commit(&self) {
+        if let Some(hook) = &self.before_resolver_commit {
+            hook().await;
+        }
+    }
+
+    async fn run_after_resolver_commit(&self) {
+        if let Some(hook) = &self.after_resolver_commit {
             hook().await;
         }
     }
@@ -751,7 +777,8 @@ impl OutboxStore {
     ) -> Result<bool, PersistenceError> {
         let changed = sqlx::query(
             "UPDATE outbox \
-             SET handoff_sdk_invocation_started = TRUE, updated_at = NOW() \
+             SET handoff_sdk_invocation_started = TRUE, handoff_invocation_token = gen_random_uuid(), \
+                 updated_at = NOW() \
              WHERE id = $1 AND status = 'handoff_started' AND claim_token = $2 \
                AND lease_expires_at > NOW()",
         )
@@ -763,13 +790,31 @@ impl OutboxStore {
         Ok(changed.rows_affected() == 1)
     }
 
+    /// Returns the token minted by the live marker write, but never exposes it
+    /// to logs or error text. The worker passes it only to the scoped adapter.
+    pub async fn handoff_invocation_token(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<Option<Uuid>, PersistenceError> {
+        sqlx::query_scalar(
+            "SELECT handoff_invocation_token FROM outbox \
+             WHERE id = $1 AND status = 'handoff_started' AND claim_token = $2 \
+               AND lease_expires_at > NOW()",
+        )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)
+        .map(|token| token.flatten())
+    }
+
     /// The dedicated fenced-recovery claim (migration 0023 rule 2). Claims
     /// expired `handoff_started` rows REGARDLESS of invoice finality — the
     /// final-invoice exclusion of the ordinary claim path must not apply to
     /// fenced rows — and keeps the row in `handoff_started` under a fresh
-    /// token/lease so `mark_handoff_unresolved` terminalization stays
-    /// fenced by the exact token. Recovery never re-runs the SDK effect and
-    /// never resolves or attributes durable SDK state (rule 3).
+    /// token/lease. Recovery never re-runs the SDK effect; its resolver may
+    /// read durable state and causally attribute a uniquely proven record.
     pub async fn claim_fence_recovery(
         &self,
         owner: Uuid,
@@ -777,10 +822,13 @@ impl OutboxStore {
         lease: Duration,
     ) -> Result<Vec<ClaimedOutbox>, PersistenceError> {
         let seconds = lease_seconds(lease)?;
+        self.terminalize_exhausted_fence_recoveries(limit).await?;
         sqlx::query_as(
             "WITH candidates AS ( \
                  SELECT id FROM outbox \
                  WHERE status = 'handoff_started' AND lease_expires_at <= NOW() \
+                   AND recovery_attempts < 20 \
+                   AND (recovery_first_at IS NULL OR NOW() < recovery_first_at + INTERVAL '1 hour') \
                  ORDER BY next_attempt_at, id \
                  FOR UPDATE SKIP LOCKED \
                  LIMIT $1 \
@@ -788,7 +836,9 @@ impl OutboxStore {
              UPDATE outbox o \
              SET lease_owner = $2, claim_token = gen_random_uuid(), \
                  lease_expires_at = NOW() + ($3 * INTERVAL '1 second'), \
-                 attempt_count = o.attempt_count + 1, updated_at = NOW() \
+                 recovery_attempts = o.recovery_attempts + 1, \
+                 recovery_first_at = COALESCE(o.recovery_first_at, NOW()), \
+                 recovery_last_at = NOW(), updated_at = NOW() \
              FROM candidates WHERE o.id = candidates.id \
              RETURNING o.id, o.creator_id, o.invoice_id, o.attempt_count, o.claim_token, \
                  (SELECT creator_lookup_hash FROM creators WHERE id = o.creator_id) AS creator_lookup_hash, \
@@ -802,20 +852,54 @@ impl OutboxStore {
         .map_err(|_| PersistenceError::Unavailable)
     }
 
+    async fn terminalize_exhausted_fence_recoveries(
+        &self,
+        limit: i64,
+    ) -> Result<(), PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let changed: Vec<Uuid> = sqlx::query_scalar(
+            "WITH candidates AS ( \
+                 SELECT id FROM outbox \
+                 WHERE status = 'handoff_started' AND lease_expires_at <= NOW() \
+                   AND (recovery_attempts >= 20 \
+                     OR (recovery_first_at IS NOT NULL \
+                       AND NOW() >= recovery_first_at + INTERVAL '1 hour')) \
+                 ORDER BY next_attempt_at, id FOR UPDATE SKIP LOCKED LIMIT $1 \
+             ) UPDATE outbox SET status = 'permanently_failed', \
+                 error_class = 'handoff_unresolved', \
+                 failure_reason = 'sdk_recovery_infrastructure_unavailable', \
+                 lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = NOW() \
+             WHERE id IN (SELECT id FROM candidates) RETURNING id",
+        )
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        for id in changed {
+            Self::cascade_terminal_descendants(&mut tx, id, "parent_handoff_unresolved").await?;
+            sqlx::query(
+                "INSERT INTO outbox_terminal_events (creator_id, invoice_id, outbox_id, event_class, reason) \
+                 SELECT creator_id, invoice_id, id, 'handoff_unresolved', \
+                        'sdk_recovery_infrastructure_unavailable' FROM outbox WHERE id = $1",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
+        tx.commit().await.map_err(|_| PersistenceError::Unavailable)
+    }
+
     /// Terminalizes a recovered fenced row (migration 0023 rule 3):
     /// `handoff_unresolved` is the closed terminal class for a
-    /// `handoff_started` row that can neither be attributed nor safely
-    /// re-executed. Recovery NEVER resolves or attributes an SDK effect, so
-    /// both marker states take the same closed transition with zero SDK
-    /// calls; only the static reason differs —
-    /// [`HANDOFF_UNRESOLVED_SDK_NOT_INVOKED`] when the durable invocation
-    /// marker is FALSE (the SDK provably never ran) and
-    /// [`HANDOFF_UNRESOLVED_SDK_INVOKED_UNATTRIBUTED`] when it is TRUE (an
-    /// effect may exist in durable SDK state and an operator reconciles it
-    /// by hand). The transition, descendant cascade, and exactly one
-    /// durable terminal event commit together; a replayed CAS matches zero
-    /// rows and inserts no second event. The SDK is never re-run for the
-    /// row afterwards.
+    /// `handoff_started` row that cannot be safely attributed or re-executed.
+    /// The transition, descendant cascade, and exactly one durable terminal
+    /// event commit together; a replayed CAS matches zero rows and inserts no
+    /// second event. The SDK is never re-run for the row afterwards.
     pub async fn mark_handoff_unresolved(
         &self,
         claim: &ClaimedOutbox,
@@ -867,6 +951,257 @@ impl OutboxStore {
         Ok(changed.rows_affected() == 1)
     }
 
+    /// Pure recovery resolver. It decrypts exactly one creator SDK snapshot
+    /// under the target fence, never invokes an SDK API, and requires the
+    /// current invocation sidecar before semantic equality can attribute.
+    pub async fn resolve_fence_recovery(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<bool, PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let marker: Option<(bool, Option<Uuid>)> = sqlx::query_as(
+            "SELECT handoff_sdk_invocation_started, handoff_invocation_token FROM outbox \
+             WHERE id = $1 AND status = 'handoff_started' AND claim_token = $2 \
+               AND lease_expires_at > NOW() FOR UPDATE",
+        )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some((started, token)) = marker else {
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(false);
+        };
+        if !started {
+            return self
+                .terminalize_fence_recovery(
+                    tx,
+                    claim.id,
+                    claim.claim_token,
+                    HANDOFF_UNRESOLVED_SDK_NOT_INVOKED,
+                )
+                .await;
+        }
+        let Some(token) = token else {
+            return self
+                .terminalize_fence_recovery(
+                    tx,
+                    claim.id,
+                    claim.claim_token,
+                    "sdk_evidence_indeterminate",
+                )
+                .await;
+        };
+        let intent = match self.delivery_intent(claim) {
+            Ok(intent) => intent,
+            Err(PersistenceError::Unavailable) => {
+                tx.commit()
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)?;
+                return Err(PersistenceError::Unavailable);
+            }
+            Err(_) => {
+                return self
+                    .terminalize_fence_recovery(
+                        tx,
+                        claim.id,
+                        claim.claim_token,
+                        "sdk_evidence_indeterminate",
+                    )
+                    .await;
+            }
+        };
+        let envelope: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT state_envelope FROM sdk_states WHERE creator_id = $1 FOR UPDATE",
+        )
+        .bind(claim.creator_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some(envelope) = envelope else {
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(false);
+        };
+        let state = decrypt_state_for_recovery(
+            &self.crypto,
+            &claim.creator_lookup_hash,
+            claim.creator_id,
+            &envelope,
+        )?;
+        let mut candidates = Vec::new();
+        for record in &state.outbound_private_messages {
+            match handoff_coordinate_matches(&intent, record) {
+                Ok(true) => candidates.push(record),
+                Ok(false) => {}
+                Err(()) => {
+                    return self
+                        .terminalize_fence_recovery(
+                            tx,
+                            claim.id,
+                            claim.claim_token,
+                            "sdk_evidence_indeterminate",
+                        )
+                        .await;
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return self
+                .terminalize_fence_recovery(tx, claim.id, claim.claim_token, "sdk_effect_not_found")
+                .await;
+        }
+        let ids = candidates
+            .iter()
+            .map(|record| record.outbound_message_id.to_string())
+            .collect::<Vec<_>>();
+        let sidecars: Vec<(String, Uuid)> = sqlx::query_as(
+            "SELECT sdk_outbound_message_id, invocation_token FROM sdk_outbound_invocations \
+             WHERE creator_id = $1 AND sdk_outbound_message_id = ANY($2)",
+        )
+        .bind(claim.creator_id)
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let sidecars = sidecars
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut current = Vec::new();
+        let mut exact_untagged = false;
+        for record in candidates {
+            let id = record.outbound_message_id.to_string();
+            let sidecar = sidecars.get(&id);
+            if sidecar.is_some_and(|candidate_token| candidate_token != &token) {
+                continue;
+            }
+            match exact_handoff_result(&intent, record) {
+                Ok(Some(_)) if sidecar.is_none() => exact_untagged = true,
+                Ok(Some(result)) => current.push((id, result)),
+                Ok(None) => {}
+                Err(()) => {
+                    return self
+                        .terminalize_fence_recovery(
+                            tx,
+                            claim.id,
+                            claim.claim_token,
+                            "sdk_evidence_indeterminate",
+                        )
+                        .await;
+                }
+            }
+        }
+        if exact_untagged {
+            return self
+                .terminalize_fence_recovery(tx, claim.id, claim.claim_token, "sdk_effect_ambiguous")
+                .await;
+        }
+        if current.is_empty() {
+            return self
+                .terminalize_fence_recovery(tx, claim.id, claim.claim_token, "sdk_effect_not_found")
+                .await;
+        }
+        if current.len() != 1 {
+            return self
+                .terminalize_fence_recovery(tx, claim.id, claim.claim_token, "sdk_effect_ambiguous")
+                .await;
+        }
+        let (outbound, result) = current.into_iter().next().expect("one current candidate");
+        let owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM outbox WHERE creator_id = $1 \
+             AND sdk_outbound_message_id = $2 AND id <> $3 FOR UPDATE)",
+        )
+        .bind(claim.creator_id)
+        .bind(&outbound)
+        .bind(claim.id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if owned {
+            return self
+                .terminalize_fence_recovery(
+                    tx,
+                    claim.id,
+                    claim.claim_token,
+                    "sdk_effect_already_owned",
+                )
+                .await;
+        }
+        let (event_id, request_id) = match result {
+            HandoffResult::EndpointPublication { .. } => (None, None),
+            HandoffResult::PaymentRequestProposal {
+                ref event_id,
+                ref payment_request_id,
+                ..
+            } => (Some(event_id.as_str()), Some(payment_request_id.as_str())),
+        };
+        let changed = sqlx::query(
+            "UPDATE outbox SET status = 'handed_off', sdk_outbound_message_id = $1, \
+             sdk_event_id = $2, sdk_payment_request_id = $3, error_class = NULL, \
+             lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = NOW() \
+             WHERE id = $4 AND status = 'handoff_started' AND claim_token = $5 \
+               AND lease_expires_at > NOW()",
+        )
+        .bind(outbound)
+        .bind(event_id)
+        .bind(request_id)
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if changed.rows_affected() == 1 {
+            self.seam.run_before_resolver_commit().await;
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        if changed.rows_affected() == 1 {
+            self.seam.run_after_resolver_commit().await;
+        }
+        Ok(changed.rows_affected() == 1)
+    }
+
+    async fn terminalize_fence_recovery(
+        &self,
+        mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+        id: Uuid,
+        claim_token: Uuid,
+        reason: &'static str,
+    ) -> Result<bool, PersistenceError> {
+        let changed = sqlx::query(
+            "UPDATE outbox SET status = 'permanently_failed', error_class = 'handoff_unresolved', \
+             failure_reason = $3, lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, \
+             updated_at = NOW() WHERE id = $1 AND status = 'handoff_started' AND claim_token = $2 \
+             AND lease_expires_at > NOW()",
+        )
+        .bind(id)
+        .bind(claim_token)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if changed.rows_affected() == 1 {
+            Self::cascade_terminal_descendants(&mut tx, id, "parent_handoff_unresolved").await?;
+            sqlx::query(
+                "INSERT INTO outbox_terminal_events (creator_id, invoice_id, outbox_id, event_class, reason) \
+                 SELECT creator_id, invoice_id, id, 'handoff_unresolved', $2 FROM outbox WHERE id = $1",
+            ).bind(id).bind(reason).execute(&mut *tx).await.map_err(|_| PersistenceError::Unavailable)?;
+        }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(changed.rows_affected() == 1)
+    }
+
     /// Releases a fenced-recovery claim the worker could not process (the
     /// per-creator adapter was unavailable): the row stays
     /// `handoff_started` (never re-executed as ordinary work) and becomes
@@ -878,6 +1213,41 @@ impl OutboxStore {
         delay: Duration,
     ) -> Result<bool, PersistenceError> {
         let seconds = lease_seconds(delay)?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let exhausted: Option<bool> = sqlx::query_scalar(
+            "SELECT recovery_attempts >= 20
+                 OR (recovery_first_at IS NOT NULL
+                     AND NOW() >= recovery_first_at + INTERVAL '1 hour')
+             FROM outbox
+             WHERE id = $1 AND status = 'handoff_started' AND claim_token = $2
+               AND lease_expires_at > NOW()
+             FOR UPDATE",
+        )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some(exhausted) = exhausted else {
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(false);
+        };
+        if exhausted {
+            return self
+                .terminalize_fence_recovery(
+                    tx,
+                    claim.id,
+                    claim.claim_token,
+                    "sdk_recovery_infrastructure_unavailable",
+                )
+                .await;
+        }
         let changed = sqlx::query(
             "UPDATE outbox \
              SET lease_owner = NULL, claim_token = NULL, \
@@ -888,9 +1258,12 @@ impl OutboxStore {
         .bind(seconds)
         .bind(claim.id)
         .bind(claim.claim_token)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         Ok(changed.rows_affected() == 1)
     }
 
@@ -1299,6 +1672,107 @@ fn lease_seconds(duration: Duration) -> Result<i64, PersistenceError> {
     i64::try_from(duration.as_secs()).map_err(|_| PersistenceError::Unavailable)
 }
 
+fn decrypt_state_for_recovery(
+    crypto: &Crypto,
+    lookup_hash: &[u8],
+    creator_id: Uuid,
+    envelope: &[u8],
+) -> Result<StorageState, PersistenceError> {
+    let hash = lookup_hash_from_storage(lookup_hash)?;
+    crate::persistence::sdk_state::decrypt_state(crypto, hash, creator_id, envelope)
+}
+
+/// `Ok(None)` means a different coordinate; `Err(())` means a malformed
+/// record at this intent's reader/path/kind coordinate and is indeterminate.
+fn exact_handoff_result(
+    intent: &DeliveryIntentV1,
+    record: &OutboundPrivateMessageRecord,
+) -> Result<Option<HandoffResult>, ()> {
+    if !handoff_coordinate_matches(intent, record)? {
+        return Ok(None);
+    }
+    match intent.operation() {
+        DeliveryOperationV1::EndpointPublication { receiving_details } => {
+            let list = parse_private_payment_list_json(&record.raw_json).map_err(|_| ())?;
+            let expected_identifiers = receiving_details
+                .iter()
+                .map(|detail| detail.identifier.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            if expected_identifiers.len() != receiving_details.len() {
+                return Err(());
+            }
+            let expected = receiving_details
+                .iter()
+                .map(|detail| (detail.identifier.as_str(), detail.payload.as_str()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let actual = list
+                .payment_endpoints
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            Ok(
+                (expected == actual).then_some(HandoffResult::EndpointPublication {
+                    outbound_message_id: record.outbound_message_id,
+                }),
+            )
+        }
+        DeliveryOperationV1::PaymentRequestProposal { terms } => {
+            let message = PrivateApplicationMessage {
+                version: Some(1),
+                kind: Some(record.kind.clone()),
+                raw_json: record.raw_json.clone(),
+            };
+            let parsed_message = parse_payment_request_event_message(&message).ok_or(())?;
+            let parsed = parsed_message.parsed_event().ok_or(())?;
+            let PaymentRequestEvent::Request(request) = parsed else {
+                return Err(());
+            };
+            let mut expected_identifiers = terms.accepted_endpoint_identifiers.clone();
+            let mut actual_identifiers = request
+                .request
+                .accepted_payment_endpoint_identifiers
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            expected_identifiers.sort();
+            actual_identifiers.sort();
+            let exact = request.request.amount.value == terms.amount
+                && request.request.amount.asset == terms.asset
+                && request.request.payment_reference.to_string() == terms.payment_reference
+                && request.request.proposal_expires_at == terms.proposal_expires_at
+                && request.request.recurrence.is_none()
+                && expected_identifiers == actual_identifiers
+                && request.request.metadata == terms.metadata;
+            Ok(exact.then_some(HandoffResult::PaymentRequestProposal {
+                outbound_message_id: record.outbound_message_id,
+                event_id: request.event_id.to_string(),
+                payment_request_id: request.payment_request_id.to_string(),
+            }))
+        }
+    }
+}
+
+fn handoff_coordinate_matches(
+    intent: &DeliveryIntentV1,
+    record: &OutboundPrivateMessageRecord,
+) -> Result<bool, ()> {
+    let reader = PubkyPublicKey::from_raw_or_app_key(intent.reader_pubky()).map_err(|_| ())?;
+    if record.counterparty != reader
+        || record.counterparty_receiver_path.as_str()
+            != intent.selected_reader_path().map_err(|_| ())?.as_str()
+    {
+        return Ok(false);
+    }
+    match intent.operation() {
+        DeliveryOperationV1::EndpointPublication { .. } => {
+            Ok(record.kind == PrivateMessageKind::PrivatePaymentList.as_str())
+        }
+        DeliveryOperationV1::PaymentRequestProposal { .. } => {
+            Ok(record.kind == PrivateMessageKind::PaymentRequest.as_str())
+        }
+    }
+}
+
 fn lookup_hash_from_storage(bytes: &[u8]) -> Result<LookupHash, PersistenceError> {
     let bytes: [u8; 32] = bytes
         .try_into()
@@ -1309,6 +1783,207 @@ fn lookup_hash_from_storage(bytes: &[u8]) -> Result<LookupHash, PersistenceError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paykit_lib::{
+        PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount,
+        PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
+        PublicKey,
+    };
+    use paykit_sdk::OutboundPrivateMessageStatus;
+
+    const TEST_READER: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+    fn test_marker() -> PaykitReceiverMarker {
+        PaykitReceiverMarker::new(
+            PaykitReceiverPath::new("paykit/server").unwrap(),
+            PaykitReceiverCapabilities {
+                private_payments: true,
+                payment_requests: true,
+                receipts: false,
+                outgoing_payments: false,
+            },
+            PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
+                .unwrap(),
+        )
+    }
+
+    fn outbound_record(kind: PrivateMessageKind, raw_json: String) -> OutboundPrivateMessageRecord {
+        OutboundPrivateMessageRecord {
+            outbound_message_id: 41,
+            counterparty: PubkyPublicKey::from_raw_or_app_key(TEST_READER).unwrap(),
+            counterparty_receiver_path: PaykitReceiverPath::new("paykit/server").unwrap(),
+            kind: kind.as_str().into(),
+            raw_json,
+            status: OutboundPrivateMessageStatus::Pending,
+            attempt_count: 0,
+            created_at: Default::default(),
+            updated_at: Default::default(),
+            last_attempt_at: None,
+            sent_at: None,
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn exact_endpoint_match_rejects_complete_semantic_negative_matrix() {
+        let intent = DeliveryIntentV1::endpoint(
+            TEST_READER.into(),
+            &test_marker(),
+            PaykitReceiverPath::new("bitkit/server").unwrap(),
+            vec![
+                (
+                    PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+                    PaymentEndpointPayload::new("address-a"),
+                ),
+                (
+                    PaymentEndpointIdentifier::new("btc-lightning-bolt11").unwrap(),
+                    PaymentEndpointPayload::new("invoice-a"),
+                ),
+            ],
+        )
+        .unwrap();
+        let exact_json = serde_json::json!({
+            "version": 1,
+            "kind": PrivateMessageKind::PrivatePaymentList.as_str(),
+            "payment_endpoints": {
+                "btc-lightning-bolt11": "invoice-a",
+                "btc-bitcoin-p2wpkh": "address-a"
+            }
+        })
+        .to_string();
+        let exact = outbound_record(PrivateMessageKind::PrivatePaymentList, exact_json.clone());
+        assert!(matches!(
+            exact_handoff_result(&intent, &exact),
+            Ok(Some(HandoffResult::EndpointPublication { .. }))
+        ));
+
+        for payment_endpoints in [
+            serde_json::json!({"btc-bitcoin-p2wpkh": "wrong-address", "btc-lightning-bolt11": "invoice-a"}),
+            serde_json::json!({"btc-bitcoin-p2wpkh": "address-a"}),
+            serde_json::json!({"btc-bitcoin-p2wpkh": "address-a", "btc-lightning-bolt11": "invoice-a", "btc-extra": "extra"}),
+        ] {
+            let record = outbound_record(
+                PrivateMessageKind::PrivatePaymentList,
+                serde_json::json!({
+                    "version": 1,
+                    "kind": PrivateMessageKind::PrivatePaymentList.as_str(),
+                    "payment_endpoints": payment_endpoints,
+                })
+                .to_string(),
+            );
+            assert_eq!(exact_handoff_result(&intent, &record), Ok(None));
+        }
+
+        let mut wrong_path = exact.clone();
+        wrong_path.counterparty_receiver_path = PaykitReceiverPath::new("other/server").unwrap();
+        assert_eq!(exact_handoff_result(&intent, &wrong_path), Ok(None));
+        let mut wrong_reader = exact.clone();
+        wrong_reader.counterparty = PubkyPublicKey::from_raw_or_app_key(
+            "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo",
+        )
+        .unwrap();
+        assert_eq!(exact_handoff_result(&intent, &wrong_reader), Ok(None));
+        let mut wrong_kind = exact.clone();
+        wrong_kind.kind = PrivateMessageKind::PaymentRequest.as_str().into();
+        assert_eq!(exact_handoff_result(&intent, &wrong_kind), Ok(None));
+
+        for raw_json in [
+            "{",
+            r#"{"version":2,"kind":"paykit.private_payment_list","payment_endpoints":{"btc-bitcoin-p2wpkh":"address-a","btc-lightning-bolt11":"invoice-a"}}"#,
+            r#"{"version":1,"kind":"paykit.private_payment_list","payment_endpoints":{"btc-bitcoin-p2wpkh":"address-a","btc-bitcoin-p2wpkh":"address-a"}}"#,
+        ] {
+            let malformed =
+                outbound_record(PrivateMessageKind::PrivatePaymentList, raw_json.into());
+            assert_eq!(exact_handoff_result(&intent, &malformed), Err(()));
+        }
+    }
+
+    #[test]
+    fn exact_payment_request_match_rejects_every_changed_canonical_term() {
+        let reference = Uuid::new_v4().hyphenated().to_string();
+        let expires = "2030-01-01T00:00:00Z".to_string();
+        let metadata = serde_json::Map::from_iter([("purpose".into(), serde_json::json!("shirt"))]);
+        let intent = DeliveryIntentV1::payment_request(
+            TEST_READER.into(),
+            &test_marker(),
+            PaykitReceiverPath::new("bitkit/server").unwrap(),
+            &PaymentRequestTerms {
+                amount: PaymentAmount::new("0.00000100", "BTC").unwrap(),
+                payment_reference: PaymentReference::new(reference.clone()).unwrap(),
+                proposal_expires_at: Some(expires.clone()),
+                recurrence: None,
+                accepted_payment_endpoint_identifiers: vec![
+                    PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+                    PaymentEndpointIdentifier::new("btc-lightning-bolt11").unwrap(),
+                ],
+                metadata: metadata.clone(),
+            },
+        )
+        .unwrap();
+        let raw = serde_json::json!({
+            "version": 1,
+            "kind": PrivateMessageKind::PaymentRequest.as_str(),
+            "event_id": Uuid::new_v4().hyphenated().to_string(),
+            "payment_request_id": Uuid::new_v4().hyphenated().to_string(),
+            "request": {
+                "amount": {"value": "0.00000100", "asset": "BTC"},
+                "payment_reference": reference,
+                "proposal_expires_at": expires,
+                "recurrence": null,
+                "accepted_payment_endpoint_identifiers": [
+                    "btc-lightning-bolt11", "btc-bitcoin-p2wpkh"
+                ],
+                "metadata": metadata,
+            }
+        });
+        let exact = outbound_record(PrivateMessageKind::PaymentRequest, raw.to_string());
+        assert!(matches!(
+            exact_handoff_result(&intent, &exact),
+            Ok(Some(HandoffResult::PaymentRequestProposal { .. }))
+        ));
+
+        let changes = [
+            ("/request/amount/value", serde_json::json!("0.00000200")),
+            ("/request/amount/asset", serde_json::json!("USD")),
+            (
+                "/request/payment_reference",
+                serde_json::json!(Uuid::new_v4().hyphenated().to_string()),
+            ),
+            (
+                "/request/proposal_expires_at",
+                serde_json::json!("2031-01-01T00:00:00Z"),
+            ),
+            (
+                "/request/accepted_payment_endpoint_identifiers",
+                serde_json::json!(["btc-bitcoin-p2wpkh"]),
+            ),
+            (
+                "/request/recurrence",
+                serde_json::json!({
+                    "every": 1,
+                    "unit": "month",
+                    "starts_at": "2030-01-01T00:00:00Z",
+                    "anchor": "2030-01-01T00:00:00Z",
+                    "ends_at": null
+                }),
+            ),
+            (
+                "/request/metadata",
+                serde_json::json!({"purpose": "different"}),
+            ),
+        ];
+        for (pointer, replacement) in changes {
+            let mut changed = raw.clone();
+            *changed.pointer_mut(pointer).unwrap() = replacement;
+            let changed = outbound_record(PrivateMessageKind::PaymentRequest, changed.to_string());
+            assert_eq!(exact_handoff_result(&intent, &changed), Ok(None));
+        }
+
+        let mut missing_id = raw;
+        missing_id["event_id"] = serde_json::json!("not-an-id");
+        let missing_id =
+            outbound_record(PrivateMessageKind::PaymentRequest, missing_id.to_string());
+        assert_eq!(exact_handoff_result(&intent, &missing_id), Err(()));
+    }
 
     #[test]
     fn retry_classes_are_closed_stage_only_diagnostics() {

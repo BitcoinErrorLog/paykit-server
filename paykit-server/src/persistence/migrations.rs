@@ -51,11 +51,38 @@ impl MigrationLock {
     }
 }
 
-/// Applies embedded forward-only PostgreSQL migrations exactly once per database.
-///
-/// Production and test startup both apply the single pre-production baseline.
+/// Applies embedded forward-only PostgreSQL migrations under the migration
+/// owner. Release migration jobs and tests use this path; the runtime role
+/// deliberately cannot execute it.
 pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     let mut lock = MigrationLock::acquire(pool).await?;
     lock.run_remaining().await?;
     lock.release().await
+}
+
+/// Verifies that the migration owner applied exactly this binary's embedded
+/// migrations without requiring runtime schema-creation or ledger-write
+/// authority.
+pub async fn verify_migrations_applied(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let applied: Vec<(i64, Vec<u8>, bool)> =
+        sqlx::query_as("SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(pool)
+            .await?;
+    if applied.len() != MIGRATOR.iter().count() {
+        return Err(sqlx::Error::Protocol(
+            "postgres migration set does not match this binary".into(),
+        ));
+    }
+
+    for ((version, checksum, success), expected) in applied.iter().zip(MIGRATOR.iter()) {
+        if !success
+            || *version != expected.version
+            || checksum.as_slice() != expected.checksum.as_ref()
+        {
+            return Err(sqlx::Error::Protocol(
+                "postgres migration set does not match this binary".into(),
+            ));
+        }
+    }
+    Ok(())
 }

@@ -342,6 +342,9 @@ impl BootedStack {
 /// `observe_tick` call), never stolen by a background tick mid-assertion.
 async fn boot(seed: u8) -> BootedStack {
     let database = TestDatabase::create().await;
+    paykit_server::persistence::run_migrations(database.pool())
+        .await
+        .unwrap();
     let signing_key = SigningKey::from_bytes(&[seed; 32]);
     let server_config = config(database.database_url(), &signing_key);
     let initialized = initialize_database(&server_config).await.unwrap();

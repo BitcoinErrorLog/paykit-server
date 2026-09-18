@@ -8,7 +8,9 @@ use thiserror::Error;
 use crate::{
     config::Config,
     crypto::Crypto,
-    persistence::{CreatorStore, DeploymentStore, InvoiceStore, StackIdentity, run_migrations},
+    persistence::{
+        CreatorStore, DeploymentStore, InvoiceStore, StackIdentity, verify_migrations_applied,
+    },
 };
 
 /// Secret-free failures from database initialization before the listener binds.
@@ -17,8 +19,8 @@ pub enum StartupError {
     /// PostgreSQL could not be reached.
     #[error("postgres connection failed")]
     Connection,
-    /// Embedded migrations could not be applied.
-    #[error("postgres migration failed")]
+    /// Owner-applied migrations are missing, changed, or unreadable.
+    #[error("postgres migration state invalid")]
     Migration,
     /// Deployment invariants could not be recorded or validated.
     #[error("deployment initialization failed")]
@@ -50,15 +52,16 @@ impl std::fmt::Debug for InitializedDatabase {
     }
 }
 
-/// Connects, migrates, validates deployment invariants, mints or reads the
-/// stack identity, and authenticates every persisted Creator credential and
-/// SDK state before returning a ready database.
+/// Connects, verifies owner-applied migrations, validates deployment
+/// invariants, mints or reads the stack identity, and authenticates every
+/// persisted Creator credential and SDK state before returning a ready
+/// database.
 pub async fn initialize_database(config: &Config) -> Result<InitializedDatabase, StartupError> {
     let pool = PgPoolOptions::new()
         .connect(config.database_url())
         .await
         .map_err(|_| StartupError::Connection)?;
-    run_migrations(&pool)
+    verify_migrations_applied(&pool)
         .await
         .map_err(|_| StartupError::Migration)?;
     let stack_identity = DeploymentStore::new(&pool)

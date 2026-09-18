@@ -371,6 +371,7 @@ impl BootedStack {
 /// 'queued' vs 'prepared' visibility is asserted, never raced.
 async fn boot(seed: u8) -> BootedStack {
     let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
     let signing_key = SigningKey::from_bytes(&[seed; 32]);
     let server_config = config(database.database_url(), &signing_key);
     let initialized = initialize_database(&server_config).await.unwrap();
