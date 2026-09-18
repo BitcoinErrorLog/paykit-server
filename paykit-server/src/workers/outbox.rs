@@ -240,10 +240,9 @@ pub async fn process_claim_with_health(
     // Durable pre-SDK invocation marker (migration 0023 rule 1): committed
     // under the live fence in its own transaction BEFORE the SDK call, so a
     // crash leaves evidence distinguishing "SDK never invoked" (provably no
-    // effect) from "SDK possibly emitted" (recovery terminalizes the row as
-    // `sdk_invoked_unattributed` for manual operator reconciliation; it
-    // never resolves or attributes the effect). A lost fence means no SDK
-    // call below.
+    // effect) from "SDK possibly emitted". Future rows may be causally
+    // attributed only by fenced recovery against a matching sidecar token;
+    // a lost fence means no SDK call below.
     if !store.mark_handoff_invocation_started(claim).await? {
         return Ok((false, ProcessingHealth::Retryable));
     }
