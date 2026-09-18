@@ -140,6 +140,18 @@ impl Drop for StorageInvocationScope {
     }
 }
 
+struct HandoffInvocationScope<'a>(&'a StdMutex<Option<Uuid>>);
+
+impl Drop for HandoffInvocationScope<'_> {
+    fn drop(&mut self) {
+        let mut slot = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = None;
+    }
+}
+
 impl std::fmt::Debug for PaykitAdapter {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("PaykitAdapter { .. }")
@@ -276,17 +288,15 @@ impl Adapter for PaykitAdapter {
             let mut slot = self.handoff_invocation_token.lock().map_err(|_| {
                 HandoffFailure::Retryable(crate::persistence::OutboxRetryClass::AdapterUnavailable)
             })?;
-            if slot.replace(invocation_token).is_some() {
+            if slot.is_some() {
                 return Err(HandoffFailure::Retryable(
                     crate::persistence::OutboxRetryClass::AdapterUnavailable,
                 ));
             }
+            *slot = Some(invocation_token);
         }
-        let result = handoff_steps(self, intent).await;
-        if let Ok(mut slot) = self.handoff_invocation_token.lock() {
-            *slot = None;
-        }
-        result
+        let _scope = HandoffInvocationScope(&self.handoff_invocation_token);
+        handoff_steps(self, intent).await
     }
 
     async fn fetch_marker(
@@ -448,6 +458,15 @@ mod tests {
 
         assert!(Arc::ptr_eq(&same_creator_first, &same_creator_second));
         assert!(!Arc::ptr_eq(&same_creator_first, &other_creator));
+    }
+
+    #[test]
+    fn handoff_invocation_scope_clears_token_on_every_drop_path() {
+        let token = StdMutex::new(Some(Uuid::new_v4()));
+        {
+            let _scope = HandoffInvocationScope(&token);
+        }
+        assert!(token.lock().unwrap().is_none());
     }
 
     #[test]

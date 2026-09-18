@@ -65,9 +65,10 @@ impl PostgresStorageAdapter {
             .invocation_token
             .lock()
             .map_err(|_| storage_context("invocation token scope is unavailable"))?;
-        if slot.replace(token).is_some() {
+        if slot.is_some() {
             return Err(storage_context("invocation token scope is already active"));
         }
+        *slot = Some(token);
         Ok(())
     }
 
@@ -75,6 +76,16 @@ impl PostgresStorageAdapter {
         if let Ok(mut slot) = self.invocation_token.lock() {
             *slot = None;
         }
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn set_invocation_token_for_test(&self, token: Uuid) -> paykit_sdk::Result<()> {
+        self.set_invocation_token(token)
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn clear_invocation_token_for_test(&self) {
+        self.clear_invocation_token();
     }
 }
 
@@ -169,10 +180,10 @@ fn storage_context(context: &str) -> PaykitSdkError {
     }
 }
 
-fn storage_error(error: sqlx::Error) -> PaykitSdkError {
+fn storage_error(_error: sqlx::Error) -> PaykitSdkError {
     PaykitSdkError::Storage {
         context: "PostgreSQL SDK state transaction failed".into(),
-        source: Some(anyhow::anyhow!(error.to_string())),
+        source: None,
     }
 }
 
@@ -325,5 +336,31 @@ mod tests {
         let debug = format!("{adapter:?}");
         assert!(!debug.contains(&creator_id.to_string()));
         assert_eq!(debug, "PostgresStorageAdapter { <redacted> }");
+    }
+
+    #[tokio::test]
+    async fn invocation_scope_refuses_replacement_and_database_errors_are_static() {
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://localhost/paykit_debug_test")
+            .unwrap();
+        let adapter = PostgresStorageAdapter::new(
+            &pool,
+            Arc::new(Crypto::from_master_key(&[10; 32]).unwrap()),
+            Uuid::new_v4(),
+        );
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        adapter.set_invocation_token(first).unwrap();
+        assert!(adapter.set_invocation_token(second).is_err());
+        assert_eq!(*adapter.invocation_token.lock().unwrap(), Some(first));
+        adapter.clear_invocation_token();
+
+        let sensitive = Uuid::new_v4().to_string();
+        let rendered = format!(
+            "{:?}",
+            storage_error(sqlx::Error::Protocol(sensitive.clone()))
+        );
+        assert!(!rendered.contains(&sensitive));
+        assert!(rendered.contains("PostgreSQL SDK state transaction failed"));
     }
 }

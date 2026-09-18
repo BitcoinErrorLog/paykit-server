@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashSet,
     fs,
     str::FromStr,
@@ -16,6 +17,21 @@ use sqlx::{Connection, PgConnection, PgPool, Row, migrate::Migrator, postgres::P
 use uuid::Uuid;
 
 static MIGRATOR: Migrator = sqlx::migrate!("../paykit-server/migrations");
+
+fn migrator_through(version: i64) -> Migrator {
+    Migrator {
+        migrations: Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|migration| migration.version <= version)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: false,
+        no_tx: false,
+    }
+}
 
 const REQUIRED_TABLES: [&str; 15] = [
     "deployment_metadata",
@@ -243,6 +259,106 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
     .unwrap();
     assert_ne!(creator_id, Uuid::nil());
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn migration_0024_upgrades_exact_deployed_0023_schema() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    let mut connection = database.acquire_connection().await;
+    migrator_through(23)
+        .run_direct(&mut *connection)
+        .await
+        .unwrap();
+    let before: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    assert_eq!(before, 23);
+    let sidecar_before: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.sdk_outbound_invocations') IS NOT NULL")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+    assert!(!sidecar_before);
+    drop(connection);
+
+    run_migrations(pool).await.unwrap();
+    let after: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(after, 24);
+    let recovery_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'outbox' \
+         AND column_name IN ('handoff_invocation_token', 'recovery_attempts', \
+                             'recovery_first_at', 'recovery_last_at')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(recovery_columns, 4);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn migration_0024_duplicate_ownership_preflight_aborts_upgrade_without_partial_schema() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    let mut connection = database.acquire_connection().await;
+    migrator_through(23)
+        .run_direct(&mut *connection)
+        .await
+        .unwrap();
+    let creator_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO creators (creator_lookup_hash, credential_envelope, first_child_index) \
+         VALUES ($1, $2, 0) RETURNING id",
+    )
+    .bind(b"preflight-creator".as_slice())
+    .bind(b"preflight-credential".as_slice())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    for intent in [b"first-intent".as_slice(), b"second-intent".as_slice()] {
+        sqlx::query(
+            "INSERT INTO outbox \
+             (creator_id, intent_envelope, status, sdk_outbound_message_id) \
+             VALUES ($1, $2, 'handed_off', '991')",
+        )
+        .bind(creator_id)
+        .bind(intent)
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    }
+    drop(connection);
+
+    let error = run_migrations(pool)
+        .await
+        .expect_err("duplicate ownership preflight unexpectedly allowed migration 0024");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("outbox outbound ownership preflight failed")
+            && rendered.contains("1 duplicate group"),
+        "preflight error did not expose only its bounded group count"
+    );
+    assert!(!rendered.contains(&creator_id.to_string()));
+    assert!(!rendered.contains("991"));
+    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(version, 23);
+    let sidecar_exists: bool =
+        sqlx::query_scalar("SELECT to_regclass('public.sdk_outbound_invocations') IS NOT NULL")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(!sidecar_exists, "failed 0024 left partial schema behind");
     database.cleanup().await;
 }
 
@@ -710,6 +826,30 @@ async fn sdk_outbound_invocation_constraints_reject_retag_and_duplicate_ownershi
         .bind(creator_id)
         .execute(pool)
         .await,
+    );
+    assert_trigger_violation(
+        "sidecar truncate",
+        sqlx::query("TRUNCATE sdk_outbound_invocations")
+            .execute(pool)
+            .await,
+    );
+    let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sdk_outbound_invocations")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(retained, 1, "failed mutations retain provenance");
+    let creator_delete = sqlx::query("DELETE FROM creators WHERE id = $1")
+        .bind(creator_id)
+        .execute(pool)
+        .await
+        .expect_err("creator deletion discarded retained provenance");
+    assert_eq!(
+        creator_delete
+            .as_database_error()
+            .unwrap()
+            .code()
+            .as_deref(),
+        Some("23503")
     );
 
     let invocation_token = Uuid::new_v4();

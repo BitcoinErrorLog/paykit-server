@@ -16,7 +16,7 @@ use axum::{
 };
 use paykit_lib::{
     PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier,
-    PaymentReference, PaymentRequestTerms,
+    PaymentReference, PaymentRequestTerms, PrivateMessageKind,
 };
 use paykit_sdk::{
     InMemoryStorage, LinkedPeerState, OutboundPrivateMessageStatus, PaykitReceiverCapabilities,
@@ -26,7 +26,7 @@ use paykit_sdk::{
 use paykit_server::{
     application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
     config::{PaykitConfig, PaykitNetwork, ReceiverPathPriority},
-    crypto::Crypto,
+    crypto::{Crypto, EnvelopeContext, LookupHash},
     domain::locks::{
         BundleId, CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader,
     },
@@ -80,6 +80,7 @@ struct LinkedPaykitFixture {
     creator: CreatorPubky,
     reader: ReaderPubky,
     creator_sdk: DurableTestSdk,
+    storage: PostgresStorageAdapter,
     adapter: paykit_server::paykit::PaykitAdapter,
     peer_public_key: PubkyPublicKey,
     peer_receiver_path: PaykitReceiverPath,
@@ -90,6 +91,23 @@ async fn linked_paykit_fixture(
     database: &TestDatabase,
     crypto: Arc<Crypto>,
     key_tail_seed: u8,
+) -> LinkedPaykitFixture {
+    paykit_fixture(database, crypto, key_tail_seed, true).await
+}
+
+async fn unlinked_paykit_fixture(
+    database: &TestDatabase,
+    crypto: Arc<Crypto>,
+    key_tail_seed: u8,
+) -> LinkedPaykitFixture {
+    paykit_fixture(database, crypto, key_tail_seed, false).await
+}
+
+async fn paykit_fixture(
+    database: &TestDatabase,
+    crypto: Arc<Crypto>,
+    key_tail_seed: u8,
+    link_peer: bool,
 ) -> LinkedPaykitFixture {
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
@@ -174,46 +192,48 @@ async fn linked_paykit_fixture(
         })
         .await
         .unwrap();
-    creator_sdk
-        .initiate_link_with_peer(
-            peer_bootstrap.public_key.clone(),
-            peer_receiver_path.clone(),
-        )
-        .await
-        .unwrap();
-    peer_sdk
-        .accept_link_with_peer(
-            creator_bootstrap.public_key.clone(),
-            creator_receiver_path.clone(),
-        )
-        .await
-        .unwrap();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    let mut creator_link = LinkedPeerState::Linking;
-    let mut peer_link = LinkedPeerState::Linking;
-    while creator_link != LinkedPeerState::Linked || peer_link != LinkedPeerState::Linked {
-        assert!(tokio::time::Instant::now() < deadline, "link timed out");
-        if creator_link != LinkedPeerState::Linked {
-            creator_link = creator_sdk
-                .advance_link_handshake(
-                    peer_bootstrap.public_key.clone(),
-                    peer_receiver_path.clone(),
-                )
-                .await
-                .unwrap()
-                .state;
+    if link_peer {
+        creator_sdk
+            .initiate_link_with_peer(
+                peer_bootstrap.public_key.clone(),
+                peer_receiver_path.clone(),
+            )
+            .await
+            .unwrap();
+        peer_sdk
+            .accept_link_with_peer(
+                creator_bootstrap.public_key.clone(),
+                creator_receiver_path.clone(),
+            )
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut creator_link = LinkedPeerState::Linking;
+        let mut peer_link = LinkedPeerState::Linking;
+        while creator_link != LinkedPeerState::Linked || peer_link != LinkedPeerState::Linked {
+            assert!(tokio::time::Instant::now() < deadline, "link timed out");
+            if creator_link != LinkedPeerState::Linked {
+                creator_link = creator_sdk
+                    .advance_link_handshake(
+                        peer_bootstrap.public_key.clone(),
+                        peer_receiver_path.clone(),
+                    )
+                    .await
+                    .unwrap()
+                    .state;
+            }
+            if peer_link != LinkedPeerState::Linked {
+                peer_link = peer_sdk
+                    .advance_link_handshake(
+                        creator_bootstrap.public_key.clone(),
+                        creator_receiver_path.clone(),
+                    )
+                    .await
+                    .unwrap()
+                    .state;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        if peer_link != LinkedPeerState::Linked {
-            peer_link = peer_sdk
-                .advance_link_handshake(
-                    creator_bootstrap.public_key.clone(),
-                    creator_receiver_path.clone(),
-                )
-                .await
-                .unwrap()
-                .state;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
     // The handoff worker reads the peer's marker through the same public
     // storage boundary as production.  Do not return a "linked" fixture
@@ -239,7 +259,7 @@ async fn linked_paykit_fixture(
 
     let reader = parse_reader(&format!("pubky{}", peer_bootstrap.public_key)).unwrap();
     let adapter = paykit_server::paykit::PaykitAdapter::new(
-        creator_storage,
+        creator_storage.clone(),
         CreatorSessionProvider::with_pubky(
             CreatorStore::new(database.pool(), crypto),
             creator.clone(),
@@ -258,6 +278,7 @@ async fn linked_paykit_fixture(
         creator,
         reader,
         creator_sdk,
+        storage: creator_storage,
         adapter,
         peer_public_key: peer_bootstrap.public_key,
         peer_receiver_path,
@@ -289,6 +310,12 @@ struct LinkedPayloads {
     marker: PaykitReceiverMarker,
 }
 
+struct FixedLinkedPayloads {
+    reader: ReaderPubky,
+    marker: PaykitReceiverMarker,
+    address: String,
+}
+
 impl NewReaderPayloadFactory for LinkedPayloads {
     fn for_child_index(&self, child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
         let address = format!("linked-outbox-test-address-{child_index}");
@@ -306,6 +333,186 @@ impl NewReaderPayloadFactory for LinkedPayloads {
             bitcoin_address: address,
         })
     }
+}
+
+impl NewReaderPayloadFactory for FixedLinkedPayloads {
+    fn for_child_index(&self, child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
+        Ok(NewReaderPayloads {
+            endpoint_intent: DeliveryIntentV1::endpoint(
+                self.reader.to_string(),
+                &self.marker,
+                PaykitReceiverPath::new("paykit/server").unwrap(),
+                vec![
+                    (
+                        PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+                        paykit_lib::PaymentEndpointPayload::new(self.address.clone()),
+                    ),
+                    (
+                        PaymentEndpointIdentifier::new("btc-lightning-bolt11").unwrap(),
+                        paykit_lib::PaymentEndpointPayload::new("same-historical-invoice"),
+                    ),
+                ],
+            )
+            .unwrap(),
+            bitcoin_address: format!("fixed-linked-allocated-address-{child_index}"),
+        })
+    }
+}
+
+async fn create_fixed_linked_invoice(
+    invoices: &InvoiceStore,
+    creator: &CreatorPubky,
+    reader: &ReaderPubky,
+    marker: &PaykitReceiverMarker,
+    seed: &str,
+) -> (Uuid, Uuid, Uuid) {
+    let bundle = format!("fixed-linked-bundle-{seed}");
+    let request = format!("fixed-linked-request-{seed}");
+    let invoice = invoices
+        .create_atomic(AtomicInvoiceInput {
+            creator,
+            reader,
+            bundle_binding: bundle.as_bytes(),
+            payment_request_binding: request.as_bytes(),
+            new_reader_payloads: &FixedLinkedPayloads {
+                reader: reader.clone(),
+                marker: marker.clone(),
+                address: "same-historical-address".into(),
+            },
+            payment_request_intent: DeliveryIntentV1::payment_request(
+                reader.to_string(),
+                marker,
+                PaykitReceiverPath::new("paykit/server").unwrap(),
+                &PaymentRequestTerms {
+                    amount: PaymentAmount::new("0.00000100", "BTC").unwrap(),
+                    payment_reference: PaymentReference::new(Uuid::new_v4().to_string()).unwrap(),
+                    proposal_expires_at: None,
+                    recurrence: None,
+                    accepted_payment_endpoint_identifiers: vec![
+                        PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+                    ],
+                    metadata: Default::default(),
+                },
+            )
+            .unwrap(),
+            required_sats: 100,
+            nonce_sats: 1,
+            prepare_ttl: Duration::from_secs(900),
+            expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        })
+        .await
+        .unwrap();
+    (
+        invoice.invoice_id(),
+        invoice.endpoint_publication_outbox_id().unwrap(),
+        invoice.payment_request_outbox_id(),
+    )
+}
+
+async fn fence_and_emit_exact(
+    database: &TestDatabase,
+    outbox: &OutboxStore,
+    adapter: &dyn Adapter,
+    target_id: Uuid,
+) -> (Uuid, HandoffResult, DeliveryIntentV1) {
+    let claim = outbox
+        .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|claim| claim.id() == target_id)
+        .expect("target is ordinary-claim eligible");
+    assert!(outbox.begin_handoff(&claim).await.unwrap());
+    assert!(
+        outbox
+            .mark_handoff_invocation_started(&claim)
+            .await
+            .unwrap()
+    );
+    let token = outbox
+        .handoff_invocation_token(&claim)
+        .await
+        .unwrap()
+        .expect("fenced invocation has a durable token");
+    let intent = outbox.delivery_intent(&claim).unwrap();
+    let result = handoff_with_invocation_token(adapter, &intent, token)
+        .await
+        .unwrap();
+    let sidecar: Uuid = sqlx::query_scalar(
+        "SELECT invocation_token FROM sdk_outbound_invocations \
+         WHERE creator_id = $1 AND sdk_outbound_message_id = $2",
+    )
+    .bind(claim.creator_id())
+    .bind(result.outbound_message_id().to_string())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(sidecar, token);
+    (token, result, intent)
+}
+
+async fn recover_and_assert_closed(
+    database: &TestDatabase,
+    outbox: &OutboxStore,
+    target_id: Uuid,
+    child_id: Uuid,
+    reason: &str,
+) {
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(target_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let recovery = outbox
+        .claim_fence_recovery(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|claim| claim.id() == target_id)
+        .expect("target is fence-recovery eligible");
+    let no_effects = CountingAdapter {
+        sdk_calls: AtomicUsize::new(0),
+    };
+    assert!(
+        process_fence_recovery(outbox, &no_effects, &recovery)
+            .await
+            .unwrap()
+    );
+    assert_eq!(no_effects.sdk_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        outbox_row(database, target_id).await.2.as_deref(),
+        Some(reason)
+    );
+    assert_eq!(outbox_row(database, child_id).await.0, "permanently_failed");
+}
+
+async fn replace_authenticated_intent(
+    database: &TestDatabase,
+    crypto: &Crypto,
+    target_id: Uuid,
+    plaintext: &[u8],
+) {
+    let creator_lookup_hash: Vec<u8> = sqlx::query_scalar(
+        "SELECT creator.creator_lookup_hash FROM creators creator \
+         JOIN outbox target ON target.creator_id = creator.id WHERE target.id = $1",
+    )
+    .bind(target_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let lookup_hash = LookupHash::from_bytes(creator_lookup_hash.try_into().unwrap());
+    let envelope = crypto
+        .encrypt(
+            &EnvelopeContext::outbox_semantic_intent(lookup_hash, target_id),
+            plaintext,
+        )
+        .unwrap();
+    sqlx::query("UPDATE outbox SET intent_envelope = $2 WHERE id = $1")
+        .bind(target_id)
+        .bind(envelope.as_bytes())
+        .execute(database.pool())
+        .await
+        .unwrap();
 }
 
 impl NewReaderPayloadFactory for Payloads {
@@ -1018,7 +1225,7 @@ async fn finality_before_worker_preflight_yields_zero_sdk_calls() {
     let crypto = Arc::new(Crypto::from_master_key(&[43; 32]).unwrap());
     let (_creator, _bundle, invoices, invoice_id, endpoint_id, _request_id) =
         create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
-    let outbox = OutboxStore::new(database.pool(), crypto);
+    let outbox = OutboxStore::new(database.pool(), crypto.clone());
     let claim = outbox
         .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
         .await
@@ -1197,6 +1404,7 @@ async fn handoff_fence_committed_before_cancellation_attributes_sdk_effect() {
                     })
                 }
             })),
+            ..HandoffFenceSeam::default()
         });
     let claim = outbox
         .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
@@ -1295,6 +1503,7 @@ async fn cancellation_committed_before_handoff_fence_yields_zero_sdk_calls() {
                 }
             })),
             after_fence: None,
+            ..HandoffFenceSeam::default()
         });
     let claim = outbox
         .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
@@ -1802,6 +2011,7 @@ async fn retryable_sdk_failure_after_cancellation_terminalizes_final_fence() {
                     })
                 }
             })),
+            ..HandoffFenceSeam::default()
         });
     let claim = outbox
         .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
@@ -3250,7 +3460,7 @@ async fn fence_recovery_attributes_unique_current_token_endpoint() {
         })
         .await
         .unwrap();
-    let outbox = OutboxStore::new(database.pool(), crypto);
+    let outbox = OutboxStore::new(database.pool(), crypto.clone());
     let claim = outbox
         .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
         .await
@@ -3323,6 +3533,992 @@ async fn fence_recovery_attributes_unique_current_token_endpoint() {
             .unwrap()
             .is_empty(),
         "a handed-off parent cannot admit its child before Sent reconciliation"
+    );
+    SdkStateStore::new(database.pool(), crypto)
+        .update(&creator, move |state| {
+            state
+                .outbound_private_messages
+                .iter_mut()
+                .find(|record| record.outbound_message_id == outbound)
+                .unwrap()
+                .status = OutboundPrivateMessageStatus::Sent;
+        })
+        .await
+        .unwrap();
+    let reconciliation = outbox
+        .claim_reconciliation(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        process_reconciliation(&outbox, &adapter, &reconciliation, Duration::from_secs(1),)
+            .await
+            .unwrap()
+    );
+    assert_eq!(outbox_row(&database, claim.id()).await.0, "delivered");
+    let child = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .expect("exact Sent reconciliation admits the dependent request");
+    assert_eq!(child.id(), invoice.payment_request_outbox_id());
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fence_recovery_historical_identical_foreign_is_not_found_and_untagged_is_ambiguous() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[74; 32]).unwrap());
+    let LinkedPaykitFixture {
+        _testnet,
+        creator,
+        reader,
+        adapter,
+        peer_marker,
+        ..
+    } = linked_paykit_fixture(&database, crypto.clone(), 74).await;
+    let invoices = InvoiceStore::new(database.pool(), crypto.clone());
+    let outbox = OutboxStore::new(database.pool(), crypto.clone());
+
+    let (_, historical_endpoint, _) =
+        create_fixed_linked_invoice(&invoices, &creator, &reader, &peer_marker, "historical").await;
+    let historical_claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(historical_claim.id(), historical_endpoint);
+    assert!(
+        process_claim(
+            &outbox,
+            &adapter,
+            &historical_claim,
+            Duration::from_secs(1),
+            20,
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap()
+    );
+    let (historical_outbound, foreign_token): (String, Uuid) = sqlx::query_as(
+        "SELECT o.sdk_outbound_message_id, sidecar.invocation_token \
+         FROM outbox o JOIN sdk_outbound_invocations sidecar \
+           ON sidecar.creator_id = o.creator_id \
+          AND sidecar.sdk_outbound_message_id = o.sdk_outbound_message_id \
+         WHERE o.id = $1",
+    )
+    .bind(historical_endpoint)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+
+    let (_, foreign_target, foreign_child) =
+        create_fixed_linked_invoice(&invoices, &creator, &reader, &peer_marker, "foreign").await;
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.id(), foreign_target);
+    assert!(outbox.begin_handoff(&claim).await.unwrap());
+    assert!(
+        outbox
+            .mark_handoff_invocation_started(&claim)
+            .await
+            .unwrap()
+    );
+    let current_token = outbox
+        .handoff_invocation_token(&claim)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(current_token, foreign_token);
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(foreign_target)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let recovery = outbox
+        .claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let no_effects = CountingAdapter {
+        sdk_calls: AtomicUsize::new(0),
+    };
+    assert!(
+        process_fence_recovery(&outbox, &no_effects, &recovery)
+            .await
+            .unwrap()
+    );
+    assert_eq!(no_effects.sdk_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        outbox_row(&database, foreign_target).await.2.as_deref(),
+        Some("sdk_effect_not_found")
+    );
+    assert_eq!(
+        outbox_row(&database, foreign_child).await.0,
+        "permanently_failed"
+    );
+
+    let historical_id = historical_outbound.parse::<u64>().unwrap();
+    let untagged_id = Arc::new(Mutex::new(None));
+    SdkStateStore::new(database.pool(), crypto.clone())
+        .update(&creator, {
+            let untagged_id = untagged_id.clone();
+            move |state| {
+                let mut legacy = state
+                    .outbound_private_messages
+                    .iter()
+                    .find(|record| record.outbound_message_id == historical_id)
+                    .unwrap()
+                    .clone();
+                legacy.outbound_message_id = state.next_outbound_private_message_id;
+                state.next_outbound_private_message_id += 1;
+                *untagged_id.lock().unwrap() = Some(legacy.outbound_message_id);
+                state.outbound_private_messages.push(legacy);
+            }
+        })
+        .await
+        .unwrap();
+    let untagged_id = untagged_id.lock().unwrap().unwrap();
+    let sidecar_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sdk_outbound_invocations \
+         WHERE creator_id = $1 AND sdk_outbound_message_id = $2)",
+    )
+    .bind(recovery.creator_id())
+    .bind(untagged_id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert!(!sidecar_exists, "legacy record must remain untagged");
+
+    let (_, untagged_target, untagged_child) =
+        create_fixed_linked_invoice(&invoices, &creator, &reader, &peer_marker, "untagged").await;
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.id(), untagged_target);
+    assert!(outbox.begin_handoff(&claim).await.unwrap());
+    assert!(
+        outbox
+            .mark_handoff_invocation_started(&claim)
+            .await
+            .unwrap()
+    );
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(untagged_target)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let recovery = outbox
+        .claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(
+        process_fence_recovery(&outbox, &no_effects, &recovery)
+            .await
+            .unwrap()
+    );
+    assert_eq!(no_effects.sdk_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        outbox_row(&database, untagged_target).await.2.as_deref(),
+        Some("sdk_effect_ambiguous")
+    );
+    assert_eq!(
+        outbox_row(&database, untagged_child).await.0,
+        "permanently_failed"
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fence_recovery_durable_semantic_and_authenticated_evidence_matrix() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[76; 32]).unwrap());
+    let LinkedPaykitFixture {
+        _testnet,
+        creator,
+        reader,
+        adapter,
+        peer_marker,
+        ..
+    } = linked_paykit_fixture(&database, crypto.clone(), 76).await;
+    let invoices = InvoiceStore::new(database.pool(), crypto.clone());
+    let outbox = OutboxStore::new(database.pool(), crypto.clone());
+
+    for case in [
+        "wrong-payload",
+        "partial-content",
+        "superset-content",
+        "wrong-reader",
+        "wrong-path",
+        "wrong-kind",
+    ] {
+        eprintln!("durable endpoint semantic case: {case}");
+        let (_, target_id, child_id) =
+            create_fixed_linked_invoice(&invoices, &creator, &reader, &peer_marker, case).await;
+        let (_, result, _) = fence_and_emit_exact(&database, &outbox, &adapter, target_id).await;
+        let outbound_id = result.outbound_message_id();
+        let wrong_reader = creator.to_string();
+        SdkStateStore::new(database.pool(), crypto.clone())
+            .update(&creator, move |state| {
+                let record = state
+                    .outbound_private_messages
+                    .iter_mut()
+                    .find(|record| record.outbound_message_id == outbound_id)
+                    .unwrap();
+                match case {
+                    "wrong-reader" => {
+                        record.counterparty =
+                            PubkyPublicKey::from_raw_or_app_key(wrong_reader).unwrap();
+                    }
+                    "wrong-path" => {
+                        record.counterparty_receiver_path =
+                            PaykitReceiverPath::new("other/server").unwrap();
+                    }
+                    "wrong-kind" => {
+                        record.kind = PrivateMessageKind::PaymentRequest.as_str().into();
+                    }
+                    content_case => {
+                        let mut payload: serde_json::Value =
+                            serde_json::from_str(&record.raw_json).unwrap();
+                        let endpoints = payload["payment_endpoints"].as_object_mut().unwrap();
+                        match content_case {
+                            "wrong-payload" => {
+                                endpoints.insert(
+                                    "btc-bitcoin-p2wpkh".into(),
+                                    serde_json::json!("different-address"),
+                                );
+                            }
+                            "partial-content" => {
+                                endpoints.remove("btc-lightning-bolt11");
+                            }
+                            "superset-content" => {
+                                endpoints
+                                    .insert("btc-extra".into(), serde_json::json!("unexpected"));
+                            }
+                            _ => unreachable!(),
+                        }
+                        record.raw_json = payload.to_string();
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        recover_and_assert_closed(
+            &database,
+            &outbox,
+            target_id,
+            child_id,
+            "sdk_effect_not_found",
+        )
+        .await;
+        if case == "wrong-kind" {
+            SdkStateStore::new(database.pool(), crypto.clone())
+                .update(&creator, move |state| {
+                    state
+                        .outbound_private_messages
+                        .iter_mut()
+                        .find(|record| record.outbound_message_id == outbound_id)
+                        .unwrap()
+                        .counterparty_receiver_path =
+                        PaykitReceiverPath::new("isolated/server").unwrap();
+                })
+                .await
+                .unwrap();
+        }
+    }
+
+    let (_, owned_target, owned_child) =
+        create_fixed_linked_invoice(&invoices, &creator, &reader, &peer_marker, "owned-target")
+            .await;
+    eprintln!("durable endpoint semantic case: owned-exact");
+    let (_, owned_result, _) =
+        fence_and_emit_exact(&database, &outbox, &adapter, owned_target).await;
+    let (_, sibling_id, _) =
+        create_fixed_linked_invoice(&invoices, &creator, &reader, &peer_marker, "owned-sibling")
+            .await;
+    sqlx::query(
+        "UPDATE outbox SET status = 'handed_off', sdk_outbound_message_id = $2 \
+         WHERE id = $1",
+    )
+    .bind(sibling_id)
+    .bind(owned_result.outbound_message_id().to_string())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    recover_and_assert_closed(
+        &database,
+        &outbox,
+        owned_target,
+        owned_child,
+        "sdk_effect_already_owned",
+    )
+    .await;
+    eprintln!("durable endpoint semantic case: malformed-relevant-record");
+
+    let (_, malformed_target, malformed_child) = create_fixed_linked_invoice(
+        &invoices,
+        &creator,
+        &reader,
+        &peer_marker,
+        "malformed-record",
+    )
+    .await;
+    let (_, malformed_result, _) =
+        fence_and_emit_exact(&database, &outbox, &adapter, malformed_target).await;
+    let malformed_id = malformed_result.outbound_message_id();
+    SdkStateStore::new(database.pool(), crypto.clone())
+        .update(&creator, move |state| {
+            state
+                .outbound_private_messages
+                .iter_mut()
+                .find(|record| record.outbound_message_id == malformed_id)
+                .unwrap()
+                .raw_json = "{".into();
+        })
+        .await
+        .unwrap();
+    recover_and_assert_closed(
+        &database,
+        &outbox,
+        malformed_target,
+        malformed_child,
+        "sdk_evidence_indeterminate",
+    )
+    .await;
+
+    eprintln!("durable endpoint semantic case: malformed-foreign-is-ignored");
+    let (_, clean_target, clean_child) = create_fixed_linked_invoice(
+        &invoices,
+        &creator,
+        &reader,
+        &peer_marker,
+        "clean-current-after-malformed-foreign",
+    )
+    .await;
+    let (_, clean_result, _) =
+        fence_and_emit_exact(&database, &outbox, &adapter, clean_target).await;
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(clean_target)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let recovery = outbox
+        .claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let no_effects = CountingAdapter {
+        sdk_calls: AtomicUsize::new(0),
+    };
+    assert!(
+        process_fence_recovery(&outbox, &no_effects, &recovery)
+            .await
+            .unwrap()
+    );
+    assert_eq!(no_effects.sdk_calls.load(Ordering::SeqCst), 0);
+    let clean_row: (String, Option<String>) =
+        sqlx::query_as("SELECT status, sdk_outbound_message_id FROM outbox WHERE id = $1")
+            .bind(clean_target)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        clean_row,
+        (
+            "handed_off".into(),
+            Some(clean_result.outbound_message_id().to_string())
+        )
+    );
+    assert_eq!(outbox_row(&database, clean_child).await.0, "queued");
+
+    for (case_index, case) in [
+        "amount-value",
+        "amount-asset",
+        "payment-reference",
+        "proposal-expiry",
+        "accepted-endpoints",
+        "recurrence",
+        "metadata",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        eprintln!("durable payment semantic case: {case}");
+        let (_, endpoint_id, target_id) =
+            create_fixed_linked_invoice(&invoices, &creator, &reader, &peer_marker, case).await;
+        sqlx::query(
+            "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = $2 WHERE id = $1",
+        )
+        .bind(endpoint_id)
+        .bind((900_000 + case_index).to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let (_, result, _) = fence_and_emit_exact(&database, &outbox, &adapter, target_id).await;
+        let outbound_id = result.outbound_message_id();
+        SdkStateStore::new(database.pool(), crypto.clone())
+            .update(&creator, move |state| {
+                let record = state
+                    .outbound_private_messages
+                    .iter_mut()
+                    .find(|record| record.outbound_message_id == outbound_id)
+                    .unwrap();
+                let mut payload: serde_json::Value =
+                    serde_json::from_str(&record.raw_json).unwrap();
+                match case {
+                    "amount-value" => {
+                        payload["request"]["amount"]["value"] = serde_json::json!("0.00000200");
+                    }
+                    "amount-asset" => {
+                        payload["request"]["amount"]["asset"] = serde_json::json!("USD");
+                    }
+                    "payment-reference" => {
+                        payload["request"]["payment_reference"] =
+                            serde_json::json!(Uuid::new_v4().to_string());
+                    }
+                    "proposal-expiry" => {
+                        payload["request"]["proposal_expires_at"] =
+                            serde_json::json!("2030-01-01T00:00:00Z");
+                    }
+                    "accepted-endpoints" => {
+                        payload["request"]["accepted_payment_endpoint_identifiers"] =
+                            serde_json::json!(["btc-lightning-bolt11"]);
+                    }
+                    "recurrence" => {
+                        payload["request"]["recurrence"] = serde_json::json!({
+                            "every": 1,
+                            "unit": "month",
+                            "starts_at": "2030-01-01T00:00:00Z",
+                            "anchor": "2030-01-01T00:00:00Z",
+                            "ends_at": null
+                        });
+                    }
+                    "metadata" => {
+                        payload["request"]["metadata"] =
+                            serde_json::json!({"purpose": "different"});
+                    }
+                    _ => unreachable!(),
+                }
+                record.raw_json = payload.to_string();
+            })
+            .await
+            .unwrap();
+        recover_and_assert_closed(
+            &database,
+            &outbox,
+            target_id,
+            target_id,
+            "sdk_effect_not_found",
+        )
+        .await;
+    }
+
+    let (_, endpoint_id, generated_id_target) = create_fixed_linked_invoice(
+        &invoices,
+        &creator,
+        &reader,
+        &peer_marker,
+        "missing-generated-id",
+    )
+    .await;
+    eprintln!("durable payment semantic case: missing-generated-id");
+    sqlx::query(
+        "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = '900100' \
+         WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let (_, generated_result, _) =
+        fence_and_emit_exact(&database, &outbox, &adapter, generated_id_target).await;
+    let generated_outbound_id = generated_result.outbound_message_id();
+    SdkStateStore::new(database.pool(), crypto.clone())
+        .update(&creator, move |state| {
+            let record = state
+                .outbound_private_messages
+                .iter_mut()
+                .find(|record| record.outbound_message_id == generated_outbound_id)
+                .unwrap();
+            let mut payload: serde_json::Value = serde_json::from_str(&record.raw_json).unwrap();
+            payload["event_id"] = serde_json::json!("not-an-id");
+            record.raw_json = payload.to_string();
+        })
+        .await
+        .unwrap();
+    recover_and_assert_closed(
+        &database,
+        &outbox,
+        generated_id_target,
+        generated_id_target,
+        "sdk_evidence_indeterminate",
+    )
+    .await;
+
+    for case in [
+        "invalid-path",
+        "unsupported-version",
+        "duplicate-identifier",
+    ] {
+        eprintln!("authenticated invalid intent case: {case}");
+        let (_, target_id, child_id) =
+            create_fixed_linked_invoice(&invoices, &creator, &reader, &peer_marker, case).await;
+        let (_, _, intent) = fence_and_emit_exact(&database, &outbox, &adapter, target_id).await;
+        let invalid = match case {
+            "invalid-path" => intent.encoded_with_invalid_path_for_test(),
+            "unsupported-version" => intent.encoded_with_unsupported_version_for_test(),
+            "duplicate-identifier" => intent.encoded_with_duplicate_expected_identifier_for_test(),
+            _ => unreachable!(),
+        };
+        assert!(
+            DeliveryIntentV1::decode(&invalid).is_err(),
+            "calibration: {case} must be invalid"
+        );
+        replace_authenticated_intent(&database, &crypto, target_id, &invalid).await;
+        recover_and_assert_closed(
+            &database,
+            &outbox,
+            target_id,
+            child_id,
+            "sdk_evidence_indeterminate",
+        )
+        .await;
+    }
+
+    let (_, duplicate_payment_parent, duplicate_payment_target) = create_fixed_linked_invoice(
+        &invoices,
+        &creator,
+        &reader,
+        &peer_marker,
+        "duplicate-payment-identifier",
+    )
+    .await;
+    sqlx::query(
+        "UPDATE outbox SET status = 'delivered', \
+         sdk_outbound_message_id = '900101' WHERE id = $1",
+    )
+    .bind(duplicate_payment_parent)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let (_, _, payment_intent) =
+        fence_and_emit_exact(&database, &outbox, &adapter, duplicate_payment_target).await;
+    let invalid_payment = payment_intent.encoded_with_duplicate_expected_identifier_for_test();
+    assert!(DeliveryIntentV1::decode(&invalid_payment).is_err());
+    replace_authenticated_intent(
+        &database,
+        &crypto,
+        duplicate_payment_target,
+        &invalid_payment,
+    )
+    .await;
+    recover_and_assert_closed(
+        &database,
+        &outbox,
+        duplicate_payment_target,
+        duplicate_payment_target,
+        "sdk_evidence_indeterminate",
+    )
+    .await;
+
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sdk_invocation_sidecar_atomic_rollback_retag_conflict_and_callback_barrier() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[75; 32]).unwrap());
+    let LinkedPaykitFixture {
+        _testnet,
+        creator,
+        reader,
+        creator_sdk,
+        storage,
+        adapter,
+        peer_marker,
+        ..
+    } = linked_paykit_fixture(&database, crypto.clone(), 75).await;
+    let invoices = InvoiceStore::new(database.pool(), crypto.clone());
+    let outbox = OutboxStore::new(database.pool(), crypto.clone());
+
+    let (_, first_endpoint, _) =
+        create_fixed_linked_invoice(&invoices, &creator, &reader, &peer_marker, "sidecar-first")
+            .await;
+    let first_claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(first_claim.id(), first_endpoint);
+    assert!(
+        process_claim(
+            &outbox,
+            &adapter,
+            &first_claim,
+            Duration::from_secs(1),
+            20,
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap()
+    );
+    let (first_outbound, first_token): (String, Uuid) = sqlx::query_as(
+        "SELECT o.sdk_outbound_message_id, sidecar.invocation_token \
+         FROM outbox o JOIN sdk_outbound_invocations sidecar \
+           ON sidecar.creator_id = o.creator_id \
+          AND sidecar.sdk_outbound_message_id = o.sdk_outbound_message_id \
+         WHERE o.id = $1",
+    )
+    .bind(first_endpoint)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let first_sidecars: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sdk_outbound_invocations WHERE invocation_token = $1",
+    )
+    .bind(first_token)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        first_sidecars, 1,
+        "marker/link callbacks cannot consume the enqueue invocation token"
+    );
+
+    let (_, update_failure_endpoint, _) = create_fixed_linked_invoice(
+        &invoices,
+        &creator,
+        &reader,
+        &peer_marker,
+        "sidecar-update-failure",
+    )
+    .await;
+    let update_claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(update_claim.id(), update_failure_endpoint);
+    assert!(outbox.begin_handoff(&update_claim).await.unwrap());
+    assert!(
+        outbox
+            .mark_handoff_invocation_started(&update_claim)
+            .await
+            .unwrap()
+    );
+    let update_token = outbox
+        .handoff_invocation_token(&update_claim)
+        .await
+        .unwrap()
+        .unwrap();
+    let update_intent = outbox.delivery_intent(&update_claim).unwrap();
+    let records_before = SdkStateStore::new(database.pool(), crypto.clone())
+        .load(&creator)
+        .await
+        .unwrap()
+        .outbound_private_messages
+        .len();
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_test_sdk_state_update() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'injected sdk state update failure'; END $$; \
+         CREATE TRIGGER reject_test_sdk_state_update BEFORE UPDATE ON sdk_states \
+         FOR EACH ROW EXECUTE FUNCTION reject_test_sdk_state_update();",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        handoff_with_invocation_token(&adapter, &update_intent, update_token)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        SdkStateStore::new(database.pool(), crypto.clone())
+            .load(&creator)
+            .await
+            .unwrap()
+            .outbound_private_messages
+            .len(),
+        records_before
+    );
+    let update_sidecars: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sdk_outbound_invocations WHERE invocation_token = $1",
+    )
+    .bind(update_token)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        update_sidecars, 0,
+        "failed state update cannot leave a sidecar"
+    );
+    sqlx::raw_sql(
+        "DROP TRIGGER reject_test_sdk_state_update ON sdk_states; \
+         DROP FUNCTION reject_test_sdk_state_update();",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let update_result = handoff_with_invocation_token(&adapter, &update_intent, update_token)
+        .await
+        .unwrap();
+    assert!(
+        outbox
+            .mark_handed_off(&update_claim, &update_result)
+            .await
+            .unwrap()
+    );
+    let first_token_after: Uuid = sqlx::query_scalar(
+        "SELECT invocation_token FROM sdk_outbound_invocations \
+         WHERE creator_id = $1 AND sdk_outbound_message_id = $2",
+    )
+    .bind(update_claim.creator_id())
+    .bind(&first_outbound)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        first_token_after, first_token,
+        "a later invocation cannot retag an existing record"
+    );
+    let update_record_token: Uuid = sqlx::query_scalar(
+        "SELECT invocation_token FROM sdk_outbound_invocations \
+         WHERE creator_id = $1 AND sdk_outbound_message_id = $2",
+    )
+    .bind(update_claim.creator_id())
+    .bind(update_result.outbound_message_id().to_string())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(update_record_token, update_token);
+    let records_after_first_append = SdkStateStore::new(database.pool(), crypto.clone())
+        .load(&creator)
+        .await
+        .unwrap()
+        .outbound_private_messages
+        .len();
+    assert!(
+        handoff_with_invocation_token(&adapter, &update_intent, update_token)
+            .await
+            .is_err(),
+        "one invocation token cannot authorize a second append"
+    );
+    assert_eq!(
+        SdkStateStore::new(database.pool(), crypto.clone())
+            .load(&creator)
+            .await
+            .unwrap()
+            .outbound_private_messages
+            .len(),
+        records_after_first_append,
+        "the rejected multi-append attempt rolls back its SDK-state record"
+    );
+    let update_token_sidecars: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sdk_outbound_invocations WHERE invocation_token = $1",
+    )
+    .bind(update_token)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(update_token_sidecars, 1);
+
+    let (_, conflict_endpoint, _) = create_fixed_linked_invoice(
+        &invoices,
+        &creator,
+        &reader,
+        &peer_marker,
+        "sidecar-conflict",
+    )
+    .await;
+    let conflict_claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(conflict_claim.id(), conflict_endpoint);
+    assert!(outbox.begin_handoff(&conflict_claim).await.unwrap());
+    assert!(
+        outbox
+            .mark_handoff_invocation_started(&conflict_claim)
+            .await
+            .unwrap()
+    );
+    let conflict_token = outbox
+        .handoff_invocation_token(&conflict_claim)
+        .await
+        .unwrap()
+        .unwrap();
+    let conflict_intent = outbox.delivery_intent(&conflict_claim).unwrap();
+    let conflict_records_before = SdkStateStore::new(database.pool(), crypto)
+        .load(&creator)
+        .await
+        .unwrap()
+        .outbound_private_messages
+        .len();
+    sqlx::query(
+        "INSERT INTO sdk_outbound_invocations \
+         (creator_id, sdk_outbound_message_id, invocation_token) VALUES ($1, $2, $3)",
+    )
+    .bind(conflict_claim.creator_id())
+    .bind("18446744073709551615")
+    .bind(conflict_token)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        handoff_with_invocation_token(&adapter, &conflict_intent, conflict_token)
+            .await
+            .is_err()
+    );
+    let conflict_records_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sdk_outbound_invocations WHERE invocation_token = $1",
+    )
+    .bind(conflict_token)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(conflict_records_after, 1);
+    let durable_record_count: usize = SdkStateStore::new(
+        database.pool(),
+        Arc::new(Crypto::from_master_key(&[75; 32]).unwrap()),
+    )
+    .load(&creator)
+    .await
+    .unwrap()
+    .outbound_private_messages
+    .len();
+    assert_eq!(
+        durable_record_count, conflict_records_before,
+        "sidecar conflict rolls back the SDK-state append"
+    );
+
+    let before_multiappend = creator_sdk.export_backup_state().await.unwrap();
+    let mut two_append = before_multiappend.clone();
+    let mut first_append = two_append
+        .outbound_private_messages
+        .last()
+        .expect("fixture has an outbound record")
+        .clone();
+    first_append.outbound_message_id = two_append.next_outbound_private_message_id;
+    let mut second_append = first_append.clone();
+    second_append.outbound_message_id += 1;
+    two_append.next_outbound_private_message_id += 2;
+    two_append.outbound_private_messages.push(first_append);
+    two_append.outbound_private_messages.push(second_append);
+    let multiappend_token = Uuid::new_v4();
+    storage
+        .set_invocation_token_for_test(multiappend_token)
+        .unwrap();
+    let multiappend = creator_sdk.restore_backup_state(two_append).await;
+    storage.clear_invocation_token_for_test();
+    assert!(
+        multiappend.is_err(),
+        "one storage callback appended two outbound records"
+    );
+    assert_eq!(
+        creator_sdk.export_backup_state().await.unwrap(),
+        before_multiappend,
+        "multiappend rejection rolls back the complete SDK snapshot"
+    );
+    let multiappend_sidecars: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sdk_outbound_invocations WHERE invocation_token = $1",
+    )
+    .bind(multiappend_token)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(multiappend_sidecars, 0);
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sdk_invocation_sidecar_unlinked_link_callback_cannot_consume_token() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[77; 32]).unwrap());
+    let LinkedPaykitFixture {
+        _testnet,
+        creator,
+        reader,
+        adapter,
+        peer_marker,
+        ..
+    } = unlinked_paykit_fixture(&database, crypto.clone(), 77).await;
+    let (_, endpoint_id, _) = create_fixed_linked_invoice(
+        &InvoiceStore::new(database.pool(), crypto.clone()),
+        &creator,
+        &reader,
+        &peer_marker,
+        "unlinked-callback",
+    )
+    .await;
+    let outbox = OutboxStore::new(database.pool(), crypto.clone());
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.id(), endpoint_id);
+    assert!(
+        process_claim(
+            &outbox,
+            &adapter,
+            &claim,
+            Duration::from_secs(1),
+            20,
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap()
+    );
+    let (status, token): (String, Uuid) =
+        sqlx::query_as("SELECT status, handoff_invocation_token FROM outbox WHERE id = $1")
+            .bind(endpoint_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(status, "retryable");
+    let sidecars: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sdk_outbound_invocations WHERE invocation_token = $1",
+    )
+    .bind(token)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        sidecars, 0,
+        "an actually-unlinked link callback cannot consume the handoff token"
+    );
+    assert!(
+        SdkStateStore::new(database.pool(), crypto)
+            .load(&creator)
+            .await
+            .unwrap()
+            .outbound_private_messages
+            .is_empty(),
+        "link establishment did not reach the intended enqueue callback"
     );
     database.cleanup().await;
 }
@@ -3501,6 +4697,365 @@ async fn fence_recovery_attributes_unique_current_token_payment_request() {
         ),
         "recovery attributes only the exact causally-tagged SDK result"
     );
+    database.cleanup().await;
+}
+
+/// Two independent PostgreSQL pools race the same durable recovery claim ten
+/// times. The target-row lock and live-fence CAS allow exactly one commit,
+/// replay after that commit is a deterministic no-op, and invoice finality on
+/// either side of the resolver commit never admits the dependent request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fence_recovery_race_replay_and_finality_orders_10x() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[73; 32]).unwrap());
+    let LinkedPaykitFixture {
+        _testnet,
+        creator,
+        reader,
+        adapter,
+        peer_marker,
+        ..
+    } = linked_paykit_fixture(&database, crypto.clone(), 73).await;
+    let replica_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(database.database_url())
+        .await
+        .unwrap();
+    let replica_a = OutboxStore::new(database.pool(), crypto.clone());
+    let replica_b = OutboxStore::new(&replica_pool, crypto.clone());
+    let invoices = InvoiceStore::new(database.pool(), crypto);
+
+    for iteration in 0..10_u8 {
+        let bundle = format!("resolver-race-bundle-{iteration}");
+        let request = format!("resolver-race-request-{iteration}");
+        let invoice = invoices
+            .create_atomic(AtomicInvoiceInput {
+                creator: &creator,
+                reader: &reader,
+                bundle_binding: bundle.as_bytes(),
+                payment_request_binding: request.as_bytes(),
+                new_reader_payloads: &LinkedPayloads {
+                    reader: reader.clone(),
+                    marker: peer_marker.clone(),
+                },
+                payment_request_intent: DeliveryIntentV1::payment_request(
+                    reader.to_string(),
+                    &peer_marker,
+                    PaykitReceiverPath::new("paykit/server").unwrap(),
+                    &PaymentRequestTerms {
+                        amount: PaymentAmount::new("0.00000100", "BTC").unwrap(),
+                        payment_reference: PaymentReference::new(Uuid::new_v4().to_string())
+                            .unwrap(),
+                        proposal_expires_at: None,
+                        recurrence: None,
+                        accepted_payment_endpoint_identifiers: vec![
+                            PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+                        ],
+                        metadata: Default::default(),
+                    },
+                )
+                .unwrap(),
+                required_sats: 100,
+                nonce_sats: 1,
+                prepare_ttl: Duration::from_secs(900),
+                expires_at: time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+            })
+            .await
+            .unwrap();
+        let endpoint_id = invoice.endpoint_publication_outbox_id().unwrap();
+        let child_id = invoice.payment_request_outbox_id();
+        let claim = replica_a
+            .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|claim| claim.id() == endpoint_id)
+            .expect("new endpoint is ordinary-claim eligible");
+        assert!(replica_a.begin_handoff(&claim).await.unwrap());
+        assert!(
+            replica_a
+                .mark_handoff_invocation_started(&claim)
+                .await
+                .unwrap()
+        );
+        let token = replica_a
+            .handoff_invocation_token(&claim)
+            .await
+            .unwrap()
+            .unwrap();
+        let intent = replica_a.delivery_intent(&claim).unwrap();
+        let result = handoff_with_invocation_token(&adapter, &intent, token)
+            .await
+            .unwrap();
+        let outbound_id = result.outbound_message_id();
+
+        // Serial order one: finality commits before attribution. The already
+        // fenced external effect remains auditable, while the child closes.
+        if iteration == 0 {
+            assert!(
+                invoices
+                    .resolve_invoice(
+                        invoice.invoice_id(),
+                        "abandoned",
+                        time::OffsetDateTime::now_utc(),
+                    )
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        sqlx::query(
+            "UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(endpoint_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let recovery = replica_a
+            .claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let (a, b) = tokio::join!(
+            process_fence_recovery(&replica_a, &adapter, &recovery),
+            process_fence_recovery(&replica_b, &adapter, &recovery),
+        );
+        assert_eq!(
+            usize::from(a.unwrap()) + usize::from(b.unwrap()),
+            1,
+            "iteration {iteration}: exactly one replica commits attribution"
+        );
+        assert!(
+            !process_fence_recovery(&replica_b, &adapter, &recovery)
+                .await
+                .unwrap(),
+            "iteration {iteration}: after-commit replay must be a no-op"
+        );
+
+        let owner_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM outbox WHERE creator_id = $1 \
+             AND sdk_outbound_message_id = $2",
+        )
+        .bind(recovery.creator_id())
+        .bind(outbound_id.to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(owner_count, 1);
+        assert_eq!(outbox_row(&database, endpoint_id).await.0, "handed_off");
+        let events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM outbox_terminal_events WHERE outbox_id = $1")
+                .bind(endpoint_id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(events, 0, "successful replay creates no terminal event");
+
+        // Serial order two: finality commits after attribution. The handed-off
+        // parent remains auditable, and finality still closes the child.
+        if iteration == 1 {
+            assert!(
+                invoices
+                    .resolve_invoice(
+                        invoice.invoice_id(),
+                        "abandoned",
+                        time::OffsetDateTime::now_utc(),
+                    )
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(
+            replica_a
+                .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+                .await
+                .unwrap()
+                .iter()
+                .all(|claim| claim.id() != child_id),
+            "iteration {iteration}: child became claimable without exact Sent"
+        );
+        if iteration <= 1 {
+            assert_eq!(
+                outbox_row(&database, child_id).await.0,
+                "permanently_failed"
+            );
+        }
+    }
+
+    drop(replica_pool);
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fence_recovery_commit_crash_replay_before_and_after_is_deterministic() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[78; 32]).unwrap());
+    let LinkedPaykitFixture {
+        _testnet,
+        creator,
+        reader,
+        adapter,
+        peer_marker,
+        ..
+    } = linked_paykit_fixture(&database, crypto.clone(), 78).await;
+    let invoices = InvoiceStore::new(database.pool(), crypto.clone());
+    let base_outbox = OutboxStore::new(database.pool(), crypto.clone());
+
+    let (_, before_id, _) = create_fixed_linked_invoice(
+        &invoices,
+        &creator,
+        &reader,
+        &peer_marker,
+        "crash-before-commit",
+    )
+    .await;
+    let (_, before_result, _) =
+        fence_and_emit_exact(&database, &base_outbox, &adapter, before_id).await;
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(before_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let before_recovery = base_outbox
+        .claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let before_entered = Arc::new(tokio::sync::Notify::new());
+    let never_release_before = Arc::new(tokio::sync::Notify::new());
+    let before_store = OutboxStore::new(database.pool(), crypto.clone()).with_handoff_fence_seam(
+        HandoffFenceSeam {
+            before_resolver_commit: Some(Arc::new({
+                let entered = before_entered.clone();
+                let release = never_release_before.clone();
+                move || {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    Box::pin(async move {
+                        entered.notify_one();
+                        release.notified().await;
+                    })
+                }
+            })),
+            ..HandoffFenceSeam::default()
+        },
+    );
+    let before_task = tokio::spawn({
+        let claim = before_recovery.clone();
+        async move {
+            let no_effects = CountingAdapter {
+                sdk_calls: AtomicUsize::new(0),
+            };
+            process_fence_recovery(&before_store, &no_effects, &claim).await
+        }
+    });
+    before_entered.notified().await;
+    before_task.abort();
+    assert!(before_task.await.unwrap_err().is_cancelled());
+    assert_eq!(outbox_row(&database, before_id).await.0, "handoff_started");
+    let before_owner_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox WHERE creator_id = $1 AND sdk_outbound_message_id = $2",
+    )
+    .bind(before_recovery.creator_id())
+    .bind(before_result.outbound_message_id().to_string())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(before_owner_count, 0, "pre-commit cancellation rolls back");
+    let no_effects = CountingAdapter {
+        sdk_calls: AtomicUsize::new(0),
+    };
+    assert!(
+        process_fence_recovery(&base_outbox, &no_effects, &before_recovery)
+            .await
+            .unwrap()
+    );
+    assert_eq!(no_effects.sdk_calls.load(Ordering::SeqCst), 0);
+
+    let (_, after_id, _) = create_fixed_linked_invoice(
+        &invoices,
+        &creator,
+        &reader,
+        &peer_marker,
+        "crash-after-commit",
+    )
+    .await;
+    let (_, after_result, _) =
+        fence_and_emit_exact(&database, &base_outbox, &adapter, after_id).await;
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(after_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let after_recovery = base_outbox
+        .claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let after_entered = Arc::new(tokio::sync::Notify::new());
+    let never_release_after = Arc::new(tokio::sync::Notify::new());
+    let after_store =
+        OutboxStore::new(database.pool(), crypto).with_handoff_fence_seam(HandoffFenceSeam {
+            after_resolver_commit: Some(Arc::new({
+                let entered = after_entered.clone();
+                let release = never_release_after.clone();
+                move || {
+                    let entered = entered.clone();
+                    let release = release.clone();
+                    Box::pin(async move {
+                        entered.notify_one();
+                        release.notified().await;
+                    })
+                }
+            })),
+            ..HandoffFenceSeam::default()
+        });
+    let after_task = tokio::spawn({
+        let claim = after_recovery.clone();
+        async move {
+            let no_effects = CountingAdapter {
+                sdk_calls: AtomicUsize::new(0),
+            };
+            process_fence_recovery(&after_store, &no_effects, &claim).await
+        }
+    });
+    after_entered.notified().await;
+    after_task.abort();
+    assert!(after_task.await.unwrap_err().is_cancelled());
+    assert_eq!(outbox_row(&database, after_id).await.0, "handed_off");
+    assert!(
+        !process_fence_recovery(&base_outbox, &no_effects, &after_recovery)
+            .await
+            .unwrap(),
+        "post-commit cancellation replays as a no-op"
+    );
+    for (id, result) in [(before_id, before_result), (after_id, after_result)] {
+        let owner_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM outbox WHERE creator_id = $1 \
+             AND sdk_outbound_message_id = $2",
+        )
+        .bind(after_recovery.creator_id())
+        .bind(result.outbound_message_id().to_string())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(owner_count, 1);
+        let events: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM outbox_terminal_events WHERE outbox_id = $1")
+                .bind(id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(events, 0);
+    }
+
     database.cleanup().await;
 }
 
@@ -4698,10 +6253,12 @@ async fn partition_lease_cap_holds_across_replicas() {
 }
 
 /// Recovery has its own durable ceiling: ordinary attempt accounting does not
-/// move while twenty recovery claims are issued, and a fresh store cannot
-/// issue claim 21 after the final lease expires.
+/// move while twenty recovery claims are issued, attempt 20 terminalizes at
+/// retry instead of scheduling another lease, and a fresh store cannot issue
+/// claim 21. A separate row proves claim 19 below the DB-time boundary and
+/// exact 3600-second terminalization before another claim.
 #[tokio::test]
-async fn recovery_ceiling_survives_restart_and_never_issues_claim_twenty_one() {
+async fn recovery_ceiling_enforces_count_time_restart_and_event_cardinality() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let crypto = Arc::new(Crypto::from_master_key(&[91; 32]).unwrap());
@@ -4740,6 +6297,19 @@ async fn recovery_ceiling_survives_restart_and_never_issues_claim_twenty_one() {
                 .await
                 .unwrap()
         );
+        if attempt == 20 {
+            let immediate: (String, Option<time::OffsetDateTime>) =
+                sqlx::query_as("SELECT status, lease_expires_at FROM outbox WHERE id = $1")
+                    .bind(endpoint_id)
+                    .fetch_one(database.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                immediate,
+                ("permanently_failed".into(), None),
+                "attempt 20 must terminalize atomically in retry_fence_recovery"
+            );
+        }
         if attempt < 20 {
             sqlx::query(
                 "UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
@@ -4750,11 +6320,6 @@ async fn recovery_ceiling_survives_restart_and_never_issues_claim_twenty_one() {
             .unwrap();
         }
     }
-    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
-        .bind(endpoint_id)
-        .execute(database.pool())
-        .await
-        .unwrap();
     let restarted = OutboxStore::new(database.pool(), crypto);
     assert!(
         restarted
@@ -4763,15 +6328,128 @@ async fn recovery_ceiling_survives_restart_and_never_issues_claim_twenty_one() {
             .unwrap()
             .is_empty()
     );
-    let row: (String, i32, Option<time::OffsetDateTime>, Option<time::OffsetDateTime>) = sqlx::query_as(
-        "SELECT status, recovery_attempts, recovery_first_at, recovery_last_at FROM outbox WHERE id = $1",
-    ).bind(endpoint_id).fetch_one(database.pool()).await.unwrap();
+    let row: (
+        String,
+        i32,
+        i32,
+        Option<time::OffsetDateTime>,
+        Option<time::OffsetDateTime>,
+        Option<time::OffsetDateTime>,
+    ) = sqlx::query_as(
+        "SELECT status, attempt_count, recovery_attempts, recovery_first_at, recovery_last_at, \
+         lease_expires_at FROM outbox WHERE id = $1",
+    )
+    .bind(endpoint_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
     assert_eq!(row.0, "permanently_failed");
-    assert_eq!(row.1, 20);
-    assert!(row.2.is_some() && row.3.is_some());
+    assert_eq!(row.1, 1, "recovery never changes ordinary attempt_count");
+    assert_eq!(row.2, 20);
+    assert!(row.3.is_some() && row.4.is_some());
+    assert!(row.5.is_none(), "attempt 20 cannot schedule another lease");
     assert_eq!(
         outbox_row(&database, request_id).await.0,
         "permanently_failed"
     );
+    let count_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox_terminal_events WHERE outbox_id = $1 \
+         AND event_class = 'handoff_unresolved' \
+         AND reason = 'sdk_recovery_infrastructure_unavailable'",
+    )
+    .bind(endpoint_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(count_events, 1);
+    assert!(
+        restarted
+            .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_empty(),
+        "the exhausted parent never admits its child"
+    );
+
+    let time_reader = distinct_readers().into_iter().nth(1).unwrap();
+    let (time_endpoint_id, time_request_id) = create_activated_invoice_for(
+        &database,
+        Arc::new(Crypto::from_master_key(&[91; 32]).unwrap()),
+        &time_reader,
+        "recovery-time-boundary",
+    )
+    .await;
+    let time_claim = restarted
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(time_claim.id(), time_endpoint_id);
+    assert!(restarted.begin_handoff(&time_claim).await.unwrap());
+    assert!(
+        restarted
+            .mark_handoff_invocation_started(&time_claim)
+            .await
+            .unwrap()
+    );
+    sqlx::query(
+        "UPDATE outbox SET attempt_count = 77, recovery_attempts = 18, \
+         recovery_first_at = NOW() - INTERVAL '3599 seconds', \
+         recovery_last_at = NOW() - INTERVAL '1 second', \
+         lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind(time_endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let recovery_19 = restarted
+        .claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .expect("claim 19 remains eligible below 3600 seconds");
+    assert!(
+        restarted
+            .retry_fence_recovery(&recovery_19, Duration::ZERO)
+            .await
+            .unwrap()
+    );
+    sqlx::query(
+        "UPDATE outbox SET recovery_first_at = NOW() - INTERVAL '3600 seconds', \
+         lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+    )
+    .bind(time_endpoint_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        restarted
+            .claim_fence_recovery(Uuid::new_v4(), 1, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_empty(),
+        "exactly 3600 seconds terminalizes before a new claim"
+    );
+    let time_row: (String, i32, i32) =
+        sqlx::query_as("SELECT status, attempt_count, recovery_attempts FROM outbox WHERE id = $1")
+            .bind(time_endpoint_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(time_row, ("permanently_failed".into(), 77, 19));
+    assert_eq!(
+        outbox_row(&database, time_request_id).await.0,
+        "permanently_failed"
+    );
+    let time_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM outbox_terminal_events WHERE outbox_id = $1 \
+         AND reason = 'sdk_recovery_infrastructure_unavailable'",
+    )
+    .bind(time_endpoint_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(time_events, 1);
     database.cleanup().await;
 }

@@ -44,6 +44,10 @@ CREATE TRIGGER sdk_outbound_invocations_immutable
 BEFORE UPDATE OR DELETE ON sdk_outbound_invocations
 FOR EACH ROW EXECUTE FUNCTION reject_sdk_outbound_invocation_mutation();
 
+CREATE TRIGGER sdk_outbound_invocations_no_truncate
+BEFORE TRUNCATE ON sdk_outbound_invocations
+FOR EACH STATEMENT EXECUTE FUNCTION reject_sdk_outbound_invocation_mutation();
+
 CREATE UNIQUE INDEX outbox_creator_outbound_owner_unique
     ON outbox (creator_id, sdk_outbound_message_id)
     WHERE sdk_outbound_message_id IS NOT NULL;
