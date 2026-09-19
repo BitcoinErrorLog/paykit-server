@@ -65,7 +65,7 @@ async fn production_schema_clone_runs_real_startup_and_server_composition() {
             .fetch_all(&initialized.pool)
             .await
             .unwrap();
-    assert_eq!(versions, (1..=24).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=25).collect::<Vec<_>>());
 
     let role_attributes: (bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
         "SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolinherit,

@@ -220,7 +220,7 @@ fn migration_catalog_has_one_contiguous_canonical_version_per_file() {
     let mut versions = migration_versions(names).unwrap();
     versions.sort_unstable();
 
-    assert_eq!(versions, (1..=24).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=25).collect::<Vec<_>>());
     assert_eq!(
         versions.len(),
         versions.iter().collect::<HashSet<_>>().len()
@@ -239,12 +239,19 @@ fn migration_catalog_has_one_contiguous_canonical_version_per_file() {
 }
 
 #[test]
-fn release_checksum_manifest_pins_unapplied_migration_0024() {
+fn release_checksum_manifest_pins_unapplied_migrations() {
     let manifest = include_str!("../../paykit-server/migrations/RELEASE_CHECKSUMS.txt");
-    let migration =
+    let migration_0024 =
         include_bytes!("../../paykit-server/migrations/0024_sdk_outbound_invocation.sql");
-    let checksum = format!("{:x}", Sha512::digest(migration));
-    assert_eq!(manifest.trim(), format!("0024 {checksum}"));
+    let migration_0025 = include_bytes!(
+        "../../paykit-server/migrations/0025_operations_inspection_and_setup_cancellation.sql"
+    );
+    let checksum_0024 = format!("{:x}", Sha512::digest(migration_0024));
+    let checksum_0025 = format!("{:x}", Sha512::digest(migration_0025));
+    assert_eq!(
+        manifest.trim(),
+        format!("0024 {checksum_0024}\n0025 {checksum_0025}")
+    );
 }
 
 #[test]
@@ -364,7 +371,8 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
     assert_eq!(
         applied_versions,
         vec![
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25
         ]
     );
 
@@ -476,7 +484,7 @@ async fn migration_0024_upgrades_exact_deployed_0023_schema() {
         .fetch_one(pool)
         .await
         .unwrap();
-    assert_eq!(after, 24);
+    assert_eq!(after, 25);
     let recovery_columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns \
          WHERE table_schema = 'public' AND table_name = 'outbox' \
