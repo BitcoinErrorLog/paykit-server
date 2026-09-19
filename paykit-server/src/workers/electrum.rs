@@ -336,7 +336,15 @@ fn tls_stream(host: &str, tcp: TcpStream) -> io::Result<StreamOwned<ClientConnec
     })?;
     let connection =
         ClientConnection::new(Arc::new(config), server_name).map_err(io::Error::other)?;
-    Ok(StreamOwned::new(connection, tcp))
+    let mut stream = StreamOwned::new(connection, tcp);
+    // `StreamOwned::new` is lazy: without this I/O, a stalled ServerHello
+    // would escape the raw-client/connect deadline and first block a later
+    // RPC. Complete the authenticated transport handshake before returning.
+    stream
+        .conn
+        .complete_io(&mut stream.sock)
+        .map_err(io::Error::other)?;
+    Ok(stream)
 }
 
 #[cfg(test)]
