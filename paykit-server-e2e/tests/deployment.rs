@@ -400,7 +400,7 @@ async fn startup_applies_as_migrator_then_boots_with_a_restricted_runtime_princi
             .fetch_all(&migrator_pool)
             .await
             .unwrap();
-    assert_eq!(applied, (1..=24).collect::<Vec<_>>());
+    assert_eq!(applied, (1..=25).collect::<Vec<_>>());
     let owned_objects: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner \
          WHERE c.relnamespace = 'public'::regnamespace AND r.rolname = current_user",
@@ -413,8 +413,8 @@ async fn startup_applies_as_migrator_then_boots_with_a_restricted_runtime_princi
         "the migrator must own the schema objects it creates"
     );
 
-    // The deployment provisioner owns baseline runtime grants. Migration 0024
-    // adds only its new-column and sidecar grants to the stable paykit role.
+    // The deployment provisioner owns baseline runtime grants. Migrations 0024
+    // and 0025 add only their narrowly scoped runtime grants to stable roles.
     sqlx::query(&format!(
         "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE \
          deployment_metadata, creators, sdk_states, reader_assignments, invoices, outbox, \
