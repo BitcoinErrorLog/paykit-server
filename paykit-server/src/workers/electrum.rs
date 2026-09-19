@@ -203,6 +203,43 @@ impl<T: Read + Write + Send + 'static> IoStream for T {}
 /// `batch_call`) is implemented for it by electrum-client.
 pub type CappedClient = RawClient<CappedStream<Box<dyn IoStream>>>;
 
+/// TCP connection established for an Electrum endpoint but not yet upgraded
+/// to TLS. Keeping the phases separate lets the async adapter assign TCP and
+/// TLS independent deadlines.
+pub struct PendingConnection {
+    endpoint: ElectrumEndpoint,
+    tcp: TcpStream,
+}
+
+impl PendingConnection {
+    pub fn use_tls(&self) -> bool {
+        self.endpoint.use_tls
+    }
+
+    /// A duplicate socket handle that can interrupt a blocking TLS handshake
+    /// if its phase deadline expires.
+    pub fn cancel_handle(&self) -> io::Result<TcpStream> {
+        self.tcp.try_clone()
+    }
+}
+
+/// A client plus a duplicate socket handle used to cooperatively interrupt a
+/// blocking request/response when its phase deadline expires.
+pub struct ConnectedClient {
+    client: CappedClient,
+    cancel: TcpStream,
+}
+
+impl ConnectedClient {
+    pub fn cancel_handle(&self) -> io::Result<TcpStream> {
+        self.cancel.try_clone()
+    }
+
+    pub fn into_parts(self) -> (CappedClient, TcpStream) {
+        (self.client, self.cancel)
+    }
+}
+
 /// A parsed `tcp://host:port` or `ssl://host:port` endpoint. Any other
 /// scheme — including `socks5://` — is refused with
 /// [`ENDPOINT_SCHEME_ERROR_MESSAGE`]: the proxy transport is deliberately
@@ -287,15 +324,60 @@ pub fn connect(
     let tcp = tcp.ok_or_else(|| {
         last_error.unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address resolved"))
     })?;
+    finish_connection(
+        PendingConnection { endpoint, tcp },
+        timeout,
+        max_response_bytes,
+    )
+    .map(|connected| connected.client)
+}
+
+/// Resolves and establishes only the TCP phase with Tokio's cancellation-safe
+/// connect future. Dropping this future at its phase deadline closes the
+/// in-progress socket instead of leaving a `spawn_blocking` connect behind.
+pub async fn connect_tcp_async(endpoint: &str) -> io::Result<PendingConnection> {
+    let endpoint = ElectrumEndpoint::parse(endpoint)?;
+    let addresses: Vec<SocketAddr> =
+        tokio::net::lookup_host((endpoint.host.as_str(), endpoint.port))
+            .await?
+            .collect();
+    let mut last_error = None;
+    for address in addresses {
+        match tokio::net::TcpStream::connect(address).await {
+            Ok(stream) => {
+                let tcp = stream.into_std()?;
+                tcp.set_nonblocking(false)?;
+                return Ok(PendingConnection { endpoint, tcp });
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address resolved")))
+}
+
+/// Completes the transport phase after TCP: socket timeouts, eager TLS
+/// handshake when configured, response cap, and raw client construction.
+/// The caller runs this blocking phase behind its own deadline and uses
+/// [`PendingConnection::cancel_handle`] to interrupt it on expiry.
+pub fn finish_connection(
+    pending: PendingConnection,
+    timeout: Duration,
+    max_response_bytes: u64,
+) -> io::Result<ConnectedClient> {
+    let PendingConnection { endpoint, tcp } = pending;
+    tcp.set_read_timeout(Some(timeout))?;
+    tcp.set_write_timeout(Some(timeout))?;
+    let cancel = tcp.try_clone()?;
     let stream: Box<dyn IoStream> = if endpoint.use_tls {
         Box::new(tls_stream(&endpoint.host, tcp)?)
     } else {
         Box::new(tcp)
     };
-    Ok(RawClient::from(CappedStream::new(
-        stream,
-        max_response_bytes,
-    )))
+    Ok(ConnectedClient {
+        client: RawClient::from(CappedStream::new(stream, max_response_bytes)),
+        cancel,
+    })
 }
 
 fn connect_tcp(address: SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
