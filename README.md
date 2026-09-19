@@ -142,7 +142,10 @@ Copy [`config/paykit-server.example.toml`](config/paykit-server.example.toml) to
 Required environment variables:
 
 - `PAYKIT_CONFIG` — path to the TOML file;
-- `PAYKIT_DATABASE_URL` — restricted non-owner runtime PostgreSQL URL;
+- `PAYKIT_DATABASE_URL` — runtime PostgreSQL URL; the migration-0024
+  production transition temporarily keeps this on the `postgres` owner, with
+  the restricted LOGIN-member cutover handled as a later approved operation
+  documented in [`docs/production-rehearsal.md`](docs/production-rehearsal.md);
 - `PAYKIT_MIGRATOR_DATABASE_URL` — dedicated migration-owner PostgreSQL URL;
 - `PAYKIT_MASTER_KEY` — unpadded base64url encoding of exactly 32 bytes.
 
