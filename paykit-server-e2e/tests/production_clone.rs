@@ -22,6 +22,7 @@ allowed_origins = ["https://app.example"]
 [paykit]
 receiver_path = "paykit/server"
 network = "mainnet"
+client_id = "paykit-server"
 [bitcoin]
 network = "mainnet"
 creation_enabled = false
