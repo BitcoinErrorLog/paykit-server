@@ -24,6 +24,6 @@ pub use migrations::{
 pub use outbox::{
     ClaimedHandoff, ClaimedOutbox, HANDOFF_UNRESOLVED_SDK_INVOKED_UNATTRIBUTED,
     HANDOFF_UNRESOLVED_SDK_NOT_INVOKED, HandoffFenceSeam, HandoffRelease, HandoffResult,
-    OutboxRetryClass, OutboxStore, SeamHook,
+    OutboxRetryClass, OutboxStore, SeamHook, UnattributedInspection,
 };
 pub use sdk_state::{PostgresStorageAdapter, SdkStateStore};
