@@ -1916,20 +1916,25 @@ impl ElectrumPort for ElectrumAdapter {
     }
 
     async fn probe(&self) -> Result<TipProbe, ObserverError> {
-        let client = self.raw_client().await?;
         let network = self.network.clone();
-        let probe = tokio::task::spawn_blocking(move || {
-            let notification = client.block_headers_subscribe().map_err(map_electrum)?;
-            let genesis = client.block_header(0).map_err(map_electrum)?;
-            if genesis.block_hash().to_string() != expected_genesis_hash(&network) {
-                return Err(ObserverError::WrongNetwork);
-            }
-            Ok(TipProbe {
-                height: u32::try_from(notification.height)
-                    .map_err(|_| ObserverError::InvalidObservation)?,
-                time_unix: notification.header.time,
+        let adapter = self.clone();
+        let probe = async move {
+            let client = adapter.raw_client().await?;
+            tokio::task::spawn_blocking(move || {
+                let notification = client.block_headers_subscribe().map_err(map_electrum)?;
+                let genesis = client.block_header(0).map_err(map_electrum)?;
+                if genesis.block_hash().to_string() != expected_genesis_hash(&network) {
+                    return Err(ObserverError::WrongNetwork);
+                }
+                Ok(TipProbe {
+                    height: u32::try_from(notification.height)
+                        .map_err(|_| ObserverError::InvalidObservation)?,
+                    time_unix: notification.header.time,
+                })
             })
-        });
+            .await
+            .map_err(|_| ObserverError::Unavailable)?
+        };
         // Wall-clock deadline over the whole probe, reusing the
         // per-address `electrum.address_deadline` knob: the per-read
         // socket timeout (`electrum.request_timeout`) does not bound a
@@ -1943,8 +1948,8 @@ impl ElectrumPort for ElectrumAdapter {
         // blocking socket read cannot be cancelled: the abandoned
         // blocking task and its socket exit only when the read returns.
         match tokio::time::timeout(self.address_deadline, probe).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) | Err(_) => Err(ObserverError::Unavailable),
+            Ok(result) => result,
+            Err(_) => Err(ObserverError::Unavailable),
         }
     }
 }
