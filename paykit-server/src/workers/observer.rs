@@ -2663,7 +2663,9 @@ mod tests {
         connect_gate.started.notified().await;
         tokio::time::advance(Duration::from_secs(4)).await;
         connect_gate.release.notify_one();
+        tokio::time::resume();
         request_gate.started.notified().await;
+        tokio::time::pause();
         tokio::time::advance(Duration::from_secs(4)).await;
         request_gate.release.notify_one();
         tokio::time::resume();
