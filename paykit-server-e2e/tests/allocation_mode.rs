@@ -1,9 +1,12 @@
 //! Safe-subset gate for the removed legacy manual-claim endpoint.
 
 use std::str::FromStr;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    net::IpAddr,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use axum::{
@@ -18,23 +21,23 @@ use bitcoin::{
     secp256k1::Secp256k1,
 };
 use paykit_lib::PaykitReceiverPath;
-use paykit_sdk::{
-    PaykitSdkConfig, PubkyLocalSecretKey, PubkyPublicKey, PubkySessionBootstrap,
-    ReceiverNoiseSecretKey, storage::StorageState,
-};
+use paykit_sdk::{PubkyAuthCompanionClaim, PubkyLocalSecretKey, PubkySessionBootstrap};
 use paykit_server::{
-    allocation::{CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1, decide_allocation},
     application::create_invoice::derive_bip84_p2wpkh_address,
+    bitkit_claim::{CLAIM_TYPE, QUERY_PARAMETER, encode_unsigned_payload, required_capabilities},
+    bitkit_setup::BitkitAuthStarter,
     chain_history::{ChainHistoryPort, ClaimScanError},
     config::{BitcoinNetwork, StackRole},
     crypto::Crypto,
     domain::locks::{CreatorPubky, parse_creator},
     http::accounts::{AccountsState, accounts_router},
-    key_identity::{canonical_key_tail, key_fingerprint},
+    key_identity::key_fingerprint,
     manual_claim::{ClaimedKeyLookup, ManualClaimError, ManualClaimService, SessionMinter},
-    persistence::{CreatorCredentials, CreatorStore, run_migrations},
-    real_setup::DirectMarkerPublisher,
+    persistence::{CreatorStore, run_migrations},
+    real_setup::{DirectMarkerPublisher, RealSetupCompleter},
     sentinel::{SentinelFinding, SentinelPolicy, scan_window_addresses},
+    setup::{PollResult, SetupLimits, SetupService, SystemClock},
+    setup_orchestration::PubkyCompanionRelay,
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use pubky::{AuthToken, Capabilities, Keypair, PubkySession};
@@ -216,47 +219,82 @@ async fn grant_created_owner_status_evidence_and_alert_acknowledgement_remain_li
     .unwrap();
     let testnet = EphemeralTestnet::builder()
         .postgres(postgres)
+        .with_http_relay()
         .build()
         .await
         .unwrap();
     let pubky = testnet.sdk().unwrap();
     let receiver_path = PaykitReceiverPath::new("paykit/server").unwrap();
-    let required_capabilities =
-        PaykitSdkConfig::new(receiver_path.clone()).required_session_capabilities();
+    let required_capabilities = required_capabilities(&receiver_path);
+    let relay_inbox = testnet.http_relay().local_url().join("inbox").unwrap();
     let seller = Keypair::random();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "paykit-server").unwrap();
-    let account = bootstrap
-        .sign_up(
-            &PubkyLocalSecretKey::new(seller.secret()),
-            ReceiverNoiseSecretKey::random(),
-            &PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key()),
-            None,
-            &required_capabilities,
-        )
+    pubky
+        .signer(seller.clone())
+        .signup(&testnet.homeserver_app().public_key(), None)
         .await
         .unwrap();
-    let creator = parse_creator(&format!("pubky{}", account.public_key)).unwrap();
+    let seller_secret = PubkyLocalSecretKey::new(seller.secret());
+    let creator = parse_creator(&format!("pubky{}", seller.public_key().z32())).unwrap();
     let xpub = account_xpub(104, 3);
     let serialized_xpub = Xpub::from_str(&xpub).unwrap().encode();
-    let key_tail = canonical_key_tail(&serialized_xpub);
     let creators = CreatorStore::new(
         database.pool(),
         Arc::new(Crypto::from_master_key(&[1; 32]).unwrap()),
     );
-    let persisted = creators
-        .create(
-            &CreatorCredentials::new(
-                creator.clone(),
-                account.export_session_secret().await.unwrap().into_inner(),
-                account.access.receiver_noise_secret_key.clone(),
-                xpub.clone(),
-                3,
-            ),
-            &StorageState::default(),
-            &key_tail,
-            &decide_allocation(CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1, 3, false, false),
-            0,
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "paykit-server")
+        .unwrap()
+        .with_auth_relay(relay_inbox.as_str())
+        .unwrap();
+    let companion_relay = Arc::new(PubkyCompanionRelay::new(pubky.client().clone()));
+    let completer = Arc::new(RealSetupCompleter::new(
+        BitkitAuthStarter::new(bootstrap.clone(), &receiver_path),
+        companion_relay,
+        creators.clone(),
+        BitcoinNetwork::Testnet,
+        StackRole::Proof,
+        receiver_path.clone(),
+    ));
+    let setup = SetupService::new(
+        vec!["https://app.example".into()],
+        completer,
+        Arc::new(SystemClock::default()),
+        SetupLimits {
+            max_polls_per_flow: 2,
+            max_polls: 2,
+            setup_per_ip_per_minute: 2,
+            max_pending_setup_flows: 2,
+        },
+    );
+    let flow = setup
+        .begin(
+            IpAddr::from([127, 0, 0, 1]),
+            "https://app.example/callback",
+            "status-alert-fixture",
+            seller_secret.public_key().as_str(),
         )
+        .await
+        .unwrap();
+    let claim = PubkyAuthCompanionClaim::new(
+        QUERY_PARAMETER,
+        CLAIM_TYPE,
+        encode_unsigned_payload(3, &serialized_xpub).to_vec(),
+    )
+    .unwrap();
+    bootstrap
+        .approve_auth_with_companion_claim(
+            &flow.authorization_url,
+            &required_capabilities,
+            &seller_secret,
+            &claim,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        setup.complete_and_poll(&flow.flow_id).await,
+        PollResult::Complete
+    );
+    let creator_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM creators")
+        .fetch_one(database.pool())
         .await
         .unwrap();
     let service = Arc::new(ManualClaimService::new(
@@ -278,8 +316,8 @@ async fn grant_created_owner_status_evidence_and_alert_acknowledgement_remain_li
     let (status_code, body) = status(&router, &creator, &owner).await;
     assert_eq!(status_code, StatusCode::OK, "{body}");
     assert_eq!(body["creator"], creator.to_string());
-    assert_eq!(body["allocation_mode"], "exclusive");
-    assert_eq!(body["claim_channel"], CLAIM_CHANNEL_BITKIT_WATCH_ONLY_V1);
+    assert_eq!(body["allocation_mode"], "shared_manual");
+    assert!(body["claim_channel"].is_null());
     assert!(body["downgrade_reason"].is_null());
     assert_eq!(body["key_fingerprint"], key_fingerprint(&serialized_xpub));
     assert_eq!(
@@ -296,11 +334,21 @@ async fn grant_created_owner_status_evidence_and_alert_acknowledgement_remain_li
         StatusCode::FORBIDDEN
     );
 
+    // Existing pre-cut exclusive rows remain live authority. Simulate that
+    // historical state only after proving production companion setup's actual
+    // shared-manual/null-channel contract above.
+    sqlx::query(
+        "UPDATE creators SET allocation_mode = 'exclusive', claim_channel = 'bitkit_watch_only_v1', downgrade_reason = NULL WHERE id = $1",
+    )
+    .bind(creator_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
     let window = scan_window_addresses(&xpub, 3, &BitcoinNetwork::Testnet, 0, 20).unwrap();
     let first_outpoint = OutPoint::new(Txid::from_byte_array([78; 32]), 1);
     let outcome = creators
         .apply_sentinel_scan(
-            persisted.id(),
+            creator_id,
             &[SentinelFinding::new(
                 4,
                 window[4].1.clone(),
@@ -364,7 +412,7 @@ async fn grant_created_owner_status_evidence_and_alert_acknowledgement_remain_li
 
     let second = creators
         .apply_sentinel_scan(
-            persisted.id(),
+            creator_id,
             &[SentinelFinding::new(
                 5,
                 window[5].1.clone(),
