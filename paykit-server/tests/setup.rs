@@ -264,7 +264,7 @@ struct InstructionCompleter;
 impl SetupCompleter for InstructionCompleter {
     async fn start(&self) -> Result<StartedSetup, Completion> {
         Ok(StartedSetup::new(
-            "pubkyauth://signin?secret=mock&label=<approve>".to_owned(),
+            "pubkyauth://signin_grant?secret=mock&label=<approve>".to_owned(),
             Box::new(MockAttempt),
         ))
     }
@@ -1339,6 +1339,8 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
     assert!(!shell.contains("</script><img"));
     assert!(shell.contains("\\u003c/script\\u003e\\u003cimg\\u003e"));
     assert!(shell.contains("Waiting for Bitkit"));
+    assert!(shell.contains("Bitkit required."));
+    assert!(shell.contains("Pubky Ring cannot complete this setup."));
     assert!(shell.contains("No approval received. Update Bitkit to 2.5 or newer and start again."));
     assert!(shell.contains("restart.href=window.location.pathname+window.location.search"));
     assert!(shell.contains("waitLimit=6*60*1000"));
@@ -1386,7 +1388,7 @@ async fn setup_page_renders_exact_claim_as_deep_link_and_qr() {
     let (page, script) = shell
         .split_once("<script>")
         .expect("setup shell contains polling script");
-    let claim = "pubkyauth://signin?secret=mock&label=<approve>";
+    let claim = "pubkyauth://signin_grant?secret=mock&label=<approve>";
     let href = page
         .split_once("href=\"")
         .and_then(|(_, rest)| rest.split_once('"'))
@@ -1395,9 +1397,11 @@ async fn setup_page_renders_exact_claim_as_deep_link_and_qr() {
     assert!(href.starts_with("pubkyauth://"));
     assert_eq!(
         href,
-        "pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;"
+        "pubkyauth://signin_grant?secret=mock&amp;label=&lt;approve&gt;"
     );
     assert!(page.contains("Bitkit 2.5 or newer is required."));
+    assert!(page.contains("Bitkit required."));
+    assert!(page.contains("Pubky Ring cannot complete this setup."));
     assert!(page.contains("Scan this code with Bitkit"));
     let expected_qr =
         qrcode::QrCode::with_error_correction_level(claim.as_bytes(), qrcode::EcLevel::M)
@@ -1406,7 +1410,7 @@ async fn setup_page_renders_exact_claim_as_deep_link_and_qr() {
             .min_dimensions(256, 256)
             .build();
     assert!(page.contains(&expected_qr));
-    assert!(!script.contains("pubkyauth://signin?secret=mock"));
+    assert!(!script.contains("pubkyauth://signin_grant?secret=mock"));
     for forbidden in ["regtest", "tpub", "npm", "docker", "examples/js-sdk"] {
         assert!(
             !shell.contains(forbidden),

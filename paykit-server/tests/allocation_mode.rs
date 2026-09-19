@@ -1,14 +1,8 @@
-//! Claim-channel allocation checks (design §B.8.6, W1.13) — handler-level
-//! and invariant tests.
+//! Allocation invariants and authenticated status-surface tests.
 //!
-//! The behavioural 200-level assertions (accepted downgrades, `exclusive`
-//! grants, re-claim keep-or-downgrade, the owner 200 on the status surface)
-//! are in the e2e suite, which drives the real session minter, marker
-//! publication and Postgres. These tests pin everything provable without a
-//! homeserver: the unconditional `pasted_auto` refusal matrix, the
-//! channel-scoped declared-vs-hardened cross-check, the zero-extra-Electrum
-//! -call budget of the corroborating checks, the status surface's 401/403,
-//! and the grep-level no-upgrade/no-flag invariants.
+//! The legacy claim handler is removed and tested at its HTTP tombstone. The
+//! dormant allocation implementation retains source-level no-upgrade/no-flag
+//! invariants, while the read-only status surface remains live.
 
 use std::sync::{Arc, Mutex};
 
@@ -17,11 +11,6 @@ use axum::{
     http::{Method, Request, StatusCode, header},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use bitcoin::{
-    Network,
-    bip32::{ChildNumber, Xpriv, Xpub},
-    secp256k1::Secp256k1,
-};
 use paykit_lib::PaykitReceiverPath;
 use paykit_sdk::PaykitSdkConfig;
 use paykit_server::{
@@ -91,22 +80,6 @@ impl ChainHistoryPort for ScriptedHistory {
     }
 }
 
-fn regtest_account_tpub(account_index: u32) -> String {
-    let secp = Secp256k1::new();
-    let account = Xpriv::new_master(Network::Regtest, &[7; 32])
-        .unwrap()
-        .derive_priv(
-            &secp,
-            &[
-                ChildNumber::from_hardened_idx(84).unwrap(),
-                ChildNumber::from_hardened_idx(1).unwrap(),
-                ChildNumber::from_hardened_idx(account_index).unwrap(),
-            ],
-        )
-        .unwrap();
-    Xpub::from_priv(&secp, &account).to_string()
-}
-
 fn required_capabilities() -> String {
     PaykitSdkConfig::new(PaykitReceiverPath::new("paykit/server").unwrap())
         .required_session_capabilities()
@@ -135,26 +108,6 @@ fn claim_router(stack_role: StackRole, history: Arc<ScriptedHistory>) -> axum::R
     accounts_router(AccountsState::new(service, 100, vec![]))
 }
 
-fn claim_body(body: serde_json::Value) -> Request<Body> {
-    Request::builder()
-        .method(Method::POST)
-        .uri("/v0/accounts/claim")
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body.to_string()))
-        .unwrap()
-}
-
-fn valid_claim_body(account_index: u32) -> serde_json::Value {
-    let capabilities = Capabilities::try_from(required_capabilities().as_str()).unwrap();
-    let auth_token =
-        URL_SAFE_NO_PAD.encode(AuthToken::sign(&Keypair::random(), capabilities).serialize());
-    serde_json::json!({
-        "auth_token": auth_token,
-        "account_xpub": regtest_account_tpub(account_index),
-        "account_index": account_index,
-    })
-}
-
 async fn response_parts(response: axum::response::Response) -> (StatusCode, serde_json::Value) {
     let status = response.status();
     let bytes = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
@@ -162,61 +115,6 @@ async fn response_parts(response: axum::response::Response) -> (StatusCode, serd
         status,
         serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
     )
-}
-
-// ---------------------------------------------------------------------------
-// `pasted_auto`: refused unconditionally, with no enabling flag anywhere
-// (design §B.8.6 r6, Sol P1). The matrix drives every channel-affecting
-// knob at every value: both stack roles, every channel (missing, `manual`,
-// `bitkit_watch_only_v1`, unknown), account indices 0 and 1, and an
-// INVALID auth token — the refusal precedes even token verification.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn pasted_auto_is_refused_unconditionally_across_every_configuration() {
-    for stack_role in [StackRole::Production, StackRole::Proof] {
-        for channel in [
-            None,
-            Some("manual"),
-            Some("bitkit_watch_only_v1"),
-            Some("carrier_pigeon"),
-        ] {
-            for account_index in [0u32, 1] {
-                for valid_token in [true, false] {
-                    let history = Arc::new(ScriptedHistory {
-                        calls: Mutex::new(0),
-                        used_in_first_window: false,
-                    });
-                    let router = claim_router(stack_role, history.clone());
-                    let mut body = valid_claim_body(account_index);
-                    if !valid_token {
-                        body["auth_token"] = serde_json::json!("not-a-token");
-                    }
-                    if let Some(channel) = channel {
-                        body["claim_channel"] = serde_json::json!(channel);
-                    }
-                    body["allocation_mode"] = serde_json::json!("pasted_auto");
-
-                    let (status, body) =
-                        response_parts(router.oneshot(claim_body(body)).await.unwrap()).await;
-
-                    assert_eq!(
-                        (status, body["error"]["code"].as_str()),
-                        (
-                            StatusCode::UNPROCESSABLE_ENTITY,
-                            Some("allocation_mode_not_enabled")
-                        ),
-                        "role={stack_role:?} channel={channel:?} index={account_index} valid_token={valid_token}"
-                    );
-                    assert_eq!(
-                        *history.calls.lock().unwrap(),
-                        0,
-                        "the refusal precedes the scan: zero Electrum calls"
-                    );
-                }
-            }
-        }
-    }
 }
 
 /// Grep-level: no configuration, environment or code path can ENABLE
@@ -263,128 +161,6 @@ fn no_enabling_flag_for_pasted_auto_exists_anywhere() {
     assert!(
         constructing_mentions.is_empty(),
         "unsanctioned `pasted_auto` code paths: {constructing_mentions:?}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// The channel-scoped declared-vs-hardened cross-check (§B.8.6): a refusal
-// under paste, a downgrade under `bitkit_watch_only_v1`.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn a_mismatched_declared_index_is_refused_on_paste_but_downgraded_on_the_bitkit_channel() {
-    // Paste: the §B.6 refusal is unchanged, before any Electrum call.
-    let history = Arc::new(ScriptedHistory {
-        calls: Mutex::new(0),
-        used_in_first_window: false,
-    });
-    let router = claim_router(StackRole::Production, history.clone());
-    let mut body = valid_claim_body(2);
-    body["account_index"] = serde_json::json!(4); // key is account 2
-    let (status, body) = response_parts(router.oneshot(claim_body(body)).await.unwrap()).await;
-    assert_eq!(
-        (status, body["error"]["code"].as_str()),
-        (StatusCode::BAD_REQUEST, Some("invalid_xpub"))
-    );
-    assert_eq!(*history.calls.lock().unwrap(), 0);
-
-    // Bitkit channel: NOT refused — the claim is downgraded
-    // (account_index_mismatch) and proceeds on the key's own index through
-    // exactly the §B.5 scan (one window, one batched call) to the session
-    // boundary. The accepted 200 + reason is asserted in the e2e suite.
-    let history = Arc::new(ScriptedHistory {
-        calls: Mutex::new(0),
-        used_in_first_window: false,
-    });
-    let router = claim_router(StackRole::Production, history.clone());
-    let mut body = valid_claim_body(2);
-    body["account_index"] = serde_json::json!(4);
-    body["claim_channel"] = serde_json::json!("bitkit_watch_only_v1");
-    let (status, body) = response_parts(router.oneshot(claim_body(body)).await.unwrap()).await;
-    assert_eq!(
-        (status, body["error"]["code"].as_str()),
-        (StatusCode::SERVICE_UNAVAILABLE, Some("session_unavailable")),
-        "a bitkit-channel mismatch downgrades instead of refusing: {body}"
-    );
-    assert_eq!(
-        *history.calls.lock().unwrap(),
-        1,
-        "the corroborating checks add zero Electrum calls beyond the scan"
-    );
-}
-
-/// `account_index = 0` on the Bitkit channel downgrades rather than refuses
-/// (the r4 range accepts 0; §B.8.6 downgrades it to `shared_manual`).
-#[tokio::test]
-async fn a_bitkit_claim_at_account_index_zero_is_downgraded_not_refused() {
-    let history = Arc::new(ScriptedHistory {
-        calls: Mutex::new(0),
-        used_in_first_window: false,
-    });
-    let router = claim_router(StackRole::Production, history.clone());
-    let mut body = valid_claim_body(0);
-    body["claim_channel"] = serde_json::json!("bitkit_watch_only_v1");
-    let (status, body) = response_parts(router.oneshot(claim_body(body)).await.unwrap()).await;
-    assert_eq!(
-        (status, body["error"]["code"].as_str()),
-        (StatusCode::SERVICE_UNAVAILABLE, Some("session_unavailable")),
-        "index 0 downgrades rather than refusing: {body}"
-    );
-    assert_eq!(*history.calls.lock().unwrap(), 1);
-}
-
-/// Scan history downgrades rather than refuses — here the claim proceeds
-/// through the full two-window scan to the session boundary, proving the
-/// `account_has_history` decision consumes the scan result with no extra
-/// Electrum call.
-#[tokio::test]
-async fn a_bitkit_claim_with_scan_history_is_downgraded_not_refused() {
-    let history = Arc::new(ScriptedHistory {
-        calls: Mutex::new(0),
-        used_in_first_window: true,
-    });
-    let router = claim_router(StackRole::Production, history.clone());
-    let mut body = valid_claim_body(3);
-    body["claim_channel"] = serde_json::json!("bitkit_watch_only_v1");
-    let (status, body) = response_parts(router.oneshot(claim_body(body)).await.unwrap()).await;
-    assert_eq!(
-        (status, body["error"]["code"].as_str()),
-        (StatusCode::SERVICE_UNAVAILABLE, Some("session_unavailable")),
-        "scan history downgrades rather than refusing: {body}"
-    );
-    assert_eq!(
-        *history.calls.lock().unwrap(),
-        2,
-        "exactly the two scan windows; the history check adds no Electrum call"
-    );
-}
-
-/// An unknown channel is refused with `unknown_claim_channel` (fail closed,
-/// §B.8.6: the field is one of `manual` | `bitkit_watch_only_v1`) — never
-/// canonicalized silently, never persisted verbatim, and never reaching the
-/// scan or any persistence.
-#[tokio::test]
-async fn an_unknown_claim_channel_is_refused_fail_closed() {
-    let history = Arc::new(ScriptedHistory {
-        calls: Mutex::new(0),
-        used_in_first_window: false,
-    });
-    let router = claim_router(StackRole::Production, history.clone());
-    let mut body = valid_claim_body(1);
-    body["claim_channel"] = serde_json::json!("carrier_pigeon");
-    let (status, body) = response_parts(router.oneshot(claim_body(body)).await.unwrap()).await;
-    assert_eq!(
-        (status, body["error"]["code"].as_str()),
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Some("unknown_claim_channel")
-        ),
-        "an unknown channel is refused: {body}"
-    );
-    assert_eq!(
-        *history.calls.lock().unwrap(),
-        0,
-        "the refusal precedes the scan"
     );
 }
 

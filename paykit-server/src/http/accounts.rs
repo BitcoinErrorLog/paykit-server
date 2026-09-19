@@ -1,15 +1,13 @@
-//! Manual watch-only account claim and existence routes.
+//! Account existence, status, and legacy-claim refusal routes.
 //!
-//! `POST /v0/accounts/claim` is called directly from browser marketplace
-//! clients (the request body carries its own proof: a capability-scoped
-//! Pubky AuthToken), so this router answers CORS preflights for the same
-//! origins the setup flow allows. `GET /v0/accounts/{creator}` is a public,
-//! secret-free existence lookup used by the marketplace transaction service
-//! to report per-seller Bitcoin availability.
+//! `POST /v0/accounts/claim` is retained only as an explicit fail-closed
+//! tombstone. The legacy flow minted cookie sessions that rc55 cannot use for
+//! private Paykit operations, so every request is refused before parsing,
+//! rate limiting, session minting, marker publication, or persistence.
+//! `GET /v0/accounts/{creator}` remains the public, secret-free existence
+//! lookup used by the marketplace transaction service.
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use axum::{
     Json, Router,
@@ -23,60 +21,23 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
-    domain::locks::parse_creator,
-    http::error::ApiError,
-    manual_claim::{
-        ManualClaimError, ManualClaimRequest, ManualClaimService, validate_request_shape,
-    },
+    domain::locks::parse_creator, http::error::ApiError, manual_claim::ManualClaimService,
 };
-
-/// Rolling one-minute claim budget. Each claim performs a relay round-trip
-/// and a homeserver session exchange, so the window is deliberately small.
-struct ClaimWindow {
-    budget: u64,
-    admitted: VecDeque<Instant>,
-}
-
-impl ClaimWindow {
-    fn new(budget: u64) -> Self {
-        Self {
-            budget,
-            admitted: VecDeque::new(),
-        }
-    }
-
-    fn try_admit(&mut self, now: Instant) -> bool {
-        while self
-            .admitted
-            .front()
-            .is_some_and(|at| now.saturating_duration_since(*at) >= Duration::from_secs(60))
-        {
-            self.admitted.pop_front();
-        }
-        if self.admitted.len() as u64 >= self.budget {
-            return false;
-        }
-        self.admitted.push_back(now);
-        true
-    }
-}
 
 #[derive(Clone)]
 pub struct AccountsState {
     service: Arc<ManualClaimService>,
-    claim_limiter: Arc<Mutex<ClaimWindow>>,
     allowed_origins: Arc<Vec<String>>,
 }
 
 impl AccountsState {
     pub fn new(
         service: Arc<ManualClaimService>,
-        claims_per_minute: u64,
+        _claims_per_minute: u64,
         allowed_origins: Vec<String>,
     ) -> Self {
         Self {
             service,
-            claim_limiter: Arc::new(Mutex::new(ClaimWindow::new(claims_per_minute))),
             allowed_origins: Arc::new(allowed_origins),
         }
     }
@@ -85,7 +46,7 @@ impl AccountsState {
 pub fn accounts_router(state: AccountsState) -> Router {
     let cors_state = state.clone();
     Router::new()
-        .route("/v0/accounts/claim", post(claim))
+        .route("/v0/accounts/claim", post(manual_claim_removed))
         .route("/v0/accounts/{creator}", get(exists))
         .route("/v0/accounts/{creator}/status", get(allocation_status))
         .route(
@@ -151,141 +112,12 @@ async fn apply_cors(state: AccountsState, request: axum::extract::Request, next:
     response
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ClaimBody {
-    auth_token: String,
-    account_xpub: String,
-    account_index: u32,
-    /// The channel the Shop client asserts (design §B.8.6): `manual` or
-    /// `bitkit_watch_only_v1`. Missing is treated as `manual`; any other
-    /// value is refused with `unknown_claim_channel` (fail closed).
-    claim_channel: Option<String>,
-    /// Optional requested mode. Honored only as a refusal: `pasted_auto` is
-    /// rejected unconditionally with `allocation_mode_not_enabled`
-    /// (§B.8.6 r6); the server decides every accepted mode itself.
-    allocation_mode: Option<String>,
-}
-
-async fn claim(State(state): State<AccountsState>, body: Json<ClaimBody>) -> Response {
-    let request = ManualClaimRequest {
-        auth_token: body.0.auth_token,
-        account_xpub: body.0.account_xpub,
-        account_index: body.0.account_index,
-        claim_channel: body.0.claim_channel,
-        allocation_mode: body.0.allocation_mode,
-    };
-    // Gate order (W1.13 r3 P2): pure request-shape validation runs BEFORE
-    // the rate-limit charge, so unauthenticated garbage (an unknown
-    // `claim_channel`, a `pasted_auto` request) never consumes claim
-    // capacity. Every I/O-bearing check — token verification, the
-    // claim-time scan, persistence — stays behind the limit inside
-    // `service.claim`, which re-runs the shape check as its first gate.
-    if let Err(error) = validate_request_shape(&request) {
-        return claim_error(error);
-    }
-    let permitted = state
-        .claim_limiter
-        .lock()
-        .expect("claim rate limiter mutex is not poisoned")
-        .try_admit(Instant::now());
-    if !permitted {
-        return ApiError::RateLimited.into_response();
-    }
-    match state.service.claim(request).await {
-        Ok(outcome) => (
-            StatusCode::OK,
-            Json(json!({
-                "status": "claimed",
-                "creator": outcome.creator,
-                "account_index": outcome.account_index,
-                "next_child_index": outcome.next_child_index,
-                "first_child_index": outcome.first_child_index,
-                "key_fingerprint": outcome.key_fingerprint,
-                "first_derived_address": outcome.first_derived_address,
-                "stack_id": outcome.stack_id,
-                "allocation_mode": outcome.allocation_mode,
-                "downgrade_reason": outcome.downgrade_reason,
-            })),
-        )
-            .into_response(),
-        Err(error) => claim_error(error),
-    }
-}
-
-fn claim_error(error: ManualClaimError) -> Response {
-    let (status, code, message) = match error {
-        ManualClaimError::InvalidToken => (
-            StatusCode::UNAUTHORIZED,
-            "invalid_token",
-            "auth token verification or session exchange failed",
-        ),
-        ManualClaimError::InvalidCapabilities => (
-            StatusCode::UNAUTHORIZED,
-            "invalid_capabilities",
-            "auth token capabilities must exactly match the receiver-path session capabilities",
-        ),
-        ManualClaimError::InvalidXpub => (
-            StatusCode::BAD_REQUEST,
-            "invalid_xpub",
-            "account xpub is not a valid BIP84 account key for this network and index",
-        ),
-        ManualClaimError::AccountIndexOutOfRange => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "account_index_out_of_range",
-            "account index is outside the claimable range 0..=99",
-        ),
-        ManualClaimError::KeyDenyListed => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "key_deny_listed",
-            "account key material is a known-public test-vector key and cannot be claimed",
-        ),
-        ManualClaimError::KeyClaimedByOtherSeller => (
-            StatusCode::CONFLICT,
-            "key_claimed_by_other_seller",
-            "this watch-only key material is claimed by a different seller on this stack",
-        ),
-        ManualClaimError::AccountMismatch => (
-            StatusCode::CONFLICT,
-            "account_mismatch",
-            "a different watch-only account is already claimed for this creator",
-        ),
-        ManualClaimError::ClaimScanUnavailable => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "claim_scan_unavailable",
-            "the claim-time address history scan could not reach Electrum; the claim was refused",
-        ),
-        ManualClaimError::AccountHistoryTooDeep => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "account_history_too_deep",
-            "account history exceeds the claim scan bound; claim a fresh, dedicated account",
-        ),
-        ManualClaimError::SessionUnavailable => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "session_unavailable",
-            "relay or homeserver session exchange is unavailable",
-        ),
-        ManualClaimError::Unavailable => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-            "marker publication or persistence is unavailable",
-        ),
-        ManualClaimError::AllocationModeNotEnabled => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "allocation_mode_not_enabled",
-            "the requested allocation mode is not enabled on this stack",
-        ),
-        ManualClaimError::UnknownClaimChannel => (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "unknown_claim_channel",
-            "claim_channel must be one of manual or bitkit_watch_only_v1 when present",
-        ),
-    };
-    (
-        status,
-        Json(json!({ "error": { "code": code, "message": message } })),
+async fn manual_claim_removed() -> Response {
+    status_error(
+        StatusCode::GONE,
+        "manual_claim_removed",
+        "legacy manual account claims were removed; connect with Bitkit setup",
     )
-        .into_response()
 }
 
 async fn exists(State(state): State<AccountsState>, Path(creator): Path<String>) -> Response {

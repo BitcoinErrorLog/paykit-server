@@ -11,11 +11,13 @@ use bitcoin::{
     bip32::{ChildNumber, Xpriv, Xpub},
     secp256k1::Secp256k1,
 };
+use paykit_sdk::{PaykitSdkError, PubkySessionBootstrap, ReceiverNoiseSecretKey};
 use paykit_server::bitkit_claim::{
     CLAIM_TYPE, LOCAL_DEMO_CAPABILITIES, QUERY_PARAMETER, UNSIGNED_PAYLOAD_LEN, decrypt_and_verify,
     derive_channel_id, encode_unsigned_payload, parse_unsigned_payload,
 };
-use pubky::{AuthToken, EncryptedHttpRelayInboxChannel, HttpRelayInboxChannel, PubkyHttpClient};
+use paykit_server::bitkit_setup::append_bitkit_claim;
+use pubky::{HttpRelayInboxChannel, PubkyHttpClient};
 use serde_json::{Value, json};
 
 const HELPER_DEADLINE: Duration = Duration::from_secs(5);
@@ -41,7 +43,7 @@ fn account_xpub(network: Network, account_index: u32) -> Xpub {
 
 fn auth_url(relay: &str, auth_secret: &[u8; 32]) -> String {
     format!(
-        "pubkyauth://signin?caps={LOCAL_DEMO_CAPABILITIES}&relay={relay}&secret={}&{QUERY_PARAMETER}={CLAIM_TYPE}",
+        "pubkyauth://signin_grant?caps={LOCAL_DEMO_CAPABILITIES}&relay={relay}&secret={}&cid=paykit.test&cpk=5jsjx1o6fzu6aeeo697r3i5rx15zq41kikcye8wtwdqm4nb4tryo&{QUERY_PARAMETER}={CLAIM_TYPE}",
         URL_SAFE_NO_PAD.encode(auth_secret)
     )
 }
@@ -346,14 +348,37 @@ async fn helper_reports_coarse_failure_without_panicking_when_success_stdout_is_
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn helper_delivers_the_exact_companion_envelope_and_auth_token() {
+async fn helper_delivers_the_exact_companion_envelope_and_rc55_consumes_the_grant() {
     let relay = http_relay::HttpRelay::builder()
         .http_port(0)
         .run()
         .await
         .unwrap();
     let inbox = relay.local_url().join("inbox").unwrap();
-    let input = valid_input(inbox.as_str());
+    let bootstrap = PubkySessionBootstrap::new("paykit.test")
+        .unwrap()
+        .with_auth_relay(inbox.as_str())
+        .unwrap();
+    let request = bootstrap
+        .start_sign_in_auth(LOCAL_DEMO_CAPABILITIES)
+        .await
+        .unwrap();
+    let authorization_url =
+        append_bitkit_claim(request.authorization_url(), LOCAL_DEMO_CAPABILITIES).unwrap();
+    let url = url::Url::parse(&authorization_url).unwrap();
+    let auth_secret: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(
+            url.query_pairs()
+                .find(|(key, _)| key == "secret")
+                .unwrap()
+                .1
+                .as_bytes(),
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let mut input = valid_input(inbox.as_str());
+    input["auth_url"] = json!(authorization_url);
 
     let output = tokio::time::timeout(
         RELAY_TASK_DEADLINE,
@@ -368,8 +393,7 @@ async fn helper_delivers_the_exact_companion_envelope_and_auth_token() {
     assert!(output.stderr.is_empty());
 
     let client = PubkyHttpClient::new().unwrap();
-    let claim_channel =
-        HttpRelayInboxChannel::new(inbox.clone(), derive_channel_id(&[9; 32])).unwrap();
+    let claim_channel = HttpRelayInboxChannel::new(inbox, derive_channel_id(&auth_secret)).unwrap();
     let encrypted_claim = claim_channel
         .poll(&client, Some(Duration::from_secs(1)))
         .await
@@ -378,20 +402,22 @@ async fn helper_delivers_the_exact_companion_envelope_and_auth_token() {
     let creator = pubky::Keypair::from_secret(&[7; 32]);
     let verifying_key =
         ed25519_dalek::VerifyingKey::from_bytes(creator.public_key().as_bytes()).unwrap();
-    let claim = decrypt_and_verify(&encrypted_claim, &[9; 32], &verifying_key).unwrap();
+    let claim = decrypt_and_verify(&encrypted_claim, &auth_secret, &verifying_key).unwrap();
     assert_eq!(claim.account_index, 0);
     assert_eq!(
         claim.serialized_xpub,
         account_xpub(Network::Testnet, 0).encode()
     );
 
-    let auth_channel = EncryptedHttpRelayInboxChannel::new(inbox, [9; 32]).unwrap();
-    let token_bytes = auth_channel
-        .poll(&client, Some(Duration::from_secs(1)))
-        .await
-        .unwrap()
-        .unwrap();
-    let token = AuthToken::verify(&token_bytes).unwrap();
-    assert_eq!(token.public_key(), &creator.public_key());
-    assert_eq!(token.capabilities().to_string(), LOCAL_DEMO_CAPABILITIES);
+    let result = request
+        .complete(
+            None,
+            ReceiverNoiseSecretKey::random(),
+            LOCAL_DEMO_CAPABILITIES,
+        )
+        .await;
+    // The real rc55 completer consumed and verified the relay approval before
+    // reaching the expected homeserver lookup failure: this fixture identity
+    // is deliberately not registered and this test starts no homeserver.
+    assert!(matches!(result, Err(PaykitSdkError::Identity { .. })));
 }

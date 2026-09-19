@@ -31,6 +31,7 @@ trusted_public_key = "{KEY}"
 allowed_origins = ["https://app.example"]
 
 [paykit]
+client_id = "paykit-server"
 receiver_path = "paykit/server"
 network = "testnet"
 
@@ -61,6 +62,7 @@ trusted_public_key = "{KEY}"
 allowed_origins = ["http://localhost:8080"]
 
 [paykit]
+client_id = "paykit-server"
 receiver_path = "bitkit/server"
 receiver_path_priority = ["bitkit"]
 network = "testnet"
@@ -88,6 +90,7 @@ fn parses_exact_local_compose_config_contract() {
     assert_eq!(config.http.listen_addr, "0.0.0.0:3001");
     assert_eq!(config.setup.allowed_origins, vec!["http://localhost:8080"]);
     assert_eq!(config.paykit.network, PaykitNetwork::Testnet);
+    assert_eq!(config.paykit.client_id, "paykit-server");
     assert_eq!(config.paykit.receiver_path.as_str(), "bitkit/server");
     assert_eq!(config.paykit.receiver_path_priority.len(), 1);
     assert_eq!(config.paykit.receiver_path_priority[0].as_str(), "bitkit");
@@ -108,6 +111,35 @@ fn parses_exact_local_compose_config_contract() {
     assert_eq!(config.electrum.endpoint, "tcp://fulcrum:50001");
     assert_eq!(config.electrum.poll_interval, Duration::from_secs(1));
     assert_eq!(config.outbox.poll_interval, Duration::from_millis(500));
+}
+
+#[test]
+fn paykit_grant_client_id_is_required_and_validated() {
+    let missing = valid_toml().replace("client_id = \"paykit-server\"\n", "");
+    assert!(matches!(
+        Config::from_toml_and_environment(&missing, environment()),
+        Err(ConfigError::Toml(_))
+    ));
+
+    let invalid = valid_toml().replace("client_id = \"paykit-server\"", "client_id = \"\"");
+    assert!(matches!(
+        Config::from_toml_and_environment(&invalid, environment()),
+        Err(ConfigError::InvalidPaykitClientId)
+    ));
+}
+
+#[test]
+fn paykit_auth_relay_requires_absolute_http_or_https() {
+    for invalid in ["ftp://relay.example/inbox", "file:///relay/inbox"] {
+        let toml = valid_toml().replace(
+            "network = \"testnet\"\n\n[bitcoin]",
+            &format!("network = \"testnet\"\nauth_relay = \"{invalid}\"\n\n[bitcoin]"),
+        );
+        assert!(matches!(
+            Config::from_toml_and_environment(&toml, environment()),
+            Err(ConfigError::InvalidUrl("paykit.auth_relay"))
+        ));
+    }
 }
 
 #[test]

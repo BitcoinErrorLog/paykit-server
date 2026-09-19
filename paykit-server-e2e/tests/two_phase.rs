@@ -246,6 +246,7 @@ trusted_public_key = "{trusted_key}"
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
+client_id = "paykit-server"
 receiver_path = "paykit/server"
 network = "testnet"
 [bitcoin]
@@ -389,7 +390,7 @@ async fn boot(seed: u8) -> BootedStack {
         .await
         .unwrap();
     let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone());
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "paykit-server").unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(&pool, crypto.clone());
@@ -426,9 +427,10 @@ async fn boot(seed: u8) -> BootedStack {
     let reader = parse_reader(&format!("pubky{}", reader_account.public_key)).unwrap();
 
     // Creator: credentials in the store, content lock published.
+    let creator_secret = PubkyLocalSecretKey::new(Keypair::random().secret_key());
     let creator_account = bootstrap
         .sign_up(
-            &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
+            &creator_secret,
             ReceiverNoiseSecretKey::random(),
             &homeserver,
             None,
@@ -442,7 +444,11 @@ async fn boot(seed: u8) -> BootedStack {
     let amount_sats = 50_000;
     let lock = content_lock(&creator, amount_sats);
     let lock_path = lock.content_lock_path().unwrap().to_string();
-    creator_account
+    let lock_writer = bootstrap
+        .sign_in(&creator_secret, ReceiverNoiseSecretKey::random(), "/:rw")
+        .await
+        .unwrap();
+    lock_writer
         .access
         .session
         .storage()
@@ -453,7 +459,11 @@ async fn boot(seed: u8) -> BootedStack {
         .create(
             &CreatorCredentials::new(
                 creator.clone(),
-                creator_account.access.session.export_secret(),
+                creator_account
+                    .export_session_secret()
+                    .await
+                    .unwrap()
+                    .into_inner(),
                 creator_account.access.receiver_noise_secret_key.clone(),
                 xpub.clone(),
                 0,

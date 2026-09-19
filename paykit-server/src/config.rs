@@ -76,6 +76,8 @@ impl Config {
         {
             return Err(ConfigError::DuplicateReceiverPathPriority);
         }
+        let client_id = raw.paykit.client_id;
+        pubky::ClientId::new(&client_id).map_err(|_| ConfigError::InvalidPaykitClientId)?;
         let bitcoin_network = BitcoinNetwork::parse(&raw.bitcoin.network)?;
         let stack_role = StackRole::parse(raw.deployment)?;
 
@@ -83,7 +85,7 @@ impl Config {
         let allowed_origins = validate_allowed_origins(raw.setup.allowed_origins)?;
         let marketplace = raw.marketplace.map(MarketplaceConfig::parse).transpose()?;
         let auth_relay = match raw.paykit.auth_relay {
-            Some(value) => validate_url("paykit.auth_relay", &value)?,
+            Some(value) => validate_http_url("paykit.auth_relay", &value)?,
             None => Url::parse(pubky::DEFAULT_HTTP_RELAY_INBOX)
                 .expect("default HTTP relay inbox URL parses"),
         };
@@ -96,6 +98,7 @@ impl Config {
             marketplace,
             setup: SetupConfig { allowed_origins },
             paykit: PaykitConfig {
+                client_id,
                 receiver_path: receiver_path.clone(),
                 receiver_path_priority,
                 network: PaykitNetwork::parse(&raw.paykit.network)?,
@@ -653,6 +656,8 @@ pub struct SetupConfig {
 
 #[derive(Clone, Debug)]
 pub struct PaykitConfig {
+    /// Stable Pubky grant audience. Changing it invalidates pending setup flows.
+    pub client_id: String,
     pub receiver_path: PaykitReceiverPath,
     /// Ordered first-segment preference for discovered reader receiver paths.
     pub receiver_path_priority: Vec<ReceiverPathPriority>,
@@ -980,6 +985,8 @@ pub enum ConfigError {
     InvalidOrigin,
     #[error("paykit.receiver_path must be a valid Paykit receiver path")]
     InvalidReceiverPath,
+    #[error("paykit.client_id must be a valid Pubky grant client ID")]
+    InvalidPaykitClientId,
     #[error("paykit.network must be mainnet or testnet")]
     InvalidPaykitNetwork,
     #[error("paykit.receiver_path_priority entries must be canonical Paykit receiver app segments")]
@@ -1032,6 +1039,14 @@ fn decode_base64url_no_pad(value: &str, error: ConfigError) -> Result<Vec<u8>, C
 fn validate_url(field: &'static str, value: &str) -> Result<Url, ConfigError> {
     let parsed = Url::parse(value).map_err(|_| ConfigError::InvalidUrl(field))?;
     if parsed.cannot_be_a_base() || parsed.host_str().is_none() {
+        return Err(ConfigError::InvalidUrl(field));
+    }
+    Ok(parsed)
+}
+
+fn validate_http_url(field: &'static str, value: &str) -> Result<Url, ConfigError> {
+    let parsed = validate_url(field, value)?;
+    if !matches!(parsed.scheme(), "http" | "https") {
         return Err(ConfigError::InvalidUrl(field));
     }
     Ok(parsed)
@@ -1120,6 +1135,7 @@ struct RawSetupConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPaykitConfig {
+    client_id: String,
     receiver_path: String,
     #[serde(default = "default_receiver_path_priority")]
     receiver_path_priority: Vec<String>,

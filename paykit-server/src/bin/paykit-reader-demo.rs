@@ -252,11 +252,13 @@ async fn execute(
     let sdk_config = PaykitSdkConfig::new(config.local_receiver_path.clone());
     let session = within_receive_deadline(
         receive_deadline,
-        PubkySessionBootstrap::with_pubky(pubky.clone()).sign_in(
-            &PubkyLocalSecretKey::new(*reader_secret),
-            ReceiverNoiseSecretKey::new(*receiver_noise_secret),
-            &sdk_config.required_session_capabilities(),
-        ),
+        PubkySessionBootstrap::with_pubky(pubky.clone(), "paykit.test")
+            .unwrap()
+            .sign_in(
+                &PubkyLocalSecretKey::new(*reader_secret),
+                ReceiverNoiseSecretKey::new(*receiver_noise_secret),
+                &sdk_config.required_session_capabilities(),
+            ),
     )
     .await?
     .map_err(|_| Failure::ProtocolFailed)?;
