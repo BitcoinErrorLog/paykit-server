@@ -1,15 +1,22 @@
 use std::{
     any::Any,
-    net::{IpAddr, Ipv4Addr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
 };
 
 use async_trait::async_trait;
+use axum::{
+    body::{Body, to_bytes},
+    extract::ConnectInfo,
+    http::{Method, Request, StatusCode},
+};
+use paykit_server::http::setup::setup_router;
 use paykit_server::setup::{
     CancellationStore, Completion, ManualClock, PostgresCancellationStore, SetupAttempt,
     SetupCompleter, SetupLimits, SetupService, StartedSetup,
 };
 use paykit_server_e2e::postgres::TestDatabase;
+use tower::ServiceExt;
 
 const CREATOR: &str = "tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 
@@ -60,6 +67,26 @@ fn peer() -> IpAddr {
     IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
+async fn cancel_http(
+    router: axum::Router,
+    flow_id: &str,
+) -> (StatusCode, String, axum::http::HeaderMap) {
+    let mut request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/setup/{flow_id}/cancel"))
+        .body(Body::empty())
+        .unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(peer(), 12345)));
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body =
+        String::from_utf8(to_bytes(response.into_body(), 4096).await.unwrap().to_vec()).unwrap();
+    (status, body, headers)
+}
+
 #[tokio::test]
 async fn postgres_cancellation_is_durable_idempotent_and_preserves_completed_flow() {
     let database = TestDatabase::create().await;
@@ -101,6 +128,58 @@ async fn postgres_cancellation_is_durable_idempotent_and_preserves_completed_flo
     assert_eq!(
         setup.cancel(peer(), &completed.flow_id).await,
         paykit_server::setup::CancelResult::Complete
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn cancel_http_route_persists_tombstone_and_maps_closed_outcomes() {
+    let database = TestDatabase::create().await;
+    paykit_server::persistence::run_migrations(database.pool())
+        .await
+        .unwrap();
+    let store: Arc<dyn CancellationStore> =
+        Arc::new(PostgresCancellationStore::new(database.pool().clone()));
+    let setup = service(store);
+    let pending = setup
+        .begin(peer(), "https://app.example", "pending-http", CREATOR)
+        .await
+        .unwrap();
+    let (status, body, headers) = cancel_http(setup_router(setup.clone()), &pending.flow_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, r#"{"status":"cancelled"}"#);
+    assert_eq!(headers["cache-control"], "no-store");
+    let stored: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM setup_flow_cancellations WHERE flow_id = $1")
+            .bind(&pending.flow_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored, 1);
+    assert_eq!(
+        cancel_http(setup_router(setup.clone()), &pending.flow_id)
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        cancel_http(setup_router(setup.clone()), "wrong-capability")
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+
+    let completed = setup
+        .begin(peer(), "https://app.example", "completed-http", CREATOR)
+        .await
+        .unwrap();
+    assert_eq!(
+        setup.trigger_completion(&completed.flow_id).await,
+        paykit_server::setup::PollResult::Complete
+    );
+    assert_eq!(
+        cancel_http(setup_router(setup), &completed.flow_id).await.0,
+        StatusCode::CONFLICT
     );
     database.cleanup().await;
 }
