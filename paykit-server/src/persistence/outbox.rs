@@ -10,7 +10,7 @@ use paykit_lib::{
     parse_payment_request_event_message, parse_private_payment_list_json,
 };
 use paykit_sdk::{
-    PubkyPublicKey,
+    OutboundPrivateMessageStatus, PubkyPublicKey,
     storage::{OutboundPrivateMessageRecord, StorageState},
 };
 use sqlx::PgPool;
@@ -80,6 +80,19 @@ pub enum HandoffResult {
         event_id: String,
         payment_request_id: String,
     },
+}
+
+/// Static, identifier-free evidence classification for an immutable legacy
+/// `sdk_invoked_unattributed` terminal event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnattributedInspection {
+    NotFound,
+    UniquePending,
+    UniqueSent,
+    UniqueTerminal,
+    Ambiguous,
+    AlreadyOwned,
+    Indeterminate,
 }
 
 impl std::fmt::Debug for HandoffResult {
@@ -1421,6 +1434,89 @@ impl OutboxStore {
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         DeliveryIntentV1::decode(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)
+    }
+
+    /// Reads immutable terminal evidence only. This path never claims,
+    /// acknowledges, requeues, repairs, or invokes the SDK.
+    pub async fn inspect_unattributed(
+        &self,
+        event_id: Uuid,
+    ) -> Result<UnattributedInspection, PersistenceError> {
+        let row: Option<(Uuid, Uuid, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT o.id, o.creator_id, c.creator_lookup_hash, o.intent_envelope, s.state_envelope \
+             FROM outbox_terminal_events e \
+             JOIN outbox o ON o.id = e.outbox_id \
+             JOIN creators c ON c.id = o.creator_id \
+             JOIN sdk_states s ON s.creator_id = o.creator_id \
+             WHERE e.id = $1 AND e.acknowledged_at IS NULL \
+               AND e.event_class = 'handoff_unresolved' \
+               AND e.reason = 'sdk_invoked_unattributed'",
+        )
+        .bind(event_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let Some((outbox_id, creator_id, lookup_hash, intent_envelope, state_envelope)) = row
+        else {
+            return Ok(UnattributedInspection::NotFound);
+        };
+        let hash = lookup_hash_from_storage(&lookup_hash)?;
+        let intent_plaintext = self
+            .crypto
+            .decrypt(
+                &EnvelopeContext::outbox_semantic_intent(hash, outbox_id),
+                &EncryptedEnvelope::from_bytes(intent_envelope),
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let intent = DeliveryIntentV1::decode(&intent_plaintext)
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let state = crate::persistence::sdk_state::decrypt_state(
+            &self.crypto,
+            hash,
+            creator_id,
+            &state_envelope,
+        )
+        .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let mut exact = Vec::new();
+        for record in &state.outbound_private_messages {
+            match exact_handoff_result(&intent, record) {
+                Ok(Some(_)) => exact.push(record),
+                Ok(None) => {}
+                Err(()) => return Ok(UnattributedInspection::Indeterminate),
+            }
+        }
+        match exact.len() {
+            0 => Ok(UnattributedInspection::NotFound),
+            2.. => Ok(UnattributedInspection::Ambiguous),
+            1 => {
+                let record = exact[0];
+                let owned: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM outbox WHERE creator_id = $1 \
+                     AND sdk_outbound_message_id = $2 AND id <> $3)",
+                )
+                .bind(creator_id)
+                .bind(record.outbound_message_id.to_string())
+                .bind(outbox_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                if owned {
+                    return Ok(UnattributedInspection::AlreadyOwned);
+                }
+                Ok(match record.status {
+                    OutboundPrivateMessageStatus::Sent => UnattributedInspection::UniqueSent,
+                    OutboundPrivateMessageStatus::Invalid
+                    | OutboundPrivateMessageStatus::RecoveryRequired
+                    | OutboundPrivateMessageStatus::Superseded => {
+                        UnattributedInspection::UniqueTerminal
+                    }
+                    OutboundPrivateMessageStatus::Pending
+                    | OutboundPrivateMessageStatus::Sending
+                    | OutboundPrivateMessageStatus::Failed => UnattributedInspection::UniquePending,
+                    _ => UnattributedInspection::Indeterminate,
+                })
+            }
+        }
     }
 
     /// Atomically associates the exact public-SDK result while the handoff
