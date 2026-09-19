@@ -37,8 +37,16 @@ deployment secret/config store and must not be committed:
 ```text
 PAYKIT_CONFIG
 PAYKIT_DATABASE_URL
+PAYKIT_MIGRATOR_DATABASE_URL
 PAYKIT_MASTER_KEY
 ```
+
+`PAYKIT_DATABASE_URL` must authenticate as the restricted, non-owner `paykit`
+runtime principal. `PAYKIT_MIGRATOR_DATABASE_URL` must authenticate as the
+dedicated migration owner. The deployment provisioner is responsible for both
+principals, the existing baseline runtime table/sequence grants, and supplying
+both URLs to every replica. Missing or malformed URLs fail configuration before
+any database connection or HTTP bind.
 
 The rendered TOML must set `bitcoin.creation_enabled = false` for the first
 boot. Omit the field only when the fail-closed default is intended; omitted
@@ -51,12 +59,14 @@ field to `true` explicitly. Do not add a second creation switch.
    dedicated PostgreSQL database.
 2. Confirm PostgreSQL PITR is enabled and a restore has been exercised before
    any creation-enabled cutover.
-3. Apply the image's release-pinned migrations with the dedicated migration
-   owner. The runtime `PAYKIT_DATABASE_URL` role must remain non-owner and
-   unable to execute migration DDL.
-4. Start the binary with the rendered config. Startup verifies the exact
-   owner-applied migration set read-only, validates deployment invariants,
-   authenticates persisted state, and only then binds HTTP.
+3. Start the binary with the rendered config. Startup connects through
+   `PAYKIT_MIGRATOR_DATABASE_URL`, applies the image's release-pinned
+   migrations under the migration advisory lock, and closes that privileged
+   pool. A migration connection or application failure aborts startup.
+4. Startup then connects through the restricted `PAYKIT_DATABASE_URL`, verifies
+   the exact migration set read-only, validates deployment invariants,
+   authenticates persisted state, and only then binds HTTP. Only this runtime
+   pool is passed to the server and workers.
 5. Verify `GET /health/live` and `GET /health/ready`. Record the exact image
    digest, `SOURCE_SHA`, and `stack_id` from the deployment and startup
    evidence.

@@ -54,6 +54,7 @@ poll_interval = "1s"
         &source,
         ConfigEnvironment {
             database_url: Some("postgres://127.0.0.1:1/paykit".into()),
+            migrator_database_url: Some("postgres://127.0.0.1:1/paykit".into()),
             master_key: Some(CONFIG_MASTER_KEY.into()),
         },
     )

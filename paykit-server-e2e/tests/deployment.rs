@@ -1,16 +1,28 @@
 use std::time::Duration;
 
 use paykit_server::{
+    Server,
     config::{Config, ConfigEnvironment, StackRole},
-    persistence::{DeploymentStore, PersistenceError},
+    persistence::{DeploymentStore, PersistenceError, run_migrations},
     startup::{StartupError, initialize_database},
 };
 use paykit_server_e2e::postgres::TestDatabase;
+use sqlx::postgres::PgPoolOptions;
+use url::Url;
 
 const KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 
 fn config(database_url: &str, network: &str, stack_role: &str) -> Config {
+    config_with_principals(database_url, database_url, network, stack_role)
+}
+
+fn config_with_principals(
+    runtime_database_url: &str,
+    migrator_database_url: &str,
+    network: &str,
+    stack_role: &str,
+) -> Config {
     Config::from_toml_and_environment(
         &format!(
             r#"
@@ -34,11 +46,20 @@ poll_interval = "5s"
 "#
         ),
         ConfigEnvironment {
-            database_url: Some(database_url.to_owned()),
+            database_url: Some(runtime_database_url.to_owned()),
+            migrator_database_url: Some(migrator_database_url.to_owned()),
             master_key: Some(MASTER_KEY.to_owned()),
         },
     )
     .expect("valid config fixture")
+}
+
+fn database_url_for_role(database_url: &str, role: &str) -> String {
+    let mut url = Url::parse(database_url).expect("isolated database URL parses");
+    url.set_username(role).expect("generated role is URL-safe");
+    url.set_password(None)
+        .expect("PostgreSQL URL accepts no password");
+    url.to_string()
 }
 
 #[tokio::test]
@@ -315,4 +336,158 @@ async fn two_databases_migrated_from_the_same_binary_get_different_stack_ids() {
 
     first_database.cleanup().await;
     second_database.cleanup().await;
+}
+
+#[tokio::test]
+async fn startup_applies_as_migrator_then_boots_with_a_restricted_runtime_principal() {
+    let admin_url =
+        std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL names the test server");
+    let admin_pool = PgPoolOptions::new().connect(&admin_url).await.unwrap();
+    let database = TestDatabase::create().await;
+    let migrator_role = format!("paykit_migrator_{}", uuid::Uuid::new_v4().simple());
+    let runtime_role = format!("paykit_runtime_{}", uuid::Uuid::new_v4().simple());
+
+    sqlx::query(&format!(
+        "CREATE ROLE {migrator_role} LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE \
+         NOREPLICATION NOBYPASSRLS"
+    ))
+    .execute(&admin_pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "CREATE ROLE {runtime_role} LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE \
+         NOREPLICATION NOBYPASSRLS"
+    ))
+    .execute(&admin_pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!("GRANT paykit TO {runtime_role}"))
+        .execute(&admin_pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "GRANT CONNECT, TEMPORARY, CREATE ON DATABASE {} TO {migrator_role}",
+        database.database_name()
+    ))
+    .execute(&admin_pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "GRANT USAGE, CREATE ON SCHEMA public TO {migrator_role}"
+    ))
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let migrator_url = database_url_for_role(database.database_url(), &migrator_role);
+    let runtime_url = database_url_for_role(database.database_url(), &runtime_role);
+    let configured = config_with_principals(&runtime_url, &migrator_url, "testnet", "proof");
+
+    // Exercise the real startup path against the fresh database. All embedded
+    // migrations run as the owner before runtime verification; startup then
+    // fails closed because the provisioner has not installed the baseline
+    // runtime table grants yet.
+    let error = initialize_database(&configured).await.unwrap_err();
+    assert_eq!(error, StartupError::Deployment);
+
+    let migrator_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&migrator_url)
+        .await
+        .unwrap();
+    let applied: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&migrator_pool)
+            .await
+            .unwrap();
+    assert_eq!(applied, (1..=24).collect::<Vec<_>>());
+    let owned_objects: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner \
+         WHERE c.relnamespace = 'public'::regnamespace AND r.rolname = current_user",
+    )
+    .fetch_one(&migrator_pool)
+    .await
+    .unwrap();
+    assert!(
+        owned_objects > 0,
+        "the migrator must own the schema objects it creates"
+    );
+
+    // The deployment provisioner owns baseline runtime grants. Migration 0024
+    // adds only its new-column and sidecar grants to the stable paykit role.
+    sqlx::query(&format!(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE \
+         deployment_metadata, creators, sdk_states, reader_assignments, invoices, outbox, \
+         bitcoin_observations, invoice_baseline_outpoints, bitcoin_observation_candidates, \
+         stack_identity, claimed_key_fingerprints, sentinel_outpoints, sentinel_events, \
+         outbox_terminal_events TO {runtime_role}"
+    ))
+    .execute(&migrator_pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
+        "GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO {runtime_role}"
+    ))
+    .execute(&migrator_pool)
+    .await
+    .unwrap();
+    migrator_pool.close().await;
+
+    let initialized = initialize_database(&configured).await.unwrap();
+    let current_user: String = sqlx::query_scalar("SELECT current_user")
+        .fetch_one(&initialized.pool)
+        .await
+        .unwrap();
+    assert_eq!(current_user, runtime_role);
+
+    let runtime_owns_objects: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner \
+         WHERE c.relnamespace = 'public'::regnamespace AND r.rolname = current_user)",
+    )
+    .fetch_one(&initialized.pool)
+    .await
+    .unwrap();
+    assert!(
+        !runtime_owns_objects,
+        "runtime principal unexpectedly owns a schema object"
+    );
+    assert!(
+        sqlx::query("CREATE TABLE runtime_must_not_own_schema (id INTEGER)")
+            .execute(&initialized.pool)
+            .await
+            .is_err(),
+        "runtime principal unexpectedly executed DDL"
+    );
+    assert!(
+        run_migrations(&initialized.pool).await.is_err(),
+        "runtime principal unexpectedly executed the migration runner"
+    );
+    assert!(
+        sqlx::query("UPDATE _sqlx_migrations SET success = FALSE WHERE version = 24")
+            .execute(&initialized.pool)
+            .await
+            .is_err(),
+        "runtime principal unexpectedly wrote the migration ledger"
+    );
+
+    let server = Server::build(
+        configured,
+        initialized.pool.clone(),
+        initialized.stack_identity,
+    )
+    .await
+    .unwrap();
+    drop(server);
+    initialized.pool.close().await;
+    database.cleanup().await;
+
+    sqlx::query(&format!("DROP ROLE {runtime_role}"))
+        .execute(&admin_pool)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP ROLE {migrator_role}"))
+        .execute(&admin_pool)
+        .await
+        .unwrap();
+    admin_pool.close().await;
 }

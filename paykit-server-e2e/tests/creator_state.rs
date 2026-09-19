@@ -56,6 +56,7 @@ poll_interval = "5s"
         ),
         ConfigEnvironment {
             database_url: Some(database_url.to_owned()),
+            migrator_database_url: Some(database_url.to_owned()),
             master_key: Some(master_key.to_owned()),
         },
     )

@@ -71,6 +71,7 @@ fn load_config(path: &str) -> anyhow::Result<Config> {
         &source,
         ConfigEnvironment {
             database_url: env::var("PAYKIT_DATABASE_URL").ok(),
+            migrator_database_url: env::var("PAYKIT_MIGRATOR_DATABASE_URL").ok(),
             master_key: env::var("PAYKIT_MASTER_KEY").ok(),
         },
     )?)

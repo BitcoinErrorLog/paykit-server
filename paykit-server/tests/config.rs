@@ -13,6 +13,7 @@ const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 fn environment() -> ConfigEnvironment {
     ConfigEnvironment {
         database_url: Some("postgres://paykit:secret@localhost/paykit".to_owned()),
+        migrator_database_url: Some("postgres://owner:secret@localhost/paykit".to_owned()),
         master_key: Some(MASTER_KEY.to_owned()),
     }
 }
@@ -181,7 +182,7 @@ fn rejects_removed_inbox_section() {
 }
 
 #[test]
-fn requires_environment_only_database_url_and_master_key() {
+fn requires_environment_only_database_urls_and_master_key() {
     let missing_database_url = ConfigEnvironment {
         database_url: None,
         ..environment()
@@ -190,8 +191,15 @@ fn requires_environment_only_database_url_and_master_key() {
         master_key: None,
         ..environment()
     };
+    let missing_migrator_database_url = ConfigEnvironment {
+        migrator_database_url: None,
+        ..environment()
+    };
 
     assert!(Config::from_toml_and_environment(&valid_toml(), missing_database_url).is_err());
+    assert!(
+        Config::from_toml_and_environment(&valid_toml(), missing_migrator_database_url).is_err()
+    );
     assert!(Config::from_toml_and_environment(&valid_toml(), missing_master_key).is_err());
 
     let toml_secret = format!(
@@ -209,6 +217,12 @@ fn rejects_non_postgresql_database_url() {
     };
 
     assert!(Config::from_toml_and_environment(&valid_toml(), non_postgresql).is_err());
+
+    let non_postgresql_migrator = ConfigEnvironment {
+        migrator_database_url: Some("https://database.example/paykit".to_owned()),
+        ..environment()
+    };
+    assert!(Config::from_toml_and_environment(&valid_toml(), non_postgresql_migrator).is_err());
 }
 
 #[test]

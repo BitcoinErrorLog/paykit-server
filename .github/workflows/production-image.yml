@@ -49,6 +49,7 @@ jobs:
           grep -q 'SOURCE_SHA' paykit-server/build.rs
           grep -q 'bitcoin.creation_enabled = false' docs/production-rehearsal.md
           grep -q 'ssl://bitkit.to:9999' docs/production-rehearsal.md
+          grep -q 'PAYKIT_MIGRATOR_DATABASE_URL' docs/production-rehearsal.md
           grep -q 'packages: write' .github/workflows/production-image.yml
           if grep -nE ':[[:space:]]*latest([[:space:]]|$)' .github/workflows/production-image.yml; then
             echo "workflow contains a mutable image tag" >&2

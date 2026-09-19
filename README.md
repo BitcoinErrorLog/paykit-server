@@ -111,7 +111,13 @@ Different Creators may use the same numeric child index because their xpubs and 
 
 PostgreSQL is the only production persistence backend. SQLite and in-memory adapters are test support only.
 
-Startup holds a session advisory lock while applying the single schema baseline. Before binding HTTP it verifies immutable deployment metadata and authenticates every persisted Creator credential, SDK-state envelope, invoice payment record, and Bitcoin observation. Missing, corrupt, swapped, conflicting, or wrong-key state aborts startup with a secret-free error.
+Startup applies embedded migrations through a dedicated owner connection under
+a session advisory lock, closes that privileged pool, then opens the restricted
+runtime pool and verifies the exact migration ledger. Before binding HTTP it
+verifies immutable deployment metadata and authenticates every persisted
+Creator credential, SDK-state envelope, invoice payment record, and Bitcoin
+observation. Missing, corrupt, swapped, conflicting, or wrong-key state aborts
+startup with a secret-free error.
 
 Immutable deployment values are:
 
@@ -136,7 +142,8 @@ Copy [`config/paykit-server.example.toml`](config/paykit-server.example.toml) to
 Required environment variables:
 
 - `PAYKIT_CONFIG` — path to the TOML file;
-- `PAYKIT_DATABASE_URL` — PostgreSQL connection URL;
+- `PAYKIT_DATABASE_URL` — restricted non-owner runtime PostgreSQL URL;
+- `PAYKIT_MIGRATOR_DATABASE_URL` — dedicated migration-owner PostgreSQL URL;
 - `PAYKIT_MASTER_KEY` — unpadded base64url encoding of exactly 32 bytes.
 
 Do not put database credentials or the master key in TOML, logs, shell history, or source control. Effective-config debug output redacts secret values.

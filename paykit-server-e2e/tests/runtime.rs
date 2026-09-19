@@ -67,6 +67,7 @@ drain_timeout = "{drain_timeout}"
         &source,
         ConfigEnvironment {
             database_url: Some(database_url.to_owned()),
+            migrator_database_url: Some(database_url.to_owned()),
             master_key: Some(MASTER_KEY.to_owned()),
         },
     )

@@ -29,7 +29,10 @@ Final pinned Debian image:
 - adds CA certificates and three application binaries to pinned runtime base;
 - contains no source tree, Cargo cache, runnable config, DB credentials, or application secrets.
 
-Supply `PAYKIT_CONFIG`, `PAYKIT_DATABASE_URL`, and `PAYKIT_MASTER_KEY` at runtime. Mount generated ignored local config. Sibling Compose definition owns mounts, env values, infrastructure image pins, and helper command overrides.
+Supply `PAYKIT_CONFIG`, restricted-runtime `PAYKIT_DATABASE_URL`,
+migration-owner `PAYKIT_MIGRATOR_DATABASE_URL`, and `PAYKIT_MASTER_KEY` at
+runtime. Mount generated ignored local config. Sibling Compose definition owns
+mounts, env values, infrastructure image pins, and helper command overrides.
 
 ## Generated local config contract
 
@@ -64,4 +67,9 @@ poll_interval = "1s"
 poll_interval = "500ms"
 ```
 
-File contains no DB URL or master key. Compose supplies those only through `PAYKIT_DATABASE_URL` and `PAYKIT_MASTER_KEY`, then points `PAYKIT_CONFIG` at mounted generated file. Parser rejects unknown top-level keys, unknown section keys, non-canonical trusted keys, and secrets placed in TOML. Production schema and defaults remain unchanged.
+File contains no DB URL or master key. Compose supplies those only through
+`PAYKIT_DATABASE_URL`, `PAYKIT_MIGRATOR_DATABASE_URL`, and
+`PAYKIT_MASTER_KEY`, then points `PAYKIT_CONFIG` at mounted generated file.
+Parser rejects unknown top-level keys, unknown section keys, non-canonical
+trusted keys, and secrets placed in TOML. Production schema and defaults remain
+unchanged.

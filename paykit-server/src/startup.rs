@@ -9,7 +9,8 @@ use crate::{
     config::Config,
     crypto::Crypto,
     persistence::{
-        CreatorStore, DeploymentStore, InvoiceStore, StackIdentity, verify_migrations_applied,
+        CreatorStore, DeploymentStore, InvoiceStore, StackIdentity, run_migrations,
+        verify_migrations_applied,
     },
 };
 
@@ -52,11 +53,21 @@ impl std::fmt::Debug for InitializedDatabase {
     }
 }
 
-/// Connects, verifies owner-applied migrations, validates deployment
-/// invariants, mints or reads the stack identity, and authenticates every
-/// persisted Creator credential and SDK state before returning a ready
-/// database.
+/// Connects as the dedicated migration owner, applies all embedded migrations,
+/// closes that privileged pool, then connects as the restricted runtime role
+/// and verifies the exact migration set before any application initialization.
+///
+/// Only the restricted runtime pool is returned to the server and its workers.
 pub async fn initialize_database(config: &Config) -> Result<InitializedDatabase, StartupError> {
+    let migrator_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(config.migrator_database_url())
+        .await
+        .map_err(|_| StartupError::Connection)?;
+    let migration_result = run_migrations(&migrator_pool).await;
+    migrator_pool.close().await;
+    migration_result.map_err(|_| StartupError::Migration)?;
+
     let pool = PgPoolOptions::new()
         .connect(config.database_url())
         .await

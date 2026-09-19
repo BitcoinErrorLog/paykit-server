@@ -42,6 +42,7 @@ pub struct Config {
     pub rate_limits: RateLimitsConfig,
     pub shutdown: ShutdownConfig,
     database_url: DatabaseUrl,
+    migrator_database_url: MigratorDatabaseUrl,
     master_key: MasterKey,
     deployment_invariants: DeploymentInvariants,
 }
@@ -53,6 +54,7 @@ impl Config {
     ) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(toml_source).map_err(ConfigError::Toml)?;
         let database_url = DatabaseUrl::parse(environment.database_url)?;
+        let migrator_database_url = MigratorDatabaseUrl::parse(environment.migrator_database_url)?;
         let master_key = MasterKey::parse(environment.master_key)?;
         let trusted_public_key = TrustedLocksPublicKey::parse(raw.locks.trusted_public_key)?;
         let trusted_locks_key_fingerprint = trusted_public_key.fingerprint();
@@ -129,6 +131,7 @@ impl Config {
             rate_limits: RateLimitsConfig::from(raw.rate_limits),
             shutdown: ShutdownConfig::from(raw.shutdown),
             database_url,
+            migrator_database_url,
             master_key,
             deployment_invariants: DeploymentInvariants {
                 bitcoin_network,
@@ -147,6 +150,10 @@ impl Config {
 
     pub fn database_url(&self) -> &str {
         self.database_url.as_str()
+    }
+
+    pub fn migrator_database_url(&self) -> &str {
+        self.migrator_database_url.as_str()
     }
 
     pub fn deployment_invariants(&self) -> &DeploymentInvariants {
@@ -407,6 +414,7 @@ impl Config {
 #[derive(Debug, Default)]
 pub struct ConfigEnvironment {
     pub database_url: Option<String>,
+    pub migrator_database_url: Option<String>,
     pub master_key: Option<String>,
 }
 
@@ -905,16 +913,43 @@ impl fmt::Debug for DatabaseUrl {
     }
 }
 
+struct MigratorDatabaseUrl(String);
+
+impl MigratorDatabaseUrl {
+    fn parse(value: Option<String>) -> Result<Self, ConfigError> {
+        let value = value.ok_or(ConfigError::MissingMigratorDatabaseUrl)?;
+        let parsed = validate_url("PAYKIT_MIGRATOR_DATABASE_URL", &value)?;
+        if !matches!(parsed.scheme(), "postgres" | "postgresql") {
+            return Err(ConfigError::InvalidMigratorDatabaseUrlScheme);
+        }
+        Ok(Self(value))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for MigratorDatabaseUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("configuration TOML is invalid: {0}")]
     Toml(toml::de::Error),
     #[error("PAYKIT_DATABASE_URL is required")]
     MissingDatabaseUrl,
+    #[error("PAYKIT_MIGRATOR_DATABASE_URL is required")]
+    MissingMigratorDatabaseUrl,
     #[error("PAYKIT_MASTER_KEY is required")]
     MissingMasterKey,
     #[error("PAYKIT_DATABASE_URL must use postgres:// or postgresql://")]
     InvalidDatabaseUrlScheme,
+    #[error("PAYKIT_MIGRATOR_DATABASE_URL must use postgres:// or postgresql://")]
+    InvalidMigratorDatabaseUrlScheme,
     #[error("PAYKIT_MASTER_KEY must be unpadded base64url encoding of exactly 32 bytes")]
     InvalidMasterKey,
     #[error("locks.trusted_public_key must be a canonical pubky-prefixed public key")]

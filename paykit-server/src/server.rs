@@ -61,7 +61,7 @@ pub enum ServerBuildError {
 
 /// Concrete process-owned server components.
 pub struct Server {
-    config: Config,
+    drain_timeout: Duration,
     router: Router,
     runtime: Arc<Runtime>,
     workers: WorkerComponents,
@@ -406,9 +406,10 @@ impl Server {
             },
             sentinel_policy: config.sentinel.policy(),
         };
+        let drain_timeout = config.shutdown.drain_timeout;
 
         Ok(Self {
-            config,
+            drain_timeout,
             router,
             runtime,
             workers,
@@ -449,7 +450,7 @@ impl Server {
     where
         F: Future<Output = ()> + Send,
     {
-        let drain_timeout = self.config.shutdown.drain_timeout;
+        let drain_timeout = self.drain_timeout;
         let mut tasks = spawn_owned_workers(self.workers, self.runtime.clone());
         let serving = crate::runtime::serve(listener, self.router, self.runtime.clone());
         tokio::pin!(serving);
@@ -1038,6 +1039,7 @@ poll_interval = "1s"
             ),
             ConfigEnvironment {
                 database_url: Some("postgres://127.0.0.1:1/paykit".into()),
+                migrator_database_url: Some("postgres://127.0.0.1:1/paykit".into()),
                 master_key: Some(CONFIG_MASTER_KEY.into()),
             },
         )
@@ -1108,6 +1110,7 @@ poll_interval = "1s"
             ),
             ConfigEnvironment {
                 database_url: Some("postgres://127.0.0.1:1/paykit".into()),
+                migrator_database_url: Some("postgres://127.0.0.1:1/paykit".into()),
                 master_key: Some(CONFIG_MASTER_KEY.into()),
             },
         )

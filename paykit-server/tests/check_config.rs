@@ -50,6 +50,10 @@ fn run(source: &str) -> std::process::Output {
             "PAYKIT_DATABASE_URL",
             "postgres://paykit:secret@localhost/paykit",
         )
+        .env(
+            "PAYKIT_MIGRATOR_DATABASE_URL",
+            "postgres://owner:secret@localhost/paykit",
+        )
         .env("PAYKIT_MASTER_KEY", MASTER_KEY)
         .output()
         .unwrap();

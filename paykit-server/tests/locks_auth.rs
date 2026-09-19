@@ -85,6 +85,7 @@ signed_burst = {burst}
         ),
         ConfigEnvironment {
             database_url: Some("postgres://paykit:secret@localhost/paykit".to_owned()),
+            migrator_database_url: Some("postgres://owner:secret@localhost/paykit".to_owned()),
             master_key: Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE".to_owned()),
         },
     )
