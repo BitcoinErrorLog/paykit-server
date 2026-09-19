@@ -24,7 +24,7 @@ use crate::{
     },
     real_setup::RealSetupCompleter,
     runtime::{OutboxTerminalHealth, PostgresDependency, Runtime, operational_router},
-    setup::{SetupLimits, SetupService, SystemClock},
+    setup::{PostgresCancellationStore, SetupLimits, SetupService, SystemClock},
     setup_orchestration::PubkyCompanionRelay,
     workers::{
         observer::{
@@ -167,7 +167,7 @@ impl Server {
             config.deployment_invariants().stack_role,
             config.paykit.receiver_path.clone(),
         ));
-        let setup = SetupService::new(
+        let setup = SetupService::with_cancellation_store(
             config.setup.allowed_origins.clone(),
             setup_completer,
             Arc::new(SystemClock::default()),
@@ -187,6 +187,7 @@ impl Server {
                 )
                 .expect("validated pending setup limit fits usize"),
             },
+            Arc::new(PostgresCancellationStore::new(pool.clone())),
         );
 
         let electrum_request_limiter = RequestLimiter::new(
