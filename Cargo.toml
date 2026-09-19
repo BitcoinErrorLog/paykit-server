@@ -23,11 +23,11 @@ ed25519-dalek = "2"
 hkdf = "0.12"
 hmac = "0.12"
 humantime-serde = "1"
-locks-core = { git = "https://github.com/pubky/locks.git", rev = "df5ea1b6d8dcdec3a9b5a915c3f57bca69d75c8a" }
-paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", rev = "52a852995bfc457b78d32f5a45f6741766a89bba" }
-paykit-sdk = { git = "https://github.com/pubky/paykit-rs.git", rev = "52a852995bfc457b78d32f5a45f6741766a89bba" }
-pubky = "=0.8.0"
-pubky-testnet = "=0.8.0"
+locks-core = { git = "https://github.com/pubky/locks.git", rev = "8502ef79c443c640976a2a901b80c5e717319149" }
+paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", rev = "4613beee25d1680ed8bc849446498e9bfb2cdb16" }
+paykit-sdk = { git = "https://github.com/pubky/paykit-rs.git", rev = "4613beee25d1680ed8bc849446498e9bfb2cdb16" }
+pubky = "=0.11.0"
+pubky-testnet = "=0.11.0"
 prometheus-client = "0.25"
 postcard = { version = "1.1", features = ["use-std"] }
 serde = { version = "1", features = ["derive"] }

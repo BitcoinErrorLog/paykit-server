@@ -6,7 +6,9 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bitcoin::bip32::Xpub;
-use paykit_sdk::{PubkyAuthCompanionClaim, PubkyLocalSecretKey, PubkySessionBootstrap};
+use paykit_sdk::{
+    PubkyAuthCompanionClaim, PubkyLocalSecretKey, PubkySessionBootstrap, parse_pubky_auth_url,
+};
 use paykit_server::{
     bitkit_claim::{CLAIM_TYPE, LOCAL_DEMO_CAPABILITIES, QUERY_PARAMETER, encode_unsigned_payload},
     config::{BitcoinNetwork, StackRole},
@@ -85,7 +87,10 @@ async fn run() -> Result<(), Failure> {
     let payload = encode_unsigned_payload(input.account_index, &xpub.encode());
     let claim = PubkyAuthCompanionClaim::new(QUERY_PARAMETER, CLAIM_TYPE, payload.to_vec())
         .map_err(|_| Failure::Authentication)?;
-    let bootstrap = PubkySessionBootstrap::new().map_err(|_| Failure::Authentication)?;
+    let auth_details =
+        parse_pubky_auth_url(&input.auth_url).map_err(|_| Failure::Authentication)?;
+    let bootstrap =
+        PubkySessionBootstrap::new(&auth_details.client_id).map_err(|_| Failure::Authentication)?;
     bootstrap
         .approve_auth_with_companion_claim(
             &input.auth_url,

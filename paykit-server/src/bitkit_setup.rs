@@ -59,11 +59,6 @@ impl BitkitAuthStarter {
             .map_err(|_| ClaimError::InvalidAuthRequest)?;
         let authorization_url =
             append_bitkit_claim(request.authorization_url(), &self.capabilities)?;
-        let request = self
-            .bootstrap
-            .resume_auth(&authorization_url, &self.capabilities)
-            .await
-            .map_err(|_| ClaimError::InvalidAuthRequest)?;
         let companion = parse_auth_request(&authorization_url, &self.capabilities)?;
         Ok(StartedBitkitAuth {
             authorization_url,
@@ -94,11 +89,77 @@ mod tests {
     use super::*;
     use crate::bitkit_claim::LOCAL_DEMO_CAPABILITIES;
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    #[tokio::test]
+    async fn rc55_builder_generates_complete_unique_bitkit_grant_and_retains_pop_state() {
+        let bootstrap = paykit_sdk::PubkySessionBootstrap::new("paykit.test")
+            .unwrap()
+            .with_auth_relay("https://relay.example/inbox")
+            .unwrap();
+        let starter = BitkitAuthStarter::new(
+            bootstrap,
+            &PaykitReceiverPath::new("bitkit/server").unwrap(),
+        );
+
+        let first = starter.start().await.unwrap();
+        let second = starter.start().await.unwrap();
+        let first_url = Url::parse(&first.authorization_url).unwrap();
+        assert_eq!(first_url.host_str(), Some("signin_grant"));
+
+        let mut values = std::collections::BTreeMap::<String, Vec<String>>::new();
+        for (key, value) in first_url.query_pairs() {
+            values
+                .entry(key.into_owned())
+                .or_default()
+                .push(value.into_owned());
+        }
+        for name in ["caps", "relay", "secret", "cid", "cpk", QUERY_PARAMETER] {
+            assert_eq!(values.get(name).map(Vec::len), Some(1), "{name}");
+        }
+        assert_eq!(values["caps"][0], LOCAL_DEMO_CAPABILITIES);
+        assert_eq!(values["relay"][0], "https://relay.example/inbox");
+        assert_eq!(values["cid"][0], "paykit.test");
+        assert_eq!(values[QUERY_PARAMETER][0], CLAIM_TYPE);
+        assert_eq!(
+            URL_SAFE_NO_PAD.decode(&values["secret"][0]).unwrap().len(),
+            32
+        );
+
+        let details = paykit_sdk::parse_pubky_auth_url(&first.authorization_url).unwrap();
+        assert_eq!(details.capabilities, LOCAL_DEMO_CAPABILITIES);
+        assert_eq!(details.client_id, "paykit.test");
+
+        // rc55 validates that the retained private PoP key corresponds to the
+        // generated cpk, even with the companion query pair preserved.
+        let state = first.auth_request.save_state().unwrap();
+        paykit_sdk::PubkyAuthRequestState::new(
+            first.authorization_url.clone(),
+            *state.client_key_secret(),
+        )
+        .unwrap();
+
+        let second_url = Url::parse(&second.authorization_url).unwrap();
+        let first_secret = values["secret"][0].as_str();
+        let second_secret = second_url
+            .query_pairs()
+            .find(|(key, _)| key == "secret")
+            .unwrap()
+            .1;
+        let first_cpk = values["cpk"][0].as_str();
+        let second_cpk = second_url
+            .query_pairs()
+            .find(|(key, _)| key == "cpk")
+            .unwrap()
+            .1;
+        assert_ne!(first_secret, second_secret);
+        assert_ne!(first_cpk, second_cpk);
+    }
+
     #[test]
     fn appends_one_exact_companion_query_pair_without_exposing_or_replacing_auth_values() {
         let secret = URL_SAFE_NO_PAD.encode([1; 32]);
         let url = format!(
-            "pubkyauth://signin?caps={LOCAL_DEMO_CAPABILITIES}&relay=https%3A%2F%2Frelay.example%2Finbox&secret={secret}"
+            "pubkyauth://signin_grant?caps={LOCAL_DEMO_CAPABILITIES}&relay=https%3A%2F%2Frelay.example%2Finbox&secret={secret}&cid=paykit.test&cpk=5jsjx1o6fzu6aeeo697r3i5rx15zq41kikcye8wtwdqm4nb4tryo"
         );
         let augmented = append_bitkit_claim(&url, LOCAL_DEMO_CAPABILITIES).unwrap();
         assert!(augmented.contains("x-bitkit-claim=watch-only-account-v1"));

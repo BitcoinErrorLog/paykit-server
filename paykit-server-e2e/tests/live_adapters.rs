@@ -169,7 +169,7 @@ async fn establish_link(
 #[ignore = "requires the Pubky Core static testnet on localhost"]
 async fn live_pubky_marker_discovery_and_payment_request_delivery() {
     let pubky = Pubky::testnet().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky);
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky, "paykit-server").unwrap();
     let homeserver = PubkyPublicKey::from_raw_or_app_key(STATIC_HOMESERVER).unwrap();
     let payee_path = PaykitReceiverPath::new("paykit/server").unwrap();
     let payer_path = PaykitReceiverPath::new("bitkit/server").unwrap();

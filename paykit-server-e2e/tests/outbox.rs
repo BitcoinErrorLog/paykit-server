@@ -120,7 +120,7 @@ async fn paykit_fixture(
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone());
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "paykit-server").unwrap();
 
     let creator_receiver_path = PaykitReceiverPath::new("bitkit/server").unwrap();
     let creator_keypair = Keypair::random();
@@ -139,7 +139,11 @@ async fn paykit_fixture(
         .create(
             &CreatorCredentials::new(
                 creator.clone(),
-                creator_bootstrap.access.session.export_secret(),
+                creator_bootstrap
+                    .export_session_secret()
+                    .await
+                    .unwrap()
+                    .into_inner(),
                 creator_bootstrap.access.receiver_noise_secret_key.clone(),
                 "unused-test-xpub".into(),
                 0,
@@ -265,15 +269,22 @@ async fn paykit_fixture(
     };
 
     let reader = parse_reader(&format!("pubky{}", peer_bootstrap.public_key)).unwrap();
+    let paykit = PaykitConfig {
+        client_id: "paykit-server".into(),
+        receiver_path: creator_receiver_path,
+        receiver_path_priority: vec![ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        network: PaykitNetwork::Testnet,
+        auth_relay: Url::parse(pubky::DEFAULT_HTTP_RELAY_INBOX).unwrap(),
+    };
     let adapter = paykit_server::paykit::PaykitAdapter::new(
         creator_storage.clone(),
-        CreatorSessionProvider::with_pubky(CreatorStore::new(pool, crypto), creator.clone(), pubky),
-        &PaykitConfig {
-            receiver_path: creator_receiver_path,
-            receiver_path_priority: vec![ReceiverPathPriority::parse("bitkit".into()).unwrap()],
-            network: PaykitNetwork::Testnet,
-            auth_relay: Url::parse(pubky::DEFAULT_HTTP_RELAY_INBOX).unwrap(),
-        },
+        CreatorSessionProvider::with_pubky(
+            CreatorStore::new(pool, crypto),
+            creator.clone(),
+            pubky,
+            &paykit,
+        ),
+        &paykit,
     )
     .unwrap();
     LinkedPaykitFixture {
