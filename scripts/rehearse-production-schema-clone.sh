@@ -12,6 +12,10 @@ readonly CLONE_BOOTSTRAP_USER="clone_admin"
 : "${RAILWAY_ENVIRONMENT:?RAILWAY_ENVIRONMENT is required}"
 : "${RAILWAY_DATABASE_SERVICE:?RAILWAY_DATABASE_SERVICE is required}"
 
+pg_client_bin="${PAYKIT_PG_CLIENT_BIN:-/opt/homebrew/opt/libpq/bin}"
+pg_server_bin="${PAYKIT_PG_SERVER_BIN:-/opt/homebrew/opt/postgresql@18/bin}"
+export PATH="$pg_client_bin:$pg_server_bin:$PATH"
+
 for tool in railway python3 psql pg_dump pg_dumpall pg_restore initdb pg_ctl; do
   command -v "$tool" >/dev/null || {
     printf 'required tool is unavailable: %s\n' "$tool" >&2
@@ -24,11 +28,20 @@ tunnel_pid=""
 cluster_started=false
 clone_target_dir="${CARGO_TARGET_DIR:-/Users/johncarvalho/work/.cargo-target/paykit-server}"
 
+stop_process_tree() {
+  local parent_pid=$1
+  local child_pid
+  while read -r child_pid; do
+    [[ -n "$child_pid" ]] && stop_process_tree "$child_pid"
+  done < <(pgrep -P "$parent_pid" 2>/dev/null || true)
+  kill "$parent_pid" 2>/dev/null || true
+}
+
 cleanup() {
   local exit_code=$?
   trap - EXIT INT TERM
   if [[ -n "$tunnel_pid" ]] && kill -0 "$tunnel_pid" 2>/dev/null; then
-    kill "$tunnel_pid" 2>/dev/null || true
+    stop_process_tree "$tunnel_pid"
     wait "$tunnel_pid" 2>/dev/null || true
   fi
   if [[ "$cluster_started" == true ]]; then
@@ -102,6 +115,25 @@ source_user="$(<"$scratch/source-user")"
 source_database="$(<"$scratch/source-database")"
 chmod 0600 "$scratch/source.pgpass"
 export PGPASSFILE="$scratch/source.pgpass"
+
+source_server_version_num="$(
+  psql -X -A -t -v ON_ERROR_STOP=1 \
+    --host "$source_host" --port "$source_port" --username "$source_user" \
+    --dbname "$source_database" --command "SHOW server_version_num"
+)"
+source_server_major=$((source_server_version_num / 10000))
+dump_client_major="$(pg_dump --version | awk '{split($3, version, "."); print version[1]}')"
+scratch_server_major="$(initdb --version | awk '{split($3, version, "."); print version[1]}')"
+if [[ "$dump_client_major" != "$source_server_major" ]]; then
+  printf 'pg_dump major %s does not match production PostgreSQL major %s\n' \
+    "$dump_client_major" "$source_server_major" >&2
+  exit 1
+fi
+if [[ "$scratch_server_major" != "$source_server_major" ]]; then
+  printf 'local scratch PostgreSQL major %s does not match production major %s\n' \
+    "$scratch_server_major" "$source_server_major" >&2
+  exit 1
+fi
 
 source_versions="$(
   psql -X -A -t -v ON_ERROR_STOP=1 \
