@@ -64,6 +64,136 @@ fn migration_test_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+async fn assert_paykit_role(pool: &PgPool, expected_login: bool) {
+    let attributes: (bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolinherit,
+                rolreplication, rolbypassrls
+         FROM pg_catalog.pg_roles
+         WHERE rolname = 'paykit'",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("paykit role exists");
+    assert_eq!(
+        attributes,
+        (expected_login, false, false, false, false, false, false),
+        "migration must create a fully restricted group role and must not mutate an existing role"
+    );
+}
+
+async fn assert_paykit_0024_grants(pool: &PgPool) {
+    let schema_usage: bool =
+        sqlx::query_scalar("SELECT has_schema_privilege('paykit', 'public', 'USAGE')")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(schema_usage, "paykit lacks public schema usage");
+
+    let migration_select: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege('paykit', 'public._sqlx_migrations', 'SELECT')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(
+        migration_select,
+        "paykit lacks migration-ledger read access"
+    );
+
+    for column in [
+        "handoff_invocation_token",
+        "recovery_attempts",
+        "recovery_first_at",
+        "recovery_last_at",
+    ] {
+        for privilege in ["SELECT", "UPDATE"] {
+            let granted: bool = sqlx::query_scalar(
+                "SELECT has_column_privilege('paykit', 'public.outbox', $1, $2)",
+            )
+            .bind(column)
+            .bind(privilege)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert!(granted, "paykit lacks {privilege} on outbox.{column}");
+        }
+    }
+
+    for column in ["creator_id", "sdk_outbound_message_id", "invocation_token"] {
+        for privilege in ["SELECT", "INSERT"] {
+            let granted: bool = sqlx::query_scalar(
+                "SELECT has_column_privilege(
+                     'paykit', 'public.sdk_outbound_invocations', $1, $2
+                 )",
+            )
+            .bind(column)
+            .bind(privilege)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            assert!(
+                granted,
+                "paykit lacks {privilege} on sdk_outbound_invocations.{column}"
+            );
+        }
+    }
+
+    for (object, privilege) in [
+        ("public.outbox", "INSERT"),
+        ("public.outbox", "DELETE"),
+        ("public.outbox", "TRUNCATE"),
+        ("public.sdk_outbound_invocations", "UPDATE"),
+        ("public.sdk_outbound_invocations", "DELETE"),
+        ("public.sdk_outbound_invocations", "TRUNCATE"),
+    ] {
+        let granted: bool = sqlx::query_scalar("SELECT has_table_privilege('paykit', $1, $2)")
+            .bind(object)
+            .bind(privilege)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert!(!granted, "paykit unexpectedly has {privilege} on {object}");
+    }
+
+    let trigger_execute: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege(
+             'paykit', 'public.reject_sdk_outbound_invocation_mutation()', 'EXECUTE'
+         )",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(
+        !trigger_execute,
+        "paykit can execute the immutable-sidecar trigger function"
+    );
+
+    let public_sidecar_select: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege(
+             0, 'public.sdk_outbound_invocations', 'SELECT'
+         )",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(
+        !public_sidecar_select,
+        "PUBLIC can read immutable invocation provenance"
+    );
+    let public_trigger_execute: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege(
+             0, 'public.reject_sdk_outbound_invocation_mutation()', 'EXECUTE'
+         )",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(
+        !public_trigger_execute,
+        "PUBLIC can execute the immutable-sidecar trigger function"
+    );
+}
+
 fn migration_versions(names: impl IntoIterator<Item = String>) -> Result<Vec<u64>, String> {
     let mut versions = Vec::new();
     for name in names {
@@ -149,6 +279,54 @@ fn applied_migration_files_are_immutable() {
             "applied migration file {name} changed; update it with a new migration instead"
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "drops a cluster-wide role and therefore requires an isolated PostgreSQL cluster"]
+async fn migration_0024_creates_absent_runtime_role_and_grants_restart_safely() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    migrator_through(23).run(pool).await.unwrap();
+
+    sqlx::query("DROP ROLE paykit").execute(pool).await.unwrap();
+    let role_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = 'paykit')")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(!role_exists, "calibration requires an absent paykit role");
+
+    run_migrations(pool).await.unwrap();
+    run_migrations(pool).await.unwrap();
+    assert_paykit_role(pool, false).await;
+    assert_paykit_0024_grants(pool).await;
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "alters a cluster-wide role and therefore requires an isolated PostgreSQL cluster"]
+async fn migration_0024_preserves_existing_runtime_login_and_grants_restart_safely() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    migrator_through(23).run(pool).await.unwrap();
+    sqlx::query("ALTER ROLE paykit LOGIN")
+        .execute(pool)
+        .await
+        .unwrap();
+
+    run_migrations(pool).await.unwrap();
+    run_migrations(pool).await.unwrap();
+    assert_paykit_role(pool, true).await;
+    assert_paykit_0024_grants(pool).await;
+
+    sqlx::query("ALTER ROLE paykit NOLOGIN")
+        .execute(pool)
+        .await
+        .unwrap();
+    database.cleanup().await;
 }
 
 #[tokio::test]

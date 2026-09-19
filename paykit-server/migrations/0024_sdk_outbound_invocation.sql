@@ -48,7 +48,26 @@ CREATE TRIGGER sdk_outbound_invocations_no_truncate
 BEFORE TRUNCATE ON sdk_outbound_invocations
 FOR EACH STATEMENT EXECUTE FUNCTION reject_sdk_outbound_invocation_mutation();
 
--- Deployment supplies the stable non-owner runtime role before migrations.
+-- The stable runtime group role is database-cluster scoped. Create it inside
+-- this transactional migration when absent, before any ACL statement names
+-- it. An existing role is intentionally left byte-for-byte under operator
+-- control, including its LOGIN setting and credentials.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'paykit'
+    ) THEN
+        CREATE ROLE paykit
+            NOLOGIN
+            NOSUPERUSER
+            NOCREATEDB
+            NOCREATEROLE
+            NOINHERIT
+            NOREPLICATION
+            NOBYPASSRLS;
+    END IF;
+END $$;
+
 -- The migration owner retains all DDL and trigger authority; runtime receives
 -- only the new column access and sidecar operations used by the fenced path.
 GRANT USAGE ON SCHEMA public TO paykit;

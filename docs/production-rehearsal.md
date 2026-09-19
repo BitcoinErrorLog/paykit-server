@@ -41,12 +41,21 @@ PAYKIT_MIGRATOR_DATABASE_URL
 PAYKIT_MASTER_KEY
 ```
 
-`PAYKIT_DATABASE_URL` must authenticate as the restricted, non-owner `paykit`
-runtime principal. `PAYKIT_MIGRATOR_DATABASE_URL` must authenticate as the
-dedicated migration owner. The deployment provisioner is responsible for both
-principals, the existing baseline runtime table/sequence grants, and supplying
-both URLs to every replica. Missing or malformed URLs fail configuration before
-any database connection or HTTP bind.
+The current production database is in a two-step runtime-login transition.
+For the image containing migration 0024, both `PAYKIT_DATABASE_URL` and
+`PAYKIT_MIGRATOR_DATABASE_URL` continue to authenticate as `postgres`.
+Migration 0024 idempotently creates the stable `paykit` group role as
+`NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION
+NOBYPASSRLS` when it is absent, then installs the fenced-path grants. If that
+role already exists, the migration does not alter its credentials or
+attributes.
+
+This image does **not** perform the runtime credential cutover. A later,
+separately approved operation must create a LOGIN role, grant membership in
+the `paykit` group, and change only `PAYKIT_DATABASE_URL` to that LOGIN
+principal. Do not create credentials or change either production URL during
+the 0024 migration deployment. Missing or malformed URLs still fail
+configuration before any database connection or HTTP bind.
 
 The rendered TOML must set `bitcoin.creation_enabled = false` for the first
 boot. Omit the field only when the fail-closed default is intended; omitted
@@ -63,10 +72,12 @@ field to `true` explicitly. Do not add a second creation switch.
    `PAYKIT_MIGRATOR_DATABASE_URL`, applies the image's release-pinned
    migrations under the migration advisory lock, and closes that privileged
    pool. A migration connection or application failure aborts startup.
-4. Startup then connects through the restricted `PAYKIT_DATABASE_URL`, verifies
-   the exact migration set read-only, validates deployment invariants,
-   authenticates persisted state, and only then binds HTTP. Only this runtime
-   pool is passed to the server and workers.
+4. Startup then reconnects through `PAYKIT_DATABASE_URL`, verifies the exact
+   migration set read-only, validates deployment invariants, authenticates
+   persisted state, and only then binds HTTP. Only this runtime pool is passed
+   to the server and workers. In this transitional image that URL still uses
+   `postgres`; after the separately approved LOGIN-member cutover it is the
+   restricted runtime connection.
 5. Verify `GET /health/live` and `GET /health/ready`. Record the exact image
    digest, `SOURCE_SHA`, and `stack_id` from the deployment and startup
    evidence.
@@ -76,6 +87,84 @@ field to `true` explicitly. Do not add a second creation switch.
    `void`, and `resolve` gates while creation remains disabled.
 8. After parent approval, run one exclusive seller canary. Do not add a
    second seller or enable general creation as part of this rehearsal.
+
+## Production-schema clone gate for migration 0024
+
+Before deploying the image, run the read-only pre-image proof through the
+Railway SSH database connection:
+
+```bash
+railway connect "$RAILWAY_DATABASE_SERVICE" \
+  --project "$RAILWAY_PROJECT_ID" \
+  --environment "$RAILWAY_ENVIRONMENT" --ssh
+```
+
+Then run this exact query in the opened `psql` session:
+
+```sql
+SELECT
+    array_agg(version ORDER BY version) AS versions,
+    count(*) = 23
+        AND min(version) = 1
+        AND max(version) = 23
+        AND bool_and(success) AS exact_successful_1_through_23
+FROM public._sqlx_migrations;
+```
+
+The only acceptable result is the array containing every integer from 1
+through 23 exactly once and `exact_successful_1_through_23 = t`. Any missing,
+failed, duplicate, additional, or version-24 row blocks the rehearsal and
+deployment.
+
+With `RAILWAY_PROJECT_ID`, `RAILWAY_ENVIRONMENT`, and
+`RAILWAY_DATABASE_SERVICE` set to the reviewed production targets, run:
+
+```bash
+scripts/rehearse-production-schema-clone.sh
+```
+
+The script defaults `CARGO_TARGET_DIR` to the shared low-disk build cache used
+by the release worker. Set `CARGO_TARGET_DIR` explicitly when running on
+another machine.
+
+The script opens a Railway SSH tunnel and captures any connection details in
+a mode-0600 scratch file that it never prints. It takes a roles-only dump with
+role passwords omitted, a schema-only dump, and a data-only dump restricted to
+`public._sqlx_migrations`. It rejects any schema dump containing table data,
+any data dump containing an object other than the migration ledger, and any
+source ledger other than successful versions 1–23.
+
+The dumps are restored into a fresh disposable local PostgreSQL cluster whose
+bootstrap superuser is `clone_admin`, not `postgres`. That distinction is
+required: the roles-only production dump must be able to restore the
+production `postgres` role without colliding with the bootstrap role. The
+rehearsal then invokes real `initialize_database`, which validates embedded
+checksums for migrations 1–23 and applies 0024, and boots the real `Server`
+composition. For this transitional image, both clone URLs deliberately
+authenticate as the restored `postgres` role. The gate asserts migration
+versions 1–24, the restricted NOLOGIN `paykit` role, and every 0024 grant.
+Traps stop the tunnel and local PostgreSQL process and delete all scratch data.
+It never mutates production.
+
+“Full migration set 0001→0024 on a production-schema clone” does not mean
+replaying migration 0001 over existing objects. The clone already contains
+the objects produced by migrations 0001–0023 and restores only their real
+`_sqlx_migrations` metadata. The real migrator checks those embedded
+checksums, then applies only pending migration 0024. Replaying 0001 against
+the cloned schema would collide with existing objects and would not faithfully
+exercise an upgrade from the production pre-image.
+
+The two cluster-role migration tests must run against a dedicated disposable
+PostgreSQL cluster because they intentionally drop or alter the cluster-wide
+`paykit` role. They are ignored by the shared-database suite. The focused
+isolated-cluster gate is:
+
+```bash
+TEST_DATABASE_URL=postgresql://<isolated-admin>@127.0.0.1:<port>/postgres \
+CARGO_TARGET_DIR=/Users/johncarvalho/work/.cargo-target/paykit-server \
+cargo test --locked -p paykit-server-e2e --test migrations \
+  migration_0024_ -- --include-ignored --test-threads=1
+```
 
 ## Health interpretation
 
