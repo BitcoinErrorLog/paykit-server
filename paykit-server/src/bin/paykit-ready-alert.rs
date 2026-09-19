@@ -133,15 +133,17 @@ async fn main() -> ExitCode {
 
     // Deliberately static: no endpoint, status body, identifiers, or secrets.
     println!("paykit ready alert decision={}", decision.as_str());
-    if let Ok(webhook) = env::var("ALERT_WEBHOOK_URL") {
-        if !webhook.is_empty() && decision != Decision::Ok {
-            if deliver(&webhook, decision).await.is_err() {
-                eprintln!("ready alert delivery failed");
-                return ExitCode::from(1);
-            }
+    match env::var("ALERT_WEBHOOK_URL") {
+        Ok(webhook)
+            if !webhook.is_empty()
+                && decision != Decision::Ok
+                && deliver(&webhook, decision).await.is_err() =>
+        {
+            eprintln!("ready alert delivery failed");
+            return ExitCode::from(1);
         }
-    } else {
-        println!("no webhook configured");
+        Ok(_) => {}
+        Err(_) => println!("no webhook configured"),
     }
     ExitCode::from(decision.exit_code())
 }
