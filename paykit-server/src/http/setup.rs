@@ -60,9 +60,10 @@ async fn complete(
 
 async fn cancel(
     State(service): State<SetupService>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(flow_id): Path<String>,
 ) -> Response<Body> {
-    let result = match service.cancel(&flow_id).await {
+    let result = match service.cancel(peer.ip(), &flow_id).await {
         CancelResult::Cancelled => safe_response(StatusCode::OK, json!({"status":"cancelled"})),
         CancelResult::Complete => safe_response(StatusCode::CONFLICT, json!({"error":"completed"})),
         CancelResult::Unknown => safe_response(StatusCode::NOT_FOUND, json!({"error":"not_found"})),
@@ -71,6 +72,11 @@ async fn cancel(
         CancelResult::Completing => {
             safe_response(StatusCode::CONFLICT, json!({"error":"completing"}))
         }
+        CancelResult::RateLimited => safe_response_with_retry(
+            StatusCode::TOO_MANY_REQUESTS,
+            json!({"error":"rate_limited"}),
+            "60",
+        ),
         CancelResult::Unavailable => safe_response_with_retry(
             StatusCode::SERVICE_UNAVAILABLE,
             json!({"error":"unavailable"}),

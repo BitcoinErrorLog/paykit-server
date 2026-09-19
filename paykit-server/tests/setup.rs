@@ -1266,11 +1266,11 @@ async fn cancel_is_idempotent_releases_capacity_and_never_cancels_completion() {
         .await
         .unwrap();
     assert_eq!(
-        setup.cancel(&pending.flow_id).await,
+        setup.cancel(peer(), &pending.flow_id).await,
         CancelResult::Cancelled
     );
     assert_eq!(
-        setup.cancel(&pending.flow_id).await,
+        setup.cancel(peer(), &pending.flow_id).await,
         CancelResult::Cancelled
     );
     let replacement = setup
@@ -1283,10 +1283,13 @@ async fn cancel_is_idempotent_releases_capacity_and_never_cancels_completion() {
         .await
         .unwrap();
     assert_eq!(
-        setup.cancel(&replacement.flow_id).await,
+        setup.cancel(peer(), &replacement.flow_id).await,
         CancelResult::Cancelled
     );
-    assert_eq!(setup.cancel("not-a-flow").await, CancelResult::Unknown);
+    assert_eq!(
+        setup.cancel(peer(), "not-a-flow").await,
+        CancelResult::Unknown
+    );
 
     let complete = setup
         .begin(peer(), "https://app.example", "complete", EXPECTED_CREATOR)
@@ -1297,7 +1300,7 @@ async fn cancel_is_idempotent_releases_capacity_and_never_cancels_completion() {
         PollResult::Complete
     );
     assert_eq!(
-        setup.cancel(&complete.flow_id).await,
+        setup.cancel(peer(), &complete.flow_id).await,
         CancelResult::Complete
     );
 }

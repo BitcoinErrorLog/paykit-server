@@ -179,6 +179,7 @@ struct Inner {
     max_polls: usize,
     setup_capacity: Arc<Semaphore>,
     setup_rate: Mutex<SetupRateLimiter>,
+    cancel_rate: Mutex<SetupRateLimiter>,
     cancellations: Arc<dyn CancellationStore>,
     state: Mutex<State>,
     active_polls: AtomicUsize,
@@ -330,6 +331,7 @@ pub enum CancelResult {
     Expired,
     Failed,
     Completing,
+    RateLimited,
     Unavailable,
 }
 
@@ -401,6 +403,10 @@ impl SetupService {
                 max_polls: limits.max_polls,
                 setup_capacity: Arc::new(Semaphore::new(limits.max_pending_setup_flows)),
                 setup_rate: Mutex::new(SetupRateLimiter {
+                    limit: limits.setup_per_ip_per_minute,
+                    windows: HashMap::new(),
+                }),
+                cancel_rate: Mutex::new(SetupRateLimiter {
                     limit: limits.setup_per_ip_per_minute,
                     windows: HashMap::new(),
                 }),
@@ -579,10 +585,13 @@ impl SetupService {
     /// Cancels only a still-pending flow. The opaque flow id is the existing
     /// capability; it is never returned or logged. Persist before dropping
     /// the one-shot attempt so a storage failure leaves the flow usable.
-    pub async fn cancel(&self, flow_id: &str) -> CancelResult {
+    pub async fn cancel(&self, peer_ip: IpAddr, flow_id: &str) -> CancelResult {
+        let now = self.inner.clock.now();
+        if !self.inner.cancel_rate.lock().await.permit(peer_ip, now) {
+            return CancelResult::RateLimited;
+        }
         {
             let mut guard = self.inner.state.lock().await;
-            let now = self.inner.clock.now();
             cleanup_expired(&mut guard, now);
             let Some(flow) = guard.flows.get_mut(flow_id) else {
                 if guard.cancelled.contains_key(flow_id) {
