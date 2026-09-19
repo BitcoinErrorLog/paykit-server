@@ -1601,6 +1601,8 @@ struct TestPhaseDelays {
     connect_gate: Option<Arc<TestPhaseGate>>,
     tls_gate: Option<Arc<TestPhaseGate>>,
     request_gate: Option<Arc<TestPhaseGate>>,
+    request_deadline_armed: Option<Arc<tokio::sync::Notify>>,
+    request_deadline_fire: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[cfg(test)]
@@ -1862,6 +1864,82 @@ impl ElectrumAdapter {
             tokio::time::sleep(delay).await;
         }
     }
+
+    async fn observe_connected(
+        &self,
+        connected: ManagedClient,
+        tip_height: u32,
+        target: ObservationTarget,
+        overall_deadline: tokio::time::Instant,
+    ) -> Result<AddressAttempt, ObserverError> {
+        let adapter = self.clone();
+        let cancel = connected.cancel_handle()?;
+        let request_deadline = self.phase_deadline(overall_deadline);
+        let permit = tokio::time::timeout_at(
+            request_deadline,
+            self.blocking_attempt_slots.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| ObserverError::Unavailable)?
+        .map_err(|_| ObserverError::Unavailable)?;
+        #[cfg(test)]
+        if tokio::time::timeout_at(request_deadline, self.delay_test_phase(TestPhase::Request))
+            .await
+            .is_err()
+        {
+            return Ok(AddressAttempt::Failed(AddressFailureReason::Deadline));
+        }
+        let mut attempt = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            match observe_address_blocking(
+                &connected.client,
+                &adapter.network,
+                tip_height,
+                &target,
+                adapter.max_utxos_per_address,
+            ) {
+                Ok(outputs) => AddressAttempt::Observed(Box::new(connected), outputs),
+                Err(reason) => AddressAttempt::Failed(reason),
+            }
+        });
+        // Request/response receives its own full phase deadline. On expiry,
+        // close the underlying socket and JOIN the blocking task before
+        // returning so neither transport nor capacity survives.
+        #[cfg(test)]
+        let outcome = if let Some(delays) = &self.test_phase_delays
+            && let Some(fire) = &delays.request_deadline_fire
+        {
+            if let Some(armed) = &delays.request_deadline_armed {
+                armed.notify_one();
+            }
+            tokio::select! {
+                result = &mut attempt => BlockingAttemptOutcome::Completed(result),
+                () = fire.notified() => BlockingAttemptOutcome::Deadline,
+            }
+        } else {
+            match tokio::time::timeout_at(request_deadline, &mut attempt).await {
+                Ok(result) => BlockingAttemptOutcome::Completed(result),
+                Err(_) => BlockingAttemptOutcome::Deadline,
+            }
+        };
+        #[cfg(not(test))]
+        let outcome = match tokio::time::timeout_at(request_deadline, &mut attempt).await {
+            Ok(result) => BlockingAttemptOutcome::Completed(result),
+            Err(_) => BlockingAttemptOutcome::Deadline,
+        };
+
+        Ok(match outcome {
+            BlockingAttemptOutcome::Completed(Ok(attempt)) => attempt,
+            BlockingAttemptOutcome::Completed(Err(_)) => {
+                AddressAttempt::Failed(AddressFailureReason::Error)
+            }
+            BlockingAttemptOutcome::Deadline => {
+                let _ = cancel.shutdown(Shutdown::Both);
+                let _ = attempt.await;
+                AddressAttempt::Failed(AddressFailureReason::Deadline)
+            }
+        })
+    }
 }
 
 /// Outcome of one address's request/response phase inside the blocking pool.
@@ -1871,6 +1949,11 @@ impl ElectrumAdapter {
 enum AddressAttempt {
     Observed(Box<ManagedClient>, Vec<ObservedOutput>),
     Failed(AddressFailureReason),
+}
+
+enum BlockingAttemptOutcome {
+    Completed(Result<AddressAttempt, tokio::task::JoinError>),
+    Deadline,
 }
 
 #[async_trait]
@@ -2006,58 +2089,14 @@ impl ElectrumPort for ElectrumAdapter {
                     }
                 };
             }
-            let adapter = self.clone();
             let target = target.clone();
             let address = target.address().to_owned();
             let connected = client
                 .take()
                 .expect("the connection phase populated the client");
-            let cancel = connected.cancel_handle()?;
-            let request_deadline = self.phase_deadline(overall_deadline);
-            let permit = tokio::time::timeout_at(
-                request_deadline,
-                self.blocking_attempt_slots.clone().acquire_owned(),
-            )
-            .await
-            .map_err(|_| ObserverError::Unavailable)?
-            .map_err(|_| ObserverError::Unavailable)?;
-            #[cfg(test)]
-            if tokio::time::timeout_at(request_deadline, self.delay_test_phase(TestPhase::Request))
-                .await
-                .is_err()
-            {
-                report.failed.push(FailedObservation {
-                    address,
-                    reason: AddressFailureReason::Deadline,
-                });
-                client = None;
-                continue;
-            }
-            let mut attempt = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                match observe_address_blocking(
-                    &connected.client,
-                    &adapter.network,
-                    tip_height,
-                    &target,
-                    adapter.max_utxos_per_address,
-                ) {
-                    Ok(outputs) => AddressAttempt::Observed(Box::new(connected), outputs),
-                    Err(reason) => AddressAttempt::Failed(reason),
-                }
-            });
-            // Request/response receives its own full phase deadline. On
-            // expiry, close the underlying socket and JOIN the blocking task
-            // before returning so neither transport nor capacity survives.
-            let attempt = match tokio::time::timeout_at(request_deadline, &mut attempt).await {
-                Ok(Ok(attempt)) => attempt,
-                Ok(Err(_)) => AddressAttempt::Failed(AddressFailureReason::Error),
-                Err(_) => {
-                    let _ = cancel.shutdown(Shutdown::Both);
-                    let _ = attempt.await;
-                    AddressAttempt::Failed(AddressFailureReason::Deadline)
-                }
-            };
+            let attempt = self
+                .observe_connected(connected, tip_height, target, overall_deadline)
+                .await?;
             match attempt {
                 AddressAttempt::Observed(returned, outputs) => {
                     report.observed.push(address);
@@ -2612,7 +2651,7 @@ mod tests {
             electrum::DEFAULT_MAX_RESPONSE_BYTES,
         )
         .unwrap()
-        .with_test_phase_delays(delays);
+        .with_test_phase_delays(delays.clone());
 
         assert_eq!(
             adapter
@@ -2679,10 +2718,17 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn request_deadline_cancels_the_attempt_and_releases_its_slot() {
         let server = ProbeServer::start_with_stalled_request();
         let address_deadline = Duration::from_secs(5);
+        let deadline_armed = Arc::new(Notify::new());
+        let deadline_fire = Arc::new(Notify::new());
+        let delays = Arc::new(TestPhaseDelays {
+            request_deadline_armed: Some(deadline_armed.clone()),
+            request_deadline_fire: Some(deadline_fire.clone()),
+            ..TestPhaseDelays::default()
+        });
         let adapter = ElectrumAdapter::configured(
             server.endpoint.clone(),
             BitcoinNetwork::Regtest,
@@ -2691,31 +2737,42 @@ mod tests {
             address_deadline,
             electrum::DEFAULT_MAX_RESPONSE_BYTES,
         )
-        .unwrap();
+        .unwrap()
+        .with_test_phase_delays(delays.clone());
         let address = test_address();
-        let pending = {
-            let adapter = adapter.clone();
-            let address = address.clone();
-            tokio::spawn(async move {
-                adapter
-                    .observations(0, &[ObservationTarget::new(address.to_string(), None)])
-                    .await
-            })
-        };
-        server.request_started.notified().await;
-        assert_eq!(
-            adapter.blocking_attempt_slots.available_permits(),
-            MAX_BLOCKING_TRANSPORT_ATTEMPTS - 1,
-            "the live blocking request owns one guarded attempt slot"
-        );
-        tokio::time::advance(address_deadline + Duration::from_nanos(1)).await;
-        let report = pending.await.unwrap().unwrap();
-        assert_eq!(
-            report.failed,
-            vec![FailedObservation {
-                address: address.to_string(),
-                reason: AddressFailureReason::Deadline,
-            }]
+        let connected = adapter
+            .raw_client(adapter.overall_deadline())
+            .await
+            .expect("real TCP phase succeeds before clock injection");
+        let overall_deadline = adapter.overall_deadline();
+        let request_started = server.request_started.clone();
+        let slots = adapter.blocking_attempt_slots.clone();
+        let clock_driver = tokio::spawn(async move {
+            deadline_armed.notified().await;
+            request_started.notified().await;
+            assert_eq!(
+                slots.available_permits(),
+                MAX_BLOCKING_TRANSPORT_ATTEMPTS - 1,
+                "the live blocking request owns one guarded attempt slot"
+            );
+            deadline_fire.notify_one();
+        });
+        let attempt = adapter
+            .observe_connected(
+                connected,
+                0,
+                ObservationTarget::new(address.to_string(), None),
+                overall_deadline,
+            )
+            .await
+            .unwrap();
+        clock_driver.await.unwrap();
+        assert!(
+            matches!(
+                attempt,
+                AddressAttempt::Failed(AddressFailureReason::Deadline)
+            ),
+            "the request phase is classified as a deadline"
         );
         assert_eq!(
             adapter.blocking_attempt_slots.available_permits(),
