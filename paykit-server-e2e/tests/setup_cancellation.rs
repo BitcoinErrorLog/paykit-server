@@ -1,7 +1,10 @@
 use std::{
     any::Any,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use async_trait::async_trait;
@@ -48,6 +51,46 @@ impl SetupCompleter for Completer {
     }
 }
 
+struct TrackedAttempt {
+    drops: Arc<AtomicUsize>,
+}
+
+impl Drop for TrackedAttempt {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl SetupAttempt for TrackedAttempt {
+    fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
+        self
+    }
+}
+
+struct TrackingCompleter {
+    drops: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl SetupCompleter for TrackingCompleter {
+    async fn start(&self) -> Result<StartedSetup, Completion> {
+        Ok(StartedSetup::new(
+            "https://bitkit.example/auth".into(),
+            Box::new(TrackedAttempt {
+                drops: self.drops.clone(),
+            }),
+        ))
+    }
+
+    async fn complete(
+        &self,
+        _attempt: Box<dyn SetupAttempt>,
+        _expected_creator: &paykit_sdk::PubkyPublicKey,
+    ) -> Completion {
+        Completion::DurableSuccess
+    }
+}
+
 fn service(store: Arc<dyn CancellationStore>) -> SetupService {
     SetupService::with_cancellation_store(
         vec!["https://app.example".into()],
@@ -58,6 +101,21 @@ fn service(store: Arc<dyn CancellationStore>) -> SetupService {
             max_polls: 2,
             setup_per_ip_per_minute: 10,
             max_pending_setup_flows: 2,
+        },
+        store,
+    )
+}
+
+fn tracked_service(store: Arc<dyn CancellationStore>, drops: Arc<AtomicUsize>) -> SetupService {
+    SetupService::with_cancellation_store(
+        vec!["https://app.example".into()],
+        Arc::new(TrackingCompleter { drops }),
+        Arc::new(ManualClock::default()),
+        SetupLimits {
+            max_polls_per_flow: 2,
+            max_polls: 2,
+            setup_per_ip_per_minute: 10,
+            max_pending_setup_flows: 1,
         },
         store,
     )
@@ -181,5 +239,52 @@ async fn cancel_http_route_persists_tombstone_and_maps_closed_outcomes() {
         cancel_http(setup_router(setup), &completed.flow_id).await.0,
         StatusCode::CONFLICT
     );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn non_owning_replica_retries_until_owner_releases_secret_and_capacity() {
+    let database = TestDatabase::create().await;
+    paykit_server::persistence::run_migrations(database.pool())
+        .await
+        .unwrap();
+    let owner_store: Arc<dyn CancellationStore> =
+        Arc::new(PostgresCancellationStore::new(database.pool().clone()));
+    let replica_store: Arc<dyn CancellationStore> =
+        Arc::new(PostgresCancellationStore::new(database.pool().clone()));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let owner = tracked_service(owner_store.clone(), drops.clone());
+    let non_owner = service(replica_store);
+    let pending = owner
+        .begin(peer(), "https://app.example", "pending-replica", CREATOR)
+        .await
+        .unwrap();
+
+    // Reproduce the owner's persist-before-release window using the real
+    // shared Postgres store while its secret-bearing flow remains local.
+    owner_store.record(&pending.flow_id).await.unwrap();
+    let (status, body, headers) = cancel_http(setup_router(non_owner), &pending.flow_id).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body, r#"{"error":"unavailable"}"#);
+    assert_eq!(headers["retry-after"], "1");
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert!(owner.flow(&pending.flow_id).await.is_some());
+    assert!(matches!(
+        owner
+            .begin(peer(), "https://app.example", "capacity-held", CREATOR)
+            .await,
+        Err(paykit_server::setup::BeginError::Unavailable)
+    ));
+
+    let (status, body, _) = cancel_http(setup_router(owner.clone()), &pending.flow_id).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, r#"{"status":"cancelled"}"#);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert!(owner.flow(&pending.flow_id).await.is_none());
+    owner
+        .begin(peer(), "https://app.example", "capacity-released", CREATOR)
+        .await
+        .expect("owner cancellation releases the pending-flow permit");
+
     database.cleanup().await;
 }

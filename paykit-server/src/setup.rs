@@ -602,7 +602,14 @@ impl SetupService {
                 }
                 drop(guard);
                 return match self.inner.cancellations.contains(flow_id).await {
-                    Ok(true) => CancelResult::Cancelled,
+                    // A durable tombstone does not prove that this replica
+                    // owned and dropped the secret-bearing flow. During the
+                    // owner's persist-before-release window, acknowledging
+                    // cancellation here would strand its attempt and capacity
+                    // reservation. Make the client retry until it reaches the
+                    // owner; only a replica with the local flow may report the
+                    // transition as complete.
+                    Ok(true) => CancelResult::Unavailable,
                     Ok(false) => CancelResult::Unknown,
                     Err(()) => CancelResult::Unavailable,
                 };
