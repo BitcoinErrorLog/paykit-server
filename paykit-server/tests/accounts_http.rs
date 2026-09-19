@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use axum::{
     body::{Body, to_bytes},
@@ -32,6 +35,22 @@ impl SessionMinter for RefusingMinter {
         _token_bytes: &[u8],
         _capabilities: &Capabilities,
     ) -> Result<PubkySession, ManualClaimError> {
+        Err(ManualClaimError::SessionUnavailable)
+    }
+}
+
+struct CountingMinter {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl SessionMinter for CountingMinter {
+    async fn mint(
+        &self,
+        _token_bytes: &[u8],
+        _capabilities: &Capabilities,
+    ) -> Result<PubkySession, ManualClaimError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Err(ManualClaimError::SessionUnavailable)
     }
 }
@@ -153,86 +172,26 @@ fn token(keypair: &Keypair, capabilities: &str) -> String {
 }
 
 #[tokio::test]
-async fn garbage_and_tampered_tokens_are_unauthorized() {
-    let router = router(10, vec![]);
-    let (status, code) = error_code(
-        router
-            .clone()
-            .oneshot(claim_request("not-base64!!", &regtest_tpub(), 0))
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(
-        (status, code.as_str()),
-        (StatusCode::UNAUTHORIZED, "invalid_token")
-    );
-
-    let mut tampered = token(&Keypair::random(), &required_capabilities());
-    tampered.replace_range(0..1, if tampered.starts_with('A') { "B" } else { "A" });
-    let (status, code) = error_code(
-        router
-            .oneshot(claim_request(&tampered, &regtest_tpub(), 0))
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(
-        (status, code.as_str()),
-        (StatusCode::UNAUTHORIZED, "invalid_token")
-    );
-}
-
-#[tokio::test]
-async fn capability_mismatch_is_refused_before_any_session_minting() {
-    let router = router(10, vec![]);
-    for capabilities in ["/:rw", "/pub/other.app/:rw"] {
-        let (status, code) = error_code(
-            router
-                .clone()
-                .oneshot(claim_request(
-                    &token(&Keypair::random(), capabilities),
-                    &regtest_tpub(),
-                    0,
-                ))
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(
-            (status, code.as_str()),
-            (StatusCode::UNAUTHORIZED, "invalid_capabilities")
-        );
-    }
-}
-
-#[tokio::test]
-async fn invalid_xpubs_are_bad_requests() {
-    let router = router(10, vec![]);
-    let valid_token = token(&Keypair::random(), &required_capabilities());
-    for (xpub, account_index) in [
-        ("garbage", 0u32),
-        // Valid tpub but claimed at the wrong account index.
-        (regtest_tpub().as_str(), 1),
-    ] {
-        let (status, code) = error_code(
-            router
-                .clone()
-                .oneshot(claim_request(&valid_token, xpub, account_index))
-                .await
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(
-            (status, code.as_str()),
-            (StatusCode::BAD_REQUEST, "invalid_xpub")
-        );
-    }
-}
-
-#[tokio::test]
-async fn valid_inputs_reach_the_minter_boundary_and_map_unavailability() {
-    let router = router(10, vec![]);
+async fn manual_cookie_claim_is_removed_before_minting_or_persistence() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://127.0.0.1:1/paykit")
+        .unwrap();
+    let service = Arc::new(ManualClaimService::new(
+        pubky::Pubky::new().unwrap(),
+        Arc::new(CountingMinter {
+            calls: calls.clone(),
+        }),
+        CreatorStore::new(&pool, Arc::new(Crypto::from_master_key(&[1; 32]).unwrap())),
+        Arc::new(UnclaimedKeys),
+        Arc::new(DirectMarkerPublisher),
+        Arc::new(UnusedHistory),
+        BitcoinNetwork::Regtest,
+        StackRole::Production,
+        "production:6f1d0c2a-9b47-4e35-8a10-73c5e2d84b19".into(),
+        receiver_path(),
+    ));
+    let router = accounts_router(AccountsState::new(service, 10, vec![]));
     let (status, code) = error_code(
         router
             .oneshot(claim_request(
@@ -246,31 +205,12 @@ async fn valid_inputs_reach_the_minter_boundary_and_map_unavailability() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (StatusCode::SERVICE_UNAVAILABLE, "session_unavailable")
+        (StatusCode::GONE, "manual_claim_removed")
     );
-}
-
-#[tokio::test]
-async fn claims_beyond_the_minute_budget_are_rate_limited() {
-    let router = router(2, vec![]);
-    for _ in 0..2 {
-        let response = router
-            .clone()
-            .oneshot(claim_request("junk", &regtest_tpub(), 0))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    }
-    let (status, code) = error_code(
-        router
-            .oneshot(claim_request("junk", &regtest_tpub(), 0))
-            .await
-            .unwrap(),
-    )
-    .await;
     assert_eq!(
-        (status, code.as_str()),
-        (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
+        calls.load(Ordering::SeqCst),
+        0,
+        "removed claims must not mint a cookie or reach persistence"
     );
 }
 
@@ -315,7 +255,7 @@ async fn cors_preflight_admits_allowed_origins_and_refuses_others() {
         .headers_mut()
         .insert(header::ORIGIN, "https://shop.example".parse().unwrap());
     let response = router.clone().oneshot(claim).await.unwrap();
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::GONE);
     assert_eq!(
         response
             .headers()

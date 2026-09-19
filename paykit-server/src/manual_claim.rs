@@ -1,20 +1,12 @@
-//! Manual watch-only account claims for clients that cannot run the Bitkit
-//! companion flow (browser apps never hold the identity secret).
+//! Legacy manual watch-only account claim implementation.
 //!
-//! The caller supplies a fresh Pubky `AuthToken` whose capabilities exactly
-//! match the receiver-path session capabilities the companion flow requests,
-//! plus the BIP84 account xpub and index in plaintext. The authenticated
-//! token signer is the creator: possession of a capability-scoped token is
-//! the same proof of identity the companion flow's normal Pubky AUTH leg
-//! establishes, and the xpub attestation moves from the companion envelope
-//! signature to this authenticated request body.
-//!
-//! The token is exchanged for a real homeserver session by looping it
-//! through the configured HTTP relay into the SDK's own auth flow — the
-//! exact channel a signer (Pubky Ring / Bitkit) would use — so session
-//! minting, capability validation, and cookie handling stay owned by the
-//! `pubky` crate. After the session exists, marker publication and encrypted
-//! credential persistence reuse the companion flow's commit path unchanged.
+//! The public `POST /v0/accounts/claim` route is a fail-closed tombstone that
+//! returns `manual_claim_removed` before this implementation can run. This
+//! code documents the removed cookie-based protocol and supports read-only
+//! status handling and historical tests; it must not be re-enabled because
+//! Paykit rc55 private operations require grant-backed sessions. A future
+//! replacement must mint and persist an rc55 grant rather than a legacy
+//! Pubky cookie.
 
 use std::{str::FromStr, sync::Arc, time::Duration};
 
@@ -24,7 +16,7 @@ use paykit_lib::PaykitReceiverPath;
 use paykit_sdk::{PubkyPublicKey, ReceiverNoiseSecretKey};
 #[allow(
     deprecated,
-    reason = "manual claims retain the existing cookie-auth contract"
+    reason = "removed manual-claim implementation documents the legacy cookie protocol"
 )]
 use pubky::{
     AuthFlowKind, AuthToken, Capabilities, EncryptedHttpRelayInboxChannel, Pubky,
@@ -242,7 +234,7 @@ impl SessionMinter for RelayLoopbackSessionMinter {
             .map_err(|_| ManualClaimError::SessionUnavailable)?;
         #[allow(
             deprecated,
-            reason = "manual claims retain the existing cookie-auth contract"
+            reason = "removed manual-claim implementation documents the legacy cookie protocol"
         )]
         let flow = PubkyCookieAuthFlow::builder(capabilities, AuthFlowKind::signin())
             .relay(self.auth_relay.clone())
