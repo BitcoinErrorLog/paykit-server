@@ -15,7 +15,11 @@ use paykit_server::{
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use sha2::{Digest, Sha512};
-use sqlx::{Connection, PgConnection, PgPool, Row, migrate::Migrator, postgres::PgConnectOptions};
+use sqlx::{
+    Connection, PgConnection, PgPool, Row,
+    migrate::Migrator,
+    postgres::{PgConnectOptions, PgPoolOptions},
+};
 use uuid::Uuid;
 
 static MIGRATOR: Migrator = sqlx::migrate!("../paykit-server/migrations");
@@ -35,7 +39,26 @@ fn migrator_through(version: i64) -> Migrator {
     }
 }
 
-const REQUIRED_TABLES: [&str; 15] = [
+const REQUIRED_TABLES: [&str; 16] = [
+    "deployment_metadata",
+    "creators",
+    "sdk_states",
+    "reader_assignments",
+    "invoices",
+    "outbox",
+    "bitcoin_observations",
+    "invoice_baseline_outpoints",
+    "bitcoin_observation_candidates",
+    "stack_identity",
+    "claimed_key_fingerprints",
+    "sentinel_outpoints",
+    "sentinel_events",
+    "outbox_terminal_events",
+    "sdk_outbound_invocations",
+    "setup_flow_cancellations",
+];
+
+const ACCOUNT_RETENTION_REGISTRY: [&str; 15] = [
     "deployment_metadata",
     "creators",
     "sdk_states",
@@ -52,8 +75,6 @@ const REQUIRED_TABLES: [&str; 15] = [
     "outbox_terminal_events",
     "sdk_outbound_invocations",
 ];
-
-const ACCOUNT_RETENTION_REGISTRY: [&str; 15] = REQUIRED_TABLES;
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
 /// migration tests deliberately use the production migration lock key, so
@@ -331,6 +352,81 @@ async fn migration_0024_preserves_existing_runtime_login_and_grants_restart_safe
 
     sqlx::query("ALTER ROLE paykit NOLOGIN")
         .execute(pool)
+        .await
+        .unwrap();
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn migration_0025_readonly_role_can_inspect_but_cannot_mutate() {
+    let _guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+
+    let attributes: (bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolinherit,
+                rolreplication, rolbypassrls
+         FROM pg_catalog.pg_roles WHERE rolname = 'paykit_readonly'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        attributes,
+        (false, false, false, false, false, false, false)
+    );
+
+    let login = format!("paykit_readonly_e2e_{}", Uuid::new_v4().simple());
+    sqlx::query(&format!(
+        "CREATE ROLE {login} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS"
+    ))
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(&format!("GRANT paykit_readonly TO {login}"))
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    let options = PgConnectOptions::from_str(database.database_url())
+        .unwrap()
+        .username(&login);
+    let readonly = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    for table in [
+        "outbox_terminal_events",
+        "outbox",
+        "creators",
+        "sdk_states",
+        "sdk_outbound_invocations",
+        "_sqlx_migrations",
+    ] {
+        sqlx::query(&format!("SELECT 1 FROM {table} LIMIT 1"))
+            .execute(&readonly)
+            .await
+            .unwrap();
+    }
+    assert!(
+        sqlx::query(
+            "INSERT INTO setup_flow_cancellations (flow_id, reason) VALUES ($1, 'user_requested')"
+        )
+        .bind("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        .execute(&readonly)
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE outbox SET status = status")
+            .execute(&readonly)
+            .await
+            .is_err()
+    );
+    readonly.close().await;
+    sqlx::query(&format!("DROP ROLE {login}"))
+        .execute(database.pool())
         .await
         .unwrap();
     database.cleanup().await;

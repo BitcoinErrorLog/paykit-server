@@ -713,6 +713,36 @@ async fn a_trickling_probe_response_exceeding_the_deadline_fails_the_probe_as_un
 }
 
 #[tokio::test]
+async fn a_stalled_tls_handshake_is_inside_the_probe_deadline() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("ssl://{}", listener.local_addr().unwrap());
+    let stalled = std::thread::spawn(move || {
+        let (_stream, _) = listener.accept().unwrap();
+        std::thread::sleep(Duration::from_secs(5));
+    });
+    let adapter = ElectrumAdapter::configured(
+        endpoint,
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(5),
+        200,
+        Duration::from_millis(300),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(2), adapter.probe())
+        .await
+        .expect("the whole-probe deadline must include TLS handshake");
+    assert_eq!(result, Err(ObserverError::Unavailable));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the 300ms deadline must cut off a stalled TLS handshake"
+    );
+    stalled.join().unwrap();
+}
+
+#[tokio::test]
 async fn probe_reports_the_tip_and_verifies_the_endpoint_genesis() {
     let server =
         ProtocolServer::start(
