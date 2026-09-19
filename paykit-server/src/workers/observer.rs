@@ -11,9 +11,10 @@
 //! line (see [`crate::workers::electrum`]) before the client buffers or
 //! decodes anything, the decoded item count is capped before any
 //! per-UTXO record is materialised, and every address runs under a
-//! wall-clock deadline, and every per-address failure is isolated — it
-//! never degrades endpoint availability or the tick's other
-//! observations.
+//! wall-clock deadline, and every post-connect per-address failure is
+//! isolated — it never degrades endpoint availability or the tick's
+//! other observations. A failed or deadline-expired connection remains
+//! an endpoint-level unavailable condition.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -101,7 +102,9 @@ pub enum AddressFailureReason {
     /// The response listed more UTXOs than `electrum.max_utxos_per_address`;
     /// it was rejected before any per-UTXO record was materialised.
     ResponseTooLarge,
-    /// Connect + call + decode exceeded `electrum.address_deadline`.
+    /// Call + decode exceeded `electrum.address_deadline`; connection
+    /// failures and connection-phase deadline expiry are endpoint-level
+    /// unavailable conditions instead.
     Deadline,
 }
 
@@ -1586,6 +1589,10 @@ const DEFAULT_CLAIM_SCAN_WINDOW_DEADLINE: Duration = Duration::from_secs(5);
 /// (`electrum.max_concurrent_claim_scans`).
 const DEFAULT_MAX_CONCURRENT_CLAIM_SCANS: usize = 2;
 
+#[cfg(test)]
+type TestConnector =
+    Arc<dyn Fn(&str, Duration, u64) -> std::io::Result<CappedClient> + Send + Sync + 'static>;
+
 /// Concrete synchronous Electrum client isolated behind the async observation port.
 #[derive(Clone)]
 pub struct ElectrumAdapter {
@@ -1624,6 +1631,10 @@ pub struct ElectrumAdapter {
     /// only when that call's socket read returns, so the bound covers
     /// reads orphaned past their window deadline too.
     claim_scan_permits: Arc<Semaphore>,
+    /// Unit-test seam for deterministically parking the TCP connect phase.
+    /// Production always calls `electrum::connect` directly.
+    #[cfg(test)]
+    test_connector: Option<TestConnector>,
 }
 
 impl ElectrumAdapter {
@@ -1638,6 +1649,8 @@ impl ElectrumAdapter {
             max_history_items_per_window: self.max_history_items_per_window,
             claim_scan_window_deadline: self.claim_scan_window_deadline,
             claim_scan_permits: self.claim_scan_permits.clone(),
+            #[cfg(test)]
+            test_connector: self.test_connector.clone(),
         }
     }
 
@@ -1680,7 +1693,15 @@ impl ElectrumAdapter {
             max_history_items_per_window: DEFAULT_MAX_HISTORY_ITEMS_PER_WINDOW,
             claim_scan_window_deadline: DEFAULT_CLAIM_SCAN_WINDOW_DEADLINE,
             claim_scan_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_CLAIM_SCANS)),
+            #[cfg(test)]
+            test_connector: None,
         })
+    }
+
+    #[cfg(test)]
+    fn with_test_connector(mut self, connector: TestConnector) -> Self {
+        self.test_connector = Some(connector);
+        self
     }
 
     pub async fn connect(
@@ -1714,7 +1735,13 @@ impl ElectrumAdapter {
         let endpoint = self.endpoint.clone();
         let timeout = self.timeout;
         let max_response_bytes = self.max_response_bytes;
+        #[cfg(test)]
+        let connector = self.test_connector.clone();
         tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(connector) = connector {
+                return connector(&endpoint, timeout, max_response_bytes);
+            }
             electrum::connect(&endpoint, timeout, max_response_bytes)
         })
         .await
@@ -1723,6 +1750,10 @@ impl ElectrumAdapter {
     }
 
     fn raw_client_blocking(&self) -> Result<CappedClient, std::io::Error> {
+        #[cfg(test)]
+        if let Some(connector) = &self.test_connector {
+            return connector(&self.endpoint, self.timeout, self.max_response_bytes);
+        }
         electrum::connect(&self.endpoint, self.timeout, self.max_response_bytes)
     }
 }
@@ -1734,7 +1765,6 @@ impl ElectrumAdapter {
 enum AddressAttempt {
     Observed(Box<CappedClient>, Vec<ObservedOutput>),
     Failed(AddressFailureReason),
-    ConnectFailed,
 }
 
 #[async_trait]
@@ -1850,37 +1880,53 @@ impl ElectrumPort for ElectrumAdapter {
         let mut report = ObservationReport::default();
         let mut client: Option<CappedClient> = None;
         for (index, target) in targets.iter().enumerate() {
+            let deadline = tokio::time::Instant::now() + self.address_deadline;
+            if client.is_none() {
+                // Connection establishment is endpoint-level work. Bound it
+                // inside the same per-address deadline as the lookup, but do
+                // not misclassify a stalled TCP connect as an address fault.
+                client = match tokio::time::timeout_at(deadline, self.raw_client()).await {
+                    Ok(Ok(client)) => Some(client),
+                    Ok(Err(_)) | Err(_) => {
+                        if index == 0 {
+                            return Err(ObserverError::Unavailable);
+                        }
+                        report.failed.extend(targets[index..].iter().map(|target| {
+                            FailedObservation {
+                                address: target.address().to_owned(),
+                                reason: AddressFailureReason::Error,
+                            }
+                        }));
+                        break;
+                    }
+                };
+            }
             let adapter = self.clone();
             let target = target.clone();
             let address = target.address().to_owned();
+            let connected = client
+                .take()
+                .expect("the connection phase populated the client");
             let attempt = tokio::task::spawn_blocking(move || {
-                // A connect failure before any lookup is an endpoint-level
-                // condition; per-address failures after it are isolated.
-                let client = match client {
-                    Some(client) => client,
-                    None => match adapter.raw_client_blocking() {
-                        Ok(client) => client,
-                        Err(_) => return AddressAttempt::ConnectFailed,
-                    },
-                };
                 match observe_address_blocking(
-                    &client,
+                    &connected,
                     &adapter.network,
                     tip_height,
                     &target,
                     adapter.max_utxos_per_address,
                 ) {
-                    Ok(outputs) => AddressAttempt::Observed(Box::new(client), outputs),
+                    Ok(outputs) => AddressAttempt::Observed(Box::new(connected), outputs),
                     Err(reason) => AddressAttempt::Failed(reason),
                 }
             });
-            // Per-address wall-clock deadline over connect + call + decode.
+            // The absolute deadline started before connection establishment,
+            // so connection + call + decode share one wall-clock budget.
             // The blocking socket read cannot be cancelled, so on expiry
             // the join handle is abandoned: the tick moves on, the
             // connection is never reused, and the detached task exits when
             // the socket read returns (bounded by
             // `electrum.request_timeout`).
-            let attempt = match tokio::time::timeout(self.address_deadline, attempt).await {
+            let attempt = match tokio::time::timeout_at(deadline, attempt).await {
                 Ok(Ok(attempt)) => attempt,
                 Ok(Err(_)) => AddressAttempt::Failed(AddressFailureReason::Error),
                 Err(_) => AddressAttempt::Failed(AddressFailureReason::Deadline),
@@ -1894,21 +1940,6 @@ impl ElectrumPort for ElectrumAdapter {
                 AddressAttempt::Failed(reason) => {
                     report.failed.push(FailedObservation { address, reason });
                     client = None;
-                }
-                AddressAttempt::ConnectFailed => {
-                    if index == 0 {
-                        return Err(ObserverError::Unavailable);
-                    }
-                    // A reconnect failure fails the remaining addresses
-                    // without discarding the observations already
-                    // collected.
-                    report
-                        .failed
-                        .extend(targets[index..].iter().map(|target| FailedObservation {
-                            address: target.address().to_owned(),
-                            reason: AddressFailureReason::Error,
-                        }));
-                    break;
                 }
             }
         }
@@ -2307,7 +2338,18 @@ fn map_persistence(_: PersistenceError) -> ObserverError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        net::{TcpListener, TcpStream},
+        sync::{
+            Condvar,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        thread,
+    };
+
     use bitcoin::constants::genesis_block;
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -2324,6 +2366,145 @@ mod tests {
             .iter()
             .map(|entry| entry.target().address().to_owned())
             .collect()
+    }
+
+    struct ProbeServer {
+        endpoint: String,
+        wake_address: std::net::SocketAddr,
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ProbeServer {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let wake_address = listener.local_addr().unwrap();
+            let endpoint = format!("tcp://{wake_address}");
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = stop.clone();
+            let header = bitcoin::consensus::encode::serialize_hex(
+                &genesis_block(bitcoin::Network::Regtest).header,
+            );
+            let handle = thread::spawn(move || {
+                while let Ok((stream, _)) = listener.accept() {
+                    if thread_stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let header = header.clone();
+                    thread::spawn(move || {
+                        let mut writer = stream.try_clone().unwrap();
+                        for line in BufReader::new(stream).lines() {
+                            let Ok(line) = line else { break };
+                            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                            let result = match request["method"].as_str().unwrap() {
+                                "blockchain.headers.subscribe" => {
+                                    serde_json::json!({"height": 0, "hex": header})
+                                }
+                                "blockchain.block.header" => serde_json::json!(header),
+                                method => panic!("unexpected probe method: {method}"),
+                            };
+                            let response = serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": result,
+                            });
+                            if writeln!(writer, "{response}").is_err() || writer.flush().is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                endpoint,
+                wake_address,
+                stop,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for ProbeServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.wake_address);
+            if let Some(handle) = self.handle.take() {
+                handle.join().unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_tcp_connect_is_unavailable_and_a_later_probe_reconnects() {
+        let server = ProbeServer::start();
+        let connect_calls = Arc::new(AtomicUsize::new(0));
+        let connect_started = Arc::new(Notify::new());
+        let stalled_connect_finished = Arc::new(Notify::new());
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+
+        let connector: TestConnector = {
+            let connect_calls = connect_calls.clone();
+            let connect_started = connect_started.clone();
+            let stalled_connect_finished = stalled_connect_finished.clone();
+            let gate = gate.clone();
+            Arc::new(move |endpoint, timeout, max_response_bytes| {
+                if connect_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    connect_started.notify_one();
+                    let (released, condvar) = &*gate;
+                    let mut released = released.lock().unwrap();
+                    while !*released {
+                        released = condvar.wait(released).unwrap();
+                    }
+                    stalled_connect_finished.notify_one();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "injected stalled connect",
+                    ));
+                }
+                electrum::connect(endpoint, timeout, max_response_bytes)
+            })
+        };
+
+        let address_deadline = Duration::from_secs(5);
+        let adapter = ElectrumAdapter::configured(
+            server.endpoint.clone(),
+            BitcoinNetwork::Regtest,
+            Duration::from_secs(30),
+            200,
+            address_deadline,
+            electrum::DEFAULT_MAX_RESPONSE_BYTES,
+        )
+        .unwrap()
+        .with_test_connector(connector);
+
+        let pending = {
+            let adapter = adapter.clone();
+            tokio::spawn(async move {
+                adapter
+                    .observations(0, &[ObservationTarget::new("not-parsed", None)])
+                    .await
+            })
+        };
+        connect_started.notified().await;
+        tokio::time::advance(address_deadline + Duration::from_nanos(1)).await;
+        assert_eq!(
+            pending.await.unwrap(),
+            Err(ObserverError::Unavailable),
+            "connection-phase deadline expiry is endpoint unavailable, not an address deadline"
+        );
+
+        let (released, condvar) = &*gate;
+        *released.lock().unwrap() = true;
+        condvar.notify_one();
+        stalled_connect_finished.notified().await;
+
+        let probe = adapter.probe().await.expect("a later probe reconnects");
+        assert_eq!(probe.height, 0);
+        assert_eq!(
+            connect_calls.load(Ordering::SeqCst),
+            2,
+            "the late result from the stalled connect is never reused"
+        );
     }
 
     #[test]
