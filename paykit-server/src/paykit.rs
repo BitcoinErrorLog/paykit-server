@@ -16,7 +16,7 @@ use paykit_sdk::{
     PaymentAdapter, PrivateReceivingDetail, PubkyPublicKey, PubkySessionAccess,
     PubkySessionBootstrap, PubkySessionProvider, ReceiverNoiseSecretKey, StorageAdapter,
 };
-use pubky::{Capabilities, Pubky, PubkySession, errors::RequestError};
+use pubky::{Pubky, errors::RequestError};
 use thiserror::Error;
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
@@ -126,12 +126,6 @@ pub(crate) enum ServerSessionRestoreError {
     Unavailable,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ServerSessionSecretKind {
-    Grant,
-    Cookie,
-}
-
 pub(crate) async fn restore_server_session(
     public_client: &Pubky,
     session_secret: &str,
@@ -139,60 +133,22 @@ pub(crate) async fn restore_server_session(
     client_id: &str,
     required_capabilities: &str,
 ) -> Result<PubkySessionAccess, ServerSessionRestoreError> {
-    match server_session_secret_kind(session_secret)? {
-        ServerSessionSecretKind::Grant => {
-            let bootstrap = PubkySessionBootstrap::with_pubky(public_client.clone(), client_id)
-                .map_err(|error| classify_sdk_restore_error(&error))?;
-            return bootstrap
-                .import_session(
-                    session_secret,
-                    None,
-                    receiver_noise_secret_key,
-                    required_capabilities,
-                )
-                .await
-                .map(|result| result.access)
-                .map_err(|error| classify_sdk_restore_error(&error));
-        }
-        ServerSessionSecretKind::Cookie => {}
+    if !session_secret.starts_with("pubky-grant-credential-") {
+        return Err(ServerSessionRestoreError::Invalid);
     }
 
-    // Existing manually claimed accounts retain their cookie-backed session
-    // format. The structural format gate above prevents a failed grant restore
-    // (including a transient homeserver failure) from downgrading into this
-    // compatibility path.
-    let session = PubkySession::import_secret(session_secret, Some(public_client.client().clone()))
+    let bootstrap = PubkySessionBootstrap::with_pubky(public_client.clone(), client_id)
+        .map_err(|error| classify_sdk_restore_error(&error))?;
+    bootstrap
+        .import_session(
+            session_secret,
+            None,
+            receiver_noise_secret_key,
+            required_capabilities,
+        )
         .await
-        .map_err(|error| classify_pubky_restore_error(&error))?;
-    if session.as_cookie().is_none() {
-        return Err(ServerSessionRestoreError::Invalid);
-    }
-    let expected = Capabilities::try_from(required_capabilities)
-        .map_err(|_| ServerSessionRestoreError::Invalid)?;
-    if Capabilities::from(session.info().capabilities().to_vec()) != expected {
-        return Err(ServerSessionRestoreError::Invalid);
-    }
-    Ok(PubkySessionAccess {
-        session,
-        outbox_client: public_client.clone(),
-        local_secret_key: None,
-        receiver_noise_secret_key,
-    })
-}
-
-fn server_session_secret_kind(
-    session_secret: &str,
-) -> Result<ServerSessionSecretKind, ServerSessionRestoreError> {
-    if session_secret.starts_with("pubky-grant-credential-") {
-        return Ok(ServerSessionSecretKind::Grant);
-    }
-    let (public_key, cookie) = session_secret
-        .split_once(':')
-        .ok_or(ServerSessionRestoreError::Invalid)?;
-    if cookie.is_empty() || pubky::PublicKey::try_from_z32(public_key).is_err() {
-        return Err(ServerSessionRestoreError::Invalid);
-    }
-    Ok(ServerSessionSecretKind::Cookie)
+        .map(|result| result.access)
+        .map_err(|error| classify_sdk_restore_error(&error))
 }
 
 fn classify_sdk_restore_error(error: &PaykitSdkError) -> ServerSessionRestoreError {
@@ -358,7 +314,9 @@ fn classify(error: PaykitSdkError) -> HandoffError {
         PaykitSdkError::Protocol { .. } => HandoffError::Permanent,
         PaykitSdkError::Policy { .. } => HandoffError::Retryable(RetryableHandoffCause::Other),
         PaykitSdkError::Storage { .. } => HandoffError::Retryable(RetryableHandoffCause::Storage),
-        PaykitSdkError::Identity { .. } => HandoffError::Retryable(RetryableHandoffCause::Identity),
+        // Identity/session failures require reauthentication. Retrying the
+        // same persisted credential can never make a private handoff succeed.
+        PaykitSdkError::Identity { .. } => HandoffError::Permanent,
         PaykitSdkError::Transport { .. } => {
             HandoffError::Retryable(RetryableHandoffCause::Transport)
         }
@@ -573,12 +531,14 @@ fn require_linked(state: LinkedPeerState) -> Result<(), HandoffError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paykit_sdk::InMemoryStorage;
     #[allow(
         deprecated,
         reason = "regression covers persisted manual-claim cookie sessions"
     )]
     use pubky::{
-        AuthFlowKind, AuthToken, EncryptedHttpRelayInboxChannel, Keypair, PubkyCookieAuthFlow,
+        AuthFlowKind, AuthToken, Capabilities, EncryptedHttpRelayInboxChannel, Keypair,
+        PubkyCookieAuthFlow, PubkySession,
     };
     use pubky_testnet::EphemeralTestnet;
 
@@ -586,12 +546,30 @@ mod tests {
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 
+    #[derive(Clone)]
+    struct FixedSessionProvider(PubkySessionAccess);
+
+    #[async_trait]
+    impl PubkySessionProvider for FixedSessionProvider {
+        async fn load_session_access(&self) -> paykit_sdk::Result<Option<PubkySessionAccess>> {
+            Ok(Some(self.0.clone()))
+        }
+
+        async fn load_public_storage(&self) -> paykit_sdk::Result<Option<pubky::PublicStorage>> {
+            Ok(None)
+        }
+
+        async fn clear_session_access(&self) -> paykit_sdk::Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[allow(
         deprecated,
         reason = "regression covers persisted manual-claim cookie sessions"
     )]
-    async fn cookie_session_secret_round_trips_through_server_restore() {
+    async fn cookie_session_private_operation_is_terminal_not_retryable() {
         let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
         let postgres = pubky_testnet::pubky_homeserver::ConnectionString::new(
             &std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL"),
@@ -635,7 +613,7 @@ mod tests {
             .and_then(|cookie| cookie.export_secret())
             .expect("manual-claim cookie session must export");
 
-        let restored = restore_server_session(
+        let restore_error = restore_server_session(
             &pubky,
             &session_secret,
             ReceiverNoiseSecretKey::random(),
@@ -643,12 +621,40 @@ mod tests {
             &required_capabilities,
         )
         .await
-        .expect("cookie-backed manual-claim session must restore");
+        .expect_err("rc55 server sessions must reject legacy cookie credentials");
+        assert_eq!(restore_error, ServerSessionRestoreError::Invalid);
 
-        assert!(restored.session.as_cookie().is_some());
+        let restored_cookie =
+            PubkySession::import_secret(&session_secret, Some(pubky.client().clone()))
+                .await
+                .expect("fixture must remain a real restorable legacy cookie");
+        assert!(restored_cookie.as_cookie().is_some());
+
+        let sdk = PaykitSdk::new(
+            InMemoryStorage::default(),
+            FixedSessionProvider(PubkySessionAccess {
+                session: restored_cookie,
+                outbox_client: pubky,
+                local_secret_key: None,
+                receiver_noise_secret_key: ReceiverNoiseSecretKey::random(),
+            }),
+            ExplicitInputsPaymentAdapter,
+            PaykitSdkConfig::new(PaykitReceiverPath::new("paykit/server").unwrap()),
+        )
+        .unwrap();
+        let private_operation_error = sdk
+            .ensure_link_with_peer(
+                PubkyPublicKey::from_public_key(&Keypair::random().public_key()),
+                PaykitReceiverPath::new("bitkit/server").unwrap(),
+                1,
+            )
+            .await
+            .expect_err("rc55 must reject cookie access before private link work");
+
         assert_eq!(
-            restored.public_key().unwrap(),
-            PubkyPublicKey::from_public_key(&keypair.public_key())
+            classify(private_operation_error),
+            HandoffError::Permanent,
+            "a persisted legacy cookie must terminalize instead of retrying forever"
         );
     }
 
@@ -663,6 +669,21 @@ mod tests {
         )
         .await
         .expect_err("malformed credentials are terminal");
+
+        assert_eq!(error, ServerSessionRestoreError::Invalid);
+    }
+
+    #[tokio::test]
+    async fn corrupt_grant_prefix_is_invalid_without_cookie_fallback() {
+        let error = restore_server_session(
+            &Pubky::new().unwrap(),
+            "pubky-grant-credential-corrupt",
+            ReceiverNoiseSecretKey::random(),
+            "paykit-server",
+            "/pub/paykit/server/:rw",
+        )
+        .await
+        .expect_err("corrupt grant credentials are terminal");
 
         assert_eq!(error, ServerSessionRestoreError::Invalid);
     }
@@ -697,6 +718,26 @@ mod tests {
             .unwrap();
         let session_secret = account.export_session_secret().await.unwrap().into_inner();
         assert!(session_secret.starts_with("pubky-grant-credential-"));
+        let restored = restore_server_session(
+            &pubky,
+            &session_secret,
+            ReceiverNoiseSecretKey::random(),
+            "paykit-server",
+            &required_capabilities,
+        )
+        .await
+        .expect("persisted grant credential must restore while its homeserver is available");
+        assert!(restored.session.as_grant().is_some());
+        PaykitSdk::new(
+            InMemoryStorage::default(),
+            FixedSessionProvider(restored),
+            ExplicitInputsPaymentAdapter,
+            PaykitSdkConfig::new(PaykitReceiverPath::new("paykit/server").unwrap()),
+        )
+        .unwrap()
+        .initialize()
+        .await
+        .expect("rc55 runtime must accept restored grant-backed access");
         drop(testnet);
 
         let error = restore_server_session(
