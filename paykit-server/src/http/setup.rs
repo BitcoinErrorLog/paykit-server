@@ -10,11 +10,12 @@ use qrcode::{EcLevel, QrCode, render::svg};
 use serde_json::json;
 use std::net::SocketAddr;
 
-use crate::setup::{BeginError, PollResult, SetupService, StartedFlow};
+use crate::setup::{BeginError, CancelResult, PollResult, SetupService, StartedFlow};
 
 pub fn setup_router(service: SetupService) -> Router {
     Router::new()
         .route("/setup", get(begin))
+        .route("/setup/{flow_id}/cancel", post(cancel))
         .route("/setup/{flow_id}/complete", post(complete))
         .with_state(service)
 }
@@ -55,6 +56,28 @@ async fn complete(
     Path(flow_id): Path<String>,
 ) -> Response<Body> {
     response_for_poll(service.complete_and_poll(&flow_id).await)
+}
+
+async fn cancel(
+    State(service): State<SetupService>,
+    Path(flow_id): Path<String>,
+) -> Response<Body> {
+    let result = match service.cancel(&flow_id).await {
+        CancelResult::Cancelled => safe_response(StatusCode::OK, json!({"status":"cancelled"})),
+        CancelResult::Complete => safe_response(StatusCode::CONFLICT, json!({"error":"completed"})),
+        CancelResult::Unknown => safe_response(StatusCode::NOT_FOUND, json!({"error":"not_found"})),
+        CancelResult::Expired => safe_response(StatusCode::GONE, json!({"error":"expired"})),
+        CancelResult::Failed => safe_response(StatusCode::CONFLICT, json!({"error":"failed"})),
+        CancelResult::Completing => {
+            safe_response(StatusCode::CONFLICT, json!({"error":"completing"}))
+        }
+        CancelResult::Unavailable => safe_response_with_retry(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error":"unavailable"}),
+            "1",
+        ),
+    };
+    with_no_store(result)
 }
 
 fn parse_setup_query(query: Option<&str>) -> Option<(String, String, String)> {
@@ -148,7 +171,7 @@ fn json_for_script(value: &str) -> String {
 }
 
 fn response_for_poll(result: PollResult) -> Response<Body> {
-    let mut response = match result {
+    let response = match result {
         PollResult::Complete => safe_response(StatusCode::OK, json!({"status":"complete"})),
         PollResult::IdentityMismatch => {
             safe_response(StatusCode::CONFLICT, json!({"status":"identity_mismatch"}))
@@ -173,6 +196,10 @@ fn response_for_poll(result: PollResult) -> Response<Body> {
             "1",
         ),
     };
+    with_no_store(response)
+}
+
+fn with_no_store(mut response: Response<Body>) -> Response<Body> {
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));

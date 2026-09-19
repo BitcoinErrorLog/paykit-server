@@ -29,8 +29,8 @@ use paykit_server::{
     key_identity::{canonical_key_tail, deny_list_account_xpub},
     real_setup::validate_xpub,
     setup::{
-        BeginError, Completion, ManualClock, PollResult, SetupAttempt, SetupCompleter, SetupLimits,
-        SetupService, StartedSetup,
+        BeginError, CancelResult, Completion, ManualClock, PollResult, SetupAttempt,
+        SetupCompleter, SetupLimits, SetupService, StartedSetup,
     },
 };
 use tokio::sync::{Mutex, Notify, Semaphore};
@@ -1250,6 +1250,55 @@ async fn cancelling_start_and_completion_releases_reservation() {
             )
             .await
             .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn cancel_is_idempotent_releases_capacity_and_never_cancels_completion() {
+    let setup = limited_service(
+        Arc::new(MockCompleter::new([Completion::DurableSuccess])),
+        Arc::new(ManualClock::default()),
+        100,
+        1,
+    );
+    let pending = setup
+        .begin(peer(), "https://app.example", "cancel", EXPECTED_CREATOR)
+        .await
+        .unwrap();
+    assert_eq!(
+        setup.cancel(&pending.flow_id).await,
+        CancelResult::Cancelled
+    );
+    assert_eq!(
+        setup.cancel(&pending.flow_id).await,
+        CancelResult::Cancelled
+    );
+    let replacement = setup
+        .begin(
+            peer(),
+            "https://app.example",
+            "replacement",
+            EXPECTED_CREATOR,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        setup.cancel(&replacement.flow_id).await,
+        CancelResult::Cancelled
+    );
+    assert_eq!(setup.cancel("not-a-flow").await, CancelResult::Unknown);
+
+    let complete = setup
+        .begin(peer(), "https://app.example", "complete", EXPECTED_CREATOR)
+        .await
+        .unwrap();
+    assert_eq!(
+        setup.trigger_completion(&complete.flow_id).await,
+        PollResult::Complete
+    );
+    assert_eq!(
+        setup.cancel(&complete.flow_id).await,
+        CancelResult::Complete
     );
 }
 
