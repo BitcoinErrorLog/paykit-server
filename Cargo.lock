@@ -2953,6 +2953,7 @@ dependencies = [
  "postcard",
  "prometheus-client",
  "pubky",
+ "pubky-testnet",
  "qrcode",
  "rand 0.9.5",
  "rustls",

@@ -61,4 +61,5 @@ zeroize.workspace = true
 
 [dev-dependencies]
 http-relay = { version = "0.7", default-features = false, features = ["server"] }
+pubky-testnet.workspace = true
 tower = { version = "0.5", features = ["util"] }

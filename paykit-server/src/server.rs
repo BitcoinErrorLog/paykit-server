@@ -17,7 +17,9 @@ use crate::{
     domain::locks::{CreatorPubky, PubkyLockResource, ReaderPubky},
     http::{self, accounts::AccountsState, auth::SignedLocksAuth},
     manual_claim::{ManualClaimService, RelayLoopbackSessionMinter},
-    paykit::{CreatorSessionProvider, PaykitAdapter, restore_server_session},
+    paykit::{
+        CreatorSessionProvider, PaykitAdapter, ServerSessionRestoreError, restore_server_session,
+    },
     persistence::{
         CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PersistenceError,
         PostgresStorageAdapter, SdkStateStore, StackIdentity,
@@ -905,7 +907,7 @@ impl SessionValidator for CreatorSessionValidator {
             &self.required_capabilities,
         )
         .await
-        .map_err(|_| SessionValidationError::Invalid)?;
+        .map_err(map_server_session_restore_error)?;
         let expected = PubkyPublicKey::from_raw_or_app_key(creator.to_string())
             .map_err(|_| SessionValidationError::Invalid)?;
         let actual = access
@@ -915,6 +917,13 @@ impl SessionValidator for CreatorSessionValidator {
             return Err(SessionValidationError::Invalid);
         }
         Ok(())
+    }
+}
+
+fn map_server_session_restore_error(error: ServerSessionRestoreError) -> SessionValidationError {
+    match error {
+        ServerSessionRestoreError::Invalid => SessionValidationError::Invalid,
+        ServerSessionRestoreError::Unavailable => SessionValidationError::Unavailable,
     }
 }
 
@@ -1015,6 +1024,18 @@ mod tests {
 
     const CONFIG_KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
     const CONFIG_MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
+
+    #[test]
+    fn session_restore_classification_preserves_invalid_and_unavailable() {
+        assert_eq!(
+            map_server_session_restore_error(ServerSessionRestoreError::Invalid),
+            SessionValidationError::Invalid
+        );
+        assert_eq!(
+            map_server_session_restore_error(ServerSessionRestoreError::Unavailable),
+            SessionValidationError::Unavailable
+        );
+    }
 
     #[tokio::test]
     async fn production_spawn_path_owns_all_three_workers() {

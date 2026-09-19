@@ -16,7 +16,8 @@ use paykit_sdk::{
     PaymentAdapter, PrivateReceivingDetail, PubkyPublicKey, PubkySessionAccess,
     PubkySessionBootstrap, PubkySessionProvider, ReceiverNoiseSecretKey, StorageAdapter,
 };
-use pubky::{Capabilities, Pubky, PubkySession};
+use pubky::{Capabilities, Pubky, PubkySession, errors::RequestError};
+use thiserror::Error;
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
@@ -90,9 +91,15 @@ impl PubkySessionProvider for CreatorSessionProvider {
             &self.required_capabilities,
         )
         .await
-        .map_err(|_| PaykitSdkError::Identity {
-            context: "creator Pubky session is unavailable".into(),
-            source: None,
+        .map_err(|error| match error {
+            ServerSessionRestoreError::Invalid => PaykitSdkError::Identity {
+                context: "creator Pubky session is invalid".into(),
+                source: None,
+            },
+            ServerSessionRestoreError::Unavailable => PaykitSdkError::Transport {
+                context: "creator Pubky session dependency is unavailable".into(),
+                source: None,
+            },
         })?;
         bind_session_to_creator(access.public_key()?, &self.creator)?;
         Ok(Some(access))
@@ -111,54 +118,114 @@ impl PubkySessionProvider for CreatorSessionProvider {
     }
 }
 
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub(crate) enum ServerSessionRestoreError {
+    #[error("creator Pubky session is invalid")]
+    Invalid,
+    #[error("creator Pubky session dependency is unavailable")]
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServerSessionSecretKind {
+    Grant,
+    Cookie,
+}
+
 pub(crate) async fn restore_server_session(
     public_client: &Pubky,
     session_secret: &str,
     receiver_noise_secret_key: ReceiverNoiseSecretKey,
     client_id: &str,
     required_capabilities: &str,
-) -> paykit_sdk::Result<PubkySessionAccess> {
-    let bootstrap = PubkySessionBootstrap::with_pubky(public_client.clone(), client_id)?;
-    if let Ok(result) = bootstrap
-        .import_session(
-            session_secret,
-            None,
-            receiver_noise_secret_key.clone(),
-            required_capabilities,
-        )
-        .await
-    {
-        return Ok(result.access);
+) -> Result<PubkySessionAccess, ServerSessionRestoreError> {
+    match server_session_secret_kind(session_secret)? {
+        ServerSessionSecretKind::Grant => {
+            let bootstrap = PubkySessionBootstrap::with_pubky(public_client.clone(), client_id)
+                .map_err(|error| classify_sdk_restore_error(&error))?;
+            return bootstrap
+                .import_session(
+                    session_secret,
+                    None,
+                    receiver_noise_secret_key,
+                    required_capabilities,
+                )
+                .await
+                .map(|result| result.access)
+                .map_err(|error| classify_sdk_restore_error(&error));
+        }
+        ServerSessionSecretKind::Cookie => {}
     }
 
     // Existing manually claimed accounts retain their cookie-backed session
-    // format. New Bitkit setup sessions are grant-backed and take the branch
-    // above; this fallback does not downgrade or rewrite either credential.
+    // format. The structural format gate above prevents a failed grant restore
+    // (including a transient homeserver failure) from downgrading into this
+    // compatibility path.
     let session = PubkySession::import_secret(session_secret, Some(public_client.client().clone()))
         .await
-        .map_err(|_| PaykitSdkError::Identity {
-            context: "creator Pubky session is unavailable".into(),
-            source: None,
-        })?;
-    let expected =
-        Capabilities::try_from(required_capabilities).map_err(|_| PaykitSdkError::Protocol {
-            context: "configured Paykit capabilities are invalid".into(),
-            source: None,
-        })?;
-    if Capabilities::from(session.info().capabilities().to_vec()) != expected {
-        return Err(PaykitSdkError::Policy {
-            context: "creator Pubky session capabilities do not match configuration".into(),
-            source: None,
-        });
+        .map_err(|error| classify_pubky_restore_error(&error))?;
+    if session.as_cookie().is_none() {
+        return Err(ServerSessionRestoreError::Invalid);
     }
-    let access = PubkySessionAccess {
+    let expected = Capabilities::try_from(required_capabilities)
+        .map_err(|_| ServerSessionRestoreError::Invalid)?;
+    if Capabilities::from(session.info().capabilities().to_vec()) != expected {
+        return Err(ServerSessionRestoreError::Invalid);
+    }
+    Ok(PubkySessionAccess {
         session,
         outbox_client: public_client.clone(),
         local_secret_key: None,
         receiver_noise_secret_key,
-    };
-    access.validate()?;
-    Ok(access)
+    })
+}
+
+fn server_session_secret_kind(
+    session_secret: &str,
+) -> Result<ServerSessionSecretKind, ServerSessionRestoreError> {
+    if session_secret.starts_with("pubky-grant-credential-") {
+        return Ok(ServerSessionSecretKind::Grant);
+    }
+    let (public_key, cookie) = session_secret
+        .split_once(':')
+        .ok_or(ServerSessionRestoreError::Invalid)?;
+    if cookie.is_empty() || pubky::PublicKey::try_from_z32(public_key).is_err() {
+        return Err(ServerSessionRestoreError::Invalid);
+    }
+    Ok(ServerSessionSecretKind::Cookie)
+}
+
+fn classify_sdk_restore_error(error: &PaykitSdkError) -> ServerSessionRestoreError {
+    match error {
+        PaykitSdkError::Identity {
+            source: Some(source),
+            ..
+        } => source.downcast_ref::<pubky::Error>().map_or(
+            ServerSessionRestoreError::Invalid,
+            classify_pubky_restore_error,
+        ),
+        PaykitSdkError::Identity { .. }
+        | PaykitSdkError::Policy { .. }
+        | PaykitSdkError::Protocol { .. } => ServerSessionRestoreError::Invalid,
+        _ => ServerSessionRestoreError::Unavailable,
+    }
+}
+
+fn classify_pubky_restore_error(error: &pubky::Error) -> ServerSessionRestoreError {
+    match error {
+        pubky::Error::Authentication(_) | pubky::Error::Parse(_) => {
+            ServerSessionRestoreError::Invalid
+        }
+        pubky::Error::Request(RequestError::Validation { .. }) => {
+            ServerSessionRestoreError::Invalid
+        }
+        pubky::Error::Request(RequestError::Server { status, .. })
+            if status.is_client_error() && status.as_u16() != 408 && status.as_u16() != 429 =>
+        {
+            ServerSessionRestoreError::Invalid
+        }
+        _ => ServerSessionRestoreError::Unavailable,
+    }
 }
 
 fn bind_session_to_creator(
@@ -506,8 +573,144 @@ fn require_linked(state: LinkedPeerState) -> Result<(), HandoffError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[allow(
+        deprecated,
+        reason = "regression covers persisted manual-claim cookie sessions"
+    )]
+    use pubky::{
+        AuthFlowKind, AuthToken, EncryptedHttpRelayInboxChannel, Keypair, PubkyCookieAuthFlow,
+    };
+    use pubky_testnet::EphemeralTestnet;
+
+    static PUBKY_TESTNET_LOCK: TokioMutex<()> = TokioMutex::const_new(());
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(
+        deprecated,
+        reason = "regression covers persisted manual-claim cookie sessions"
+    )]
+    async fn cookie_session_secret_round_trips_through_server_restore() {
+        let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+        let postgres = pubky_testnet::pubky_homeserver::ConnectionString::new(
+            &std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL"),
+        )
+        .unwrap();
+        let testnet = EphemeralTestnet::builder()
+            .postgres(postgres)
+            .with_http_relay()
+            .build()
+            .await
+            .unwrap();
+        let pubky = testnet.sdk().unwrap();
+        let keypair = Keypair::random();
+        pubky
+            .signer(keypair.clone())
+            .signup(&testnet.homeserver_app().public_key(), None)
+            .await
+            .unwrap();
+
+        let required_capabilities =
+            PaykitSdkConfig::new(PaykitReceiverPath::new("paykit/server").unwrap())
+                .required_session_capabilities();
+        let capabilities = Capabilities::try_from(required_capabilities.as_str()).unwrap();
+        let client_secret = [42; 32];
+        let relay = testnet.http_relay().local_url().join("inbox").unwrap();
+        let flow = PubkyCookieAuthFlow::builder(&capabilities, AuthFlowKind::signin())
+            .client(pubky.client().clone())
+            .client_secret(client_secret)
+            .relay(relay.clone())
+            .start()
+            .unwrap();
+        let token = AuthToken::sign(&keypair, capabilities.clone()).serialize();
+        EncryptedHttpRelayInboxChannel::new(relay, client_secret)
+            .unwrap()
+            .produce(pubky.client(), &token)
+            .await
+            .unwrap();
+        let minted = flow.await_approval().await.unwrap();
+        let session_secret = minted
+            .as_cookie()
+            .and_then(|cookie| cookie.export_secret())
+            .expect("manual-claim cookie session must export");
+
+        let restored = restore_server_session(
+            &pubky,
+            &session_secret,
+            ReceiverNoiseSecretKey::random(),
+            "paykit-server",
+            &required_capabilities,
+        )
+        .await
+        .expect("cookie-backed manual-claim session must restore");
+
+        assert!(restored.session.as_cookie().is_some());
+        assert_eq!(
+            restored.public_key().unwrap(),
+            PubkyPublicKey::from_public_key(&keypair.public_key())
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_session_secret_is_invalid_without_cookie_fallback() {
+        let error = restore_server_session(
+            &Pubky::new().unwrap(),
+            "not-a-session-secret",
+            ReceiverNoiseSecretKey::random(),
+            "paykit-server",
+            "/pub/paykit/server/:rw",
+        )
+        .await
+        .expect_err("malformed credentials are terminal");
+
+        assert_eq!(error, ServerSessionRestoreError::Invalid);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transient_grant_restore_failure_is_unavailable_without_cookie_fallback() {
+        let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+        let postgres = pubky_testnet::pubky_homeserver::ConnectionString::new(
+            &std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL"),
+        )
+        .unwrap();
+        let testnet = EphemeralTestnet::builder()
+            .postgres(postgres)
+            .build()
+            .await
+            .unwrap();
+        let pubky = testnet.sdk().unwrap();
+        let required_capabilities =
+            PaykitSdkConfig::new(PaykitReceiverPath::new("paykit/server").unwrap())
+                .required_session_capabilities();
+        let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "paykit-server").unwrap();
+        let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+        let account = bootstrap
+            .sign_up(
+                &paykit_sdk::PubkyLocalSecretKey::new(Keypair::random().secret()),
+                ReceiverNoiseSecretKey::random(),
+                &homeserver,
+                None,
+                &required_capabilities,
+            )
+            .await
+            .unwrap();
+        let session_secret = account.export_session_secret().await.unwrap().into_inner();
+        assert!(session_secret.starts_with("pubky-grant-credential-"));
+        drop(testnet);
+
+        let error = restore_server_session(
+            &pubky,
+            &session_secret,
+            ReceiverNoiseSecretKey::random(),
+            "paykit-server",
+            &required_capabilities,
+        )
+        .await
+        .expect_err("stopped homeserver must be retryable");
+
+        assert_eq!(error, ServerSessionRestoreError::Unavailable);
+    }
 
     #[test]
     fn mutation_locks_are_shared_per_creator_and_isolated_between_creators() {
