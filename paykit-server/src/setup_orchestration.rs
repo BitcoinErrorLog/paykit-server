@@ -142,7 +142,7 @@ mod tests {
     }
     fn request() -> AuthRequest {
         crate::bitkit_claim::parse_auth_request(&format!(
-            "pubkyauth://signin?caps={}&relay=https://relay.example/inbox&secret=AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM&x-bitkit-claim=watch-only-account-v1",
+            "pubkyauth://signin_grant?caps={}&relay=https://relay.example/inbox&secret=AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM&cid=paykit.test&cpk=5jsjx1o6fzu6aeeo697r3i5rx15zq41kikcye8wtwdqm4nb4tryo&x-bitkit-claim=watch-only-account-v1",
             crate::bitkit_claim::LOCAL_DEMO_CAPABILITIES
         ), crate::bitkit_claim::LOCAL_DEMO_CAPABILITIES)
         .unwrap()

@@ -112,8 +112,16 @@ fn account_xpub(seed: u8, account_index: u32) -> String {
 }
 
 fn claim_token(keypair: &Keypair, capabilities: &str) -> String {
-    let capabilities = Capabilities::try_from(capabilities).unwrap();
-    URL_SAFE_NO_PAD.encode(AuthToken::sign(keypair, capabilities).serialize())
+    let parsed = Capabilities::try_from(capabilities).unwrap();
+    let serialized = AuthToken::sign(keypair, parsed).serialize();
+    assert_eq!(
+        AuthToken::verify(&serialized)
+            .unwrap()
+            .capabilities()
+            .to_string(),
+        capabilities
+    );
+    URL_SAFE_NO_PAD.encode(serialized)
 }
 
 fn creator_of(keypair: &Keypair) -> CreatorPubky {
@@ -229,7 +237,7 @@ async fn fixture() -> Fixture {
 
 impl Fixture {
     fn service(&self, stack_role: StackRole, history: Arc<ScriptedHistory>) -> ManualClaimService {
-        ManualClaimService::new(
+        let service = ManualClaimService::new(
             self.pubky.clone(),
             Arc::new(RelayLoopbackSessionMinter::new(
                 self.pubky.clone(),
@@ -243,7 +251,9 @@ impl Fixture {
             stack_role,
             self.stack_id.clone(),
             PaykitReceiverPath::new("paykit/server").unwrap(),
-        )
+        );
+        assert_eq!(service.required_capabilities(), self.required_capabilities);
+        service
     }
 
     fn router(&self, service: ManualClaimService) -> axum::Router {

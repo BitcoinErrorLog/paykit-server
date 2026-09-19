@@ -11,7 +11,7 @@ use crypto_secretbox::{
 };
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use paykit_lib::PaykitReceiverPath;
-use paykit_sdk::PaykitSdkConfig;
+use paykit_sdk::{PaykitSdkConfig, PubkyAuthRequestKind, parse_pubky_auth_url};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
@@ -96,11 +96,16 @@ pub fn parse_auth_request(
     expected_capabilities: &str,
 ) -> Result<AuthRequest, ClaimError> {
     let url = Url::parse(value).map_err(|_| ClaimError::InvalidAuthRequest)?;
-    if url.scheme() != "pubkyauth" || !matches!(url.host_str(), Some("signin") | Some("signup")) {
+    if url.scheme() != "pubkyauth" || url.host_str() != Some("signin_grant") {
+        return Err(ClaimError::InvalidAuthRequest);
+    }
+    let details = parse_pubky_auth_url(value).map_err(|_| ClaimError::InvalidAuthRequest)?;
+    if details.kind != PubkyAuthRequestKind::SignIn || details.capabilities != expected_capabilities
+    {
         return Err(ClaimError::InvalidAuthRequest);
     }
     let claim_type = unique_query(&url, QUERY_PARAMETER)?;
-    if claim_type != CLAIM_TYPE || unique_query(&url, "caps")? != expected_capabilities {
+    if claim_type != CLAIM_TYPE {
         return Err(ClaimError::InvalidAuthRequest);
     }
     let secret_text = unique_query(&url, "secret")?;
@@ -109,8 +114,7 @@ pub fn parse_auth_request(
         .ok()
         .and_then(|v| v.try_into().ok())
         .ok_or(ClaimError::InvalidAuthRequest)?;
-    let relay =
-        Url::parse(&unique_query(&url, "relay")?).map_err(|_| ClaimError::InvalidAuthRequest)?;
+    let relay = Url::parse(&details.relay_url).map_err(|_| ClaimError::InvalidAuthRequest)?;
     if !matches!(relay.scheme(), "http" | "https")
         || relay.host_str().is_none()
         || relay.cannot_be_a_base()
@@ -221,7 +225,7 @@ mod tests {
 
     fn auth(secret: &[u8; 32]) -> String {
         format!(
-            "pubkyauth://signin?caps={LOCAL_DEMO_CAPABILITIES}&relay=https%3A%2F%2Frelay.example%2Finbox&secret={}&{QUERY_PARAMETER}={CLAIM_TYPE}",
+            "pubkyauth://signin_grant?caps={LOCAL_DEMO_CAPABILITIES}&relay=https%3A%2F%2Frelay.example%2Finbox&secret={}&cid=paykit.test&cpk=5jsjx1o6fzu6aeeo697r3i5rx15zq41kikcye8wtwdqm4nb4tryo&{QUERY_PARAMETER}={CLAIM_TYPE}",
             URL_SAFE_NO_PAD.encode(secret)
         )
     }

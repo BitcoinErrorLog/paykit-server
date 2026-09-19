@@ -21,10 +21,14 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bitcoin::bip32::Xpub;
 use paykit_lib::PaykitReceiverPath;
-use paykit_sdk::{PubkyPublicKey, PubkySessionAccess, ReceiverNoiseSecretKey};
+use paykit_sdk::{PubkyPublicKey, ReceiverNoiseSecretKey};
+#[allow(
+    deprecated,
+    reason = "manual claims retain the existing cookie-auth contract"
+)]
 use pubky::{
-    AuthFlowKind, AuthToken, Capabilities, EncryptedHttpRelayInboxChannel, Pubky, PubkyAuthFlow,
-    PubkySession,
+    AuthFlowKind, AuthToken, Capabilities, EncryptedHttpRelayInboxChannel, Pubky,
+    PubkyCookieAuthFlow, PubkySession,
 };
 use rand::{TryRngCore, rngs::OsRng};
 use url::Url;
@@ -236,7 +240,11 @@ impl SessionMinter for RelayLoopbackSessionMinter {
         OsRng
             .try_fill_bytes(&mut secret)
             .map_err(|_| ManualClaimError::SessionUnavailable)?;
-        let flow = PubkyAuthFlow::builder(capabilities, AuthFlowKind::signin())
+        #[allow(
+            deprecated,
+            reason = "manual claims retain the existing cookie-auth contract"
+        )]
+        let flow = PubkyCookieAuthFlow::builder(capabilities, AuthFlowKind::signin())
             .relay(self.auth_relay.clone())
             .client(self.pubky.client().clone())
             .client_secret(secret)
@@ -447,17 +455,16 @@ impl ManualClaimService {
             .map_err(|_| ManualClaimError::InvalidToken)?;
         let creator: CreatorPubky =
             parse_creator(&public_key.to_app_key()).map_err(|_| ManualClaimError::InvalidToken)?;
-        let session_secret = session.export_secret();
+        let session_secret = session
+            .as_cookie()
+            .and_then(|cookie| cookie.export_secret())
+            .ok_or(ManualClaimError::SessionUnavailable)?;
 
-        let access = PubkySessionAccess {
-            session: session.clone(),
-            outbox_client: self.pubky.clone(),
-            local_secret_key: None,
-            receiver_noise_secret_key: ReceiverNoiseSecretKey::random(),
-        };
-        access
-            .validate_for_capabilities(&self.required_capabilities)
-            .map_err(|_| ManualClaimError::InvalidCapabilities)?;
+        let session_capabilities = Capabilities::from(session.info().capabilities().to_vec());
+        if session_capabilities != capabilities {
+            return Err(ManualClaimError::InvalidCapabilities);
+        }
+        let receiver_noise_secret_key = ReceiverNoiseSecretKey::random();
 
         let commit = CreatorSetupCommit {
             session,
@@ -465,7 +472,7 @@ impl ManualClaimService {
             owner,
             creator: creator.clone(),
             session_secret,
-            initial_noise_secret: access.receiver_noise_secret_key,
+            initial_noise_secret: receiver_noise_secret_key,
             creators: self.creators.clone(),
             marker_publisher: self.marker_publisher.clone(),
             bitcoin_network: self.bitcoin_network.clone(),
@@ -618,7 +625,9 @@ impl ManualClaimService {
             return Err(ManualClaimError::InvalidToken);
         }
         let token = AuthToken::verify(&token_bytes).map_err(|_| ManualClaimError::InvalidToken)?;
-        if token.capabilities().to_string() != self.required_capabilities {
+        let expected = Capabilities::try_from(self.required_capabilities.as_str())
+            .map_err(|_| ManualClaimError::InvalidCapabilities)?;
+        if token.capabilities() != &expected {
             return Err(ManualClaimError::InvalidCapabilities);
         }
         Ok(token)

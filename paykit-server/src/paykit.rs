@@ -14,9 +14,9 @@ use paykit_lib::{
 use paykit_sdk::{
     LinkedPeerState, OutboundPrivateMessageStatus, PaykitSdk, PaykitSdkConfig, PaykitSdkError,
     PaymentAdapter, PrivateReceivingDetail, PubkyPublicKey, PubkySessionAccess,
-    PubkySessionProvider, StorageAdapter,
+    PubkySessionBootstrap, PubkySessionProvider, ReceiverNoiseSecretKey, StorageAdapter,
 };
-use pubky::{Pubky, PubkySession};
+use pubky::{Capabilities, Pubky, PubkySession};
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
@@ -36,23 +36,37 @@ pub struct CreatorSessionProvider {
     creators: CreatorStore,
     creator: CreatorPubky,
     public_client: Pubky,
+    client_id: String,
+    required_capabilities: String,
 }
 
 impl CreatorSessionProvider {
-    pub fn new(creators: CreatorStore, creator: CreatorPubky) -> Result<Self, PaykitSdkError> {
+    pub fn new(
+        creators: CreatorStore,
+        creator: CreatorPubky,
+        paykit: &PaykitConfig,
+    ) -> Result<Self, PaykitSdkError> {
         let public_client = Pubky::new().map_err(|error| PaykitSdkError::Identity {
             context: "could not construct Pubky client".into(),
             source: Some(anyhow::anyhow!(error.to_string())),
         })?;
-        Ok(Self::with_pubky(creators, creator, public_client))
+        Ok(Self::with_pubky(creators, creator, public_client, paykit))
     }
 
     /// Uses the process-selected Pubky network for this Creator's restored session.
-    pub fn with_pubky(creators: CreatorStore, creator: CreatorPubky, public_client: Pubky) -> Self {
+    pub fn with_pubky(
+        creators: CreatorStore,
+        creator: CreatorPubky,
+        public_client: Pubky,
+        paykit: &PaykitConfig,
+    ) -> Self {
         Self {
             creators,
             creator,
             public_client,
+            client_id: paykit.client_id.clone(),
+            required_capabilities: PaykitSdkConfig::new(paykit.receiver_path.clone())
+                .required_session_capabilities(),
         }
     }
 }
@@ -68,23 +82,19 @@ impl PubkySessionProvider for CreatorSessionProvider {
                     context: "creator credentials are unavailable".into(),
                     source: None,
                 })?;
-        let session = PubkySession::import_secret(
+        let access = restore_server_session(
+            &self.public_client,
             credentials.session_secret(),
-            Some(self.public_client.client().clone()),
+            credentials.receiver_noise_secret().clone(),
+            &self.client_id,
+            &self.required_capabilities,
         )
         .await
-        .map_err(|error| PaykitSdkError::Identity {
+        .map_err(|_| PaykitSdkError::Identity {
             context: "creator Pubky session is unavailable".into(),
-            source: Some(anyhow::anyhow!(error.to_string())),
+            source: None,
         })?;
-        let access = PubkySessionAccess {
-            session,
-            outbox_client: self.public_client.clone(),
-            local_secret_key: None,
-            receiver_noise_secret_key: credentials.receiver_noise_secret().clone(),
-        };
         bind_session_to_creator(access.public_key()?, &self.creator)?;
-        access.validate()?;
         Ok(Some(access))
     }
 
@@ -99,6 +109,56 @@ impl PubkySessionProvider for CreatorSessionProvider {
             source: None,
         })
     }
+}
+
+pub(crate) async fn restore_server_session(
+    public_client: &Pubky,
+    session_secret: &str,
+    receiver_noise_secret_key: ReceiverNoiseSecretKey,
+    client_id: &str,
+    required_capabilities: &str,
+) -> paykit_sdk::Result<PubkySessionAccess> {
+    let bootstrap = PubkySessionBootstrap::with_pubky(public_client.clone(), client_id)?;
+    if let Ok(result) = bootstrap
+        .import_session(
+            session_secret,
+            None,
+            receiver_noise_secret_key.clone(),
+            required_capabilities,
+        )
+        .await
+    {
+        return Ok(result.access);
+    }
+
+    // Existing manually claimed accounts retain their cookie-backed session
+    // format. New Bitkit setup sessions are grant-backed and take the branch
+    // above; this fallback does not downgrade or rewrite either credential.
+    let session = PubkySession::import_secret(session_secret, Some(public_client.client().clone()))
+        .await
+        .map_err(|_| PaykitSdkError::Identity {
+            context: "creator Pubky session is unavailable".into(),
+            source: None,
+        })?;
+    let expected =
+        Capabilities::try_from(required_capabilities).map_err(|_| PaykitSdkError::Protocol {
+            context: "configured Paykit capabilities are invalid".into(),
+            source: None,
+        })?;
+    if Capabilities::from(session.info().capabilities().to_vec()) != expected {
+        return Err(PaykitSdkError::Policy {
+            context: "creator Pubky session capabilities do not match configuration".into(),
+            source: None,
+        });
+    }
+    let access = PubkySessionAccess {
+        session,
+        outbox_client: public_client.clone(),
+        local_secret_key: None,
+        receiver_noise_secret_key,
+    };
+    access.validate()?;
+    Ok(access)
 }
 
 fn bind_session_to_creator(

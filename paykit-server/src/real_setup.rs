@@ -217,7 +217,10 @@ impl SetupCompleter for RealSetupCompleter {
             Ok(key) => key,
             Err(_) => return Completion::DefinitiveFailure,
         };
-        let session_secret = auth.export_session_secret().into_inner();
+        let session_secret = match auth.export_session_secret().await {
+            Ok(secret) => secret.into_inner(),
+            Err(_) => return Completion::DefinitiveFailure,
+        };
         let commit = CreatorSetupCommit {
             session: auth.access.session,
             public_storage_client: auth.access.outbox_client,
