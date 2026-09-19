@@ -107,6 +107,114 @@ async fn connect_bounded(
     .unwrap()
 }
 
+struct StalledTlsServer {
+    endpoint: String,
+    wake_address: SocketAddr,
+    shutdown: Arc<AtomicBool>,
+    gate: Arc<(Mutex<bool>, Condvar)>,
+    accept_handle: Option<thread::JoinHandle<()>>,
+    connection_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+}
+
+impl StalledTlsServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let wake_address = listener.local_addr().unwrap();
+        let endpoint = format!("ssl://{wake_address}");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let connection_handles = Arc::new(Mutex::new(Vec::new()));
+        let accept_handle = {
+            let shutdown = shutdown.clone();
+            let gate = gate.clone();
+            let connection_handles = connection_handles.clone();
+            thread::spawn(move || {
+                while let Ok((stream, _)) = listener.accept() {
+                    if shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let gate = gate.clone();
+                    connection_handles
+                        .lock()
+                        .unwrap()
+                        .push(thread::spawn(move || {
+                            let _stream = stream;
+                            let (released, condvar) = &*gate;
+                            let mut released = released.lock().unwrap();
+                            while !*released {
+                                released = condvar.wait(released).unwrap();
+                            }
+                        }));
+                }
+            })
+        };
+        Self {
+            endpoint,
+            wake_address,
+            shutdown,
+            gate,
+            accept_handle: Some(accept_handle),
+            connection_handles,
+        }
+    }
+}
+
+impl Drop for StalledTlsServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        let _ = TcpStream::connect(self.wake_address);
+        if let Some(handle) = self.accept_handle.take() {
+            handle.join().unwrap();
+        }
+        let (released, condvar) = &*self.gate;
+        *released.lock().unwrap() = true;
+        condvar.notify_all();
+        for handle in std::mem::take(&mut *self.connection_handles.lock().unwrap()) {
+            handle.join().unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn tls_handshake_failure_is_eager_endpoint_unavailable_not_an_address_deadline() {
+    let server = StalledTlsServer::start();
+    let request_timeout = Duration::from_millis(100);
+    let address_deadline = Duration::from_millis(50);
+    let result = ElectrumAdapter::connect(
+        server.endpoint.clone(),
+        BitcoinNetwork::Regtest,
+        request_timeout,
+        200,
+        address_deadline,
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .await;
+
+    match result {
+        Err(ObserverError::Unavailable) => {}
+        Err(other) => panic!("stalled TLS handshake had unexpected classification: {other:?}"),
+        Ok(adapter) => {
+            // This is the pre-fix lazy-handshake path: construction
+            // incorrectly succeeds, and the first address RPC inherits the
+            // stalled handshake until the per-address deadline expires.
+            let address = fixture_address();
+            let report = adapter
+                .observations(
+                    TIP_HEIGHT as u32,
+                    &[ObservationTarget::new(address.to_string(), None)],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                report.failed,
+                vec![failed(&address, AddressFailureReason::Deadline)],
+                "the lazy pre-fix path must reach the address-deadline classification"
+            );
+            panic!("TLS handshake was deferred until the first address RPC");
+        }
+    }
+}
+
 #[tokio::test]
 async fn an_empty_address_observes_no_outputs_with_one_lookup() {
     let address = fixture_address();
