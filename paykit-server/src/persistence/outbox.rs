@@ -276,6 +276,8 @@ pub struct OutboxStore {
     seam: HandoffFenceSeam,
 }
 
+type UnattributedInspectionRow = (Uuid, Uuid, Vec<u8>, Vec<u8>, Vec<u8>);
+
 #[derive(Clone, Debug, Default)]
 pub struct TerminalFailureHealth {
     pub count: i64,
@@ -1442,7 +1444,7 @@ impl OutboxStore {
         &self,
         event_id: Uuid,
     ) -> Result<UnattributedInspection, PersistenceError> {
-        let row: Option<(Uuid, Uuid, Vec<u8>, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        let row: Option<UnattributedInspectionRow> = sqlx::query_as(
             "SELECT o.id, o.creator_id, c.creator_lookup_hash, o.intent_envelope, s.state_envelope \
              FROM outbox_terminal_events e \
              JOIN outbox o ON o.id = e.outbox_id \
