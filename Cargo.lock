@@ -411,6 +411,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1809,7 +1815,7 @@ version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b3314d5adb5d94bcdf56771f2e50dbbc80bb4bdf88967526706205ac9eff24eb"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "headers-core",
  "http",
@@ -2091,7 +2097,7 @@ version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96547c2556ec9d12fb1578c4eaf448b04993e7fb79cbaad930a656880a6bdfa0"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-channel",
  "futures-util",
@@ -2385,7 +2391,7 @@ version = "9.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "js-sys",
  "pem",
  "ring",
@@ -2758,7 +2764,7 @@ checksum = "42afda58fa2cf50914402d132cc1caacff116a85d10c72ab2082bb7c50021754"
 dependencies = [
  "anyhow",
  "backon",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "futures",
@@ -2891,12 +2897,12 @@ version = "0.1.0-rc55"
 source = "git+https://github.com/pubky/paykit-rs.git?rev=4613beee25d1680ed8bc849446498e9bfb2cdb16#4613beee25d1680ed8bc849446498e9bfb2cdb16"
 dependencies = [
  "anyhow",
- "base64",
+ "base64 0.22.1",
  "chacha20poly1305",
  "chrono",
  "pubky",
  "pubky-noise",
- "reqwest 0.13.4",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -2912,7 +2918,7 @@ source = "git+https://github.com/pubky/paykit-rs.git?rev=4613beee25d1680ed8bc849
 dependencies = [
  "anyhow",
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "bip39",
  "blake3",
  "chrono",
@@ -2920,7 +2926,7 @@ dependencies = [
  "hex",
  "paykit-lib",
  "pubky",
- "reqwest 0.13.4",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2936,7 +2942,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
- "base64",
+ "base64 0.22.1",
  "bitcoin",
  "blake3",
  "chacha20poly1305",
@@ -2956,6 +2962,7 @@ dependencies = [
  "pubky-testnet",
  "qrcode",
  "rand 0.9.5",
+ "reqwest 0.13.5",
  "rustls",
  "serde",
  "serde_ignored",
@@ -2982,7 +2989,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "base64",
+ "base64 0.22.1",
  "bitcoin",
  "ed25519-dalek 2.2.0",
  "locks-core",
@@ -3010,7 +3017,7 @@ version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "serde_core",
 ]
 
@@ -3127,7 +3134,7 @@ dependencies = [
  "mainline",
  "ntimestamp",
  "page_size",
- "reqwest 0.13.4",
+ "reqwest 0.13.5",
  "rustls",
  "rustls-webpki",
  "self_cell",
@@ -3363,7 +3370,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15a7b191157d57d5095f1577c8064aeda85f96606957fcf4c0a6f4b675adb96d"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.22.1",
  "cookie",
  "eventsource-stream",
  "flume 0.11.1",
@@ -3374,7 +3381,7 @@ dependencies = [
  "percent-encoding",
  "pkarr",
  "pubky-common",
- "reqwest 0.13.4",
+ "reqwest 0.13.5",
  "rustls",
  "serde",
  "serde_json",
@@ -3394,7 +3401,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ee26f4cf7d9d11a300180b351f1ea0efebf17ec66f0e615a8867f8aba47dc5f"
 dependencies = [
  "argon2",
- "base64",
+ "base64 0.22.1",
  "blake3",
  "crypto_secretbox",
  "ed25519-dalek 3.0.0",
@@ -3423,7 +3430,7 @@ dependencies = [
  "axum-server",
  "backon",
  "base32",
- "base64",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "clap",
@@ -3451,7 +3458,7 @@ dependencies = [
  "pubky-common",
  "pubky_test_utils",
  "rand 0.10.2",
- "reqwest 0.13.4",
+ "reqwest 0.13.5",
  "sea-query",
  "sea-query-binder",
  "serde",
@@ -3848,7 +3855,7 @@ version = "0.12.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "futures-core",
  "futures-util",
@@ -3885,11 +3892,11 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "219c5811de6525e5416c7d5d53bb656d3afdbc6c5af816e0802bcfa42dbdc1c3"
+checksum = "16a1cfa75cc186dd73d5818e510e042e40927bccc9c236b061cea97e1eb08029"
 dependencies = [
- "base64",
+ "base64 0.23.1",
  "bytes",
  "cookie",
  "cookie_store",
@@ -4630,7 +4637,7 @@ version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6798b1838b6a0f69c007c133b8df5866302197e404e8b6ee8ed3e3a5e68dc6"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "crc",
@@ -4708,7 +4715,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa003f0038df784eb8fecbbac13affe3da23b45194bd57dba231c8f48199c526"
 dependencies = [
  "atoi",
- "base64",
+ "base64 0.22.1",
  "bitflags",
  "byteorder",
  "bytes",
@@ -4753,7 +4760,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db58fcd5a53cf07c184b154801ff91347e4c30d17a3562a635ff028ad5deda46"
 dependencies = [
  "atoi",
- "base64",
+ "base64 0.22.1",
  "bitflags",
  "byteorder",
  "chrono",

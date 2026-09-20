@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use paykit_sdk::PubkyPublicKey;
 use rand::{TryRngCore, rngs::OsRng};
+use sqlx::PgPool;
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
@@ -62,6 +63,61 @@ pub trait SetupCompleter: Send + Sync {
         attempt: Box<dyn SetupAttempt>,
         expected_creator: &PubkyPublicKey,
     ) -> Completion;
+}
+
+#[async_trait]
+pub trait CancellationStore: Send + Sync {
+    async fn record(&self, flow_id: &str) -> Result<(), ()>;
+    async fn contains(&self, flow_id: &str) -> Result<bool, ()>;
+}
+
+pub struct PostgresCancellationStore {
+    pool: PgPool,
+}
+
+impl PostgresCancellationStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl CancellationStore for PostgresCancellationStore {
+    async fn record(&self, flow_id: &str) -> Result<(), ()> {
+        sqlx::query(
+            "INSERT INTO setup_flow_cancellations (flow_id, reason) \
+             VALUES ($1, 'user_requested') ON CONFLICT (flow_id) DO NOTHING",
+        )
+        .bind(flow_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|_| ())
+    }
+
+    async fn contains(&self, flow_id: &str) -> Result<bool, ()> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM setup_flow_cancellations WHERE flow_id = $1)",
+        )
+        .bind(flow_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| ())
+    }
+}
+
+struct MemoryCancellationStore(Mutex<HashMap<String, ()>>);
+
+#[async_trait]
+impl CancellationStore for MemoryCancellationStore {
+    async fn record(&self, flow_id: &str) -> Result<(), ()> {
+        self.0.lock().await.insert(flow_id.to_owned(), ());
+        Ok(())
+    }
+
+    async fn contains(&self, flow_id: &str) -> Result<bool, ()> {
+        Ok(self.0.lock().await.contains_key(flow_id))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -123,6 +179,8 @@ struct Inner {
     max_polls: usize,
     setup_capacity: Arc<Semaphore>,
     setup_rate: Mutex<SetupRateLimiter>,
+    cancel_rate: Mutex<SetupRateLimiter>,
+    cancellations: Arc<dyn CancellationStore>,
     state: Mutex<State>,
     active_polls: AtomicUsize,
     changed: Notify,
@@ -134,6 +192,7 @@ struct State {
     /// its secret-bearing AUTH attempt are removed immediately, while callers
     /// still receive the protocol's terminal `Expired` result.
     expired: HashMap<String, Duration>,
+    cancelled: HashMap<String, Duration>,
 }
 
 struct Flow {
@@ -197,6 +256,7 @@ impl Drop for CompletionLease {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FlowStatus {
     Pending,
+    Cancelling,
     Completing,
     Completed,
     Failed,
@@ -263,6 +323,18 @@ pub enum PollResult {
     Unavailable,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelResult {
+    Cancelled,
+    Complete,
+    Unknown,
+    Expired,
+    Failed,
+    Completing,
+    RateLimited,
+    Unavailable,
+}
+
 impl SetupService {
     pub fn new(
         allowed_origins: Vec<String>,
@@ -286,6 +358,41 @@ impl SetupService {
         limits: SetupLimits,
         poll_timeout: Duration,
     ) -> Self {
+        Self::with_poll_timeout_and_cancellation_store(
+            allowed_origins,
+            completer,
+            clock,
+            limits,
+            poll_timeout,
+            Arc::new(MemoryCancellationStore(Mutex::new(HashMap::new()))),
+        )
+    }
+
+    pub fn with_cancellation_store(
+        allowed_origins: Vec<String>,
+        completer: Arc<dyn SetupCompleter>,
+        clock: Arc<dyn Clock>,
+        limits: SetupLimits,
+        cancellations: Arc<dyn CancellationStore>,
+    ) -> Self {
+        Self::with_poll_timeout_and_cancellation_store(
+            allowed_origins,
+            completer,
+            clock,
+            limits,
+            DEFAULT_POLL_TIMEOUT,
+            cancellations,
+        )
+    }
+
+    fn with_poll_timeout_and_cancellation_store(
+        allowed_origins: Vec<String>,
+        completer: Arc<dyn SetupCompleter>,
+        clock: Arc<dyn Clock>,
+        limits: SetupLimits,
+        poll_timeout: Duration,
+        cancellations: Arc<dyn CancellationStore>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 allowed_origins,
@@ -299,9 +406,15 @@ impl SetupService {
                     limit: limits.setup_per_ip_per_minute,
                     windows: HashMap::new(),
                 }),
+                cancel_rate: Mutex::new(SetupRateLimiter {
+                    limit: limits.setup_per_ip_per_minute,
+                    windows: HashMap::new(),
+                }),
+                cancellations,
                 state: Mutex::new(State {
                     flows: HashMap::new(),
                     expired: HashMap::new(),
+                    cancelled: HashMap::new(),
                 }),
                 active_polls: AtomicUsize::new(0),
                 changed: Notify::new(),
@@ -388,6 +501,7 @@ impl SetupService {
                 FlowStatus::Failed => {
                     return flow.failure_result.unwrap_or(PollResult::Failed);
                 }
+                FlowStatus::Cancelling => return PollResult::PendingTimeout,
                 FlowStatus::Completing => return PollResult::PendingTimeout,
                 FlowStatus::Pending => {}
             }
@@ -468,6 +582,73 @@ impl SetupService {
         }
     }
 
+    /// Cancels only a still-pending flow. The opaque flow id is the existing
+    /// capability; it is never returned or logged. Persist before dropping
+    /// the one-shot attempt so a storage failure leaves the flow usable.
+    pub async fn cancel(&self, peer_ip: IpAddr, flow_id: &str) -> CancelResult {
+        let now = self.inner.clock.now();
+        if !self.inner.cancel_rate.lock().await.permit(peer_ip, now) {
+            return CancelResult::RateLimited;
+        }
+        {
+            let mut guard = self.inner.state.lock().await;
+            cleanup_expired(&mut guard, now);
+            let Some(flow) = guard.flows.get_mut(flow_id) else {
+                if guard.cancelled.contains_key(flow_id) {
+                    return CancelResult::Cancelled;
+                }
+                if guard.expired.contains_key(flow_id) {
+                    return CancelResult::Expired;
+                }
+                drop(guard);
+                return match self.inner.cancellations.contains(flow_id).await {
+                    // A durable tombstone does not prove that this replica
+                    // owned and dropped the secret-bearing flow. During the
+                    // owner's persist-before-release window, acknowledging
+                    // cancellation here would strand its attempt and capacity
+                    // reservation. Make the client retry until it reaches the
+                    // owner; only a replica with the local flow may report the
+                    // transition as complete.
+                    Ok(true) => CancelResult::Unavailable,
+                    Ok(false) => CancelResult::Unknown,
+                    Err(()) => CancelResult::Unavailable,
+                };
+            };
+            match flow.status {
+                FlowStatus::Pending => flow.status = FlowStatus::Cancelling,
+                FlowStatus::Cancelling => return CancelResult::Completing,
+                FlowStatus::Completing => return CancelResult::Completing,
+                FlowStatus::Completed => return CancelResult::Complete,
+                FlowStatus::Failed => return CancelResult::Failed,
+            }
+        }
+        if self.inner.cancellations.record(flow_id).await.is_err() {
+            let mut guard = self.inner.state.lock().await;
+            if let Some(flow) = guard.flows.get_mut(flow_id)
+                && flow.status == FlowStatus::Cancelling
+            {
+                flow.status = FlowStatus::Pending;
+            }
+            return CancelResult::Unavailable;
+        }
+        let mut guard = self.inner.state.lock().await;
+        let now = self.inner.clock.now();
+        cleanup_expired(&mut guard, now);
+        let Some(flow) = guard.flows.get(flow_id) else {
+            return expired_or_unknown(&guard, flow_id).into_cancel_result();
+        };
+        if flow.status != FlowStatus::Cancelling {
+            return CancelResult::Completing;
+        }
+        guard.flows.remove(flow_id);
+        guard
+            .cancelled
+            .insert(flow_id.to_owned(), now + FLOW_LIFETIME);
+        drop(guard);
+        self.inner.changed.notify_waiters();
+        CancelResult::Cancelled
+    }
+
     pub async fn flow(&self, flow_id: &str) -> Option<StartedFlow> {
         let mut guard = self.inner.state.lock().await;
         cleanup_expired(&mut guard, self.inner.clock.now());
@@ -485,7 +666,7 @@ impl SetupService {
         match guard.flows.get(flow_id) {
             None => expired_or_unknown(&guard, flow_id),
             Some(Flow {
-                status: FlowStatus::Pending | FlowStatus::Completing,
+                status: FlowStatus::Pending | FlowStatus::Cancelling | FlowStatus::Completing,
                 ..
             }) => PollResult::PendingTimeout,
             Some(Flow {
@@ -512,7 +693,7 @@ impl SetupService {
                 return Err(flow.failure_result.unwrap_or(PollResult::Failed));
             }
             FlowStatus::Completed => return Err(PollResult::Complete),
-            FlowStatus::Pending | FlowStatus::Completing => {}
+            FlowStatus::Pending | FlowStatus::Cancelling | FlowStatus::Completing => {}
         }
         let flow_polls = flow.active_polls.clone();
         drop(guard);
@@ -552,6 +733,7 @@ fn reserve_poll(counter: &AtomicUsize, maximum: usize) -> bool {
 
 fn cleanup_expired(state: &mut State, now: Duration) {
     state.expired.retain(|_, until| now < *until);
+    state.cancelled.retain(|_, until| now < *until);
     let expired_ids = state
         .flows
         .iter()
@@ -563,6 +745,20 @@ fn cleanup_expired(state: &mut State, now: Duration) {
         // tombstone is recorded. Tombstones contain no flow secrets.
         state.flows.remove(&flow_id);
         state.expired.insert(flow_id, now + FLOW_LIFETIME);
+    }
+}
+
+impl PollResult {
+    fn into_cancel_result(self) -> CancelResult {
+        match self {
+            Self::Unknown => CancelResult::Unknown,
+            Self::Expired => CancelResult::Expired,
+            Self::Complete => CancelResult::Complete,
+            Self::Failed | Self::IdentityMismatch => CancelResult::Failed,
+            Self::PendingTimeout | Self::Overloaded | Self::Unavailable => {
+                CancelResult::Unavailable
+            }
+        }
     }
 }
 

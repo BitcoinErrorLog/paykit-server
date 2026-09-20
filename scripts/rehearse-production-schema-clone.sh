@@ -3,8 +3,8 @@ set -Eeuo pipefail
 umask 077
 export LC_ALL=C
 
-readonly EXPECTED_SOURCE_VERSIONS="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23"
-readonly EXPECTED_CLONE_VERSIONS="${EXPECTED_SOURCE_VERSIONS},24"
+readonly EXPECTED_SOURCE_VERSIONS="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24"
+readonly EXPECTED_CLONE_VERSIONS="${EXPECTED_SOURCE_VERSIONS},25"
 readonly CLONE_DATABASE="paykit_production_clone"
 readonly CLONE_BOOTSTRAP_USER="clone_admin"
 
@@ -14,7 +14,7 @@ readonly CLONE_BOOTSTRAP_USER="clone_admin"
 
 pg_client_bin="${PAYKIT_PG_CLIENT_BIN:-/opt/homebrew/opt/libpq/bin}"
 pg_server_bin="${PAYKIT_PG_SERVER_BIN:-/opt/homebrew/opt/postgresql@18/bin}"
-export PATH="$pg_client_bin:$pg_server_bin:$PATH"
+export PATH="$pg_server_bin:$pg_client_bin:$PATH"
 
 for tool in railway python3 psql pg_dump pg_dumpall pg_restore initdb pg_ctl; do
   command -v "$tool" >/dev/null || {
