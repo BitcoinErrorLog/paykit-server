@@ -2698,7 +2698,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn request_deadline_cancels_the_attempt_and_releases_its_slot() {
         let server = ProbeServer::start_with_stalled_request();
         let address_deadline = Duration::from_secs(5);
@@ -2737,6 +2737,7 @@ mod tests {
             MAX_BLOCKING_TRANSPORT_ATTEMPTS - 1,
             "the live blocking request owns one guarded attempt slot"
         );
+        tokio::time::pause();
         tokio::time::advance(address_deadline + Duration::from_secs(1)).await;
         let attempt = pending.await.unwrap().unwrap();
         assert!(
