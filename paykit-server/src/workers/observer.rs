@@ -1601,8 +1601,6 @@ struct TestPhaseDelays {
     connect_gate: Option<Arc<TestPhaseGate>>,
     tls_gate: Option<Arc<TestPhaseGate>>,
     request_gate: Option<Arc<TestPhaseGate>>,
-    request_deadline_armed: Option<Arc<tokio::sync::Notify>>,
-    request_deadline_fire: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[cfg(test)]
@@ -1905,24 +1903,6 @@ impl ElectrumAdapter {
         // Request/response receives its own full phase deadline. On expiry,
         // close the underlying socket and JOIN the blocking task before
         // returning so neither transport nor capacity survives.
-        #[cfg(test)]
-        let outcome = if let Some(delays) = &self.test_phase_delays
-            && let Some(fire) = &delays.request_deadline_fire
-        {
-            if let Some(armed) = &delays.request_deadline_armed {
-                armed.notify_one();
-            }
-            tokio::select! {
-                result = &mut attempt => BlockingAttemptOutcome::Completed(result),
-                () = fire.notified() => BlockingAttemptOutcome::Deadline,
-            }
-        } else {
-            match tokio::time::timeout_at(request_deadline, &mut attempt).await {
-                Ok(result) => BlockingAttemptOutcome::Completed(result),
-                Err(_) => BlockingAttemptOutcome::Deadline,
-            }
-        };
-        #[cfg(not(test))]
         let outcome = match tokio::time::timeout_at(request_deadline, &mut attempt).await {
             Ok(result) => BlockingAttemptOutcome::Completed(result),
             Err(_) => BlockingAttemptOutcome::Deadline,
@@ -2718,17 +2698,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn request_deadline_cancels_the_attempt_and_releases_its_slot() {
         let server = ProbeServer::start_with_stalled_request();
         let address_deadline = Duration::from_secs(5);
-        let deadline_armed = Arc::new(Notify::new());
-        let deadline_fire = Arc::new(Notify::new());
-        let delays = Arc::new(TestPhaseDelays {
-            request_deadline_armed: Some(deadline_armed.clone()),
-            request_deadline_fire: Some(deadline_fire.clone()),
-            ..TestPhaseDelays::default()
-        });
         let adapter = ElectrumAdapter::configured(
             server.endpoint.clone(),
             BitcoinNetwork::Regtest,
@@ -2737,36 +2710,35 @@ mod tests {
             address_deadline,
             electrum::DEFAULT_MAX_RESPONSE_BYTES,
         )
-        .unwrap()
-        .with_test_phase_delays(delays.clone());
+        .unwrap();
         let address = test_address();
         let connected = adapter
             .raw_client(adapter.overall_deadline())
             .await
-            .expect("real TCP phase succeeds before clock injection");
+            .expect("real TCP phase succeeds");
         let overall_deadline = adapter.overall_deadline();
-        let request_started = server.request_started.clone();
-        let slots = adapter.blocking_attempt_slots.clone();
-        let clock_driver = tokio::spawn(async move {
-            deadline_armed.notified().await;
-            request_started.notified().await;
-            assert_eq!(
-                slots.available_permits(),
-                MAX_BLOCKING_TRANSPORT_ATTEMPTS - 1,
-                "the live blocking request owns one guarded attempt slot"
-            );
-            deadline_fire.notify_one();
-        });
-        let attempt = adapter
-            .observe_connected(
-                connected,
-                0,
-                ObservationTarget::new(address.to_string(), None),
-                overall_deadline,
-            )
-            .await
-            .unwrap();
-        clock_driver.await.unwrap();
+        let pending = {
+            let adapter = adapter.clone();
+            tokio::spawn(async move {
+                adapter
+                    .observe_connected(
+                        connected,
+                        0,
+                        ObservationTarget::new(address.to_string(), None),
+                        overall_deadline,
+                    )
+                    .await
+            })
+        };
+
+        server.request_started.notified().await;
+        assert_eq!(
+            adapter.blocking_attempt_slots.available_permits(),
+            MAX_BLOCKING_TRANSPORT_ATTEMPTS - 1,
+            "the live blocking request owns one guarded attempt slot"
+        );
+        tokio::time::advance(address_deadline + Duration::from_secs(1)).await;
+        let attempt = pending.await.unwrap().unwrap();
         assert!(
             matches!(
                 attempt,
