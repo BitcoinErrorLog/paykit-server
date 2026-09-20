@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 /// Creator allocation mode and the claim-channel corroborating checks (design §B.8.6).
 pub mod allocation;
 /// Application services and explicit side-effect ports.
