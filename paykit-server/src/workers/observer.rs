@@ -2230,17 +2230,15 @@ impl ChainHistoryPort for ElectrumAdapter {
         // TCP connect + TLS handshake sit inside the window deadline, the
         // same phase policy the observer probe uses. A blocking connect
         // outside this budget is the leftover slow-drip / TCP-in-deadline
-        // gap this path previously had.
+        // gap this path previously had. If connect fails, the concurrency
+        // permit drops with this future: no blocking read is outstanding.
         let connected = self
             .raw_client(overall_deadline)
             .await
             .map_err(|_| ClaimScanError::Unavailable)?;
-        let cancel = connected
-            .cancel_handle()
-            .map_err(|_| ClaimScanError::Unavailable)?;
         let scripts = scripts.to_vec();
         let max_items = self.max_history_items_per_window;
-        let mut fetch = tokio::task::spawn_blocking(move || {
+        let fetch = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let mut batch = Batch::default();
             for script in &scripts {
@@ -2270,13 +2268,13 @@ impl ChainHistoryPort for ElectrumAdapter {
             }
             Ok(presence)
         });
-        match tokio::time::timeout_at(overall_deadline, &mut fetch).await {
+        // The blocking socket read cannot be cancelled, so on expiry the
+        // join handle is abandoned: the window fails Unavailable, the
+        // connection is never reused, and the detached task — which owns
+        // the concurrency permit — exits when the socket read returns.
+        match tokio::time::timeout_at(overall_deadline, fetch).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) | Err(_) => {
-                let _ = cancel.shutdown(Shutdown::Both);
-                let _ = fetch.await;
-                Err(ClaimScanError::Unavailable)
-            }
+            Ok(Err(_)) | Err(_) => Err(ClaimScanError::Unavailable),
         }
     }
 }
