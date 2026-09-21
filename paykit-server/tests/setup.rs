@@ -1,7 +1,7 @@
 use std::{
     any::Any,
     collections::VecDeque,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -457,6 +457,10 @@ fn runtime_limits(
         claim_identity_burst: SetupLimits::generous_claim_for_tests().1,
         claim_ip_per_second: SetupLimits::generous_claim_for_tests().2,
         claim_ip_burst: SetupLimits::generous_claim_for_tests().3,
+        claim_limiter_max_entries: SetupLimits::TEST_MAX_ENTRIES,
+        claim_limiter_idle_ttl: SetupLimits::test_idle_ttl(),
+        claim_ip_ipv4_prefix: SetupLimits::TEST_IPV4_PREFIX,
+        claim_ip_ipv6_prefix: SetupLimits::TEST_IPV6_PREFIX,
     }
 }
 
@@ -1546,6 +1550,10 @@ fn claim_token_limits(
         claim_identity_burst: identity_burst,
         claim_ip_per_second: ip_rate,
         claim_ip_burst: ip_burst,
+        claim_limiter_max_entries: SetupLimits::TEST_MAX_ENTRIES,
+        claim_limiter_idle_ttl: SetupLimits::test_idle_ttl(),
+        claim_ip_ipv4_prefix: SetupLimits::TEST_IPV4_PREFIX,
+        claim_ip_ipv6_prefix: SetupLimits::TEST_IPV6_PREFIX,
     }
 }
 
@@ -1627,5 +1635,39 @@ async fn claim_ip_token_bucket_isolates_peers_ahead_of_the_sliding_window() {
             .await
             .is_ok(),
         "a different IP has a separate claim-IP bucket"
+    );
+}
+
+#[tokio::test]
+async fn claim_ip_bucket_is_keyed_by_ipv6_prefix_not_raw_address() {
+    let setup = claim_limited_service(10_000, 1);
+    let a = IpAddr::V6(Ipv6Addr::new(
+        0x2001, 0xdb8, 0x1, 0x2, 0xaaaa, 0xbbbb, 0xcccc, 0xdddd,
+    ));
+    let b = IpAddr::V6(Ipv6Addr::new(
+        0x2001, 0xdb8, 0x1, 0x2, 0x1111, 0x2222, 0x3333, 0x4444,
+    ));
+    let other = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x1, 0x3, 0, 0, 0, 1));
+    assert!(
+        setup
+            .begin(a, "https://app.example", "one", EXPECTED_CREATOR)
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        setup
+            .begin(b, "https://app.example", "two", EXPECTED_CREATOR)
+            .await,
+        Err(BeginError::RateLimited {
+            retry_after_secs: 1
+        }),
+        "IPv6 addresses in the same /64 share the claim-IP bucket"
+    );
+    assert!(
+        setup
+            .begin(other, "https://app.example", "three", EXPECTED_CREATOR)
+            .await
+            .is_ok(),
+        "a different /64 has a separate claim-IP bucket"
     );
 }

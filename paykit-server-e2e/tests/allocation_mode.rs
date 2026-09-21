@@ -267,6 +267,10 @@ async fn grant_created_owner_status_evidence_and_alert_acknowledgement_remain_li
             claim_identity_burst: SetupLimits::generous_claim_for_tests().1,
             claim_ip_per_second: SetupLimits::generous_claim_for_tests().2,
             claim_ip_burst: SetupLimits::generous_claim_for_tests().3,
+            claim_limiter_max_entries: SetupLimits::TEST_MAX_ENTRIES,
+            claim_limiter_idle_ttl: SetupLimits::test_idle_ttl(),
+            claim_ip_ipv4_prefix: SetupLimits::TEST_IPV4_PREFIX,
+            claim_ip_ipv6_prefix: SetupLimits::TEST_IPV6_PREFIX,
         },
     );
     let flow = setup

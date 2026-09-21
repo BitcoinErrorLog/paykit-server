@@ -196,6 +196,13 @@ impl Server {
                 claim_identity_burst: config.rate_limits.claim_identity_burst,
                 claim_ip_per_second: config.rate_limits.claim_ip_per_second,
                 claim_ip_burst: config.rate_limits.claim_ip_burst,
+                claim_limiter_max_entries: usize::try_from(
+                    config.rate_limits.claim_limiter_max_entries,
+                )
+                .expect("validated claim limiter max entries fits usize"),
+                claim_limiter_idle_ttl: config.rate_limits.claim_limiter_idle_ttl,
+                claim_ip_ipv4_prefix: config.rate_limits.claim_ip_ipv4_prefix,
+                claim_ip_ipv6_prefix: config.rate_limits.claim_ip_ipv6_prefix,
             },
             Arc::new(PostgresCancellationStore::new(pool.clone())),
         );

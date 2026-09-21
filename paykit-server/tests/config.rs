@@ -1148,13 +1148,20 @@ fn claim_limiter_and_http_deadline_default_when_omitted() {
     assert_eq!(config.rate_limits.claim_identity_burst, 3);
     assert_eq!(config.rate_limits.claim_ip_per_second, 2);
     assert_eq!(config.rate_limits.claim_ip_burst, 6);
+    assert_eq!(config.rate_limits.claim_limiter_max_entries, 100_000);
+    assert_eq!(
+        config.rate_limits.claim_limiter_idle_ttl,
+        Duration::from_secs(600)
+    );
+    assert_eq!(config.rate_limits.claim_ip_ipv4_prefix, 32);
+    assert_eq!(config.rate_limits.claim_ip_ipv6_prefix, 64);
     assert_eq!(config.limits.http_request_deadline, Duration::from_secs(20));
 }
 
 #[test]
 fn claim_limiter_and_http_deadline_env_overrides_toml() {
     let toml = format!(
-        "{}\n[rate_limits]\nclaim_identity_per_second = 4\nclaim_identity_burst = 8\nclaim_ip_per_second = 5\nclaim_ip_burst = 9\n[limits]\nhttp_request_deadline = \"25s\"\n",
+        "{}\n[rate_limits]\nclaim_identity_per_second = 4\nclaim_identity_burst = 8\nclaim_ip_per_second = 5\nclaim_ip_burst = 9\nclaim_limiter_max_entries = 2048\nclaim_limiter_idle_ttl = \"2m\"\nclaim_ip_ipv4_prefix = 24\nclaim_ip_ipv6_prefix = 48\n[limits]\nhttp_request_deadline = \"25s\"\n",
         valid_toml()
     );
     let toml_values = Config::from_toml_and_environment(&toml, environment()).unwrap();
@@ -1162,6 +1169,13 @@ fn claim_limiter_and_http_deadline_env_overrides_toml() {
     assert_eq!(toml_values.rate_limits.claim_identity_burst, 8);
     assert_eq!(toml_values.rate_limits.claim_ip_per_second, 5);
     assert_eq!(toml_values.rate_limits.claim_ip_burst, 9);
+    assert_eq!(toml_values.rate_limits.claim_limiter_max_entries, 2048);
+    assert_eq!(
+        toml_values.rate_limits.claim_limiter_idle_ttl,
+        Duration::from_secs(120)
+    );
+    assert_eq!(toml_values.rate_limits.claim_ip_ipv4_prefix, 24);
+    assert_eq!(toml_values.rate_limits.claim_ip_ipv6_prefix, 48);
     assert_eq!(
         toml_values.limits.http_request_deadline,
         Duration::from_secs(25)
@@ -1172,6 +1186,10 @@ fn claim_limiter_and_http_deadline_env_overrides_toml() {
         claim_identity_burst: Some(11),
         claim_ip_rate_per_second: Some(7),
         claim_ip_burst: Some(13),
+        claim_limiter_max_entries: Some(4096),
+        claim_limiter_idle_ttl: Some(Duration::from_secs(30)),
+        claim_ip_ipv4_prefix: Some(16),
+        claim_ip_ipv6_prefix: Some(56),
         http_request_deadline: Some(Duration::from_secs(3)),
         ..environment()
     };
@@ -1180,6 +1198,13 @@ fn claim_limiter_and_http_deadline_env_overrides_toml() {
     assert_eq!(config.rate_limits.claim_identity_burst, 11);
     assert_eq!(config.rate_limits.claim_ip_per_second, 7);
     assert_eq!(config.rate_limits.claim_ip_burst, 13);
+    assert_eq!(config.rate_limits.claim_limiter_max_entries, 4096);
+    assert_eq!(
+        config.rate_limits.claim_limiter_idle_ttl,
+        Duration::from_secs(30)
+    );
+    assert_eq!(config.rate_limits.claim_ip_ipv4_prefix, 16);
+    assert_eq!(config.rate_limits.claim_ip_ipv6_prefix, 56);
     assert_eq!(config.limits.http_request_deadline, Duration::from_secs(3));
 }
 
@@ -1190,6 +1215,12 @@ fn rejects_zero_claim_limiter_and_http_deadline_values() {
         "[rate_limits]\nclaim_identity_burst = 0\n",
         "[rate_limits]\nclaim_ip_per_second = 0\n",
         "[rate_limits]\nclaim_ip_burst = 0\n",
+        "[rate_limits]\nclaim_limiter_max_entries = 0\n",
+        "[rate_limits]\nclaim_limiter_idle_ttl = \"0s\"\n",
+        "[rate_limits]\nclaim_ip_ipv4_prefix = 0\n",
+        "[rate_limits]\nclaim_ip_ipv6_prefix = 0\n",
+        "[rate_limits]\nclaim_ip_ipv4_prefix = 33\n",
+        "[rate_limits]\nclaim_ip_ipv6_prefix = 129\n",
         "[limits]\nhttp_request_deadline = \"0s\"\n",
     ] {
         let input = format!("{}\n{extra}", valid_toml());

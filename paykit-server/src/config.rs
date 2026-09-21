@@ -58,6 +58,10 @@ impl Config {
             claim_identity_burst: environment.claim_identity_burst,
             claim_ip_rate_per_second: environment.claim_ip_rate_per_second,
             claim_ip_burst: environment.claim_ip_burst,
+            claim_limiter_max_entries: environment.claim_limiter_max_entries,
+            claim_limiter_idle_ttl: environment.claim_limiter_idle_ttl,
+            claim_ip_ipv4_prefix: environment.claim_ip_ipv4_prefix,
+            claim_ip_ipv6_prefix: environment.claim_ip_ipv6_prefix,
             http_request_deadline: environment.http_request_deadline,
             ..Default::default()
         };
@@ -205,6 +209,10 @@ impl Config {
                 "limits.http_request_deadline",
                 self.limits.http_request_deadline,
             ),
+            (
+                "rate_limits.claim_limiter_idle_ttl",
+                self.rate_limits.claim_limiter_idle_ttl,
+            ),
             ("shutdown.drain_timeout", self.shutdown.drain_timeout),
             (
                 "electrum.claim_scan_window_deadline",
@@ -316,6 +324,10 @@ impl Config {
                 "rate_limits.claim_ip_burst",
                 self.rate_limits.claim_ip_burst,
             ),
+            (
+                "rate_limits.claim_limiter_max_entries",
+                self.rate_limits.claim_limiter_max_entries,
+            ),
             ("sentinel.min_value_sats", self.sentinel.min_value_sats),
             ("sentinel.hit_count", self.sentinel.hit_count),
             (
@@ -330,6 +342,20 @@ impl Config {
             if value == 0 {
                 return Err(ConfigError::ZeroValue(name));
             }
+        }
+        if !(1..=32).contains(&self.rate_limits.claim_ip_ipv4_prefix) {
+            return Err(ConfigError::InvalidIntegerRange(
+                "rate_limits.claim_ip_ipv4_prefix",
+                1,
+                32,
+            ));
+        }
+        if !(1..=128).contains(&self.rate_limits.claim_ip_ipv6_prefix) {
+            return Err(ConfigError::InvalidIntegerRange(
+                "rate_limits.claim_ip_ipv6_prefix",
+                1,
+                128,
+            ));
         }
         for (name, value) in [
             ("electrum.poll_interval", self.electrum.poll_interval),
@@ -456,6 +482,14 @@ pub struct ConfigEnvironment {
     pub claim_ip_rate_per_second: Option<u64>,
     /// When set, overrides `rate_limits.claim_ip_burst`.
     pub claim_ip_burst: Option<u64>,
+    /// When set, overrides `rate_limits.claim_limiter_max_entries`.
+    pub claim_limiter_max_entries: Option<u64>,
+    /// When set, overrides `rate_limits.claim_limiter_idle_ttl`.
+    pub claim_limiter_idle_ttl: Option<Duration>,
+    /// When set, overrides `rate_limits.claim_ip_ipv4_prefix`.
+    pub claim_ip_ipv4_prefix: Option<u8>,
+    /// When set, overrides `rate_limits.claim_ip_ipv6_prefix`.
+    pub claim_ip_ipv6_prefix: Option<u8>,
     /// When set, overrides `limits.http_request_deadline`.
     pub http_request_deadline: Option<Duration>,
 }
@@ -475,6 +509,10 @@ impl ConfigEnvironment {
             claim_identity_burst: parse_optional_u64_env("PAYKIT_CLAIM_IDENTITY_BURST")?,
             claim_ip_rate_per_second: parse_optional_u64_env("PAYKIT_CLAIM_IP_RATE_PER_SECOND")?,
             claim_ip_burst: parse_optional_u64_env("PAYKIT_CLAIM_IP_BURST")?,
+            claim_limiter_max_entries: parse_optional_u64_env("PAYKIT_CLAIM_LIMITER_MAX_ENTRIES")?,
+            claim_limiter_idle_ttl: parse_optional_duration_env("PAYKIT_CLAIM_LIMITER_IDLE_TTL")?,
+            claim_ip_ipv4_prefix: parse_optional_u8_env("PAYKIT_CLAIM_IP_IPV4_PREFIX")?,
+            claim_ip_ipv6_prefix: parse_optional_u8_env("PAYKIT_CLAIM_IP_IPV6_PREFIX")?,
             http_request_deadline: parse_optional_duration_env("PAYKIT_HTTP_REQUEST_DEADLINE")?,
         })
     }
@@ -961,6 +999,14 @@ pub struct RateLimitsConfig {
     pub claim_ip_per_second: u64,
     /// Token-bucket burst for Bitkit `/setup` keyed by peer IP.
     pub claim_ip_burst: u64,
+    /// Maximum live identity or IP-prefix buckets per keyed limiter.
+    pub claim_limiter_max_entries: u64,
+    /// Idle buckets older than this are swept on the next permit.
+    pub claim_limiter_idle_ttl: Duration,
+    /// IPv4 prefix length used to key the claim-IP bucket (default /32).
+    pub claim_ip_ipv4_prefix: u8,
+    /// IPv6 prefix length used to key the claim-IP bucket (default /64).
+    pub claim_ip_ipv6_prefix: u8,
 }
 
 #[derive(Debug)]
@@ -1072,6 +1118,8 @@ pub enum ConfigError {
     ZeroDuration(&'static str),
     #[error("{0} must be greater than zero")]
     ZeroValue(&'static str),
+    #[error("{0} must be an integer from {1} to {2}")]
+    InvalidIntegerRange(&'static str, u64, u64),
     #[error("{0} must be at least one second")]
     SubsecondPersistenceDuration(&'static str),
     #[error("{0} must fit PostgreSQL make_interval(secs => i64)")]
@@ -1126,6 +1174,18 @@ fn apply_environment_overrides(config: &mut Config, environment: &ConfigEnvironm
     if let Some(value) = environment.claim_ip_burst {
         config.rate_limits.claim_ip_burst = value;
     }
+    if let Some(value) = environment.claim_limiter_max_entries {
+        config.rate_limits.claim_limiter_max_entries = value;
+    }
+    if let Some(value) = environment.claim_limiter_idle_ttl {
+        config.rate_limits.claim_limiter_idle_ttl = value;
+    }
+    if let Some(value) = environment.claim_ip_ipv4_prefix {
+        config.rate_limits.claim_ip_ipv4_prefix = value;
+    }
+    if let Some(value) = environment.claim_ip_ipv6_prefix {
+        config.rate_limits.claim_ip_ipv6_prefix = value;
+    }
     if let Some(value) = environment.http_request_deadline {
         config.limits.http_request_deadline = value;
     }
@@ -1139,6 +1199,15 @@ fn parse_optional_u64_env(name: &'static str) -> Result<Option<u64>, ConfigError
             .map_err(|_| ConfigError::InvalidEnvInteger(name)),
         Err(std::env::VarError::NotPresent) => Ok(None),
         Err(_) => Err(ConfigError::InvalidEnvInteger(name)),
+    }
+}
+
+fn parse_optional_u8_env(name: &'static str) -> Result<Option<u8>, ConfigError> {
+    match parse_optional_u64_env(name)? {
+        None => Ok(None),
+        Some(value) => u8::try_from(value)
+            .map(Some)
+            .map_err(|_| ConfigError::InvalidEnvInteger(name)),
     }
 }
 
@@ -1557,6 +1626,14 @@ struct RawRateLimitsConfig {
     claim_ip_per_second: u64,
     #[serde(default = "default_claim_ip_burst")]
     claim_ip_burst: u64,
+    #[serde(default = "default_claim_limiter_max_entries")]
+    claim_limiter_max_entries: u64,
+    #[serde(default = "default_claim_limiter_idle_ttl", with = "humantime_serde")]
+    claim_limiter_idle_ttl: Duration,
+    #[serde(default = "default_claim_ip_ipv4_prefix")]
+    claim_ip_ipv4_prefix: u8,
+    #[serde(default = "default_claim_ip_ipv6_prefix")]
+    claim_ip_ipv6_prefix: u8,
 }
 
 #[derive(Deserialize)]
@@ -1591,6 +1668,10 @@ impl Default for RawRateLimitsConfig {
             claim_identity_burst: default_claim_identity_burst(),
             claim_ip_per_second: default_claim_ip_per_second(),
             claim_ip_burst: default_claim_ip_burst(),
+            claim_limiter_max_entries: default_claim_limiter_max_entries(),
+            claim_limiter_idle_ttl: default_claim_limiter_idle_ttl(),
+            claim_ip_ipv4_prefix: default_claim_ip_ipv4_prefix(),
+            claim_ip_ipv6_prefix: default_claim_ip_ipv6_prefix(),
         }
     }
 }
@@ -1642,6 +1723,10 @@ impl From<RawRateLimitsConfig> for RateLimitsConfig {
             claim_identity_burst: value.claim_identity_burst,
             claim_ip_per_second: value.claim_ip_per_second,
             claim_ip_burst: value.claim_ip_burst,
+            claim_limiter_max_entries: value.claim_limiter_max_entries,
+            claim_limiter_idle_ttl: value.claim_limiter_idle_ttl,
+            claim_ip_ipv4_prefix: value.claim_ip_ipv4_prefix,
+            claim_ip_ipv6_prefix: value.claim_ip_ipv6_prefix,
         }
     }
 }
@@ -1696,6 +1781,18 @@ const fn default_claim_ip_per_second() -> u64 {
 }
 const fn default_claim_ip_burst() -> u64 {
     6
+}
+const fn default_claim_limiter_max_entries() -> u64 {
+    100_000
+}
+const fn default_claim_limiter_idle_ttl() -> Duration {
+    Duration::from_secs(600)
+}
+const fn default_claim_ip_ipv4_prefix() -> u8 {
+    32
+}
+const fn default_claim_ip_ipv6_prefix() -> u8 {
+    64
 }
 const fn default_signed_requests_per_second() -> u64 {
     100
