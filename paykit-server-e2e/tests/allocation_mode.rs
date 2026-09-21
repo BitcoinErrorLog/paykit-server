@@ -263,6 +263,10 @@ async fn grant_created_owner_status_evidence_and_alert_acknowledgement_remain_li
             max_polls: 2,
             setup_per_ip_per_minute: 2,
             max_pending_setup_flows: 2,
+            claim_identity_per_second: SetupLimits::generous_claim_for_tests().0,
+            claim_identity_burst: SetupLimits::generous_claim_for_tests().1,
+            claim_ip_per_second: SetupLimits::generous_claim_for_tests().2,
+            claim_ip_burst: SetupLimits::generous_claim_for_tests().3,
         },
     );
     let flow = setup

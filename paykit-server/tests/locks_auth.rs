@@ -88,6 +88,7 @@ signed_burst = {burst}
             database_url: Some("postgres://paykit:secret@localhost/paykit".to_owned()),
             migrator_database_url: Some("postgres://owner:secret@localhost/paykit".to_owned()),
             master_key: Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE".to_owned()),
+            ..Default::default()
         },
     )
     .unwrap()

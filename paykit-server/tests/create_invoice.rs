@@ -1255,6 +1255,7 @@ signed_burst = 100
             database_url: Some("postgres://paykit:secret@localhost/paykit".into()),
             migrator_database_url: Some("postgres://owner:secret@localhost/paykit".into()),
             master_key: Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE".into()),
+            ..Default::default()
         },
     )
     .unwrap();

@@ -101,6 +101,10 @@ fn service(store: Arc<dyn CancellationStore>) -> SetupService {
             max_polls: 2,
             setup_per_ip_per_minute: 10,
             max_pending_setup_flows: 2,
+            claim_identity_per_second: SetupLimits::generous_claim_for_tests().0,
+            claim_identity_burst: SetupLimits::generous_claim_for_tests().1,
+            claim_ip_per_second: SetupLimits::generous_claim_for_tests().2,
+            claim_ip_burst: SetupLimits::generous_claim_for_tests().3,
         },
         store,
     )
@@ -116,6 +120,10 @@ fn tracked_service(store: Arc<dyn CancellationStore>, drops: Arc<AtomicUsize>) -
             max_polls: 2,
             setup_per_ip_per_minute: 10,
             max_pending_setup_flows: 1,
+            claim_identity_per_second: SetupLimits::generous_claim_for_tests().0,
+            claim_identity_burst: SetupLimits::generous_claim_for_tests().1,
+            claim_ip_per_second: SetupLimits::generous_claim_for_tests().2,
+            claim_ip_burst: SetupLimits::generous_claim_for_tests().3,
         },
         store,
     )

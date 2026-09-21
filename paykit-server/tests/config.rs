@@ -15,6 +15,7 @@ fn environment() -> ConfigEnvironment {
         database_url: Some("postgres://paykit:secret@localhost/paykit".to_owned()),
         migrator_database_url: Some("postgres://owner:secret@localhost/paykit".to_owned()),
         master_key: Some(MASTER_KEY.to_owned()),
+        ..Default::default()
     }
 }
 
@@ -1138,4 +1139,69 @@ fn sentinel_config_is_redacted_in_the_effective_config() {
     assert!(effective.contains("SentinelConfig"), "{effective}");
     assert!(effective.contains("min_value_sats: 546"), "{effective}");
     assert!(!effective.contains(MASTER_KEY));
+}
+
+#[test]
+fn claim_limiter_and_http_deadline_default_when_omitted() {
+    let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
+    assert_eq!(config.rate_limits.claim_identity_per_second, 1);
+    assert_eq!(config.rate_limits.claim_identity_burst, 3);
+    assert_eq!(config.rate_limits.claim_ip_per_second, 2);
+    assert_eq!(config.rate_limits.claim_ip_burst, 6);
+    assert_eq!(config.limits.http_request_deadline, Duration::from_secs(10));
+}
+
+#[test]
+fn claim_limiter_and_http_deadline_env_overrides_toml() {
+    let toml = format!(
+        "{}\n[rate_limits]\nclaim_identity_per_second = 4\nclaim_identity_burst = 8\nclaim_ip_per_second = 5\nclaim_ip_burst = 9\n[limits]\nhttp_request_deadline = \"20s\"\n",
+        valid_toml()
+    );
+    let toml_values = Config::from_toml_and_environment(&toml, environment()).unwrap();
+    assert_eq!(toml_values.rate_limits.claim_identity_per_second, 4);
+    assert_eq!(toml_values.rate_limits.claim_identity_burst, 8);
+    assert_eq!(toml_values.rate_limits.claim_ip_per_second, 5);
+    assert_eq!(toml_values.rate_limits.claim_ip_burst, 9);
+    assert_eq!(
+        toml_values.limits.http_request_deadline,
+        Duration::from_secs(20)
+    );
+
+    let overridden = ConfigEnvironment {
+        claim_identity_rate_per_second: Some(9),
+        claim_identity_burst: Some(11),
+        claim_ip_rate_per_second: Some(7),
+        claim_ip_burst: Some(13),
+        http_request_deadline: Some(Duration::from_secs(3)),
+        ..environment()
+    };
+    let config = Config::from_toml_and_environment(&toml, overridden).unwrap();
+    assert_eq!(config.rate_limits.claim_identity_per_second, 9);
+    assert_eq!(config.rate_limits.claim_identity_burst, 11);
+    assert_eq!(config.rate_limits.claim_ip_per_second, 7);
+    assert_eq!(config.rate_limits.claim_ip_burst, 13);
+    assert_eq!(config.limits.http_request_deadline, Duration::from_secs(3));
+}
+
+#[test]
+fn rejects_zero_claim_limiter_and_http_deadline_values() {
+    for extra in [
+        "[rate_limits]\nclaim_identity_per_second = 0\n",
+        "[rate_limits]\nclaim_identity_burst = 0\n",
+        "[rate_limits]\nclaim_ip_per_second = 0\n",
+        "[rate_limits]\nclaim_ip_burst = 0\n",
+        "[limits]\nhttp_request_deadline = \"0s\"\n",
+    ] {
+        let input = format!("{}\n{extra}", valid_toml());
+        assert!(
+            Config::from_toml_and_environment(&input, environment()).is_err(),
+            "{extra} should be rejected"
+        );
+    }
+
+    let zero_override = ConfigEnvironment {
+        claim_identity_rate_per_second: Some(0),
+        ..environment()
+    };
+    assert!(Config::from_toml_and_environment(&valid_toml(), zero_override).is_err());
 }

@@ -1667,6 +1667,9 @@ pub struct ElectrumAdapter {
     /// only when that call's socket read returns, so the bound covers
     /// reads orphaned past their window deadline too.
     claim_scan_permits: Arc<Semaphore>,
+    /// Shared Electrum token bucket. Claim-time `history_presence_batch`
+    /// charges one token per batched window before opening a connection.
+    request_limiter: Option<RequestLimiter>,
     /// Capacity guard for blocking TLS and request phases. Deadline handling
     /// shuts down the socket and joins the task before returning, so expired
     /// work cannot retain one of these slots.
@@ -1687,6 +1690,7 @@ impl ElectrumAdapter {
             max_history_items_per_window: self.max_history_items_per_window,
             claim_scan_window_deadline: self.claim_scan_window_deadline,
             claim_scan_permits: self.claim_scan_permits.clone(),
+            request_limiter: self.request_limiter.clone(),
             blocking_attempt_slots: self.blocking_attempt_slots.clone(),
             #[cfg(test)]
             test_phase_delays: self.test_phase_delays.clone(),
@@ -1705,6 +1709,14 @@ impl ElectrumAdapter {
         self.max_history_items_per_window = max_history_items_per_window;
         self.claim_scan_window_deadline = claim_scan_window_deadline;
         self.claim_scan_permits = Arc::new(Semaphore::new(max_concurrent_claim_scans));
+        self
+    }
+
+    /// Charges each claim-scan window against the process-wide Electrum
+    /// `RequestLimiter`. Production wiring passes the shared limiter used
+    /// by the observer tick and creation snapshots.
+    pub fn with_request_limiter(mut self, limiter: RequestLimiter) -> Self {
+        self.request_limiter = Some(limiter);
         self
     }
 
@@ -1732,6 +1744,7 @@ impl ElectrumAdapter {
             max_history_items_per_window: DEFAULT_MAX_HISTORY_ITEMS_PER_WINDOW,
             claim_scan_window_deadline: DEFAULT_CLAIM_SCAN_WINDOW_DEADLINE,
             claim_scan_permits: Arc::new(Semaphore::new(DEFAULT_MAX_CONCURRENT_CLAIM_SCANS)),
+            request_limiter: None,
             blocking_attempt_slots: Arc::new(Semaphore::new(MAX_BLOCKING_TRANSPORT_ATTEMPTS)),
             #[cfg(test)]
             test_phase_delays: None,
@@ -2196,6 +2209,16 @@ impl ChainHistoryPort for ElectrumAdapter {
         &self,
         scripts: &[ScriptBuf],
     ) -> Result<Vec<bool>, ClaimScanError> {
+        if let Some(limiter) = &self.request_limiter {
+            limiter.try_reserve(1).map_err(|_| {
+                tracing::warn!(
+                    target: "paykit.refusal_audit",
+                    kind = "claim_electrum_budget",
+                    "claim-time history scan refused: Electrum RequestLimiter exhausted"
+                );
+                ClaimScanError::Unavailable
+            })?;
+        }
         // Concurrency bound first: over it the claim scan is unavailable
         // immediately, before any blocking task or Electrum call exists.
         let permit = self
@@ -2203,44 +2226,33 @@ impl ChainHistoryPort for ElectrumAdapter {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ClaimScanError::Unavailable)?;
-        let adapter = self.clone_for_fetch();
+        let overall_deadline = tokio::time::Instant::now() + self.claim_scan_window_deadline;
+        // TCP connect + TLS handshake sit inside the window deadline, the
+        // same phase policy the observer probe uses. A blocking connect
+        // outside this budget is the leftover slow-drip / TCP-in-deadline
+        // gap this path previously had.
+        let connected = self
+            .raw_client(overall_deadline)
+            .await
+            .map_err(|_| ClaimScanError::Unavailable)?;
+        let cancel = connected
+            .cancel_handle()
+            .map_err(|_| ClaimScanError::Unavailable)?;
         let scripts = scripts.to_vec();
         let max_items = self.max_history_items_per_window;
-        let fetch = tokio::task::spawn_blocking(move || {
-            // The permit lives exactly as long as the Electrum I/O it
-            // admits: it is owned by this blocking call and released only
-            // when the call returns — never when the awaiting side gives
-            // up on the per-window deadline. A window whose socket read
-            // outlives its deadline therefore keeps its slot occupied
-            // until the read ends — not bounded by one
-            // `electrum.request_timeout`: the timeout is per read, so the
-            // true wire bound is retries × request_timeout + reconnect
-            // backoff (client-side retries are pinned at zero in this
-            // composition) plus, for a drip-feeding endpoint, up to one
-            // request_timeout per delivered byte until the
-            // `electrum.max_response_bytes` + 1 line cap trips — so the
-            // semaphore bounds live blocking threads and sockets, not
-            // just awaited windows.
+        let mut fetch = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let client = adapter
-                .raw_client_blocking()
-                .map_err(|_| ClaimScanError::Unavailable)?;
-            // ONE batched get_history round-trip for the window; presence
-            // only, so transactions are never fetched.
             let mut batch = Batch::default();
             for script in &scripts {
                 batch.script_get_history(script.as_script());
             }
-            let responses = client
+            let responses = connected
+                .client
                 .batch_call(&batch)
                 .map_err(|_| ClaimScanError::Unavailable)?;
             if responses.len() != scripts.len() {
-                // A malformed response is an Electrum failure, not an empty
-                // window.
                 return Err(ClaimScanError::Unavailable);
             }
-            // Cap the decoded item count BEFORE any domain value is
-            // materialised; presence is computed on the raw values.
             let mut items = 0_usize;
             let mut presence = Vec::with_capacity(responses.len());
             for response in &responses {
@@ -2249,9 +2261,6 @@ impl ChainHistoryPort for ElectrumAdapter {
                 presence.push(!entries.is_empty());
             }
             if items > max_items {
-                // Over-cap: the whole window is treated as used (design
-                // §B.5 — conservative: it only advances the start index;
-                // the 50-window bound still yields account_history_too_deep).
                 tracing::debug!(
                     items,
                     max_items,
@@ -2261,23 +2270,13 @@ impl ChainHistoryPort for ElectrumAdapter {
             }
             Ok(presence)
         });
-        // Per-window wall-clock deadline over connect + call + decode. The
-        // blocking socket read cannot be cancelled, so on expiry the join
-        // handle is abandoned: the scan fails the window Unavailable, the
-        // connection is never reused, and the detached task exits when the
-        // socket read returns — not bounded by one
-        // `electrum.request_timeout`: the timeout is per read, so the true
-        // wire bound is retries × request_timeout + reconnect backoff
-        // (client-side retries are pinned at zero in this composition)
-        // plus, for a drip-feeding endpoint, up to one request_timeout per
-        // delivered byte until the `electrum.max_response_bytes` + 1 line
-        // cap trips. The semaphore permit
-        // moved into the blocking closure above stays held for exactly that
-        // long too: the slot frees only when the read actually ends, not
-        // when the deadline fires.
-        match tokio::time::timeout(self.claim_scan_window_deadline, fetch).await {
+        match tokio::time::timeout_at(overall_deadline, &mut fetch).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) | Err(_) => Err(ClaimScanError::Unavailable),
+            Ok(Err(_)) | Err(_) => {
+                let _ = cancel.shutdown(Shutdown::Both);
+                let _ = fetch.await;
+                Err(ClaimScanError::Unavailable)
+            }
         }
     }
 }

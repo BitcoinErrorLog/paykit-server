@@ -23,6 +23,7 @@ use bitcoin::{
 use electrum_client::{ScriptHash, ToElectrumScriptHash};
 use paykit_server::{
     bitcoin::{ObservationTarget, TrackedOutput},
+    chain_history::{ChainHistoryPort, ClaimScanError},
     config::BitcoinNetwork,
     workers::{
         electrum::DEFAULT_MAX_RESPONSE_BYTES,
@@ -213,6 +214,82 @@ async fn tls_handshake_failure_is_eager_endpoint_unavailable_not_an_address_dead
             panic!("TLS handshake was deferred until the first address RPC");
         }
     }
+}
+
+fn claim_scan_script() -> bitcoin::ScriptBuf {
+    fixture_address().script_pubkey()
+}
+
+#[tokio::test]
+async fn claim_scan_stalled_tls_handshake_fails_inside_the_window_deadline() {
+    let server = StalledTlsServer::start();
+    let adapter = ElectrumAdapter::configured(
+        server.endpoint.clone(),
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(30),
+        200,
+        Duration::from_millis(80),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .unwrap()
+    .with_claim_scan_bounds(200, Duration::from_millis(200), 1);
+
+    let started = std::time::Instant::now();
+    let result = adapter.history_presence_batch(&[claim_scan_script()]).await;
+    let elapsed = started.elapsed();
+    assert_eq!(result, Err(ClaimScanError::Unavailable));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "stalled TLS must fail inside the claim-scan window, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn claim_scan_tcp_connect_is_inside_the_window_deadline() {
+    let adapter = ElectrumAdapter::configured(
+        "tcp://192.0.2.1:1",
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(30),
+        200,
+        Duration::from_millis(80),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .unwrap()
+    .with_claim_scan_bounds(200, Duration::from_millis(200), 1);
+
+    let started = std::time::Instant::now();
+    let result = adapter.history_presence_batch(&[claim_scan_script()]).await;
+    let elapsed = started.elapsed();
+    assert_eq!(result, Err(ClaimScanError::Unavailable));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "TCP connect must sit inside the claim-scan window, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn claim_scan_charges_the_shared_electrum_request_limiter() {
+    let limiter = RequestLimiter::new(0, 1);
+    let adapter = ElectrumAdapter::configured(
+        "tcp://127.0.0.1:1",
+        BitcoinNetwork::Regtest,
+        Duration::from_millis(50),
+        200,
+        Duration::from_millis(50),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .unwrap()
+    .with_request_limiter(limiter)
+    .with_claim_scan_bounds(200, Duration::from_millis(200), 1);
+
+    let started = std::time::Instant::now();
+    let result = adapter.history_presence_batch(&[claim_scan_script()]).await;
+    let elapsed = started.elapsed();
+    assert_eq!(result, Err(ClaimScanError::Unavailable));
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "an exhausted limiter must refuse before connecting, took {elapsed:?}"
+    );
 }
 
 #[tokio::test]

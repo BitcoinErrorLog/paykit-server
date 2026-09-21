@@ -1,5 +1,6 @@
 pub mod accounts;
 pub mod auth;
+pub mod claim_limiter;
 pub mod error;
 pub mod health;
 pub mod invoices;

@@ -200,6 +200,10 @@ link_establishment_max_age = "1h"
 request_body_bytes = 16384
 lock_resource_bytes = 262144
 lock_fetch_timeout = "10s"
+# Whole-request deadline covering inbound handler work and outbound HTTP
+# (TCP connect + TLS handshake + body), not just a socket read timeout.
+# Override with PAYKIT_HTTP_REQUEST_DEADLINE.
+# http_request_deadline = "10s"
 
 [rate_limits]
 signed_requests_per_second = 100
@@ -208,6 +212,14 @@ setup_per_ip_per_minute = 10
 max_pending_setup_flows = 100
 max_completion_polls_per_flow = 2
 max_completion_polls = 200
+# Claim-time Bitkit `/setup` token buckets, keyed by creator identity and
+# by peer IP. These sit in front of setup_per_ip_per_minute. Override with
+# PAYKIT_CLAIM_IDENTITY_RATE_PER_SECOND / PAYKIT_CLAIM_IDENTITY_BURST and
+# PAYKIT_CLAIM_IP_RATE_PER_SECOND / PAYKIT_CLAIM_IP_BURST.
+# claim_identity_per_second = 1
+# claim_identity_burst = 3
+# claim_ip_per_second = 2
+# claim_ip_burst = 6
 
 [shutdown]
 drain_timeout = "30s"
