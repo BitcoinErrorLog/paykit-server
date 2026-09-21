@@ -10,12 +10,12 @@ use async_trait::async_trait;
 use axum::{
     Router,
     body::{Body, to_bytes},
-    http::{Request, StatusCode},
+    http::{Request, StatusCode, header},
     routing::get,
 };
 use paykit_server::runtime::{
     ComponentState, DependencyCheck, ElectrumProbe, PostgresDependency, Runtime,
-    operational_router, shutdown_and_drain,
+    operational_router, operational_router_with_deadline, shutdown_and_drain,
 };
 use paykit_server::{
     Server,
@@ -57,6 +57,7 @@ poll_interval = "1s"
             database_url: Some("postgres://127.0.0.1:1/paykit".into()),
             migrator_database_url: Some("postgres://127.0.0.1:1/paykit".into()),
             master_key: Some(CONFIG_MASTER_KEY.into()),
+            ..Default::default()
         },
     )
     .unwrap()
@@ -694,4 +695,47 @@ async fn production_constructor_rejects_malformed_electrum_adapter_configuration
         .await
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn slow_handler_exceeding_http_request_deadline_fails_fast_with_504() {
+    let runtime = runtime(true, 8);
+    let app = operational_router_with_deadline(
+        Router::new().route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                "ok"
+            }),
+        ),
+        runtime,
+        Duration::from_millis(50),
+    );
+
+    let started = std::time::Instant::now();
+    let response = app
+        .oneshot(Request::get("/slow").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    let body = to_bytes(response.into_body(), 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["error"]["code"], "request_deadline_exceeded");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "deadline must fail fast, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn health_live_is_exempt_from_the_http_request_deadline() {
+    let runtime = runtime(true, 1);
+    let app = operational_router_with_deadline(Router::new(), runtime, Duration::from_millis(1));
+    let response = app
+        .oneshot(Request::get("/health/live").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }

@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::http::claim_limiter::{KeyedRequestLimiter, ip_prefix_key};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use paykit_sdk::PubkyPublicKey;
@@ -180,6 +181,10 @@ struct Inner {
     setup_capacity: Arc<Semaphore>,
     setup_rate: Mutex<SetupRateLimiter>,
     cancel_rate: Mutex<SetupRateLimiter>,
+    claim_identity_rate: KeyedRequestLimiter,
+    claim_ip_rate: KeyedRequestLimiter,
+    claim_ip_ipv4_prefix: u8,
+    claim_ip_ipv6_prefix: u8,
     cancellations: Arc<dyn CancellationStore>,
     state: Mutex<State>,
     active_polls: AtomicUsize,
@@ -265,7 +270,7 @@ enum FlowStatus {
 #[derive(Debug, PartialEq, Eq)]
 pub enum BeginError {
     InvalidRequest,
-    RateLimited,
+    RateLimited { retry_after_secs: u64 },
     Unavailable,
 }
 
@@ -275,6 +280,31 @@ pub struct SetupLimits {
     pub max_polls: usize,
     pub setup_per_ip_per_minute: usize,
     pub max_pending_setup_flows: usize,
+    pub claim_identity_per_second: u64,
+    pub claim_identity_burst: u64,
+    pub claim_ip_per_second: u64,
+    pub claim_ip_burst: u64,
+    pub claim_limiter_max_entries: usize,
+    pub claim_limiter_idle_ttl: Duration,
+    pub claim_ip_ipv4_prefix: u8,
+    pub claim_ip_ipv6_prefix: u8,
+}
+
+impl SetupLimits {
+    /// Bounded-store defaults for tests that do not exercise eviction.
+    pub const TEST_MAX_ENTRIES: usize = 100_000;
+    pub const TEST_IPV4_PREFIX: u8 = 32;
+    pub const TEST_IPV6_PREFIX: u8 = 64;
+
+    pub fn test_idle_ttl() -> Duration {
+        Duration::from_secs(600)
+    }
+
+    /// Burst/refill high enough that existing setup tests are not
+    /// constrained by the claim-time token buckets.
+    pub fn generous_claim_for_tests() -> (u64, u64, u64, u64) {
+        (10_000, 10_000, 10_000, 10_000)
+    }
 }
 
 struct SetupRateLimiter {
@@ -410,6 +440,20 @@ impl SetupService {
                     limit: limits.setup_per_ip_per_minute,
                     windows: HashMap::new(),
                 }),
+                claim_identity_rate: KeyedRequestLimiter::new(
+                    limits.claim_identity_per_second,
+                    limits.claim_identity_burst,
+                    limits.claim_limiter_max_entries,
+                    limits.claim_limiter_idle_ttl,
+                ),
+                claim_ip_rate: KeyedRequestLimiter::new(
+                    limits.claim_ip_per_second,
+                    limits.claim_ip_burst,
+                    limits.claim_limiter_max_entries,
+                    limits.claim_limiter_idle_ttl,
+                ),
+                claim_ip_ipv4_prefix: limits.claim_ip_ipv4_prefix,
+                claim_ip_ipv6_prefix: limits.claim_ip_ipv6_prefix,
                 cancellations,
                 state: Mutex::new(State {
                     flows: HashMap::new(),
@@ -436,8 +480,46 @@ impl SetupService {
         }
         let expected_creator = parse_expected_creator(creator).ok_or(BeginError::InvalidRequest)?;
         let now = self.inner.clock.now();
+        if let Err(exceeded) = self.inner.claim_identity_rate.permit(creator, now) {
+            tracing::warn!(
+                target: "paykit.refusal_audit",
+                kind = "claim_rate_limited",
+                key_class = "identity",
+                retry_after_secs = exceeded.retry_after_secs,
+                "claim-time request refused by RequestLimiter"
+            );
+            return Err(BeginError::RateLimited {
+                retry_after_secs: exceeded.retry_after_secs,
+            });
+        }
+        let ip_key = ip_prefix_key(
+            peer_ip,
+            self.inner.claim_ip_ipv4_prefix,
+            self.inner.claim_ip_ipv6_prefix,
+        );
+        if let Err(exceeded) = self.inner.claim_ip_rate.permit(&ip_key, now) {
+            tracing::warn!(
+                target: "paykit.refusal_audit",
+                kind = "claim_rate_limited",
+                key_class = "ip",
+                retry_after_secs = exceeded.retry_after_secs,
+                "claim-time request refused by RequestLimiter"
+            );
+            return Err(BeginError::RateLimited {
+                retry_after_secs: exceeded.retry_after_secs,
+            });
+        }
         if !self.inner.setup_rate.lock().await.permit(peer_ip, now) {
-            return Err(BeginError::RateLimited);
+            tracing::warn!(
+                target: "paykit.refusal_audit",
+                kind = "claim_rate_limited",
+                key_class = "ip_window",
+                retry_after_secs = 60_u64,
+                "claim-time request refused by per-IP sliding window"
+            );
+            return Err(BeginError::RateLimited {
+                retry_after_secs: 60,
+            });
         }
         {
             let mut guard = self.inner.state.lock().await;

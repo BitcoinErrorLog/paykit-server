@@ -38,10 +38,10 @@ async fn begin(
             ),
         },
         Err(BeginError::InvalidRequest) => invalid_request(),
-        Err(BeginError::RateLimited) => safe_response_with_retry(
+        Err(BeginError::RateLimited { retry_after_secs }) => safe_response_with_retry_after(
             StatusCode::TOO_MANY_REQUESTS,
             json!({"error":"rate_limited"}),
-            "60",
+            retry_after_secs,
         ),
         Err(BeginError::Unavailable) => safe_response_with_retry(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -235,5 +235,18 @@ fn safe_response_with_retry(
     response
         .headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from_static(retry_after));
+    response
+}
+
+fn safe_response_with_retry_after(
+    status: StatusCode,
+    payload: serde_json::Value,
+    retry_after_secs: u64,
+) -> Response<Body> {
+    let mut response = safe_response(status, payload);
+    let retry = retry_after_secs.max(1).to_string();
+    if let Ok(value) = HeaderValue::from_str(&retry) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
     response
 }

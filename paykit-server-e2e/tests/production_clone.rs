@@ -38,6 +38,7 @@ poll_interval = "5s"
             database_url: Some(runtime_database_url),
             migrator_database_url: Some(migrator_database_url),
             master_key: Some(MASTER_KEY.to_owned()),
+            ..Default::default()
         },
     )
     .expect("production-clone rehearsal config is valid")

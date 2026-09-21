@@ -53,8 +53,8 @@ pub enum ClaimScanError {
 /// History-presence boundary for the claim-time address-index scan.
 ///
 /// [`ChainHistoryPort::history_presence_batch`] is the single choke-point
-/// through which every claim-scan Electrum RPC is routed: a later slice can
-/// charge each batched call against the shared Electrum request limiter here
+/// through which every claim-scan Electrum RPC is routed: each batched
+/// call is charged against the shared Electrum request limiter here
 /// without touching the scan loop or the observer. The observer tick never
 /// calls this port; the scan runs only in the claim handler.
 #[async_trait::async_trait]

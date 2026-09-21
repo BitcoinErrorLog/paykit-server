@@ -1,7 +1,7 @@
 use std::{
     any::Any,
     collections::VecDeque,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -453,6 +453,14 @@ fn runtime_limits(
         setup_per_ip_per_minute,
         max_polls_per_flow,
         max_polls,
+        claim_identity_per_second: SetupLimits::generous_claim_for_tests().0,
+        claim_identity_burst: SetupLimits::generous_claim_for_tests().1,
+        claim_ip_per_second: SetupLimits::generous_claim_for_tests().2,
+        claim_ip_burst: SetupLimits::generous_claim_for_tests().3,
+        claim_limiter_max_entries: SetupLimits::TEST_MAX_ENTRIES,
+        claim_limiter_idle_ttl: SetupLimits::test_idle_ttl(),
+        claim_ip_ipv4_prefix: SetupLimits::TEST_IPV4_PREFIX,
+        claim_ip_ipv6_prefix: SetupLimits::TEST_IPV6_PREFIX,
     }
 }
 
@@ -1524,5 +1532,142 @@ async fn wildcard_setup_policy_uses_the_callers_concrete_origin() {
             .begin(peer(), &oversized, "opaque", EXPECTED_CREATOR)
             .await,
         Err(BeginError::InvalidRequest)
+    );
+}
+
+fn claim_token_limits(
+    identity_rate: u64,
+    identity_burst: u64,
+    ip_rate: u64,
+    ip_burst: u64,
+) -> SetupLimits {
+    SetupLimits {
+        max_pending_setup_flows: 100,
+        setup_per_ip_per_minute: 100,
+        max_polls_per_flow: 2,
+        max_polls: 4,
+        claim_identity_per_second: identity_rate,
+        claim_identity_burst: identity_burst,
+        claim_ip_per_second: ip_rate,
+        claim_ip_burst: ip_burst,
+        claim_limiter_max_entries: SetupLimits::TEST_MAX_ENTRIES,
+        claim_limiter_idle_ttl: SetupLimits::test_idle_ttl(),
+        claim_ip_ipv4_prefix: SetupLimits::TEST_IPV4_PREFIX,
+        claim_ip_ipv6_prefix: SetupLimits::TEST_IPV6_PREFIX,
+    }
+}
+
+fn claim_limited_service(identity_burst: u64, ip_burst: u64) -> SetupService {
+    SetupService::with_poll_timeout(
+        vec!["https://app.example".to_owned()],
+        Arc::new(MockCompleter::new([])),
+        Arc::new(ManualClock::default()),
+        claim_token_limits(1, identity_burst, 1, ip_burst),
+        Duration::ZERO,
+    )
+}
+
+#[tokio::test]
+async fn claim_identity_token_bucket_isolates_creators_and_returns_retry_after() {
+    let setup = claim_limited_service(1, 10_000);
+    assert!(
+        setup
+            .begin(peer(), "https://app.example", "one", EXPECTED_CREATOR)
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        setup
+            .begin(peer(), "https://app.example", "two", EXPECTED_CREATOR)
+            .await,
+        Err(BeginError::RateLimited {
+            retry_after_secs: 1
+        })
+    );
+    assert!(
+        setup
+            .begin(peer(), "https://app.example", "other", OTHER_CREATOR)
+            .await
+            .is_ok(),
+        "a different creator has a separate identity bucket"
+    );
+
+    let router = setup_router(claim_limited_service(1, 10_000));
+    let first = request(
+        router.clone(),
+        Method::GET,
+        &format!("/setup?return_to=https://app.example&state=one&creator={EXPECTED_CREATOR}"),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let limited = request(
+        router,
+        Method::GET,
+        &format!("/setup?return_to=https://app.example&state=two&creator={EXPECTED_CREATOR}"),
+    )
+    .await;
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(limited.headers()["retry-after"], "1");
+    assert_eq!(body(limited).await, r#"{"error":"rate_limited"}"#);
+}
+
+#[tokio::test]
+async fn claim_ip_token_bucket_isolates_peers_ahead_of_the_sliding_window() {
+    let setup = claim_limited_service(10_000, 1);
+    let other_peer = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+    assert!(
+        setup
+            .begin(peer(), "https://app.example", "one", EXPECTED_CREATOR)
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        setup
+            .begin(peer(), "https://app.example", "two", EXPECTED_CREATOR)
+            .await,
+        Err(BeginError::RateLimited {
+            retry_after_secs: 1
+        })
+    );
+    assert!(
+        setup
+            .begin(other_peer, "https://app.example", "three", EXPECTED_CREATOR)
+            .await
+            .is_ok(),
+        "a different IP has a separate claim-IP bucket"
+    );
+}
+
+#[tokio::test]
+async fn claim_ip_bucket_is_keyed_by_ipv6_prefix_not_raw_address() {
+    let setup = claim_limited_service(10_000, 1);
+    let a = IpAddr::V6(Ipv6Addr::new(
+        0x2001, 0xdb8, 0x1, 0x2, 0xaaaa, 0xbbbb, 0xcccc, 0xdddd,
+    ));
+    let b = IpAddr::V6(Ipv6Addr::new(
+        0x2001, 0xdb8, 0x1, 0x2, 0x1111, 0x2222, 0x3333, 0x4444,
+    ));
+    let other = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0x1, 0x3, 0, 0, 0, 1));
+    assert!(
+        setup
+            .begin(a, "https://app.example", "one", EXPECTED_CREATOR)
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        setup
+            .begin(b, "https://app.example", "two", EXPECTED_CREATOR)
+            .await,
+        Err(BeginError::RateLimited {
+            retry_after_secs: 1
+        }),
+        "IPv6 addresses in the same /64 share the claim-IP bucket"
+    );
+    assert!(
+        setup
+            .begin(other, "https://app.example", "three", EXPECTED_CREATOR)
+            .await
+            .is_ok(),
+        "a different /64 has a separate claim-IP bucket"
     );
 }

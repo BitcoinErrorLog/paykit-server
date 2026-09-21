@@ -709,11 +709,27 @@ pub async fn shutdown_and_drain(runtime: &Runtime, drain_timeout: Duration) -> b
 }
 
 pub fn operational_router(public_routes: Router, runtime: Arc<Runtime>) -> Router {
+    operational_router_with_deadline(public_routes, runtime, DEFAULT_HTTP_REQUEST_DEADLINE)
+}
+
+/// Default whole-request deadline used by tests that do not supply one.
+/// Must sit above create-invoice/two-phase `REQUEST_DEADLINE` (15s).
+pub const DEFAULT_HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(20);
+
+pub fn operational_router_with_deadline(
+    public_routes: Router,
+    runtime: Arc<Runtime>,
+    request_deadline: Duration,
+) -> Router {
     let metrics_runtime = runtime.clone();
     public_routes
         .merge(health::router(runtime.clone()))
         .route("/metrics", get(move || metrics(metrics_runtime.clone())))
         .layer(middleware::from_fn_with_state(runtime, capacity_middleware))
+        .layer(middleware::from_fn_with_state(
+            request_deadline,
+            request_deadline_middleware,
+        ))
 }
 
 async fn metrics(runtime: Arc<Runtime>) -> Response {
@@ -758,6 +774,38 @@ async fn capacity_middleware(
         _permit: permit,
     };
     next.run(request).await
+}
+
+async fn request_deadline_middleware(
+    axum::extract::State(deadline): axum::extract::State<Duration>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let live = request.uri().path() == "/health/live";
+    if live {
+        return next.run(request).await;
+    }
+    match timeout(deadline, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => {
+            tracing::warn!(
+                target: "paykit.refusal_audit",
+                kind = "http_request_deadline",
+                "request exceeded http_request_deadline (TCP connect + TLS + body)"
+            );
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                [(header::RETRY_AFTER, "1")],
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "code": "request_deadline_exceeded",
+                        "message": "request deadline exceeded",
+                    }
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 fn unavailable() -> Response {

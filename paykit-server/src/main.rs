@@ -69,10 +69,6 @@ fn load_config(path: &str) -> anyhow::Result<Config> {
         fs::read_to_string(path).map_err(|_| anyhow::anyhow!("configuration could not be read"))?;
     Ok(Config::from_toml_and_environment(
         &source,
-        ConfigEnvironment {
-            database_url: env::var("PAYKIT_DATABASE_URL").ok(),
-            migrator_database_url: env::var("PAYKIT_MIGRATOR_DATABASE_URL").ok(),
-            master_key: env::var("PAYKIT_MASTER_KEY").ok(),
-        },
+        ConfigEnvironment::from_process()?,
     )?)
 }

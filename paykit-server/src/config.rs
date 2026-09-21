@@ -53,6 +53,18 @@ impl Config {
         environment: ConfigEnvironment,
     ) -> Result<Self, ConfigError> {
         let raw: RawConfig = toml::from_str(toml_source).map_err(ConfigError::Toml)?;
+        let operational_overrides = ConfigEnvironment {
+            claim_identity_rate_per_second: environment.claim_identity_rate_per_second,
+            claim_identity_burst: environment.claim_identity_burst,
+            claim_ip_rate_per_second: environment.claim_ip_rate_per_second,
+            claim_ip_burst: environment.claim_ip_burst,
+            claim_limiter_max_entries: environment.claim_limiter_max_entries,
+            claim_limiter_idle_ttl: environment.claim_limiter_idle_ttl,
+            claim_ip_ipv4_prefix: environment.claim_ip_ipv4_prefix,
+            claim_ip_ipv6_prefix: environment.claim_ip_ipv6_prefix,
+            http_request_deadline: environment.http_request_deadline,
+            ..Default::default()
+        };
         let database_url = DatabaseUrl::parse(environment.database_url)?;
         let migrator_database_url = MigratorDatabaseUrl::parse(environment.migrator_database_url)?;
         let master_key = MasterKey::parse(environment.master_key)?;
@@ -90,7 +102,7 @@ impl Config {
                 .expect("default HTTP relay inbox URL parses"),
         };
 
-        let config = Self {
+        let mut config = Self {
             http: HttpConfig {
                 listen_addr: raw.http.listen_addr,
             },
@@ -143,6 +155,7 @@ impl Config {
                 trusted_locks_key_fingerprint,
             },
         };
+        apply_environment_overrides(&mut config, &operational_overrides);
         config.validate_operational_values()?;
         Ok(config)
     }
@@ -192,6 +205,14 @@ impl Config {
                 self.outbox.link_establishment_max_age,
             ),
             ("limits.lock_fetch_timeout", self.limits.lock_fetch_timeout),
+            (
+                "limits.http_request_deadline",
+                self.limits.http_request_deadline,
+            ),
+            (
+                "rate_limits.claim_limiter_idle_ttl",
+                self.rate_limits.claim_limiter_idle_ttl,
+            ),
             ("shutdown.drain_timeout", self.shutdown.drain_timeout),
             (
                 "electrum.claim_scan_window_deadline",
@@ -287,6 +308,26 @@ impl Config {
                 "rate_limits.claims_per_minute",
                 self.rate_limits.claims_per_minute,
             ),
+            (
+                "rate_limits.claim_identity_per_second",
+                self.rate_limits.claim_identity_per_second,
+            ),
+            (
+                "rate_limits.claim_identity_burst",
+                self.rate_limits.claim_identity_burst,
+            ),
+            (
+                "rate_limits.claim_ip_per_second",
+                self.rate_limits.claim_ip_per_second,
+            ),
+            (
+                "rate_limits.claim_ip_burst",
+                self.rate_limits.claim_ip_burst,
+            ),
+            (
+                "rate_limits.claim_limiter_max_entries",
+                self.rate_limits.claim_limiter_max_entries,
+            ),
             ("sentinel.min_value_sats", self.sentinel.min_value_sats),
             ("sentinel.hit_count", self.sentinel.hit_count),
             (
@@ -301,6 +342,20 @@ impl Config {
             if value == 0 {
                 return Err(ConfigError::ZeroValue(name));
             }
+        }
+        if !(1..=32).contains(&self.rate_limits.claim_ip_ipv4_prefix) {
+            return Err(ConfigError::InvalidIntegerRange(
+                "rate_limits.claim_ip_ipv4_prefix",
+                1,
+                32,
+            ));
+        }
+        if !(1..=128).contains(&self.rate_limits.claim_ip_ipv6_prefix) {
+            return Err(ConfigError::InvalidIntegerRange(
+                "rate_limits.claim_ip_ipv6_prefix",
+                1,
+                128,
+            ));
         }
         for (name, value) in [
             ("electrum.poll_interval", self.electrum.poll_interval),
@@ -419,6 +474,48 @@ pub struct ConfigEnvironment {
     pub database_url: Option<String>,
     pub migrator_database_url: Option<String>,
     pub master_key: Option<String>,
+    /// When set, overrides `rate_limits.claim_identity_per_second`.
+    pub claim_identity_rate_per_second: Option<u64>,
+    /// When set, overrides `rate_limits.claim_identity_burst`.
+    pub claim_identity_burst: Option<u64>,
+    /// When set, overrides `rate_limits.claim_ip_per_second`.
+    pub claim_ip_rate_per_second: Option<u64>,
+    /// When set, overrides `rate_limits.claim_ip_burst`.
+    pub claim_ip_burst: Option<u64>,
+    /// When set, overrides `rate_limits.claim_limiter_max_entries`.
+    pub claim_limiter_max_entries: Option<u64>,
+    /// When set, overrides `rate_limits.claim_limiter_idle_ttl`.
+    pub claim_limiter_idle_ttl: Option<Duration>,
+    /// When set, overrides `rate_limits.claim_ip_ipv4_prefix`.
+    pub claim_ip_ipv4_prefix: Option<u8>,
+    /// When set, overrides `rate_limits.claim_ip_ipv6_prefix`.
+    pub claim_ip_ipv6_prefix: Option<u8>,
+    /// When set, overrides `limits.http_request_deadline`.
+    pub http_request_deadline: Option<Duration>,
+}
+
+impl ConfigEnvironment {
+    /// Reads secrets and the optional operational overrides from the
+    /// process environment. Unset override names leave the TOML/default
+    /// values in place; a set-but-invalid value fails startup.
+    pub fn from_process() -> Result<Self, ConfigError> {
+        Ok(Self {
+            database_url: std::env::var("PAYKIT_DATABASE_URL").ok(),
+            migrator_database_url: std::env::var("PAYKIT_MIGRATOR_DATABASE_URL").ok(),
+            master_key: std::env::var("PAYKIT_MASTER_KEY").ok(),
+            claim_identity_rate_per_second: parse_optional_u64_env(
+                "PAYKIT_CLAIM_IDENTITY_RATE_PER_SECOND",
+            )?,
+            claim_identity_burst: parse_optional_u64_env("PAYKIT_CLAIM_IDENTITY_BURST")?,
+            claim_ip_rate_per_second: parse_optional_u64_env("PAYKIT_CLAIM_IP_RATE_PER_SECOND")?,
+            claim_ip_burst: parse_optional_u64_env("PAYKIT_CLAIM_IP_BURST")?,
+            claim_limiter_max_entries: parse_optional_u64_env("PAYKIT_CLAIM_LIMITER_MAX_ENTRIES")?,
+            claim_limiter_idle_ttl: parse_optional_duration_env("PAYKIT_CLAIM_LIMITER_IDLE_TTL")?,
+            claim_ip_ipv4_prefix: parse_optional_u8_env("PAYKIT_CLAIM_IP_IPV4_PREFIX")?,
+            claim_ip_ipv6_prefix: parse_optional_u8_env("PAYKIT_CLAIM_IP_IPV6_PREFIX")?,
+            http_request_deadline: parse_optional_duration_env("PAYKIT_HTTP_REQUEST_DEADLINE")?,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -875,6 +972,12 @@ pub struct LimitsConfig {
     pub request_body_bytes: u64,
     pub lock_resource_bytes: u64,
     pub lock_fetch_timeout: Duration,
+    /// Whole-request deadline covering inbound handler work and outbound
+    /// HTTP (TCP connect + TLS handshake + body), not just a read timeout.
+    /// Default sits above create-invoice/two-phase `REQUEST_DEADLINE` (15s)
+    /// so those paths can still answer 503 `dependency_timeout`; this cap
+    /// is the last-resort 504 for a hang that never consults that budget.
+    pub http_request_deadline: Duration,
 }
 
 #[derive(Debug)]
@@ -888,6 +991,22 @@ pub struct RateLimitsConfig {
     /// Process-wide manual claim budget: each claim performs a relay
     /// round-trip and a homeserver session exchange.
     pub claims_per_minute: u64,
+    /// Token-bucket refill for Bitkit `/setup` keyed by creator identity.
+    pub claim_identity_per_second: u64,
+    /// Token-bucket burst for Bitkit `/setup` keyed by creator identity.
+    pub claim_identity_burst: u64,
+    /// Token-bucket refill for Bitkit `/setup` keyed by peer IP.
+    pub claim_ip_per_second: u64,
+    /// Token-bucket burst for Bitkit `/setup` keyed by peer IP.
+    pub claim_ip_burst: u64,
+    /// Maximum live identity or IP-prefix buckets per keyed limiter.
+    pub claim_limiter_max_entries: u64,
+    /// Idle buckets older than this are swept on the next permit.
+    pub claim_limiter_idle_ttl: Duration,
+    /// IPv4 prefix length used to key the claim-IP bucket (default /32).
+    pub claim_ip_ipv4_prefix: u8,
+    /// IPv6 prefix length used to key the claim-IP bucket (default /64).
+    pub claim_ip_ipv6_prefix: u8,
 }
 
 #[derive(Debug)]
@@ -999,6 +1118,8 @@ pub enum ConfigError {
     ZeroDuration(&'static str),
     #[error("{0} must be greater than zero")]
     ZeroValue(&'static str),
+    #[error("{0} must be an integer from {1} to {2}")]
+    InvalidIntegerRange(&'static str, u64, u64),
     #[error("{0} must be at least one second")]
     SubsecondPersistenceDuration(&'static str),
     #[error("{0} must fit PostgreSQL make_interval(secs => i64)")]
@@ -1027,6 +1148,10 @@ pub enum ConfigError {
     PlaintextElectrumEndpointOnMainnet(String),
     #[error("{0}")]
     InvalidElectrumEndpoint(&'static str),
+    #[error("{0} is not a positive integer")]
+    InvalidEnvInteger(&'static str),
+    #[error("{0} is not a valid duration (for example 10s)")]
+    InvalidEnvDuration(&'static str),
 }
 
 fn decode_base64url_no_pad(value: &str, error: ConfigError) -> Result<Vec<u8>, ConfigError> {
@@ -1034,6 +1159,76 @@ fn decode_base64url_no_pad(value: &str, error: ConfigError) -> Result<Vec<u8>, C
         return Err(error);
     }
     URL_SAFE_NO_PAD.decode(value).map_err(|_| error)
+}
+
+fn apply_environment_overrides(config: &mut Config, environment: &ConfigEnvironment) {
+    if let Some(value) = environment.claim_identity_rate_per_second {
+        config.rate_limits.claim_identity_per_second = value;
+    }
+    if let Some(value) = environment.claim_identity_burst {
+        config.rate_limits.claim_identity_burst = value;
+    }
+    if let Some(value) = environment.claim_ip_rate_per_second {
+        config.rate_limits.claim_ip_per_second = value;
+    }
+    if let Some(value) = environment.claim_ip_burst {
+        config.rate_limits.claim_ip_burst = value;
+    }
+    if let Some(value) = environment.claim_limiter_max_entries {
+        config.rate_limits.claim_limiter_max_entries = value;
+    }
+    if let Some(value) = environment.claim_limiter_idle_ttl {
+        config.rate_limits.claim_limiter_idle_ttl = value;
+    }
+    if let Some(value) = environment.claim_ip_ipv4_prefix {
+        config.rate_limits.claim_ip_ipv4_prefix = value;
+    }
+    if let Some(value) = environment.claim_ip_ipv6_prefix {
+        config.rate_limits.claim_ip_ipv6_prefix = value;
+    }
+    if let Some(value) = environment.http_request_deadline {
+        config.limits.http_request_deadline = value;
+    }
+}
+
+fn parse_optional_u64_env(name: &'static str) -> Result<Option<u64>, ConfigError> {
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| ConfigError::InvalidEnvInteger(name)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err(ConfigError::InvalidEnvInteger(name)),
+    }
+}
+
+fn parse_optional_u8_env(name: &'static str) -> Result<Option<u8>, ConfigError> {
+    match parse_optional_u64_env(name)? {
+        None => Ok(None),
+        Some(value) => u8::try_from(value)
+            .map(Some)
+            .map_err(|_| ConfigError::InvalidEnvInteger(name)),
+    }
+}
+
+fn parse_optional_duration_env(name: &'static str) -> Result<Option<Duration>, ConfigError> {
+    match std::env::var(name) {
+        Ok(value) => parse_humantime_duration(name, &value).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err(ConfigError::InvalidEnvDuration(name)),
+    }
+}
+
+fn parse_humantime_duration(name: &'static str, raw: &str) -> Result<Duration, ConfigError> {
+    #[derive(Deserialize)]
+    struct DurationValue {
+        #[serde(with = "humantime_serde")]
+        value: Duration,
+    }
+    let wrapped = format!("value = \"{}\"", raw.replace('"', ""));
+    toml::from_str::<DurationValue>(&wrapped)
+        .map(|parsed| parsed.value)
+        .map_err(|_| ConfigError::InvalidEnvDuration(name))
 }
 
 fn validate_url(field: &'static str, value: &str) -> Result<Url, ConfigError> {
@@ -1402,6 +1597,8 @@ struct RawLimitsConfig {
     lock_resource_bytes: u64,
     #[serde(default = "default_lock_fetch_timeout", with = "humantime_serde")]
     lock_fetch_timeout: Duration,
+    #[serde(default = "default_http_request_deadline", with = "humantime_serde")]
+    http_request_deadline: Duration,
 }
 
 #[derive(Deserialize)]
@@ -1421,6 +1618,22 @@ struct RawRateLimitsConfig {
     max_completion_polls: u64,
     #[serde(default = "default_claims_per_minute")]
     claims_per_minute: u64,
+    #[serde(default = "default_claim_identity_per_second")]
+    claim_identity_per_second: u64,
+    #[serde(default = "default_claim_identity_burst")]
+    claim_identity_burst: u64,
+    #[serde(default = "default_claim_ip_per_second")]
+    claim_ip_per_second: u64,
+    #[serde(default = "default_claim_ip_burst")]
+    claim_ip_burst: u64,
+    #[serde(default = "default_claim_limiter_max_entries")]
+    claim_limiter_max_entries: u64,
+    #[serde(default = "default_claim_limiter_idle_ttl", with = "humantime_serde")]
+    claim_limiter_idle_ttl: Duration,
+    #[serde(default = "default_claim_ip_ipv4_prefix")]
+    claim_ip_ipv4_prefix: u8,
+    #[serde(default = "default_claim_ip_ipv6_prefix")]
+    claim_ip_ipv6_prefix: u8,
 }
 
 #[derive(Deserialize)]
@@ -1436,6 +1649,7 @@ impl Default for RawLimitsConfig {
             request_body_bytes: default_request_body_bytes(),
             lock_resource_bytes: default_lock_resource_bytes(),
             lock_fetch_timeout: default_lock_fetch_timeout(),
+            http_request_deadline: default_http_request_deadline(),
         }
     }
 }
@@ -1450,6 +1664,14 @@ impl Default for RawRateLimitsConfig {
             max_completion_polls_per_flow: default_max_completion_polls_per_flow(),
             max_completion_polls: default_max_completion_polls(),
             claims_per_minute: default_claims_per_minute(),
+            claim_identity_per_second: default_claim_identity_per_second(),
+            claim_identity_burst: default_claim_identity_burst(),
+            claim_ip_per_second: default_claim_ip_per_second(),
+            claim_ip_burst: default_claim_ip_burst(),
+            claim_limiter_max_entries: default_claim_limiter_max_entries(),
+            claim_limiter_idle_ttl: default_claim_limiter_idle_ttl(),
+            claim_ip_ipv4_prefix: default_claim_ip_ipv4_prefix(),
+            claim_ip_ipv6_prefix: default_claim_ip_ipv6_prefix(),
         }
     }
 }
@@ -1482,6 +1704,7 @@ impl From<RawLimitsConfig> for LimitsConfig {
             request_body_bytes: value.request_body_bytes,
             lock_resource_bytes: value.lock_resource_bytes,
             lock_fetch_timeout: value.lock_fetch_timeout,
+            http_request_deadline: value.http_request_deadline,
         }
     }
 }
@@ -1496,6 +1719,14 @@ impl From<RawRateLimitsConfig> for RateLimitsConfig {
             max_completion_polls_per_flow: value.max_completion_polls_per_flow,
             max_completion_polls: value.max_completion_polls,
             claims_per_minute: value.claims_per_minute,
+            claim_identity_per_second: value.claim_identity_per_second,
+            claim_identity_burst: value.claim_identity_burst,
+            claim_ip_per_second: value.claim_ip_per_second,
+            claim_ip_burst: value.claim_ip_burst,
+            claim_limiter_max_entries: value.claim_limiter_max_entries,
+            claim_limiter_idle_ttl: value.claim_limiter_idle_ttl,
+            claim_ip_ipv4_prefix: value.claim_ip_ipv4_prefix,
+            claim_ip_ipv6_prefix: value.claim_ip_ipv6_prefix,
         }
     }
 }
@@ -1535,6 +1766,33 @@ const fn default_lock_resource_bytes() -> u64 {
 }
 const fn default_lock_fetch_timeout() -> Duration {
     Duration::from_secs(10)
+}
+const fn default_http_request_deadline() -> Duration {
+    Duration::from_secs(20)
+}
+const fn default_claim_identity_per_second() -> u64 {
+    1
+}
+const fn default_claim_identity_burst() -> u64 {
+    3
+}
+const fn default_claim_ip_per_second() -> u64 {
+    2
+}
+const fn default_claim_ip_burst() -> u64 {
+    6
+}
+const fn default_claim_limiter_max_entries() -> u64 {
+    100_000
+}
+const fn default_claim_limiter_idle_ttl() -> Duration {
+    Duration::from_secs(600)
+}
+const fn default_claim_ip_ipv4_prefix() -> u8 {
+    32
+}
+const fn default_claim_ip_ipv6_prefix() -> u8 {
+    64
 }
 const fn default_signed_requests_per_second() -> u64 {
     100

@@ -200,6 +200,12 @@ link_establishment_max_age = "1h"
 request_body_bytes = 16384
 lock_resource_bytes = 262144
 lock_fetch_timeout = "10s"
+# Whole-request deadline covering inbound handler work and outbound HTTP
+# (TCP connect + TLS handshake + body), not just a socket read timeout.
+# Default 20s sits above create-invoice/two-phase REQUEST_DEADLINE (15s)
+# so those paths still answer 503 dependency_timeout; this cap is the
+# last-resort 504. Override with PAYKIT_HTTP_REQUEST_DEADLINE.
+# http_request_deadline = "20s"
 
 [rate_limits]
 signed_requests_per_second = 100
@@ -208,6 +214,23 @@ setup_per_ip_per_minute = 10
 max_pending_setup_flows = 100
 max_completion_polls_per_flow = 2
 max_completion_polls = 200
+# Claim-time Bitkit `/setup` token buckets, keyed by creator identity and
+# by peer IP. These sit in front of setup_per_ip_per_minute. Override with
+# PAYKIT_CLAIM_IDENTITY_RATE_PER_SECOND / PAYKIT_CLAIM_IDENTITY_BURST and
+# PAYKIT_CLAIM_IP_RATE_PER_SECOND / PAYKIT_CLAIM_IP_BURST.
+# claim_identity_per_second = 1
+# claim_identity_burst = 3
+# claim_ip_per_second = 2
+# claim_ip_burst = 6
+# Bounded LRU store plus idle TTL for the identity and IP buckets.
+# Override with PAYKIT_CLAIM_LIMITER_MAX_ENTRIES / PAYKIT_CLAIM_LIMITER_IDLE_TTL.
+# claim_limiter_max_entries = 100000
+# claim_limiter_idle_ttl = "10m"
+# Claim-IP buckets are keyed by prefix, not the raw address string.
+# IPv4 default /32, IPv6 default /64. IPv4-mapped IPv6 is treated as IPv4.
+# Override with PAYKIT_CLAIM_IP_IPV4_PREFIX / PAYKIT_CLAIM_IP_IPV6_PREFIX.
+# claim_ip_ipv4_prefix = 32
+# claim_ip_ipv6_prefix = 64
 
 [shutdown]
 drain_timeout = "30s"

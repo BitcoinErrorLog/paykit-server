@@ -25,7 +25,9 @@ use crate::{
         PostgresStorageAdapter, SdkStateStore, StackIdentity,
     },
     real_setup::RealSetupCompleter,
-    runtime::{OutboxTerminalHealth, PostgresDependency, Runtime, operational_router},
+    runtime::{
+        OutboxTerminalHealth, PostgresDependency, Runtime, operational_router_with_deadline,
+    },
     setup::{PostgresCancellationStore, SetupLimits, SetupService, SystemClock},
     setup_orchestration::PubkyCompanionRelay,
     workers::{
@@ -190,6 +192,17 @@ impl Server {
                     config.rate_limits.max_pending_setup_flows,
                 )
                 .expect("validated pending setup limit fits usize"),
+                claim_identity_per_second: config.rate_limits.claim_identity_per_second,
+                claim_identity_burst: config.rate_limits.claim_identity_burst,
+                claim_ip_per_second: config.rate_limits.claim_ip_per_second,
+                claim_ip_burst: config.rate_limits.claim_ip_burst,
+                claim_limiter_max_entries: usize::try_from(
+                    config.rate_limits.claim_limiter_max_entries,
+                )
+                .expect("validated claim limiter max entries fits usize"),
+                claim_limiter_idle_ttl: config.rate_limits.claim_limiter_idle_ttl,
+                claim_ip_ipv4_prefix: config.rate_limits.claim_ip_ipv4_prefix,
+                claim_ip_ipv6_prefix: config.rate_limits.claim_ip_ipv6_prefix,
             },
             Arc::new(PostgresCancellationStore::new(pool.clone())),
         );
@@ -339,7 +352,8 @@ impl Server {
                 config.electrum.claim_scan_window_deadline,
                 usize::try_from(config.electrum.max_concurrent_claim_scans)
                     .expect("validated claim scan concurrency bound fits usize"),
-            ),
+            )
+            .with_request_limiter(electrum_request_limiter.clone()),
         );
         let manual_claims = Arc::new(ManualClaimService::new(
             pubky.clone(),
@@ -389,7 +403,11 @@ impl Server {
             _ => Some(config.electrum.max_tip_age),
         });
         runtime.set_bitcoin_creation_enabled(config.bitcoin.creation_enabled);
-        let router = operational_router(business_routes, runtime.clone());
+        let router = operational_router_with_deadline(
+            business_routes,
+            runtime.clone(),
+            config.limits.http_request_deadline,
+        );
         let workers = WorkerComponents {
             pool,
             crypto,
@@ -938,6 +956,10 @@ struct PubkyLockFetcher {
 #[async_trait]
 impl LockFetcher for PubkyLockFetcher {
     async fn fetch(&self, resource: &PubkyLockResource) -> Result<ContentLock, LockFetchError> {
+        // Whole-request deadline: TCP connect, TLS handshake, and body
+        // all run inside this timeout. Cancelling the future aborts an
+        // in-progress async connect rather than waiting for the OS SYN
+        // timeout.
         tokio::time::timeout(self.timeout, self.fetch_inner(resource))
             .await
             .map_err(|_| LockFetchError::Unavailable)?
@@ -1068,6 +1090,7 @@ poll_interval = "1s"
                 database_url: Some("postgres://127.0.0.1:1/paykit".into()),
                 migrator_database_url: Some("postgres://127.0.0.1:1/paykit".into()),
                 master_key: Some(CONFIG_MASTER_KEY.into()),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1140,6 +1163,7 @@ poll_interval = "1s"
                 database_url: Some("postgres://127.0.0.1:1/paykit".into()),
                 migrator_database_url: Some("postgres://127.0.0.1:1/paykit".into()),
                 master_key: Some(CONFIG_MASTER_KEY.into()),
+                ..Default::default()
             },
         )
         .unwrap();
