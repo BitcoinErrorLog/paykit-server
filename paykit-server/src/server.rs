@@ -203,6 +203,7 @@ impl Server {
                 claim_limiter_idle_ttl: config.rate_limits.claim_limiter_idle_ttl,
                 claim_ip_ipv4_prefix: config.rate_limits.claim_ip_ipv4_prefix,
                 claim_ip_ipv6_prefix: config.rate_limits.claim_ip_ipv6_prefix,
+                trusted_proxy_hops: config.rate_limits.trusted_proxy_hops,
             },
             Arc::new(PostgresCancellationStore::new(pool.clone())),
         );

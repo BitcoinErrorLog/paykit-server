@@ -185,6 +185,7 @@ struct Inner {
     claim_ip_rate: KeyedRequestLimiter,
     claim_ip_ipv4_prefix: u8,
     claim_ip_ipv6_prefix: u8,
+    trusted_proxy_hops: u32,
     cancellations: Arc<dyn CancellationStore>,
     state: Mutex<State>,
     active_polls: AtomicUsize,
@@ -288,6 +289,8 @@ pub struct SetupLimits {
     pub claim_limiter_idle_ttl: Duration,
     pub claim_ip_ipv4_prefix: u8,
     pub claim_ip_ipv6_prefix: u8,
+    /// `0` = TCP peer. `1` = last `X-Forwarded-For` hop (Railway).
+    pub trusted_proxy_hops: u32,
 }
 
 impl SetupLimits {
@@ -454,6 +457,7 @@ impl SetupService {
                 ),
                 claim_ip_ipv4_prefix: limits.claim_ip_ipv4_prefix,
                 claim_ip_ipv6_prefix: limits.claim_ip_ipv6_prefix,
+                trusted_proxy_hops: limits.trusted_proxy_hops,
                 cancellations,
                 state: Mutex::new(State {
                     flows: HashMap::new(),
@@ -464,6 +468,10 @@ impl SetupService {
                 changed: Notify::new(),
             }),
         }
+    }
+
+    pub fn trusted_proxy_hops(&self) -> u32 {
+        self.inner.trusted_proxy_hops
     }
 
     pub async fn begin(

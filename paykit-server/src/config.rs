@@ -22,6 +22,7 @@ use crate::workers::{
 /// under 1 KiB. Used only by the item-cap/byte-cap coupling rule.
 pub const LISTUNSPENT_RESPONSE_ENVELOPE_BYTES: u64 = 1024;
 const MAX_POSTGRES_INTERVAL_SECONDS: u64 = i64::MAX as u64;
+const MAX_TRUSTED_PROXY_HOPS: u32 = 16;
 
 #[derive(Debug)]
 pub struct Config {
@@ -62,6 +63,7 @@ impl Config {
             claim_limiter_idle_ttl: environment.claim_limiter_idle_ttl,
             claim_ip_ipv4_prefix: environment.claim_ip_ipv4_prefix,
             claim_ip_ipv6_prefix: environment.claim_ip_ipv6_prefix,
+            trusted_proxy_hops: environment.trusted_proxy_hops,
             http_request_deadline: environment.http_request_deadline,
             ..Default::default()
         };
@@ -357,6 +359,13 @@ impl Config {
                 128,
             ));
         }
+        if self.rate_limits.trusted_proxy_hops > MAX_TRUSTED_PROXY_HOPS {
+            return Err(ConfigError::InvalidIntegerRange(
+                "rate_limits.trusted_proxy_hops",
+                0,
+                u64::from(MAX_TRUSTED_PROXY_HOPS),
+            ));
+        }
         for (name, value) in [
             ("electrum.poll_interval", self.electrum.poll_interval),
             ("outbox.lease_duration", self.outbox.lease_duration),
@@ -490,6 +499,8 @@ pub struct ConfigEnvironment {
     pub claim_ip_ipv4_prefix: Option<u8>,
     /// When set, overrides `rate_limits.claim_ip_ipv6_prefix`.
     pub claim_ip_ipv6_prefix: Option<u8>,
+    /// When set, overrides `rate_limits.trusted_proxy_hops`.
+    pub trusted_proxy_hops: Option<u32>,
     /// When set, overrides `limits.http_request_deadline`.
     pub http_request_deadline: Option<Duration>,
 }
@@ -513,6 +524,7 @@ impl ConfigEnvironment {
             claim_limiter_idle_ttl: parse_optional_duration_env("PAYKIT_CLAIM_LIMITER_IDLE_TTL")?,
             claim_ip_ipv4_prefix: parse_optional_u8_env("PAYKIT_CLAIM_IP_IPV4_PREFIX")?,
             claim_ip_ipv6_prefix: parse_optional_u8_env("PAYKIT_CLAIM_IP_IPV6_PREFIX")?,
+            trusted_proxy_hops: trusted_proxy_hops_from_process()?,
             http_request_deadline: parse_optional_duration_env("PAYKIT_HTTP_REQUEST_DEADLINE")?,
         })
     }
@@ -995,9 +1007,9 @@ pub struct RateLimitsConfig {
     pub claim_identity_per_second: u64,
     /// Token-bucket burst for Bitkit `/setup` keyed by creator identity.
     pub claim_identity_burst: u64,
-    /// Token-bucket refill for Bitkit `/setup` keyed by peer IP.
+    /// Token-bucket refill for Bitkit `/setup` keyed by client IP prefix.
     pub claim_ip_per_second: u64,
-    /// Token-bucket burst for Bitkit `/setup` keyed by peer IP.
+    /// Token-bucket burst for Bitkit `/setup` keyed by client IP prefix.
     pub claim_ip_burst: u64,
     /// Maximum live identity or IP-prefix buckets per keyed limiter.
     pub claim_limiter_max_entries: u64,
@@ -1007,6 +1019,12 @@ pub struct RateLimitsConfig {
     pub claim_ip_ipv4_prefix: u8,
     /// IPv6 prefix length used to key the claim-IP bucket (default /64).
     pub claim_ip_ipv6_prefix: u8,
+    /// Trusted proxy hops in `X-Forwarded-For`. `0` uses the TCP peer
+    /// (local/dev). `1` is the Railway default: the last XFF hop, which is
+    /// the address the edge appended. Never take the first hop when more
+    /// than one is present — that entry is client-spoofable if the edge
+    /// appends rather than strips.
+    pub trusted_proxy_hops: u32,
 }
 
 #[derive(Debug)]
@@ -1186,8 +1204,28 @@ fn apply_environment_overrides(config: &mut Config, environment: &ConfigEnvironm
     if let Some(value) = environment.claim_ip_ipv6_prefix {
         config.rate_limits.claim_ip_ipv6_prefix = value;
     }
+    if let Some(value) = environment.trusted_proxy_hops {
+        config.rate_limits.trusted_proxy_hops = value;
+    }
     if let Some(value) = environment.http_request_deadline {
         config.limits.http_request_deadline = value;
+    }
+}
+
+/// Explicit `PAYKIT_TRUSTED_PROXY_HOPS` wins. Otherwise Railway injects
+/// `RAILWAY_ENVIRONMENT`, and production behind the edge must trust one hop.
+fn trusted_proxy_hops_from_process() -> Result<Option<u32>, ConfigError> {
+    Ok(resolve_trusted_proxy_hops(
+        parse_optional_u32_env("PAYKIT_TRUSTED_PROXY_HOPS")?,
+        std::env::var_os("RAILWAY_ENVIRONMENT").is_some(),
+    ))
+}
+
+fn resolve_trusted_proxy_hops(explicit: Option<u32>, railway_environment_set: bool) -> Option<u32> {
+    match explicit {
+        Some(value) => Some(value),
+        None if railway_environment_set => Some(1),
+        None => None,
     }
 }
 
@@ -1206,6 +1244,15 @@ fn parse_optional_u8_env(name: &'static str) -> Result<Option<u8>, ConfigError> 
     match parse_optional_u64_env(name)? {
         None => Ok(None),
         Some(value) => u8::try_from(value)
+            .map(Some)
+            .map_err(|_| ConfigError::InvalidEnvInteger(name)),
+    }
+}
+
+fn parse_optional_u32_env(name: &'static str) -> Result<Option<u32>, ConfigError> {
+    match parse_optional_u64_env(name)? {
+        None => Ok(None),
+        Some(value) => u32::try_from(value)
             .map(Some)
             .map_err(|_| ConfigError::InvalidEnvInteger(name)),
     }
@@ -1634,6 +1681,8 @@ struct RawRateLimitsConfig {
     claim_ip_ipv4_prefix: u8,
     #[serde(default = "default_claim_ip_ipv6_prefix")]
     claim_ip_ipv6_prefix: u8,
+    #[serde(default = "default_trusted_proxy_hops")]
+    trusted_proxy_hops: u32,
 }
 
 #[derive(Deserialize)]
@@ -1672,6 +1721,7 @@ impl Default for RawRateLimitsConfig {
             claim_limiter_idle_ttl: default_claim_limiter_idle_ttl(),
             claim_ip_ipv4_prefix: default_claim_ip_ipv4_prefix(),
             claim_ip_ipv6_prefix: default_claim_ip_ipv6_prefix(),
+            trusted_proxy_hops: default_trusted_proxy_hops(),
         }
     }
 }
@@ -1727,6 +1777,7 @@ impl From<RawRateLimitsConfig> for RateLimitsConfig {
             claim_limiter_idle_ttl: value.claim_limiter_idle_ttl,
             claim_ip_ipv4_prefix: value.claim_ip_ipv4_prefix,
             claim_ip_ipv6_prefix: value.claim_ip_ipv6_prefix,
+            trusted_proxy_hops: value.trusted_proxy_hops,
         }
     }
 }
@@ -1794,6 +1845,9 @@ const fn default_claim_ip_ipv4_prefix() -> u8 {
 const fn default_claim_ip_ipv6_prefix() -> u8 {
     64
 }
+const fn default_trusted_proxy_hops() -> u32 {
+    0
+}
 const fn default_signed_requests_per_second() -> u64 {
     100
 }
@@ -1821,10 +1875,18 @@ const fn default_shutdown_drain_timeout() -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::default_bitcoin_creation_enabled;
+    use super::{default_bitcoin_creation_enabled, resolve_trusted_proxy_hops};
 
     #[test]
     fn omitted_bitcoin_creation_is_disabled() {
         assert!(!default_bitcoin_creation_enabled());
+    }
+
+    #[test]
+    fn railway_defaults_one_trusted_proxy_hop_unless_explicit() {
+        assert_eq!(resolve_trusted_proxy_hops(None, false), None);
+        assert_eq!(resolve_trusted_proxy_hops(None, true), Some(1));
+        assert_eq!(resolve_trusted_proxy_hops(Some(0), true), Some(0));
+        assert_eq!(resolve_trusted_proxy_hops(Some(2), false), Some(2));
     }
 }

@@ -215,7 +215,7 @@ max_pending_setup_flows = 100
 max_completion_polls_per_flow = 2
 max_completion_polls = 200
 # Claim-time Bitkit `/setup` token buckets, keyed by creator identity and
-# by peer IP. These sit in front of setup_per_ip_per_minute. Override with
+# by client IP prefix. These sit in front of setup_per_ip_per_minute. Override with
 # PAYKIT_CLAIM_IDENTITY_RATE_PER_SECOND / PAYKIT_CLAIM_IDENTITY_BURST and
 # PAYKIT_CLAIM_IP_RATE_PER_SECOND / PAYKIT_CLAIM_IP_BURST.
 # claim_identity_per_second = 1
@@ -231,6 +231,11 @@ max_completion_polls = 200
 # Override with PAYKIT_CLAIM_IP_IPV4_PREFIX / PAYKIT_CLAIM_IP_IPV6_PREFIX.
 # claim_ip_ipv4_prefix = 32
 # claim_ip_ipv6_prefix = 64
+# Trusted proxy hops counted from the right of X-Forwarded-For.
+# 0 = TCP peer (local/dev). 1 = last hop (Railway edge). Never take the
+# first hop: that entry is client-spoofable if the edge appends.
+# PAYKIT_TRUSTED_PROXY_HOPS overrides this; RAILWAY_ENVIRONMENT defaults it to 1.
+# trusted_proxy_hops = 0
 
 [shutdown]
 drain_timeout = "30s"

@@ -1,12 +1,17 @@
 //! Per-key token-bucket limiter for claim-time HTTP routes (`GET /setup`).
 //!
-//! One bucket is kept per identity (creator pubky) and another per peer IP
+//! One bucket is kept per identity (creator pubky) and another per client IP
 //! prefix. Burst is the starting token count; tokens refill from elapsed wall
 //! time at `rate_per_second` up to `burst`. A refused request does not charge.
 //!
 //! The store is bounded: at most `max_entries` live buckets, with LRU eviction
 //! under churn and a TTL sweep of idle buckets. Entry count is logged on every
 //! mutation.
+//!
+//! Client IP for the IP bucket is resolved by [`client_ip`]: hops `0` uses the
+//! TCP peer; hops `≥1` takes the Nth `X-Forwarded-For` hop from the right
+//! (never a spoofable leading hop unless it is also the last remaining hop),
+//! then `X-Real-IP`, then the peer.
 
 use std::{
     collections::HashMap,
@@ -269,6 +274,69 @@ impl TokenBucket {
     }
 }
 
+/// Resolve the client IP used to key claim-IP and per-IP setup windows.
+///
+/// * `trusted_proxy_hops == 0` ignores forwarding headers and returns `peer`
+///   (local/dev).
+/// * `trusted_proxy_hops >= 1` takes the Nth `X-Forwarded-For` hop from the
+///   right — the hop a trusted proxy appended — so spoofed leading entries
+///   are ignored. A missing or unparseable XFF hop falls back to `X-Real-IP`
+///   (Railway overwrites this header) and then to `peer`.
+pub fn client_ip(
+    peer: IpAddr,
+    trusted_proxy_hops: u32,
+    x_forwarded_for: Option<&str>,
+    x_real_ip: Option<&str>,
+) -> IpAddr {
+    if trusted_proxy_hops == 0 {
+        return canonicalize_ip(peer);
+    }
+    if let Some(xff) = x_forwarded_for {
+        let hops: Vec<&str> = xff
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect();
+        if hops.len() >= trusted_proxy_hops as usize {
+            let idx = hops.len() - trusted_proxy_hops as usize;
+            if let Some(ip) = parse_forwarded_hop(hops[idx]) {
+                return ip;
+            }
+        }
+    }
+    if let Some(real) = x_real_ip.and_then(parse_forwarded_hop) {
+        return real;
+    }
+    canonicalize_ip(peer)
+}
+
+fn parse_forwarded_hop(raw: &str) -> Option<IpAddr> {
+    let raw = raw.trim().trim_matches('"').trim_matches('\'');
+    let raw = raw
+        .strip_prefix("for=")
+        .or_else(|| raw.strip_prefix("For="))
+        .unwrap_or(raw)
+        .trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+    let unbracketed = raw
+        .strip_prefix('[')
+        .and_then(|rest| rest.split(']').next())
+        .unwrap_or(raw);
+    if let Ok(ip) = unbracketed.parse::<IpAddr>() {
+        return Some(canonicalize_ip(ip));
+    }
+    if let Some((host, port)) = unbracketed.rsplit_once(':')
+        && !host.contains(':')
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && let Ok(ip) = host.parse::<IpAddr>()
+    {
+        return Some(canonicalize_ip(ip));
+    }
+    None
+}
+
 /// Claim-IP bucket key: IPv4 uses `ipv4_prefix` (default /32), IPv6 uses
 /// `ipv6_prefix` (default /64). IPv4-mapped IPv6 is treated as IPv4.
 pub fn ip_prefix_key(ip: IpAddr, ipv4_prefix: u8, ipv6_prefix: u8) -> String {
@@ -481,6 +549,80 @@ mod tests {
             ip_prefix_key(a, 32, 64),
             ip_prefix_key(mapped, 32, 64),
             "IPv4-mapped IPv6 must bucket as the embedded IPv4 /32"
+        );
+    }
+
+    fn peer() -> IpAddr {
+        "10.0.0.1".parse().unwrap()
+    }
+
+    #[test]
+    fn hops_zero_ignores_headers_and_returns_peer() {
+        let spoofed = "203.0.113.1, 198.51.100.7";
+        assert_eq!(
+            client_ip(peer(), 0, Some(spoofed), Some("198.51.100.9")),
+            peer()
+        );
+    }
+
+    #[test]
+    fn no_header_returns_peer() {
+        assert_eq!(client_ip(peer(), 1, None, None), peer());
+        assert_eq!(client_ip(peer(), 1, Some(" "), Some("")), peer());
+    }
+
+    #[test]
+    fn hops_one_takes_last_xff_and_ignores_spoofed_leading_entries() {
+        let xff = "203.0.113.1, 192.0.2.2, 198.51.100.7";
+        assert_eq!(
+            client_ip(peer(), 1, Some(xff), Some("203.0.113.9")),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+        assert_ne!(
+            client_ip(peer(), 1, Some(xff), None),
+            "203.0.113.1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn hops_two_skips_the_last_proxy_hop() {
+        let xff = "203.0.113.1, 198.51.100.7, 10.0.0.2";
+        assert_eq!(
+            client_ip(peer(), 2, Some(xff), None),
+            "198.51.100.7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn hops_one_falls_back_to_x_real_ip_when_xff_missing() {
+        assert_eq!(
+            client_ip(peer(), 1, None, Some("198.51.100.9")),
+            "198.51.100.9".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn too_few_xff_hops_does_not_take_the_first_spoofed_entry() {
+        assert_eq!(
+            client_ip(
+                peer(),
+                3,
+                Some("203.0.113.1, 198.51.100.7"),
+                Some("198.51.100.9")
+            ),
+            "198.51.100.9".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn railway_edge_ula_pool_shares_a_slash64() {
+        let a: IpAddr = "fd12:0:8:0:2000:9d:8000:1".parse().unwrap();
+        let b: IpAddr = "fd12:0:8:0:2000:f1:8000:1".parse().unwrap();
+        assert_eq!(ip_prefix_key(a, 32, 64), "fd12:0:8::/64");
+        assert_eq!(
+            ip_prefix_key(a, 32, 64),
+            ip_prefix_key(b, 32, 64),
+            "Railway edge TCP peers on fd12:0:8:0::/64 collapse to one claim-IP bucket"
         );
     }
 }

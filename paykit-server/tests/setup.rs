@@ -461,6 +461,7 @@ fn runtime_limits(
         claim_limiter_idle_ttl: SetupLimits::test_idle_ttl(),
         claim_ip_ipv4_prefix: SetupLimits::TEST_IPV4_PREFIX,
         claim_ip_ipv6_prefix: SetupLimits::TEST_IPV6_PREFIX,
+        trusted_proxy_hops: 0,
     }
 }
 
@@ -471,6 +472,24 @@ fn limited_service(
     max_pending_setup_flows: usize,
 ) -> SetupService {
     let limits = runtime_limits(2, 4, setup_per_ip_per_minute, max_pending_setup_flows);
+    SetupService::with_poll_timeout(
+        vec!["https://app.example".to_owned()],
+        completer,
+        clock,
+        limits,
+        Duration::ZERO,
+    )
+}
+
+fn limited_service_with_hops(
+    completer: Arc<dyn SetupCompleter>,
+    clock: Arc<ManualClock>,
+    setup_per_ip_per_minute: usize,
+    max_pending_setup_flows: usize,
+    trusted_proxy_hops: u32,
+) -> SetupService {
+    let mut limits = runtime_limits(2, 4, setup_per_ip_per_minute, max_pending_setup_flows);
+    limits.trusted_proxy_hops = trusted_proxy_hops;
     SetupService::with_poll_timeout(
         vec!["https://app.example".to_owned()],
         completer,
@@ -1028,8 +1047,34 @@ async fn concurrent_starts_never_exceed_pending_setup_capacity() {
     }
 }
 
+fn setup_policy_request(
+    peer_ip: IpAddr,
+    forwarded_for: Option<&str>,
+    real_ip: Option<&str>,
+    state: &str,
+) -> Request<Body> {
+    let mut builder = Request::builder().method(Method::GET).uri(format!(
+        "/setup?return_to=https://app.example&state={state}&creator={EXPECTED_CREATOR}"
+    ));
+    if let Some(value) = forwarded_for {
+        builder = builder.header("X-Forwarded-For", value);
+    }
+    if let Some(value) = real_ip {
+        builder = builder.header("X-Real-IP", value);
+    }
+    let mut request = builder.body(Body::empty()).unwrap();
+    request
+        .extensions_mut()
+        .insert(ConnectInfo(SocketAddr::new(peer_ip, 12345)));
+    request
+}
+
+async fn setup_policy_status(router: axum::Router, request: Request<Body>) -> StatusCode {
+    router.oneshot(request).await.unwrap().status()
+}
+
 #[tokio::test]
-async fn setup_policy_uses_transport_ip_and_ignores_forwarded_for() {
+async fn setup_policy_hops_zero_ignores_forwarded_headers() {
     let setup = limited_service(
         Arc::new(MockCompleter::new([])),
         Arc::new(ManualClock::default()),
@@ -1037,46 +1082,152 @@ async fn setup_policy_uses_transport_ip_and_ignores_forwarded_for() {
         10,
     );
     let router = setup_router(setup);
-    let make_request = |peer_ip: IpAddr, forwarded_for: &str, state: &str| {
-        let mut request = Request::builder()
-            .method(Method::GET)
-            .uri(format!(
-                "/setup?return_to=https://app.example&state={state}&creator={EXPECTED_CREATOR}"
-            ))
-            .header("X-Forwarded-For", forwarded_for)
-            .body(Body::empty())
-            .unwrap();
-        request
-            .extensions_mut()
-            .insert(ConnectInfo(SocketAddr::new(peer_ip, 12345)));
-        request
-    };
     assert_eq!(
-        router
-            .clone()
-            .oneshot(make_request(peer(), "198.51.100.1", "one"))
-            .await
-            .unwrap()
-            .status(),
+        setup_policy_status(
+            router.clone(),
+            setup_policy_request(peer(), Some("198.51.100.1"), Some("198.51.100.9"), "one"),
+        )
+        .await,
         StatusCode::OK
     );
     let limited = router
         .clone()
-        .oneshot(make_request(peer(), "203.0.113.2", "two"))
+        .oneshot(setup_policy_request(
+            peer(),
+            Some("203.0.113.2"),
+            Some("203.0.113.9"),
+            "two",
+        ))
         .await
         .unwrap();
     assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(limited.headers()["retry-after"], "60");
     assert_eq!(
-        router
-            .oneshot(make_request(
+        setup_policy_status(
+            router,
+            setup_policy_request(
                 IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)),
-                "203.0.113.2",
+                Some("203.0.113.2"),
+                Some("203.0.113.9"),
                 "three",
-            ))
-            .await
-            .unwrap()
-            .status(),
+            ),
+        )
+        .await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn setup_policy_hops_one_uses_last_xff_and_ignores_spoofed_leading_entries() {
+    let setup = limited_service_with_hops(
+        Arc::new(MockCompleter::new([])),
+        Arc::new(ManualClock::default()),
+        1,
+        10,
+        1,
+    );
+    let router = setup_router(setup);
+    let edge = peer();
+    assert_eq!(
+        setup_policy_status(
+            router.clone(),
+            setup_policy_request(edge, Some("203.0.113.1, 198.51.100.7"), None, "one"),
+        )
+        .await,
+        StatusCode::OK
+    );
+    let limited = router
+        .clone()
+        .oneshot(setup_policy_request(
+            edge,
+            Some("192.0.2.1, 198.51.100.7"),
+            Some("203.0.113.9"),
+            "two",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(limited.headers()["retry-after"], "60");
+    assert_eq!(
+        setup_policy_status(
+            router,
+            setup_policy_request(edge, Some("198.51.100.8"), None, "three"),
+        )
+        .await,
+        StatusCode::OK,
+        "a different last XFF hop is a different client even on the same TCP peer"
+    );
+}
+
+#[tokio::test]
+async fn setup_policy_hops_one_falls_back_to_peer_when_headers_are_missing() {
+    let setup = limited_service_with_hops(
+        Arc::new(MockCompleter::new([])),
+        Arc::new(ManualClock::default()),
+        1,
+        10,
+        1,
+    );
+    let router = setup_router(setup);
+    assert_eq!(
+        setup_policy_status(
+            router.clone(),
+            setup_policy_request(peer(), None, None, "one"),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        setup_policy_status(
+            router.clone(),
+            setup_policy_request(peer(), None, None, "two"),
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        setup_policy_status(
+            router,
+            setup_policy_request(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), None, None, "three"),
+        )
+        .await,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn setup_policy_hops_one_uses_x_real_ip_when_xff_is_missing() {
+    let setup = limited_service_with_hops(
+        Arc::new(MockCompleter::new([])),
+        Arc::new(ManualClock::default()),
+        1,
+        10,
+        1,
+    );
+    let router = setup_router(setup);
+    let edge = peer();
+    assert_eq!(
+        setup_policy_status(
+            router.clone(),
+            setup_policy_request(edge, None, Some("198.51.100.9"), "one"),
+        )
+        .await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        setup_policy_status(
+            router.clone(),
+            setup_policy_request(edge, None, Some("198.51.100.9"), "two"),
+        )
+        .await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        setup_policy_status(
+            router,
+            setup_policy_request(edge, None, Some("198.51.100.10"), "three"),
+        )
+        .await,
         StatusCode::OK
     );
 }
@@ -1554,6 +1705,7 @@ fn claim_token_limits(
         claim_limiter_idle_ttl: SetupLimits::test_idle_ttl(),
         claim_ip_ipv4_prefix: SetupLimits::TEST_IPV4_PREFIX,
         claim_ip_ipv6_prefix: SetupLimits::TEST_IPV6_PREFIX,
+        trusted_proxy_hops: 0,
     }
 }
 

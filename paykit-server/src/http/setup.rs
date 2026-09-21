@@ -2,14 +2,15 @@ use axum::{
     Router,
     body::Body,
     extract::{ConnectInfo, Path, RawQuery, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
     routing::{get, post},
 };
 use qrcode::{EcLevel, QrCode, render::svg};
 use serde_json::json;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
+use crate::http::claim_limiter::client_ip;
 use crate::setup::{BeginError, CancelResult, PollResult, SetupService, StartedFlow};
 
 pub fn setup_router(service: SetupService) -> Router {
@@ -23,12 +24,21 @@ pub fn setup_router(service: SetupService) -> Router {
 async fn begin(
     State(service): State<SetupService>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
     let Some((return_to, state, creator)) = parse_setup_query(query.as_deref()) else {
         return invalid_request();
     };
-    match service.begin(peer.ip(), &return_to, &state, &creator).await {
+    match service
+        .begin(
+            request_client_ip(&service, peer.ip(), &headers),
+            &return_to,
+            &state,
+            &creator,
+        )
+        .await
+    {
         Ok(flow) => match iframe_response(flow) {
             Ok(response) => response,
             Err(()) => safe_response_with_retry(
@@ -61,9 +71,13 @@ async fn complete(
 async fn cancel(
     State(service): State<SetupService>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(flow_id): Path<String>,
 ) -> Response<Body> {
-    let result = match service.cancel(peer.ip(), &flow_id).await {
+    let result = match service
+        .cancel(request_client_ip(&service, peer.ip(), &headers), &flow_id)
+        .await
+    {
         CancelResult::Cancelled => safe_response(StatusCode::OK, json!({"status":"cancelled"})),
         CancelResult::Complete => safe_response(StatusCode::CONFLICT, json!({"error":"completed"})),
         CancelResult::Unknown => safe_response(StatusCode::NOT_FOUND, json!({"error":"not_found"})),
@@ -84,6 +98,19 @@ async fn cancel(
         ),
     };
     with_no_store(result)
+}
+
+fn request_client_ip(service: &SetupService, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+    client_ip(
+        peer,
+        service.trusted_proxy_hops(),
+        header_str(headers, "x-forwarded-for"),
+        header_str(headers, "x-real-ip"),
+    )
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str> {
+    headers.get(name).and_then(|value| value.to_str().ok())
 }
 
 fn parse_setup_query(query: Option<&str>) -> Option<(String, String, String)> {

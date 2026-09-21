@@ -271,6 +271,7 @@ async fn grant_created_owner_status_evidence_and_alert_acknowledgement_remain_li
             claim_limiter_idle_ttl: SetupLimits::test_idle_ttl(),
             claim_ip_ipv4_prefix: SetupLimits::TEST_IPV4_PREFIX,
             claim_ip_ipv6_prefix: SetupLimits::TEST_IPV6_PREFIX,
+            trusted_proxy_hops: 0,
         },
     );
     let flow = setup

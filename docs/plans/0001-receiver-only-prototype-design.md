@@ -459,9 +459,9 @@ Rules:
 - HTTP bind, allowed setup origins, Paykit network, same-network Electrum endpoint, and operational polling/retry/lease/rate/size settings may change across restarts.
 - Closed TOML includes `rate_limits` section.
 - Default signed Locks API limit is 100 requests/second globally with burst 200.
-- Default new-setup limit is 10/minute per transport peer IP with at most 100 pending flows globally.
+- Default new-setup limit is 10/minute per resolved client IP with at most 100 pending flows globally.
 - Completion permits at most two concurrent long polls per flow and 200 globally.
-- `X-Forwarded-For` is ignored; trusted-proxy interpretation is not supported in prototype.
+- Client IP for setup/claim limits: `trusted_proxy_hops = 0` uses the TCP peer (local/dev). `1` (Railway default via `RAILWAY_ENVIRONMENT` / `PAYKIT_TRUSTED_PROXY_HOPS`) takes the last `X-Forwarded-For` hop, never the first spoofable hop. Missing headers fall back to `X-Real-IP` then the peer.
 - Policy-limited requests return `429` with `Retry-After`; exhausted capacity/semaphore returns `503` with `Retry-After: 1`; no denied operation commits state.
 - Liveness/readiness endpoints are exempt.
 
