@@ -55,12 +55,16 @@ poll_interval = "5s"
     .expect("valid config fixture")
 }
 
-fn database_url_for_role(database_url: &str, role: &str) -> String {
+fn database_url_for_role(database_url: &str, role: &str, password: &str) -> String {
     let mut url = Url::parse(database_url).expect("isolated database URL parses");
     url.set_username(role).expect("generated role is URL-safe");
-    url.set_password(None)
-        .expect("PostgreSQL URL accepts no password");
+    url.set_password(Some(password))
+        .expect("generated role password is URL-safe");
     url.to_string()
+}
+
+fn login_role_password() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 #[tokio::test]
@@ -347,17 +351,22 @@ async fn startup_applies_as_migrator_then_boots_with_a_restricted_runtime_princi
     let database = TestDatabase::create().await;
     let migrator_role = format!("paykit_migrator_{}", uuid::Uuid::new_v4().simple());
     let runtime_role = format!("paykit_runtime_{}", uuid::Uuid::new_v4().simple());
+    let migrator_password = login_role_password();
+    let runtime_password = login_role_password();
 
+    // CI Postgres uses scram-sha-256 over TCP. LOGIN roles with no password
+    // cannot authenticate there, so initialize_database reported Connection
+    // instead of the missing-grant Deployment failure this test asserts.
     sqlx::query(&format!(
         "CREATE ROLE {migrator_role} LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE \
-         NOREPLICATION NOBYPASSRLS"
+         NOREPLICATION NOBYPASSRLS PASSWORD '{migrator_password}'"
     ))
     .execute(&admin_pool)
     .await
     .unwrap();
     sqlx::query(&format!(
         "CREATE ROLE {runtime_role} LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE \
-         NOREPLICATION NOBYPASSRLS"
+         NOREPLICATION NOBYPASSRLS PASSWORD '{runtime_password}'"
     ))
     .execute(&admin_pool)
     .await
@@ -374,14 +383,23 @@ async fn startup_applies_as_migrator_then_boots_with_a_restricted_runtime_princi
     .await
     .unwrap();
     sqlx::query(&format!(
+        "GRANT CONNECT ON DATABASE {} TO {runtime_role}",
+        database.database_name()
+    ))
+    .execute(&admin_pool)
+    .await
+    .unwrap();
+    sqlx::query(&format!(
         "GRANT USAGE, CREATE ON SCHEMA public TO {migrator_role}"
     ))
     .execute(database.pool())
     .await
     .unwrap();
 
-    let migrator_url = database_url_for_role(database.database_url(), &migrator_role);
-    let runtime_url = database_url_for_role(database.database_url(), &runtime_role);
+    let migrator_url =
+        database_url_for_role(database.database_url(), &migrator_role, &migrator_password);
+    let runtime_url =
+        database_url_for_role(database.database_url(), &runtime_role, &runtime_password);
     let configured = config_with_principals(&runtime_url, &migrator_url, "testnet", "proof");
 
     // Exercise the real startup path against the fresh database. All embedded
@@ -491,4 +509,19 @@ async fn startup_applies_as_migrator_then_boots_with_a_restricted_runtime_princi
         .await
         .unwrap();
     admin_pool.close().await;
+}
+
+#[test]
+fn database_url_for_role_replaces_user_and_password() {
+    let url = database_url_for_role(
+        "postgres://postgres:admin-secret@localhost:5432/paykit_e2e_test?sslmode=require",
+        "paykit_runtime_abc",
+        "runtime-secret",
+    );
+    let parsed = Url::parse(&url).unwrap();
+
+    assert_eq!(parsed.username(), "paykit_runtime_abc");
+    assert_eq!(parsed.password(), Some("runtime-secret"));
+    assert_eq!(parsed.path(), "/paykit_e2e_test");
+    assert_eq!(parsed.query(), Some("sslmode=require"));
 }

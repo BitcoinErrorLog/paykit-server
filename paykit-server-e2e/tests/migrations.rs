@@ -377,8 +377,10 @@ async fn migration_0025_readonly_role_can_inspect_but_cannot_mutate() {
     );
 
     let login = format!("paykit_readonly_e2e_{}", Uuid::new_v4().simple());
+    let password = Uuid::new_v4().simple().to_string();
     sqlx::query(&format!(
-        "CREATE ROLE {login} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS"
+        "CREATE ROLE {login} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE INHERIT NOREPLICATION NOBYPASSRLS \
+         PASSWORD '{password}'"
     ))
     .execute(database.pool())
     .await
@@ -390,7 +392,8 @@ async fn migration_0025_readonly_role_can_inspect_but_cannot_mutate() {
 
     let options = PgConnectOptions::from_str(database.database_url())
         .unwrap()
-        .username(&login);
+        .username(&login)
+        .password(&password);
     let readonly = PgPoolOptions::new()
         .max_connections(1)
         .connect_with(options)
