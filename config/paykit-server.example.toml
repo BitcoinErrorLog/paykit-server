@@ -202,8 +202,10 @@ lock_resource_bytes = 262144
 lock_fetch_timeout = "10s"
 # Whole-request deadline covering inbound handler work and outbound HTTP
 # (TCP connect + TLS handshake + body), not just a socket read timeout.
-# Override with PAYKIT_HTTP_REQUEST_DEADLINE.
-# http_request_deadline = "10s"
+# Default 20s sits above create-invoice/two-phase REQUEST_DEADLINE (15s)
+# so those paths still answer 503 dependency_timeout; this cap is the
+# last-resort 504. Override with PAYKIT_HTTP_REQUEST_DEADLINE.
+# http_request_deadline = "20s"
 
 [rate_limits]
 signed_requests_per_second = 100

@@ -713,7 +713,8 @@ pub fn operational_router(public_routes: Router, runtime: Arc<Runtime>) -> Route
 }
 
 /// Default whole-request deadline used by tests that do not supply one.
-pub const DEFAULT_HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+/// Must sit above create-invoice/two-phase `REQUEST_DEADLINE` (15s).
+pub const DEFAULT_HTTP_REQUEST_DEADLINE: Duration = Duration::from_secs(20);
 
 pub fn operational_router_with_deadline(
     public_routes: Router,

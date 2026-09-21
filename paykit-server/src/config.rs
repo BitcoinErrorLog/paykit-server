@@ -936,6 +936,9 @@ pub struct LimitsConfig {
     pub lock_fetch_timeout: Duration,
     /// Whole-request deadline covering inbound handler work and outbound
     /// HTTP (TCP connect + TLS handshake + body), not just a read timeout.
+    /// Default sits above create-invoice/two-phase `REQUEST_DEADLINE` (15s)
+    /// so those paths can still answer 503 `dependency_timeout`; this cap
+    /// is the last-resort 504 for a hang that never consults that budget.
     pub http_request_deadline: Duration,
 }
 
@@ -1680,7 +1683,7 @@ const fn default_lock_fetch_timeout() -> Duration {
     Duration::from_secs(10)
 }
 const fn default_http_request_deadline() -> Duration {
-    Duration::from_secs(10)
+    Duration::from_secs(20)
 }
 const fn default_claim_identity_per_second() -> u64 {
     1

@@ -1148,13 +1148,13 @@ fn claim_limiter_and_http_deadline_default_when_omitted() {
     assert_eq!(config.rate_limits.claim_identity_burst, 3);
     assert_eq!(config.rate_limits.claim_ip_per_second, 2);
     assert_eq!(config.rate_limits.claim_ip_burst, 6);
-    assert_eq!(config.limits.http_request_deadline, Duration::from_secs(10));
+    assert_eq!(config.limits.http_request_deadline, Duration::from_secs(20));
 }
 
 #[test]
 fn claim_limiter_and_http_deadline_env_overrides_toml() {
     let toml = format!(
-        "{}\n[rate_limits]\nclaim_identity_per_second = 4\nclaim_identity_burst = 8\nclaim_ip_per_second = 5\nclaim_ip_burst = 9\n[limits]\nhttp_request_deadline = \"20s\"\n",
+        "{}\n[rate_limits]\nclaim_identity_per_second = 4\nclaim_identity_burst = 8\nclaim_ip_per_second = 5\nclaim_ip_burst = 9\n[limits]\nhttp_request_deadline = \"25s\"\n",
         valid_toml()
     );
     let toml_values = Config::from_toml_and_environment(&toml, environment()).unwrap();
@@ -1164,7 +1164,7 @@ fn claim_limiter_and_http_deadline_env_overrides_toml() {
     assert_eq!(toml_values.rate_limits.claim_ip_burst, 9);
     assert_eq!(
         toml_values.limits.http_request_deadline,
-        Duration::from_secs(20)
+        Duration::from_secs(25)
     );
 
     let overridden = ConfigEnvironment {
