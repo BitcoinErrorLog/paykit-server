@@ -227,6 +227,7 @@ stack_role = "proof"
 [electrum]
 endpoint = "tcp://127.0.0.1:1"
 poll_interval = "1h"
+observer_lease_ttl = "2h"
 request_timeout = "1s"
 max_concurrent_creation_snapshots = 1
 [outbox]

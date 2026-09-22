@@ -214,6 +214,12 @@ async fn two_instances_overlap_without_double_processing() {
     let first_writes = Arc::new(AtomicUsize::new(0));
     let second_writes = Arc::new(AtomicUsize::new(0));
 
+    first
+        .acquire()
+        .await
+        .unwrap()
+        .expect("first replica claims the lease before overlap");
+
     async fn tick(
         leadership: &PgObserverLeadership,
         invoices: &InvoiceStore,

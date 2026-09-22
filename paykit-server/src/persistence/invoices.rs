@@ -2216,6 +2216,7 @@ impl InvoiceStore {
 
     async fn mark_invoice_integrity_failed(&self, address: &str) -> Result<(), PersistenceError> {
         let address_lookup_hash = self.crypto.bitcoin_address_lookup_hash(address.as_bytes());
+        let mut tx = self.begin_observer_write().await?;
         let result = sqlx::query_as::<_, (Uuid, bool, i32)>(
             "WITH current AS (
                  SELECT id,
@@ -2238,9 +2239,12 @@ impl InvoiceStore {
              RETURNING invoices.id, current.should_log, invoices.integrity_failure_count",
         )
         .bind(address_lookup_hash.as_bytes().as_slice())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         if let Some((invoice_id, true, failure_count)) = result {
             tracing::error!(
                 invoice_id = %invoice_id,
