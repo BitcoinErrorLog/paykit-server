@@ -285,4 +285,8 @@ pub enum PersistenceError {
     /// An abandoned resolution lost the invoice-row payment observation race.
     #[error("payment was observed before abandonment could commit")]
     PaymentObserved,
+    /// An observer write ran with a fencing token that no longer matches
+    /// the lease row: another replica has taken over leadership.
+    #[error("observer lease fencing token is stale")]
+    StaleObserverLease,
 }

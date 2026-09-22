@@ -67,7 +67,7 @@ async fn production_schema_clone_runs_real_startup_and_server_composition() {
             .fetch_all(&initialized.pool)
             .await
             .unwrap();
-    assert_eq!(versions, (1..=25).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=26).collect::<Vec<_>>());
 
     let role_attributes: (bool, bool, bool, bool, bool, bool, bool) = sqlx::query_as(
         "SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolinherit,
@@ -100,6 +100,54 @@ async fn production_schema_clone_runs_real_startup_and_server_composition() {
                 .unwrap()
         };
         assert!(granted, "paykit lacks {privilege} on {object}");
+    }
+
+    for privilege in ["SELECT", "INSERT", "UPDATE"] {
+        let granted: bool = sqlx::query_scalar(
+            "SELECT has_table_privilege('paykit', 'public.observer_leadership', $1)",
+        )
+        .bind(privilege)
+        .fetch_one(&initialized.pool)
+        .await
+        .unwrap();
+        assert!(granted, "paykit lacks {privilege} on observer_leadership");
+    }
+    for privilege in ["DELETE", "TRUNCATE"] {
+        let granted: bool = sqlx::query_scalar(
+            "SELECT has_table_privilege('paykit', 'public.observer_leadership', $1)",
+        )
+        .bind(privilege)
+        .fetch_one(&initialized.pool)
+        .await
+        .unwrap();
+        assert!(
+            !granted,
+            "paykit unexpectedly has {privilege} on observer_leadership"
+        );
+    }
+
+    let readonly_select: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege('paykit_readonly', 'public.observer_leadership', 'SELECT')",
+    )
+    .fetch_one(&initialized.pool)
+    .await
+    .unwrap();
+    assert!(
+        readonly_select,
+        "paykit_readonly lacks SELECT on observer_leadership"
+    );
+    for privilege in ["INSERT", "UPDATE", "DELETE"] {
+        let granted: bool = sqlx::query_scalar(
+            "SELECT has_table_privilege('paykit_readonly', 'public.observer_leadership', $1)",
+        )
+        .bind(privilege)
+        .fetch_one(&initialized.pool)
+        .await
+        .unwrap();
+        assert!(
+            !granted,
+            "paykit_readonly unexpectedly has {privilege} on observer_leadership"
+        );
     }
 
     let server = Server::build(config, initialized.pool.clone(), initialized.stack_identity)

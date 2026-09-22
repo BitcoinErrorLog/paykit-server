@@ -81,6 +81,7 @@ use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod common;
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
 
@@ -227,6 +228,7 @@ stack_role = "proof"
 [electrum]
 endpoint = "tcp://127.0.0.1:1"
 poll_interval = "1h"
+observer_lease_ttl = "2h"
 request_timeout = "1s"
 max_concurrent_creation_snapshots = 1
 [outbox]
@@ -482,7 +484,7 @@ async fn boot(seed: u8) -> BootedStack {
 
     BootedStack {
         address,
-        store: InvoiceStore::new(&pool, crypto.clone()),
+        store: common::fenced_invoice_store(&pool, crypto.clone()).await,
         outbox: OutboxStore::new(&pool, crypto.clone()),
         pool,
         runtime,

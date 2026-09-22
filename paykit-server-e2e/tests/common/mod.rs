@@ -1,9 +1,49 @@
+//! Shared e2e helpers. Each integration test binary compiles this independently
+//! and uses only a subset, so unused helpers must not fail `-D dead-code`.
+#![allow(dead_code)]
+
+use std::{sync::Arc, time::Duration};
+
 use paykit_lib::{
     PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount,
     PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
     PublicKey,
 };
-use paykit_server::{application::semantic_intent::DeliveryIntentV1, domain::locks::ReaderPubky};
+use paykit_server::{
+    application::semantic_intent::DeliveryIntentV1,
+    crypto::Crypto,
+    domain::locks::ReaderPubky,
+    persistence::{
+        InvoiceStore, OBSERVER_LEADERSHIP_LEASE_NAME, ObserverLease, PgObserverLeadership,
+    },
+};
+use sqlx::PgPool;
+
+/// Current leadership fence, or a newly acquired lease when the row is empty.
+///
+/// Tests that drive observer writes against a booted server must share the
+/// live holder's fence rather than steal the lease.
+pub async fn observer_lease(pool: &PgPool) -> ObserverLease {
+    if let Some((holder, fence)) = sqlx::query_as::<_, (uuid::Uuid, i64)>(
+        "SELECT holder, fence FROM observer_leadership WHERE name = $1",
+    )
+    .bind(OBSERVER_LEADERSHIP_LEASE_NAME)
+    .fetch_optional(pool)
+    .await
+    .expect("read observer_leadership")
+    {
+        return ObserverLease { holder, fence };
+    }
+    PgObserverLeadership::new(pool, Duration::from_secs(30))
+        .acquire()
+        .await
+        .expect("acquire test observer lease")
+        .expect("test observer lease")
+}
+
+pub async fn fenced_invoice_store(pool: &PgPool, crypto: Arc<Crypto>) -> InvoiceStore {
+    InvoiceStore::new(pool, crypto).with_observer_lease(observer_lease(pool).await)
+}
 
 fn marker() -> PaykitReceiverMarker {
     PaykitReceiverMarker::new(

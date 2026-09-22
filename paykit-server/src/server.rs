@@ -32,8 +32,8 @@ use crate::{
     setup_orchestration::PubkyCompanionRelay,
     workers::{
         observer::{
-            ElectrumAdapter, ElectrumPort, ObservationBackend, ObserverError, ObserverLeadership,
-            ObserverPolicy, RequestLimiter, observation_loop,
+            ElectrumAdapter, ElectrumPort, ObserverError, ObserverLeadership, ObserverPolicy,
+            RequestLimiter, observation_loop,
         },
         outbox::{
             ProcessingHealth, process_claim_with_health, process_fence_recovery_with_health,
@@ -90,6 +90,7 @@ struct WorkerComponents {
     link_establishment_max_age: Duration,
     electrum_policy: ObserverPolicy,
     sentinel_policy: crate::sentinel::SentinelPolicy,
+    observer_lease_ttl: Duration,
 }
 
 impl Server {
@@ -439,6 +440,7 @@ impl Server {
                 expiry_tail: config.bitcoin.expiry_tail,
             },
             sentinel_policy: config.sentinel.policy(),
+            observer_lease_ttl: config.electrum.observer_lease_ttl,
         };
         let drain_timeout = config.shutdown.drain_timeout;
 
@@ -875,9 +877,11 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
 async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
     observation_loop(
         workers.electrum.clone(),
-        Arc::new(workers.invoices.clone()) as Arc<dyn ObservationBackend>,
-        Arc::new(crate::persistence::PgObserverLeadership::new(&workers.pool))
-            as Arc<dyn ObserverLeadership>,
+        workers.invoices.clone(),
+        Arc::new(crate::persistence::PgObserverLeadership::new(
+            &workers.pool,
+            workers.observer_lease_ttl,
+        )) as Arc<dyn ObserverLeadership>,
         workers.bitcoin_network.clone(),
         workers.electrum_policy,
         workers.sentinel_policy,

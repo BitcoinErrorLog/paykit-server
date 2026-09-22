@@ -2590,8 +2590,17 @@ async fn void_and_abandoned_terminalize_non_handed_off_rows() {
 /// transitions to `expired_final`, injecting the clock through SQL
 /// timestamp moves (never sleeping): first `observing → expired_tail` at
 /// `expires_at`, then `expired_tail → expired_final` at `expires_at +
-/// tail`.
-async fn expire_invoice(database: &TestDatabase, invoices: &InvoiceStore, invoice_id: Uuid) {
+/// tail`. Acquires the observer lease on a cloned store — the same fence
+/// `observation_loop` binds before `observe_tick` — because expiry is an
+/// observer write.
+async fn expire_invoice(
+    database: &TestDatabase,
+    invoices: &InvoiceStore,
+    invoice_id: Uuid,
+) -> InvoiceStore {
+    let invoices = invoices
+        .clone()
+        .with_observer_lease(common::observer_lease(database.pool()).await);
     sqlx::query("UPDATE invoices SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
         .bind(invoice_id)
         .execute(database.pool())
@@ -2618,6 +2627,7 @@ async fn expire_invoice(database: &TestDatabase, invoices: &InvoiceStore, invoic
         .await
         .unwrap();
     assert_eq!(baseline, "expired_final");
+    invoices
 }
 
 /// The production residue shape: an `expired_final` invoice whose endpoint
@@ -2784,7 +2794,7 @@ async fn expiry_terminalization_is_idempotent_on_a_second_pass() {
     let crypto = Arc::new(Crypto::from_master_key(&[61; 32]).unwrap());
     let (_creator, _bundle, invoices, invoice_id, _endpoint_id, _request_id) =
         create_activated_invoice(&database, crypto.clone(), "000G40R40M30E209185GR38E1W").await;
-    expire_invoice(&database, &invoices, invoice_id).await;
+    let invoices = expire_invoice(&database, &invoices, invoice_id).await;
     let events_after_first: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM outbox_terminal_events WHERE invoice_id = $1")
             .bind(invoice_id)

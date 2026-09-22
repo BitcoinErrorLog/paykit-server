@@ -87,7 +87,7 @@ async fn store(database: &TestDatabase) -> InvoiceStore {
         )
         .await
         .unwrap();
-    InvoiceStore::new(database.pool(), crypto)
+    common::fenced_invoice_store(database.pool(), crypto).await
 }
 async fn invoice(store: &InvoiceStore) -> (uuid::Uuid, String) {
     invoice_for(store, b"bundle", b"request", "bitcoin-address-0").await

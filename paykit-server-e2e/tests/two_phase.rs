@@ -86,6 +86,8 @@ use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod common;
+
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
 
@@ -256,7 +258,8 @@ network = "testnet"
 stack_role = "proof"
 [electrum]
 endpoint = "tcp://127.0.0.1:1"
-poll_interval = "1s"
+poll_interval = "1h"
+observer_lease_ttl = "2h"
 request_timeout = "1s"
 max_concurrent_creation_snapshots = 1
 [outbox]
@@ -369,9 +372,9 @@ impl BootedStack {
 
 /// Boots the production server over a real database and an ephemeral pubky
 /// testnet, with one creator (credentials stored, content lock published)
-/// and one reader (marker published). The outbox worker is configured at a
-/// 1 h poll so NOTHING delivers unless a test drives the store directly —
-/// 'queued' vs 'prepared' visibility is asserted, never raced.
+/// and one reader (marker published). Outbox and Electrum polls are 1 h so
+/// NOTHING delivers or observation-stamps unless a test drives the store
+/// directly — zero-write asserts must not race `observe_tick`.
 async fn boot(seed: u8) -> BootedStack {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
@@ -503,7 +506,7 @@ async fn boot(seed: u8) -> BootedStack {
 
     BootedStack {
         address,
-        store: InvoiceStore::new(&pool, crypto.clone()),
+        store: common::fenced_invoice_store(&pool, crypto.clone()).await,
         outbox: OutboxStore::new(&pool, crypto.clone()),
         pool,
         runtime,
@@ -1551,7 +1554,7 @@ async fn reaper_voids_expired_prepares_and_nothing_else() {
         )
         .await
         .unwrap();
-    let store = InvoiceStore::new(pool, crypto);
+    let store = common::fenced_invoice_store(pool, crypto).await;
     let reader = reaper_reader();
     let payloads = ReaperPayloads(reader.clone());
 
