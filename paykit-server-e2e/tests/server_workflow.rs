@@ -42,9 +42,7 @@ use paykit_server::{
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
-    persistence::{
-        CreatorCredentials, CreatorStore, InvoiceStore, PostgresStorageAdapter, SdkStateStore,
-    },
+    persistence::{CreatorCredentials, CreatorStore, PostgresStorageAdapter, SdkStateStore},
     runtime::{ElectrumProbe, Runtime},
     startup::initialize_database,
     workers::observer::{

@@ -1,3 +1,7 @@
+//! Shared e2e helpers. Each integration test binary compiles this independently
+//! and uses only a subset, so unused helpers must not fail `-D dead-code`.
+#![allow(dead_code)]
+
 use std::{sync::Arc, time::Duration};
 
 use paykit_lib::{
