@@ -234,7 +234,9 @@ max_completion_polls = 200
 # Trusted proxy hops counted from the right of X-Forwarded-For.
 # 0 = TCP peer (local/dev). 1 = last hop (Railway edge). Never take the
 # first hop: that entry is client-spoofable if the edge appends.
-# PAYKIT_TRUSTED_PROXY_HOPS overrides this; RAILWAY_ENVIRONMENT defaults it to 1.
+# PAYKIT_TRUSTED_PROXY_HOPS overrides this. RAILWAY_ENVIRONMENT defaults
+# hops to 1 only when this key is absent from TOML; an explicit
+# trusted_proxy_hops = 0 is left in place.
 # trusted_proxy_hops = 0
 
 [shutdown]

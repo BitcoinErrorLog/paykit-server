@@ -64,9 +64,11 @@ impl Config {
             claim_ip_ipv4_prefix: environment.claim_ip_ipv4_prefix,
             claim_ip_ipv6_prefix: environment.claim_ip_ipv6_prefix,
             trusted_proxy_hops: environment.trusted_proxy_hops,
+            railway_trusted_proxy_hops_default: environment.railway_trusted_proxy_hops_default,
             http_request_deadline: environment.http_request_deadline,
             ..Default::default()
         };
+        let toml_trusted_proxy_hops_present = raw.rate_limits.trusted_proxy_hops.is_some();
         let database_url = DatabaseUrl::parse(environment.database_url)?;
         let migrator_database_url = MigratorDatabaseUrl::parse(environment.migrator_database_url)?;
         let master_key = MasterKey::parse(environment.master_key)?;
@@ -157,7 +159,11 @@ impl Config {
                 trusted_locks_key_fingerprint,
             },
         };
-        apply_environment_overrides(&mut config, &operational_overrides);
+        apply_environment_overrides(
+            &mut config,
+            &operational_overrides,
+            toml_trusted_proxy_hops_present,
+        );
         config.validate_operational_values()?;
         Ok(config)
     }
@@ -500,7 +506,12 @@ pub struct ConfigEnvironment {
     /// When set, overrides `rate_limits.claim_ip_ipv6_prefix`.
     pub claim_ip_ipv6_prefix: Option<u8>,
     /// When set, overrides `rate_limits.trusted_proxy_hops`.
+    /// Explicit `PAYKIT_TRUSTED_PROXY_HOPS` always wins, including `0`.
     pub trusted_proxy_hops: Option<u32>,
+    /// When true and the TOML key is absent, apply Railway's hops=1
+    /// default. An explicit TOML `trusted_proxy_hops = 0` is not
+    /// overwritten. Set from `RAILWAY_ENVIRONMENT` in `from_process`.
+    pub railway_trusted_proxy_hops_default: bool,
     /// When set, overrides `limits.http_request_deadline`.
     pub http_request_deadline: Option<Duration>,
 }
@@ -524,7 +535,8 @@ impl ConfigEnvironment {
             claim_limiter_idle_ttl: parse_optional_duration_env("PAYKIT_CLAIM_LIMITER_IDLE_TTL")?,
             claim_ip_ipv4_prefix: parse_optional_u8_env("PAYKIT_CLAIM_IP_IPV4_PREFIX")?,
             claim_ip_ipv6_prefix: parse_optional_u8_env("PAYKIT_CLAIM_IP_IPV6_PREFIX")?,
-            trusted_proxy_hops: trusted_proxy_hops_from_process()?,
+            trusted_proxy_hops: parse_optional_u32_env("PAYKIT_TRUSTED_PROXY_HOPS")?,
+            railway_trusted_proxy_hops_default: std::env::var_os("RAILWAY_ENVIRONMENT").is_some(),
             http_request_deadline: parse_optional_duration_env("PAYKIT_HTTP_REQUEST_DEADLINE")?,
         })
     }
@@ -1179,7 +1191,11 @@ fn decode_base64url_no_pad(value: &str, error: ConfigError) -> Result<Vec<u8>, C
     URL_SAFE_NO_PAD.decode(value).map_err(|_| error)
 }
 
-fn apply_environment_overrides(config: &mut Config, environment: &ConfigEnvironment) {
+fn apply_environment_overrides(
+    config: &mut Config,
+    environment: &ConfigEnvironment,
+    toml_trusted_proxy_hops_present: bool,
+) {
     if let Some(value) = environment.claim_identity_rate_per_second {
         config.rate_limits.claim_identity_per_second = value;
     }
@@ -1204,7 +1220,11 @@ fn apply_environment_overrides(config: &mut Config, environment: &ConfigEnvironm
     if let Some(value) = environment.claim_ip_ipv6_prefix {
         config.rate_limits.claim_ip_ipv6_prefix = value;
     }
-    if let Some(value) = environment.trusted_proxy_hops {
+    if let Some(value) = resolve_trusted_proxy_hops(
+        environment.trusted_proxy_hops,
+        environment.railway_trusted_proxy_hops_default,
+        toml_trusted_proxy_hops_present,
+    ) {
         config.rate_limits.trusted_proxy_hops = value;
     }
     if let Some(value) = environment.http_request_deadline {
@@ -1212,19 +1232,17 @@ fn apply_environment_overrides(config: &mut Config, environment: &ConfigEnvironm
     }
 }
 
-/// Explicit `PAYKIT_TRUSTED_PROXY_HOPS` wins. Otherwise Railway injects
-/// `RAILWAY_ENVIRONMENT`, and production behind the edge must trust one hop.
-fn trusted_proxy_hops_from_process() -> Result<Option<u32>, ConfigError> {
-    Ok(resolve_trusted_proxy_hops(
-        parse_optional_u32_env("PAYKIT_TRUSTED_PROXY_HOPS")?,
-        std::env::var_os("RAILWAY_ENVIRONMENT").is_some(),
-    ))
-}
-
-fn resolve_trusted_proxy_hops(explicit: Option<u32>, railway_environment_set: bool) -> Option<u32> {
+/// Explicit `PAYKIT_TRUSTED_PROXY_HOPS` wins. Otherwise an explicit TOML
+/// value, including `0`, is left in place. Railway's hops=1 auto-default
+/// applies only when both the env override and the TOML key are absent.
+fn resolve_trusted_proxy_hops(
+    explicit: Option<u32>,
+    railway_environment_set: bool,
+    toml_key_present: bool,
+) -> Option<u32> {
     match explicit {
         Some(value) => Some(value),
-        None if railway_environment_set => Some(1),
+        None if railway_environment_set && !toml_key_present => Some(1),
         None => None,
     }
 }
@@ -1681,8 +1699,8 @@ struct RawRateLimitsConfig {
     claim_ip_ipv4_prefix: u8,
     #[serde(default = "default_claim_ip_ipv6_prefix")]
     claim_ip_ipv6_prefix: u8,
-    #[serde(default = "default_trusted_proxy_hops")]
-    trusted_proxy_hops: u32,
+    #[serde(default)]
+    trusted_proxy_hops: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1721,7 +1739,7 @@ impl Default for RawRateLimitsConfig {
             claim_limiter_idle_ttl: default_claim_limiter_idle_ttl(),
             claim_ip_ipv4_prefix: default_claim_ip_ipv4_prefix(),
             claim_ip_ipv6_prefix: default_claim_ip_ipv6_prefix(),
-            trusted_proxy_hops: default_trusted_proxy_hops(),
+            trusted_proxy_hops: None,
         }
     }
 }
@@ -1777,7 +1795,9 @@ impl From<RawRateLimitsConfig> for RateLimitsConfig {
             claim_limiter_idle_ttl: value.claim_limiter_idle_ttl,
             claim_ip_ipv4_prefix: value.claim_ip_ipv4_prefix,
             claim_ip_ipv6_prefix: value.claim_ip_ipv6_prefix,
-            trusted_proxy_hops: value.trusted_proxy_hops,
+            trusted_proxy_hops: value
+                .trusted_proxy_hops
+                .unwrap_or_else(default_trusted_proxy_hops),
         }
     }
 }
@@ -1884,9 +1904,14 @@ mod tests {
 
     #[test]
     fn railway_defaults_one_trusted_proxy_hop_unless_explicit() {
-        assert_eq!(resolve_trusted_proxy_hops(None, false), None);
-        assert_eq!(resolve_trusted_proxy_hops(None, true), Some(1));
-        assert_eq!(resolve_trusted_proxy_hops(Some(0), true), Some(0));
-        assert_eq!(resolve_trusted_proxy_hops(Some(2), false), Some(2));
+        assert_eq!(resolve_trusted_proxy_hops(None, false, false), None);
+        assert_eq!(resolve_trusted_proxy_hops(None, true, false), Some(1));
+        assert_eq!(
+            resolve_trusted_proxy_hops(None, true, true),
+            None,
+            "explicit TOML, including hops=0, is not overwritten by Railway"
+        );
+        assert_eq!(resolve_trusted_proxy_hops(Some(0), true, true), Some(0));
+        assert_eq!(resolve_trusted_proxy_hops(Some(2), false, false), Some(2));
     }
 }

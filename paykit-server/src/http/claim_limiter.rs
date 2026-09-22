@@ -615,6 +615,23 @@ mod tests {
     }
 
     #[test]
+    fn bracketed_ipv6_xff_and_ipv6_with_port() {
+        let v6: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(
+            client_ip(peer(), 1, Some("[2001:db8::1]"), None),
+            v6,
+            "bracketed IPv6 XFF hop"
+        );
+        assert_eq!(
+            client_ip(peer(), 1, Some("[2001:db8::1]:443"), None),
+            v6,
+            "bracketed IPv6 with port"
+        );
+        assert_eq!(parse_forwarded_hop("[2001:db8::1]"), Some(v6));
+        assert_eq!(parse_forwarded_hop("[2001:db8::1]:8080"), Some(v6));
+    }
+
+    #[test]
     fn railway_edge_ula_pool_shares_a_slash64() {
         let a: IpAddr = "fd12:0:8:0:2000:9d:8000:1".parse().unwrap();
         let b: IpAddr = "fd12:0:8:0:2000:f1:8000:1".parse().unwrap();
