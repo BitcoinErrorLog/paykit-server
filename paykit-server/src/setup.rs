@@ -474,6 +474,13 @@ impl SetupService {
         self.inner.trusted_proxy_hops
     }
 
+    pub fn claim_ip_prefixes(&self) -> (u8, u8) {
+        (
+            self.inner.claim_ip_ipv4_prefix,
+            self.inner.claim_ip_ipv6_prefix,
+        )
+    }
+
     pub async fn begin(
         &self,
         peer_ip: IpAddr,
