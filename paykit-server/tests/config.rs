@@ -1272,7 +1272,7 @@ fn railway_auto_default_applies_only_when_toml_omits_hops() {
         ..environment()
     };
     let config = Config::from_toml_and_environment(&valid_toml(), railway).unwrap();
-    assert_eq!(config.rate_limits.trusted_proxy_hops, 1);
+    assert_eq!(config.rate_limits.trusted_proxy_hops, 2);
 
     let env_wins = ConfigEnvironment {
         trusted_proxy_hops: Some(2),

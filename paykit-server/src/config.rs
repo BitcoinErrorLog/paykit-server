@@ -508,7 +508,7 @@ pub struct ConfigEnvironment {
     /// When set, overrides `rate_limits.trusted_proxy_hops`.
     /// Explicit `PAYKIT_TRUSTED_PROXY_HOPS` always wins, including `0`.
     pub trusted_proxy_hops: Option<u32>,
-    /// When true and the TOML key is absent, apply Railway's hops=1
+    /// When true and the TOML key is absent, apply Railway's hops=2
     /// default. An explicit TOML `trusted_proxy_hops = 0` is not
     /// overwritten. Set from `RAILWAY_ENVIRONMENT` in `from_process`.
     pub railway_trusted_proxy_hops_default: bool,
@@ -1032,10 +1032,12 @@ pub struct RateLimitsConfig {
     /// IPv6 prefix length used to key the claim-IP bucket (default /64).
     pub claim_ip_ipv6_prefix: u8,
     /// Trusted proxy hops in `X-Forwarded-For`. `0` uses the TCP peer
-    /// (local/dev). `1` is the Railway default: the last XFF hop, which is
-    /// the address the edge appended. Never take the first hop when more
-    /// than one is present — that entry is client-spoofable if the edge
-    /// appends rather than strips.
+    /// (local/dev). `2` is the Railway default: skip the hop Railway
+    /// appended (rightmost) and take the previous hop, which is the
+    /// client the edge observed. `1` would key on Railway's own hop
+    /// and would not group requests from one client. Never take the
+    /// first hop when more than two are present — that entry is
+    /// client-spoofable if the edge appends rather than strips.
     pub trusted_proxy_hops: u32,
 }
 
@@ -1233,7 +1235,7 @@ fn apply_environment_overrides(
 }
 
 /// Explicit `PAYKIT_TRUSTED_PROXY_HOPS` wins. Otherwise an explicit TOML
-/// value, including `0`, is left in place. Railway's hops=1 auto-default
+/// value, including `0`, is left in place. Railway's hops=2 auto-default
 /// applies only when both the env override and the TOML key are absent.
 fn resolve_trusted_proxy_hops(
     explicit: Option<u32>,
@@ -1242,7 +1244,7 @@ fn resolve_trusted_proxy_hops(
 ) -> Option<u32> {
     match explicit {
         Some(value) => Some(value),
-        None if railway_environment_set && !toml_key_present => Some(1),
+        None if railway_environment_set && !toml_key_present => Some(2),
         None => None,
     }
 }
@@ -1903,15 +1905,15 @@ mod tests {
     }
 
     #[test]
-    fn railway_defaults_one_trusted_proxy_hop_unless_explicit() {
+    fn railway_defaults_two_trusted_proxy_hops_unless_explicit() {
         assert_eq!(resolve_trusted_proxy_hops(None, false, false), None);
-        assert_eq!(resolve_trusted_proxy_hops(None, true, false), Some(1));
+        assert_eq!(resolve_trusted_proxy_hops(None, true, false), Some(2));
         assert_eq!(
             resolve_trusted_proxy_hops(None, true, true),
             None,
             "explicit TOML, including hops=0, is not overwritten by Railway"
         );
         assert_eq!(resolve_trusted_proxy_hops(Some(0), true, true), Some(0));
-        assert_eq!(resolve_trusted_proxy_hops(Some(2), false, false), Some(2));
+        assert_eq!(resolve_trusted_proxy_hops(Some(1), false, false), Some(1));
     }
 }
