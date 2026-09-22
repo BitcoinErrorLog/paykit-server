@@ -109,6 +109,7 @@ fn service(store: Arc<dyn CancellationStore>) -> SetupService {
             claim_limiter_idle_ttl: SetupLimits::test_idle_ttl(),
             claim_ip_ipv4_prefix: SetupLimits::TEST_IPV4_PREFIX,
             claim_ip_ipv6_prefix: SetupLimits::TEST_IPV6_PREFIX,
+            trusted_proxy_hops: 0,
         },
         store,
     )
@@ -132,6 +133,7 @@ fn tracked_service(store: Arc<dyn CancellationStore>, drops: Arc<AtomicUsize>) -
             claim_limiter_idle_ttl: SetupLimits::test_idle_ttl(),
             claim_ip_ipv4_prefix: SetupLimits::TEST_IPV4_PREFIX,
             claim_ip_ipv6_prefix: SetupLimits::TEST_IPV6_PREFIX,
+            trusted_proxy_hops: 0,
         },
         store,
     )

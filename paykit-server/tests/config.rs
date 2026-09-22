@@ -1155,13 +1155,14 @@ fn claim_limiter_and_http_deadline_default_when_omitted() {
     );
     assert_eq!(config.rate_limits.claim_ip_ipv4_prefix, 32);
     assert_eq!(config.rate_limits.claim_ip_ipv6_prefix, 64);
+    assert_eq!(config.rate_limits.trusted_proxy_hops, 0);
     assert_eq!(config.limits.http_request_deadline, Duration::from_secs(20));
 }
 
 #[test]
 fn claim_limiter_and_http_deadline_env_overrides_toml() {
     let toml = format!(
-        "{}\n[rate_limits]\nclaim_identity_per_second = 4\nclaim_identity_burst = 8\nclaim_ip_per_second = 5\nclaim_ip_burst = 9\nclaim_limiter_max_entries = 2048\nclaim_limiter_idle_ttl = \"2m\"\nclaim_ip_ipv4_prefix = 24\nclaim_ip_ipv6_prefix = 48\n[limits]\nhttp_request_deadline = \"25s\"\n",
+        "{}\n[rate_limits]\nclaim_identity_per_second = 4\nclaim_identity_burst = 8\nclaim_ip_per_second = 5\nclaim_ip_burst = 9\nclaim_limiter_max_entries = 2048\nclaim_limiter_idle_ttl = \"2m\"\nclaim_ip_ipv4_prefix = 24\nclaim_ip_ipv6_prefix = 48\ntrusted_proxy_hops = 2\n[limits]\nhttp_request_deadline = \"25s\"\n",
         valid_toml()
     );
     let toml_values = Config::from_toml_and_environment(&toml, environment()).unwrap();
@@ -1176,6 +1177,7 @@ fn claim_limiter_and_http_deadline_env_overrides_toml() {
     );
     assert_eq!(toml_values.rate_limits.claim_ip_ipv4_prefix, 24);
     assert_eq!(toml_values.rate_limits.claim_ip_ipv6_prefix, 48);
+    assert_eq!(toml_values.rate_limits.trusted_proxy_hops, 2);
     assert_eq!(
         toml_values.limits.http_request_deadline,
         Duration::from_secs(25)
@@ -1190,6 +1192,7 @@ fn claim_limiter_and_http_deadline_env_overrides_toml() {
         claim_limiter_idle_ttl: Some(Duration::from_secs(30)),
         claim_ip_ipv4_prefix: Some(16),
         claim_ip_ipv6_prefix: Some(56),
+        trusted_proxy_hops: Some(1),
         http_request_deadline: Some(Duration::from_secs(3)),
         ..environment()
     };
@@ -1205,6 +1208,7 @@ fn claim_limiter_and_http_deadline_env_overrides_toml() {
     );
     assert_eq!(config.rate_limits.claim_ip_ipv4_prefix, 16);
     assert_eq!(config.rate_limits.claim_ip_ipv6_prefix, 56);
+    assert_eq!(config.rate_limits.trusted_proxy_hops, 1);
     assert_eq!(config.limits.http_request_deadline, Duration::from_secs(3));
 }
 
@@ -1221,6 +1225,7 @@ fn rejects_zero_claim_limiter_and_http_deadline_values() {
         "[rate_limits]\nclaim_ip_ipv6_prefix = 0\n",
         "[rate_limits]\nclaim_ip_ipv4_prefix = 33\n",
         "[rate_limits]\nclaim_ip_ipv6_prefix = 129\n",
+        "[rate_limits]\ntrusted_proxy_hops = 17\n",
         "[limits]\nhttp_request_deadline = \"0s\"\n",
     ] {
         let input = format!("{}\n{extra}", valid_toml());
@@ -1235,4 +1240,15 @@ fn rejects_zero_claim_limiter_and_http_deadline_values() {
         ..environment()
     };
     assert!(Config::from_toml_and_environment(&valid_toml(), zero_override).is_err());
+
+    let hops_zero = format!("{}\n[rate_limits]\ntrusted_proxy_hops = 0\n", valid_toml());
+    let hops_zero_config = Config::from_toml_and_environment(&hops_zero, environment())
+        .expect("trusted_proxy_hops = 0 is valid local/dev");
+    assert_eq!(hops_zero_config.rate_limits.trusted_proxy_hops, 0);
+
+    let hops_too_many = ConfigEnvironment {
+        trusted_proxy_hops: Some(17),
+        ..environment()
+    };
+    assert!(Config::from_toml_and_environment(&valid_toml(), hops_too_many).is_err());
 }

@@ -293,7 +293,7 @@ cargo clippy -p paykit-server --all-targets -- -D warnings
 - Unsigned/invalid requests do not consume the trusted signed-caller policy bucket.
 - Coarse pre-auth capacity still bounds signature-verification work.
 - Pending setup reservations never exceed `max_pending_setup_flows`, including concurrent starts.
-- Setup rate limiting uses transport peer IP and ignores `X-Forwarded-For`.
+- Setup rate limiting keys client IP from the TCP peer when `trusted_proxy_hops = 0`, and from the Nth `X-Forwarded-For` hop counted from the right when hops ≥ 1 (Railway: 1). Spoofed leading XFF entries are ignored.
 - Reservations release on start failure, terminal completion, expiry, and cancellation.
 - Sub-second lease/retry durations are rejected instead of truncating to zero.
 
@@ -309,9 +309,11 @@ cargo clippy -p paykit-server --all-targets -- -D warnings
 - The trusted signed-caller bucket is charged only after body-size enforcement,
   signature verification, canonical JSON validation, and closed-schema
   deserialization. Policy rejection is `429` with `Retry-After`.
-- Setup admission uses Axum transport `ConnectInfo<SocketAddr>` and ignores
-  forwarding headers. The production serve path supplies this transport
-  metadata.
+- Setup admission resolves client IP with `PAYKIT_TRUSTED_PROXY_HOPS` (default 0
+  locally; 1 when `RAILWAY_ENVIRONMENT` is set). Hops `0` uses Axum transport
+  `ConnectInfo<SocketAddr>`. Hops `≥1` takes the Nth `X-Forwarded-For` hop from
+  the right, then `X-Real-IP`, then the peer. The production serve path supplies
+  transport metadata.
 - A process-local semaphore reserves `max_pending_setup_flows` capacity before
   external AUTH start. RAII ownership releases reservations after start error,
   terminal success or failure, expiry, canceled start, and canceled completion;

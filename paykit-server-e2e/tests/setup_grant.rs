@@ -74,6 +74,7 @@ async fn wrong_rc55_grant_identity_is_409_equivalent_and_leaves_claim_unconsumed
             claim_limiter_idle_ttl: SetupLimits::test_idle_ttl(),
             claim_ip_ipv4_prefix: SetupLimits::TEST_IPV4_PREFIX,
             claim_ip_ipv6_prefix: SetupLimits::TEST_IPV6_PREFIX,
+            trusted_proxy_hops: 0,
         },
     );
 
