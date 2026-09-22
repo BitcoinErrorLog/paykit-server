@@ -10,7 +10,7 @@ use qrcode::{EcLevel, QrCode, render::svg};
 use serde_json::json;
 use std::net::{IpAddr, SocketAddr};
 
-use crate::http::claim_limiter::client_ip;
+use crate::http::claim_limiter::{client_ip, ip_prefix_key};
 use crate::setup::{BeginError, CancelResult, PollResult, SetupService, StartedFlow};
 
 pub fn setup_router(service: SetupService) -> Router {
@@ -27,6 +27,7 @@ async fn begin(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
+    maybe_log_client_ip_debug(&service, peer.ip(), &headers);
     let Some((return_to, state, creator)) = parse_setup_query(query.as_deref()) else {
         return invalid_request();
     };
@@ -109,8 +110,129 @@ fn request_client_ip(service: &SetupService, peer: IpAddr, headers: &HeaderMap) 
     )
 }
 
+fn client_ip_debug_enabled() -> bool {
+    matches!(std::env::var("PAYKIT_DEBUG_CLIENT_IP"), Ok(value) if value == "1")
+}
+
+fn maybe_log_client_ip_debug(service: &SetupService, peer: IpAddr, headers: &HeaderMap) {
+    if !client_ip_debug_enabled() {
+        return;
+    }
+    let hops = service.trusted_proxy_hops();
+    let (ipv4_prefix, ipv6_prefix) = service.claim_ip_prefixes();
+    let resolved = client_ip(
+        peer,
+        hops,
+        header_str(headers, "x-forwarded-for"),
+        header_str(headers, "x-real-ip"),
+    );
+    let dump = ClientIpDebugDump::capture(peer, headers, hops, ipv4_prefix, ipv6_prefix, resolved);
+    tracing::info!(
+        target: "paykit.claim_limiter",
+        x_forwarded_for_first = dump.x_forwarded_for_first.as_str(),
+        x_forwarded_for_all = dump.x_forwarded_for_all.as_str(),
+        x_forwarded_for_count = dump.x_forwarded_for_count,
+        x_real_ip_first = dump.x_real_ip_first.as_str(),
+        x_real_ip_all = dump.x_real_ip_all.as_str(),
+        forwarded = dump.forwarded.as_str(),
+        cf_connecting_ip = dump.cf_connecting_ip.as_str(),
+        x_envoy_headers = dump.x_envoy_headers.as_str(),
+        forwarding_headers = dump.forwarding_headers.as_str(),
+        tcp_peer = dump.tcp_peer.as_str(),
+        trusted_proxy_hops = dump.trusted_proxy_hops,
+        railway_environment_set = dump.railway_environment_set,
+        client_ip = dump.client_ip.as_str(),
+        prefix_key = dump.prefix_key.as_str(),
+        "claim client-ip debug dump"
+    );
+}
+
+struct ClientIpDebugDump {
+    x_forwarded_for_first: String,
+    x_forwarded_for_all: String,
+    x_forwarded_for_count: usize,
+    x_real_ip_first: String,
+    x_real_ip_all: String,
+    forwarded: String,
+    cf_connecting_ip: String,
+    x_envoy_headers: String,
+    forwarding_headers: String,
+    tcp_peer: String,
+    trusted_proxy_hops: u32,
+    railway_environment_set: bool,
+    client_ip: String,
+    prefix_key: String,
+}
+
+impl ClientIpDebugDump {
+    fn capture(
+        peer: IpAddr,
+        headers: &HeaderMap,
+        trusted_proxy_hops: u32,
+        ipv4_prefix: u8,
+        ipv6_prefix: u8,
+        resolved: IpAddr,
+    ) -> Self {
+        let xff_values = header_values(headers, "x-forwarded-for");
+        let real_values = header_values(headers, "x-real-ip");
+        Self {
+            x_forwarded_for_first: header_str(headers, "x-forwarded-for")
+                .unwrap_or("")
+                .to_owned(),
+            x_forwarded_for_all: xff_values.join(","),
+            x_forwarded_for_count: xff_values.len(),
+            x_real_ip_first: header_str(headers, "x-real-ip").unwrap_or("").to_owned(),
+            x_real_ip_all: real_values.join(","),
+            forwarded: header_str(headers, "forwarded").unwrap_or("").to_owned(),
+            cf_connecting_ip: header_str(headers, "cf-connecting-ip")
+                .unwrap_or("")
+                .to_owned(),
+            x_envoy_headers: named_headers(headers, |name| name.starts_with("x-envoy-")),
+            forwarding_headers: named_headers(headers, is_client_ip_debug_header),
+            tcp_peer: peer.to_string(),
+            trusted_proxy_hops,
+            railway_environment_set: std::env::var_os("RAILWAY_ENVIRONMENT").is_some(),
+            client_ip: resolved.to_string(),
+            prefix_key: ip_prefix_key(resolved, ipv4_prefix, ipv6_prefix),
+        }
+    }
+}
+
+fn is_client_ip_debug_header(name: &str) -> bool {
+    name == "x-forwarded-for"
+        || name == "x-real-ip"
+        || name == "forwarded"
+        || name == "cf-connecting-ip"
+        || name.starts_with("x-envoy-")
+        || name.contains("forwarded")
+        || name.contains("real-ip")
+        || name.contains("connecting-ip")
+}
+
+fn named_headers(headers: &HeaderMap, keep: impl Fn(&str) -> bool) -> String {
+    let mut parts = Vec::new();
+    for (name, value) in headers.iter() {
+        let name = name.as_str();
+        if !keep(name) {
+            continue;
+        }
+        let value = value.to_str().unwrap_or("<non-utf8>");
+        parts.push(format!("{name}={value}"));
+    }
+    parts.join("; ")
+}
+
 fn header_str<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
+}
+
+fn header_values<'a>(headers: &'a HeaderMap, name: &'static str) -> Vec<&'a str> {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 fn parse_setup_query(query: Option<&str>) -> Option<(String, String, String)> {
@@ -276,4 +398,71 @@ fn safe_response_with_retry_after(
         response.headers_mut().insert(header::RETRY_AFTER, value);
     }
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    fn peer() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))
+    }
+
+    #[test]
+    fn debug_dump_distinguishes_first_xff_from_all_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("203.0.113.10"));
+        headers.append("x-forwarded-for", HeaderValue::from_static("198.51.100.7"));
+        headers.insert("x-real-ip", HeaderValue::from_static("192.0.2.9"));
+        headers.insert("forwarded", HeaderValue::from_static("for=203.0.113.10"));
+        headers.insert("cf-connecting-ip", HeaderValue::from_static("203.0.113.10"));
+        headers.insert(
+            "x-envoy-external-address",
+            HeaderValue::from_static("198.51.100.7"),
+        );
+        headers.insert("x-request-id", HeaderValue::from_static("not-an-ip"));
+        let resolved = client_ip(
+            peer(),
+            1,
+            header_str(&headers, "x-forwarded-for"),
+            header_str(&headers, "x-real-ip"),
+        );
+        let dump = ClientIpDebugDump::capture(peer(), &headers, 1, 32, 64, resolved);
+        assert_eq!(dump.x_forwarded_for_first, "203.0.113.10");
+        assert_eq!(dump.x_forwarded_for_all, "203.0.113.10,198.51.100.7");
+        assert_eq!(dump.x_forwarded_for_count, 2);
+        assert_eq!(dump.client_ip, "203.0.113.10");
+        assert_eq!(dump.prefix_key, "203.0.113.10/32");
+        assert_eq!(dump.trusted_proxy_hops, 1);
+        assert_eq!(dump.tcp_peer, "10.0.0.1");
+        assert!(
+            dump.forwarding_headers
+                .contains("x-forwarded-for=203.0.113.10")
+        );
+        assert!(
+            dump.forwarding_headers
+                .contains("x-forwarded-for=198.51.100.7")
+        );
+        assert!(
+            dump.x_envoy_headers
+                .contains("x-envoy-external-address=198.51.100.7")
+        );
+        assert!(!dump.forwarding_headers.contains("x-request-id"));
+        assert_eq!(dump.forwarded, "for=203.0.113.10");
+        assert_eq!(dump.cf_connecting_ip, "203.0.113.10");
+    }
+
+    #[test]
+    fn debug_dump_empty_headers_uses_peer_when_hops_one() {
+        let headers = HeaderMap::new();
+        let resolved = client_ip(peer(), 1, None, None);
+        let dump = ClientIpDebugDump::capture(peer(), &headers, 1, 32, 64, resolved);
+        assert_eq!(dump.x_forwarded_for_count, 0);
+        assert_eq!(dump.x_forwarded_for_first, "");
+        assert_eq!(dump.client_ip, "10.0.0.1");
+        assert_eq!(dump.prefix_key, "10.0.0.1/32");
+        assert!(dump.forwarding_headers.is_empty());
+        assert!(!client_ip_debug_enabled());
+    }
 }
