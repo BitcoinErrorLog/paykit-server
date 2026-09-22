@@ -1233,6 +1233,49 @@ async fn setup_policy_hops_one_uses_x_real_ip_when_xff_is_missing() {
 }
 
 #[tokio::test]
+async fn setup_policy_too_few_xff_hops_falls_back_instead_of_taking_the_spoofed_first() {
+    let setup = limited_service_with_hops(
+        Arc::new(MockCompleter::new([])),
+        Arc::new(ManualClock::default()),
+        1,
+        10,
+        3,
+    );
+    let router = setup_router(setup);
+    let edge = peer();
+    let spoofed_xff = Some("203.0.113.1, 198.51.100.7");
+    assert_eq!(
+        setup_policy_status(
+            router.clone(),
+            setup_policy_request(edge, spoofed_xff, Some("198.51.100.9"), "one"),
+        )
+        .await,
+        StatusCode::OK
+    );
+    let limited = router
+        .clone()
+        .oneshot(setup_policy_request(
+            edge,
+            spoofed_xff,
+            Some("198.51.100.9"),
+            "two",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(limited.headers()["retry-after"], "60");
+    assert_eq!(
+        setup_policy_status(
+            router,
+            setup_policy_request(edge, spoofed_xff, Some("198.51.100.10"), "three"),
+        )
+        .await,
+        StatusCode::OK,
+        "too-few XFF hops must not key the bucket on the spoofed first hop"
+    );
+}
+
+#[tokio::test]
 async fn reservation_releases_after_start_failure_terminal_completion_and_expiry() {
     let failed_start = limited_service(
         Arc::new(FailFirstStartCompleter(AtomicUsize::new(0))),

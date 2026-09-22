@@ -1252,3 +1252,37 @@ fn rejects_zero_claim_limiter_and_http_deadline_values() {
     };
     assert!(Config::from_toml_and_environment(&valid_toml(), hops_too_many).is_err());
 }
+
+#[test]
+fn railway_auto_default_does_not_overwrite_explicit_toml_zero() {
+    let hops_zero = format!("{}\n[rate_limits]\ntrusted_proxy_hops = 0\n", valid_toml());
+    let railway = ConfigEnvironment {
+        railway_trusted_proxy_hops_default: true,
+        ..environment()
+    };
+    let config = Config::from_toml_and_environment(&hops_zero, railway)
+        .expect("explicit TOML hops=0 must survive the Railway auto-default");
+    assert_eq!(config.rate_limits.trusted_proxy_hops, 0);
+}
+
+#[test]
+fn railway_auto_default_applies_only_when_toml_omits_hops() {
+    let railway = ConfigEnvironment {
+        railway_trusted_proxy_hops_default: true,
+        ..environment()
+    };
+    let config = Config::from_toml_and_environment(&valid_toml(), railway).unwrap();
+    assert_eq!(config.rate_limits.trusted_proxy_hops, 1);
+
+    let env_wins = ConfigEnvironment {
+        trusted_proxy_hops: Some(2),
+        railway_trusted_proxy_hops_default: true,
+        ..environment()
+    };
+    let hops_zero = format!("{}\n[rate_limits]\ntrusted_proxy_hops = 0\n", valid_toml());
+    let config = Config::from_toml_and_environment(&hops_zero, env_wins).unwrap();
+    assert_eq!(
+        config.rate_limits.trusted_proxy_hops, 2,
+        "PAYKIT_TRUSTED_PROXY_HOPS still wins over TOML 0"
+    );
+}
