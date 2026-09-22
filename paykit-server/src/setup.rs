@@ -289,7 +289,8 @@ pub struct SetupLimits {
     pub claim_limiter_idle_ttl: Duration,
     pub claim_ip_ipv4_prefix: u8,
     pub claim_ip_ipv6_prefix: u8,
-    /// `0` = TCP peer. `1` = last `X-Forwarded-For` hop (Railway).
+    /// `0` = TCP peer. `2` = skip Railway's appended XFF hop, take the
+    /// previous hop (the client the edge observed).
     pub trusted_proxy_hops: u32,
 }
 

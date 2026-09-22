@@ -594,6 +594,34 @@ mod tests {
     }
 
     #[test]
+    fn hops_two_on_railway_two_hop_xff_selects_client_not_appended_proxy() {
+        // Staging dump: XFF is "client, railway-hop"; X-Real-IP is the client.
+        // hops=1 keys the Railway hop; hops=2 keys the client.
+        let xff = "203.0.113.10, 198.51.100.7";
+        let client: IpAddr = "203.0.113.10".parse().unwrap();
+        let railway: IpAddr = "198.51.100.7".parse().unwrap();
+        assert_eq!(
+            client_ip(peer(), 1, Some(xff), Some("203.0.113.10")),
+            railway,
+            "hops=1 selects the hop Railway appended"
+        );
+        assert_eq!(
+            client_ip(peer(), 2, Some(xff), Some("203.0.113.10")),
+            client,
+            "hops=2 skips Railway's hop and selects the client"
+        );
+    }
+
+    #[test]
+    fn hops_two_with_single_xff_falls_back_to_x_real_ip() {
+        assert_eq!(
+            client_ip(peer(), 2, Some("198.51.100.7"), Some("203.0.113.10")),
+            "203.0.113.10".parse::<IpAddr>().unwrap(),
+            "too few XFF hops must not take the remaining hop; X-Real-IP is the client"
+        );
+    }
+
+    #[test]
     fn hops_one_falls_back_to_x_real_ip_when_xff_missing() {
         assert_eq!(
             client_ip(peer(), 1, None, Some("198.51.100.9")),
