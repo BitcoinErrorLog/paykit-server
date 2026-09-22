@@ -589,6 +589,9 @@ impl InvoiceStore {
         let Some(lease) = self.observer_lease else {
             return Ok(());
         };
+        // FOR SHARE conflicts with the acquire UPDATE of `fence`, so a hung
+        // fenced transaction delays takeover past TTL. Observer writes never
+        // hold this lock across network I/O.
         let fence = sqlx::query_scalar::<_, i64>(
             "SELECT fence FROM observer_leadership
              WHERE name = $1 AND holder = $2

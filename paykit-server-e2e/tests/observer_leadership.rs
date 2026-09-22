@@ -144,6 +144,63 @@ async fn stale_fencing_token_aborts_observer_writes() {
     database.cleanup().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_fenced_write_serializes_takeover_then_stale_stamp_aborts() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let invoices = invoices(database.pool());
+
+    let first = PgObserverLeadership::new(database.pool(), Duration::from_secs(1));
+    let second = Arc::new(PgObserverLeadership::new(
+        database.pool(),
+        Duration::from_secs(1),
+    ));
+    let first_lease = first.acquire().await.unwrap().expect("first holder");
+
+    let mut held = database.pool().begin().await.unwrap();
+    let held_fence: i64 = sqlx::query_scalar(
+        "SELECT fence FROM observer_leadership
+         WHERE name = $1 AND holder = $2
+         FOR SHARE",
+    )
+    .bind(OBSERVER_LEADERSHIP_LEASE_NAME)
+    .bind(first_lease.holder)
+    .fetch_one(&mut *held)
+    .await
+    .unwrap();
+    assert_eq!(held_fence, first_lease.fence);
+
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    let takeover = {
+        let second = Arc::clone(&second);
+        tokio::spawn(async move { second.acquire().await })
+    };
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        !takeover.is_finished(),
+        "acquire must wait on the open FOR SHARE rather than bump fence under it"
+    );
+
+    held.commit().await.unwrap();
+    let second_lease = takeover
+        .await
+        .expect("takeover task")
+        .unwrap()
+        .expect("takeover after the fenced transaction commits");
+    assert_eq!(second_lease.fence, 2);
+    assert_eq!(second_lease.holder, second.holder());
+
+    let stale = stamp(&invoices, first_lease).await.unwrap_err();
+    assert_eq!(stale, PersistenceError::StaleObserverLease);
+    stamp(&invoices, second_lease)
+        .await
+        .expect("new leader may stamp");
+
+    second.release().await.unwrap();
+    database.cleanup().await;
+}
+
 #[tokio::test]
 async fn two_instances_overlap_without_double_processing() {
     let database = TestDatabase::create().await;

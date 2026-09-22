@@ -461,9 +461,19 @@ Takeover is fail-closed: a live lease keeps other replicas on standby
 (they still probe Electrum so `/health/ready` can pass; logged once per
 transition), an expired or released lease lets the next check acquire
 leadership and bump `fence`, and a failed leadership check idles the
-replica. A stale fencing token aborts in-flight observer writes. No
-per-row database lock is ever held across network I/O. Overlap during a
-rolling deploy is allowed: only the lease holder stamps invoices.
+replica. A stale fencing token aborts in-flight observer writes. Observer
+writes take `FOR SHARE` on the lease row in the same transaction as the
+mutation, so a takeover `UPDATE` of `fence` waits for that transaction
+to commit. Failover latency therefore tracks the old leader's open
+fenced write; those writes never hold the row across network I/O. No
+per-row database lock is ever held across network I/O.
+
+Overlap of two **lease** binaries is allowed: only the lease holder
+stamps invoices. The first image that contains migration 0026 must be
+stop-start (scale to zero, then connect the new image). A live
+advisory-lock binary and a lease binary coordinate on different
+primitives, so they can both observe until the old replica dies. After
+that lease image is SUCCESS, later additive images may roll.
 
 ## Two-phase creation and activation (§B.11, W1.1c)
 

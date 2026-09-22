@@ -420,7 +420,7 @@ async fn startup_applies_as_migrator_then_boots_with_a_restricted_runtime_princi
             .fetch_all(&migrator_pool)
             .await
             .unwrap();
-    assert_eq!(applied, (1..=25).collect::<Vec<_>>());
+    assert_eq!(applied, (1..=26).collect::<Vec<_>>());
     let owned_objects: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner \
          WHERE c.relnamespace = 'public'::regnamespace AND r.rolname = current_user",
