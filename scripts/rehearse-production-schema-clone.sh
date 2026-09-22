@@ -3,8 +3,8 @@ set -Eeuo pipefail
 umask 077
 export LC_ALL=C
 
-readonly EXPECTED_SOURCE_VERSIONS="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24"
-readonly EXPECTED_CLONE_VERSIONS="${EXPECTED_SOURCE_VERSIONS},25"
+readonly EXPECTED_SOURCE_VERSIONS="1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25"
+readonly EXPECTED_CLONE_VERSIONS="${EXPECTED_SOURCE_VERSIONS},26"
 readonly CLONE_DATABASE="paykit_production_clone"
 readonly CLONE_BOOTSTRAP_USER="clone_admin"
 
@@ -144,7 +144,7 @@ source_versions="$(
                FROM public._sqlx_migrations"
 )"
 if [[ "$source_versions" != "${EXPECTED_SOURCE_VERSIONS}|true" ]]; then
-  printf 'production pre-image is not exactly successful migrations 1..23; refusing rehearsal\n' >&2
+  printf 'production pre-image is not exactly successful migrations 1..25; refusing rehearsal\n' >&2
   exit 1
 fi
 
@@ -222,7 +222,7 @@ clone_versions="$(
                FROM public._sqlx_migrations"
 )"
 if [[ "$clone_versions" != "${EXPECTED_CLONE_VERSIONS}|true" ]]; then
-  printf 'clone migration ledger is not exactly successful migrations 1..24\n' >&2
+  printf 'clone migration ledger is not exactly successful migrations 1..26\n' >&2
   exit 1
 fi
 
@@ -252,10 +252,18 @@ role_and_grants="$(
       AND NOT has_function_privilege(
         'paykit', 'public.reject_sdk_outbound_invocation_mutation()', 'EXECUTE'
       )
+      AND has_table_privilege('paykit', 'public.observer_leadership', 'SELECT')
+      AND has_table_privilege('paykit', 'public.observer_leadership', 'INSERT')
+      AND has_table_privilege('paykit', 'public.observer_leadership', 'UPDATE')
+      AND NOT has_table_privilege('paykit', 'public.observer_leadership', 'DELETE')
+      AND has_table_privilege('paykit_readonly', 'public.observer_leadership', 'SELECT')
+      AND NOT has_table_privilege('paykit_readonly', 'public.observer_leadership', 'INSERT')
+      AND NOT has_table_privilege('paykit_readonly', 'public.observer_leadership', 'UPDATE')
+      AND NOT has_table_privilege('paykit_readonly', 'public.observer_leadership', 'DELETE')
     FROM pg_catalog.pg_roles r WHERE r.rolname = 'paykit'"
 )"
 if [[ "$role_and_grants" != "t" ]]; then
-  printf 'clone paykit role attributes or migration 0024 grants are invalid\n' >&2
+  printf 'clone paykit role attributes or migration 0024/0026 grants are invalid\n' >&2
   exit 1
 fi
 

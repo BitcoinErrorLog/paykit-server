@@ -81,6 +81,7 @@ use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod common;
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
 
@@ -483,7 +484,7 @@ async fn boot(seed: u8) -> BootedStack {
 
     BootedStack {
         address,
-        store: InvoiceStore::new(&pool, crypto.clone()),
+        store: common::fenced_invoice_store(&pool, crypto.clone()).await,
         outbox: OutboxStore::new(&pool, crypto.clone()),
         pool,
         runtime,

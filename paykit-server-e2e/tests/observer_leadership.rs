@@ -1,12 +1,6 @@
 //! Cluster-single observer leadership over a Postgres TTL lease.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use paykit_server::{
     crypto::Crypto,
@@ -202,91 +196,52 @@ async fn open_fenced_write_serializes_takeover_then_stale_stamp_aborts() {
 }
 
 #[tokio::test]
+async fn missing_observer_lease_refuses_observer_writes() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let invoices = invoices(database.pool());
+
+    let error = invoices
+        .record_observation_tick(&[STAMP_ADDRESS.to_owned()], &[])
+        .await
+        .unwrap_err();
+    assert_eq!(error, PersistenceError::StaleObserverLease);
+
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_instances_overlap_without_double_processing() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let invoices = invoices(database.pool());
 
-    let first = Arc::new(PgObserverLeadership::new(database.pool(), LEASE_TTL));
-    let second = Arc::new(PgObserverLeadership::new(database.pool(), LEASE_TTL));
-    let concurrent = Arc::new(AtomicUsize::new(0));
-    let max_concurrent = Arc::new(AtomicUsize::new(0));
-    let first_writes = Arc::new(AtomicUsize::new(0));
-    let second_writes = Arc::new(AtomicUsize::new(0));
+    let first = PgObserverLeadership::new(database.pool(), Duration::from_secs(1));
+    let second = PgObserverLeadership::new(database.pool(), Duration::from_secs(1));
+    let first_lease = first.acquire().await.unwrap().expect("first holder");
+    assert_eq!(first_lease.fence, 1);
 
-    first
-        .acquire()
-        .await
-        .unwrap()
-        .expect("first replica claims the lease before overlap");
-
-    async fn tick(
-        leadership: &PgObserverLeadership,
-        invoices: &InvoiceStore,
-        writes: &AtomicUsize,
-        concurrent: &AtomicUsize,
-        max_concurrent: &AtomicUsize,
-    ) {
-        let Some(lease) = leadership.acquire().await.unwrap() else {
-            return;
-        };
-        let now = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
-        max_concurrent.fetch_max(now, Ordering::SeqCst);
-        stamp(invoices, lease).await.expect("leader stamp");
-        writes.fetch_add(1, Ordering::SeqCst);
-        concurrent.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    for _ in 0..40 {
-        tokio::join!(
-            tick(
-                &first,
-                &invoices,
-                &first_writes,
-                &concurrent,
-                &max_concurrent
-            ),
-            tick(
-                &second,
-                &invoices,
-                &second_writes,
-                &concurrent,
-                &max_concurrent
-            ),
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let second_lease = loop {
+        if let Some(lease) = second.acquire().await.unwrap() {
+            break lease;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "TTL expiry must let the overlapping replica hold a lease"
         );
-    }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(second_lease.fence, 2);
 
-    assert!(
-        first_writes.load(Ordering::SeqCst) > 0,
-        "the first replica must process while it holds the lease"
+    let (first_result, second_result) = tokio::join!(
+        stamp(&invoices, first_lease),
+        stamp(&invoices, second_lease),
     );
-    assert_eq!(
-        second_writes.load(Ordering::SeqCst),
-        0,
-        "the overlapping replica must not process while the first lease is live"
-    );
-    assert_eq!(
-        max_concurrent.load(Ordering::SeqCst),
-        1,
-        "two replicas must never process an observer write at the same time"
-    );
-
-    first.release().await.unwrap();
-    for _ in 0..20 {
-        tick(
-            &second,
-            &invoices,
-            &second_writes,
-            &concurrent,
-            &max_concurrent,
-        )
-        .await;
+    match (first_result, second_result) {
+        (Err(PersistenceError::StaleObserverLease), Ok(_)) => {}
+        other => panic!("exactly one fenced write must win after takeover; got {other:?}"),
     }
-    assert!(
-        second_writes.load(Ordering::SeqCst) > 0,
-        "the standby must process after handover"
-    );
-    assert_eq!(max_concurrent.load(Ordering::SeqCst), 1);
 
     second.release().await.unwrap();
     database.cleanup().await;

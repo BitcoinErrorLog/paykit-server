@@ -58,6 +58,8 @@ use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tower::ServiceExt;
 
+mod common;
+
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
 
@@ -1574,7 +1576,7 @@ async fn a_creation_cancelled_after_commit_is_in_progress_on_retry_and_voided_by
 
     // The sweeper is the terminal fallback: the orphan is voided and the
     // outbox is never queued.
-    let store = InvoiceStore::new(&pool, crypto.clone());
+    let store = common::fenced_invoice_store(&pool, crypto.clone()).await;
     assert_eq!(
         store
             .sweep_stale_creation_baselines(Duration::ZERO)

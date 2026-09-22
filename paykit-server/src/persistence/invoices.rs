@@ -539,7 +539,8 @@ pub struct InvoiceStore {
     crypto: Arc<Crypto>,
     outbox_ceiling_alarm: Option<OutboxCeilingAlarm>,
     /// Present only on the observer worker's per-tick clone. HTTP handlers
-    /// keep `None` so request-path writes never take the leadership row.
+    /// keep `None`; observer write paths refuse a missing fence rather than
+    /// stamping unfenced.
     observer_lease: Option<ObserverLease>,
 }
 
@@ -587,7 +588,7 @@ impl InvoiceStore {
         tx: &mut Transaction<'_, Postgres>,
     ) -> Result<(), PersistenceError> {
         let Some(lease) = self.observer_lease else {
-            return Ok(());
+            return Err(PersistenceError::StaleObserverLease);
         };
         // FOR SHARE conflicts with the acquire UPDATE of `fence`, so a hung
         // fenced transaction delays takeover past TTL. Observer writes never

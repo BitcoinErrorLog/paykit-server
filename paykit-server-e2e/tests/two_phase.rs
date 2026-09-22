@@ -86,6 +86,8 @@ use pubky_testnet::{EphemeralTestnet, pubky::Keypair};
 use sqlx::PgPool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod common;
+
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
 
@@ -503,7 +505,7 @@ async fn boot(seed: u8) -> BootedStack {
 
     BootedStack {
         address,
-        store: InvoiceStore::new(&pool, crypto.clone()),
+        store: common::fenced_invoice_store(&pool, crypto.clone()).await,
         outbox: OutboxStore::new(&pool, crypto.clone()),
         pool,
         runtime,
@@ -1551,7 +1553,7 @@ async fn reaper_voids_expired_prepares_and_nothing_else() {
         )
         .await
         .unwrap();
-    let store = InvoiceStore::new(pool, crypto);
+    let store = common::fenced_invoice_store(pool, crypto).await;
     let reader = reaper_reader();
     let payloads = ReaperPayloads(reader.clone());
 

@@ -157,7 +157,7 @@ async fn exclusive_store(database: &TestDatabase, xpub: &str, account_index: u32
         .unwrap();
     Stores {
         creators: creators.clone(),
-        invoices: InvoiceStore::new(database.pool(), crypto),
+        invoices: common::fenced_invoice_store(database.pool(), crypto).await,
         creator_id: persisted.id(),
     }
 }
@@ -1063,7 +1063,7 @@ async fn mode_survives_restart_and_transition_reads_current_db_value() {
 
     // "Restart": brand-new stores over the same pool; nothing is cached.
     let crypto = crypto();
-    let restarted = InvoiceStore::new(database.pool(), crypto.clone());
+    let restarted = common::fenced_invoice_store(database.pool(), crypto.clone()).await;
     let restarted_creators = CreatorStore::new(database.pool(), crypto);
     assert_eq!(creator_mode(database.pool()).await, "shared_manual");
     let evidence = restarted_creators
@@ -1836,7 +1836,7 @@ async fn sentinel_tick_never_exceeds_its_global_budget() {
         )
         .await
         .unwrap();
-    let invoices = InvoiceStore::new(database.pool(), crypto);
+    let invoices = common::fenced_invoice_store(database.pool(), crypto).await;
 
     let tight = SentinelPolicy {
         max_requests_per_tick: 25,
