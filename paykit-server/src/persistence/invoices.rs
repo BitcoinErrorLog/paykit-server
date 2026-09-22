@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -424,79 +424,111 @@ fn derived_address_fingerprint(address: &str) -> String {
         .collect()
 }
 
-/// PostgreSQL advisory-lock key for cluster-single observer leadership.
-/// Fixed and documented: every replica of one deployment tries the same key,
-/// so exactly one observer is active cluster-wide. (Advisory locks are
-/// per-DATABASE in PostgreSQL — the lock tag is scoped by the database OID —
-/// so two deployments that share one PostgreSQL cluster contend on this key
-/// only when they share one database; in that case the second stack's
-/// observer simply idles, which is the designed fail-closed behaviour.)
-pub const OBSERVER_LEADERSHIP_LOCK_KEY: i64 = 7_216_043_388_155_778_021;
+/// Single-row rendezvous for cluster-wide observer leadership.
+/// Every replica of one deployment contends on this name; a live holder
+/// keeps the row until TTL expiry or an explicit release, and a fencing
+/// token increments whenever the holder changes so in-flight writes from
+/// the previous leader abort.
+pub const OBSERVER_LEADERSHIP_LEASE_NAME: &str = "observer";
 
-/// Cluster-single observer leadership backed by a session-scoped
-/// PostgreSQL advisory lock. The lock is held on a dedicated detached
-/// connection for as long as this replica leads; the connection is never
-/// held across per-row database locks, and no row lock is ever held across
-/// network I/O. `is_leader` re-asserts the lock on every call, so takeover
-/// is fail-closed: while another replica's session holds the lock this
-/// replica idles, and when the leader's session dies PostgreSQL releases
-/// the lock and the next call here acquires it.
+/// Fencing token returned by a successful lease acquire. Observer writes
+/// carry this into the same transaction as the mutation (`FOR SHARE` on
+/// the lease row) so a stale replica cannot stamp invoices after handover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObserverLease {
+    pub holder: Uuid,
+    pub fence: i64,
+}
+
+/// Cluster-single observer leadership backed by a TTL row lease. Acquire
+/// is re-asserted on every call: the same holder renews without bumping
+/// `fence`; a different holder may take over only after `lease_until` or
+/// an explicit release. Takeover is fail-closed: while another replica's
+/// lease is live this replica is standby (it still probes Electrum so
+/// `/health/ready` can pass).
 pub struct PgObserverLeadership {
     pool: PgPool,
-    connection: tokio::sync::Mutex<Option<PgConnection>>,
+    holder: Uuid,
+    ttl: std::time::Duration,
+    current: tokio::sync::Mutex<Option<ObserverLease>>,
 }
 
 impl PgObserverLeadership {
-    pub fn new(pool: &PgPool) -> Self {
+    pub fn new(pool: &PgPool, ttl: std::time::Duration) -> Self {
         Self {
             pool: pool.clone(),
-            connection: tokio::sync::Mutex::new(None),
+            holder: Uuid::new_v4(),
+            ttl,
+            current: tokio::sync::Mutex::new(None),
         }
     }
 
-    /// Re-asserts the leadership advisory lock on this replica's dedicated
-    /// session. Returns `true` while this replica leads, `false` while a
-    /// live peer leads, and `Err` when the check itself cannot complete
-    /// (the caller treats that as "not leader" and idles fail-closed). A
-    /// dead session is replaced once before giving up.
+    pub fn holder(&self) -> Uuid {
+        self.holder
+    }
+
+    /// Re-asserts the leadership lease on this replica. Returns the
+    /// fencing token while this replica leads, `None` while a live peer
+    /// leads, and `Err` when the check itself cannot complete (the caller
+    /// treats that as "not leader" and idles fail-closed).
+    pub async fn acquire(&self) -> Result<Option<ObserverLease>, PersistenceError> {
+        let ttl_secs =
+            i64::try_from(self.ttl.as_secs()).map_err(|_| PersistenceError::Unavailable)?;
+        let fence = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO observer_leadership (name, holder, lease_until, fence)
+             VALUES ($1, $2, NOW() + make_interval(secs => $3), 1)
+             ON CONFLICT (name) DO UPDATE
+             SET holder = EXCLUDED.holder,
+                 lease_until = EXCLUDED.lease_until,
+                 fence = CASE
+                   WHEN observer_leadership.holder = EXCLUDED.holder
+                   THEN observer_leadership.fence
+                   ELSE observer_leadership.fence + 1
+                 END
+             WHERE observer_leadership.lease_until <= NOW()
+                OR observer_leadership.holder = EXCLUDED.holder
+             RETURNING fence",
+        )
+        .bind(OBSERVER_LEADERSHIP_LEASE_NAME)
+        .bind(self.holder)
+        .bind(ttl_secs)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let lease = fence.map(|fence| ObserverLease {
+            holder: self.holder,
+            fence,
+        });
+        *self.current.lock().await = lease;
+        Ok(lease)
+    }
+
+    /// Ends this holder's lease without bumping `fence`, so a waiting
+    /// replica can acquire on its next poll. A crash skips this path and
+    /// recovers at `lease_until`.
+    pub async fn release(&self) -> Result<(), PersistenceError> {
+        let lease = self.current.lock().await.take();
+        let Some(lease) = lease else {
+            return Ok(());
+        };
+        sqlx::query(
+            "UPDATE observer_leadership
+             SET lease_until = NOW()
+             WHERE name = $1 AND holder = $2 AND fence = $3",
+        )
+        .bind(OBSERVER_LEADERSHIP_LEASE_NAME)
+        .bind(lease.holder)
+        .bind(lease.fence)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(())
+    }
+
+    /// Convenience for callers that only need the boolean. Re-asserts the
+    /// lease on every call, same as [`Self::acquire`].
     pub async fn is_leader(&self) -> Result<bool, PersistenceError> {
-        let mut guard = self.connection.lock().await;
-        for attempt in 0..2 {
-            if guard.is_none() {
-                let connection = self
-                    .pool
-                    .acquire()
-                    .await
-                    .map_err(|_| PersistenceError::Unavailable)?
-                    .detach();
-                *guard = Some(connection);
-            }
-            let connection = guard.as_mut().expect("leadership connection present");
-            match sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
-                .bind(OBSERVER_LEADERSHIP_LOCK_KEY)
-                .fetch_one(&mut *connection)
-                .await
-            {
-                // Re-entrant on the holding session, so a leader stays
-                // leader; a non-leader holds no lock and drops its session.
-                Ok(acquired) => {
-                    if !acquired {
-                        guard.take();
-                    }
-                    return Ok(acquired);
-                }
-                Err(_) => {
-                    // The session is dead: PostgreSQL has already released
-                    // any lock it held, so dropping it and retrying once on
-                    // a fresh session is safe and never double-leads.
-                    guard.take();
-                    if attempt == 1 {
-                        return Err(PersistenceError::Unavailable);
-                    }
-                }
-            }
-        }
-        Err(PersistenceError::Unavailable)
+        Ok(self.acquire().await?.is_some())
     }
 }
 
@@ -506,6 +538,9 @@ pub struct InvoiceStore {
     pool: PgPool,
     crypto: Arc<Crypto>,
     outbox_ceiling_alarm: Option<OutboxCeilingAlarm>,
+    /// Present only on the observer worker's per-tick clone. HTTP handlers
+    /// keep `None` so request-path writes never take the leadership row.
+    observer_lease: Option<ObserverLease>,
 }
 
 /// Non-secret creation-time alarm: the configured link-establishment max age
@@ -536,6 +571,52 @@ impl InvoiceStore {
             pool: pool.clone(),
             crypto,
             outbox_ceiling_alarm: None,
+            observer_lease: None,
+        }
+    }
+
+    /// Binds this clone to a leadership fencing token. Observer writes
+    /// then check `observer_leadership.fence` in the same transaction.
+    pub fn with_observer_lease(mut self, lease: ObserverLease) -> Self {
+        self.observer_lease = Some(lease);
+        self
+    }
+
+    async fn assert_observer_fence(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+    ) -> Result<(), PersistenceError> {
+        let Some(lease) = self.observer_lease else {
+            return Ok(());
+        };
+        let fence = sqlx::query_scalar::<_, i64>(
+            "SELECT fence FROM observer_leadership
+             WHERE name = $1 AND holder = $2
+             FOR SHARE",
+        )
+        .bind(OBSERVER_LEADERSHIP_LEASE_NAME)
+        .bind(lease.holder)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        match fence {
+            Some(held) if held == lease.fence => Ok(()),
+            _ => Err(PersistenceError::StaleObserverLease),
+        }
+    }
+
+    async fn begin_observer_write(&self) -> Result<Transaction<'_, Postgres>, PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        match self.assert_observer_fence(&mut tx).await {
+            Ok(()) => Ok(tx),
+            Err(error) => {
+                let _ = tx.rollback().await;
+                Err(error)
+            }
         }
     }
 
@@ -723,11 +804,7 @@ impl InvoiceStore {
         if observed.is_empty() && failed.is_empty() {
             return Ok(0);
         }
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| PersistenceError::Unavailable)?;
+        let mut tx = self.begin_observer_write().await?;
         let mut misses = 0_u64;
         for (address, succeeded) in observed
             .iter()
@@ -1143,6 +1220,13 @@ impl InvoiceStore {
         findings: &[crate::sentinel::SentinelFinding],
         thresholds: &crate::sentinel::SentinelThresholds,
     ) -> Result<crate::sentinel::SentinelScanOutcome, PersistenceError> {
+        // Fence-check-then-call: CreatorStore uses its own transactions.
+        // Sentinel apply is one-way (exclusive → shared_manual) and
+        // idempotent, so a TOCTOU stale apply cannot credit a payment.
+        let tx = self.begin_observer_write().await?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         crate::persistence::CreatorStore::new(&self.pool, self.crypto.clone())
             .apply_sentinel_scan(creator_id, findings, thresholds)
             .await
@@ -1659,13 +1743,17 @@ impl InvoiceStore {
     /// final, so the invoice never enters `observation_targets()` — a reaped
     /// prepare costs one burned derivation index and nothing else.
     pub async fn reap_expired_prepares(&self) -> Result<u64, PersistenceError> {
+        let mut tx = self.begin_observer_write().await?;
         let reaped = sqlx::query(
             "UPDATE invoices SET baseline_state = 'void_prepare_expired', updated_at = NOW()
              WHERE baseline_state = 'prepared' AND prepare_expires_at < NOW()",
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         Ok(reaped.rows_affected())
     }
 
@@ -1694,11 +1782,7 @@ impl InvoiceStore {
     ) -> Result<ExpiryTransitions, PersistenceError> {
         let tail_seconds =
             i64::try_from(tail.as_secs()).map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| PersistenceError::Unavailable)?;
+        let mut transaction = self.begin_observer_write().await?;
         let tailed = sqlx::query(
             "UPDATE invoices
              SET baseline_state = 'expired_tail', expired_tail_at = NOW(), updated_at = NOW()
@@ -1737,11 +1821,7 @@ impl InvoiceStore {
     ) -> Result<u64, PersistenceError> {
         let timeout_seconds =
             i64::try_from(timeout.as_secs()).map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| PersistenceError::Unavailable)?;
+        let mut tx = self.begin_observer_write().await?;
         let rows = sqlx::query_scalar::<_, Uuid>(
             "SELECT id FROM invoices
              WHERE baseline_state = 'awaiting_baseline'
@@ -1813,6 +1893,7 @@ impl InvoiceStore {
             // increments `attempt_count`, never transitions the candidate
             // to `unfetchable`, and never moves the invoice to
             // `manual_review`; only diagnostic state is recorded.
+            let mut tx = self.begin_observer_write().await?;
             sqlx::query(
                 "UPDATE bitcoin_observation_candidates
                  SET last_attempt_at = NOW(), last_error_kind = $4, updated_at = NOW()
@@ -1822,16 +1903,15 @@ impl InvoiceStore {
             .bind(&txid)
             .bind(vout)
             .bind(error_kind)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
             return Ok(());
         }
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| PersistenceError::Unavailable)?;
+        let mut tx = self.begin_observer_write().await?;
         let row = if error_kind == "transaction_too_large" {
             // A response over `electrum.max_transaction_bytes` is
             // deterministically unresolvable: one attempt ends the
@@ -1905,11 +1985,7 @@ impl InvoiceStore {
         candidate: &PendingCandidate,
         inputs: &[bitcoin::OutPoint],
     ) -> Result<(), PersistenceError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| PersistenceError::Unavailable)?;
+        let mut tx = self.begin_observer_write().await?;
         let replaces_baseline: bool = sqlx::query_scalar(
             "SELECT EXISTS(
                 SELECT 1 FROM invoice_baseline_outpoints
@@ -2086,11 +2162,7 @@ impl InvoiceStore {
         present: bool,
         require_candidate: bool,
     ) -> Result<bool, PersistenceError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|_| PersistenceError::Unavailable)?;
+        let mut tx = self.begin_observer_write().await?;
         let applied = self
             .apply_bitcoin_observation_in_tx(
                 &mut tx,

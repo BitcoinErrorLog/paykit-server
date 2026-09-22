@@ -16,7 +16,8 @@ pub(crate) use invoices::BitcoinObservationInput;
 pub use invoices::{
     ActivationWrite, AtomicInvoiceInput, AtomicInvoiceResult, ExpiryTransitions, InvoicePhaseView,
     InvoicePreflight, InvoiceStore, NewReaderPayloadFactory, NewReaderPayloads,
-    OBSERVER_LEADERSHIP_LOCK_KEY, PendingCandidate, PgObserverLeadership, ResolveWrite, VoidWrite,
+    OBSERVER_LEADERSHIP_LEASE_NAME, ObserverLease, PendingCandidate, PgObserverLeadership,
+    ResolveWrite, VoidWrite,
 };
 pub use migrations::{
     MIGRATION_ADVISORY_LOCK_KEY, MigrationLock, run_migrations, verify_migrations_applied,

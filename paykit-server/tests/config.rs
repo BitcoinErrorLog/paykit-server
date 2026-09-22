@@ -449,6 +449,7 @@ fn parses_accepted_durations_and_uses_ledger_defaults() {
     let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
 
     assert_eq!(config.electrum.poll_interval, Duration::from_secs(10));
+    assert_eq!(config.electrum.observer_lease_ttl, Duration::from_secs(30));
     assert_eq!(config.electrum.request_timeout, Duration::from_secs(10));
     assert_eq!(config.electrum.max_requests_per_tick, 1000);
     assert_eq!(config.electrum.max_requests_per_second, 5);
@@ -474,10 +475,45 @@ fn parses_accepted_durations_and_uses_ledger_defaults() {
 
     let input = valid_toml().replace(
         "endpoint = \"ssl://electrum.example:50002\"",
-        "endpoint = \"ssl://electrum.example:50002\"\npoll_interval = \"30s\"",
+        "endpoint = \"ssl://electrum.example:50002\"\npoll_interval = \"30s\"\nobserver_lease_ttl = \"60s\"",
     );
     let configured = Config::from_toml_and_environment(&input, environment()).unwrap();
     assert_eq!(configured.electrum.poll_interval, Duration::from_secs(30));
+    assert_eq!(
+        configured.electrum.observer_lease_ttl,
+        Duration::from_secs(60)
+    );
+}
+
+#[test]
+fn observer_lease_ttl_must_be_at_least_twice_poll_interval() {
+    let too_short = valid_toml().replace(
+        "endpoint = \"ssl://electrum.example:50002\"",
+        "endpoint = \"ssl://electrum.example:50002\"\npoll_interval = \"30s\"",
+    );
+    assert!(matches!(
+        Config::from_toml_and_environment(&too_short, environment()),
+        Err(ConfigError::ObserverLeaseShorterThanPoll)
+    ));
+
+    let env_too_short = ConfigEnvironment {
+        observer_lease_ttl: Some(Duration::from_secs(10)),
+        ..environment()
+    };
+    assert!(matches!(
+        Config::from_toml_and_environment(&valid_toml(), env_too_short),
+        Err(ConfigError::ObserverLeaseShorterThanPoll)
+    ));
+}
+
+#[test]
+fn rejects_subsecond_observer_lease_ttl() {
+    let input = valid_toml().replace(
+        "endpoint = \"ssl://electrum.example:50002\"",
+        "endpoint = \"ssl://electrum.example:50002\"\nobserver_lease_ttl = \"999ms\"",
+    );
+    let error = Config::from_toml_and_environment(&input, environment()).unwrap_err();
+    assert!(error.to_string().contains("at least one second"), "{error}");
 }
 
 #[test]

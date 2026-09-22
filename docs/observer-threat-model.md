@@ -454,15 +454,16 @@ unfetchable/baseline anomalies.
 
 ## Cluster-single observer
 
-Exactly one replica observes cluster-wide, enforced by a session-scoped
-PostgreSQL advisory lock (`pg_try_advisory_lock` on the fixed key
-`OBSERVER_LEADERSHIP_LOCK_KEY`, persistence/invoices.rs). Takeover is
-fail-closed: a live lease keeps other replicas idle (logged once per
-transition), an expired lease (dead session) lets the next check acquire
-leadership, and a failed leadership check idles the replica. No per-row
-database lock is ever held across network I/O. With the current single
-Railway instance this is operationally a no-op; it exists so a second
-replica can never double-stamp a tick.
+Exactly one replica observes cluster-wide, enforced by a Postgres row
+lease on `observer_leadership` (`OBSERVER_LEADERSHIP_LEASE_NAME`,
+persistence/invoices.rs) with a fencing token on observer writes.
+Takeover is fail-closed: a live lease keeps other replicas on standby
+(they still probe Electrum so `/health/ready` can pass; logged once per
+transition), an expired or released lease lets the next check acquire
+leadership and bump `fence`, and a failed leadership check idles the
+replica. A stale fencing token aborts in-flight observer writes. No
+per-row database lock is ever held across network I/O. Overlap during a
+rolling deploy is allowed: only the lease holder stamps invoices.
 
 ## Two-phase creation and activation (§B.11, W1.1c)
 

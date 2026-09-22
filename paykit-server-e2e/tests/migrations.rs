@@ -39,7 +39,7 @@ fn migrator_through(version: i64) -> Migrator {
     }
 }
 
-const REQUIRED_TABLES: [&str; 16] = [
+const REQUIRED_TABLES: [&str; 17] = [
     "deployment_metadata",
     "creators",
     "sdk_states",
@@ -56,6 +56,7 @@ const REQUIRED_TABLES: [&str; 16] = [
     "outbox_terminal_events",
     "sdk_outbound_invocations",
     "setup_flow_cancellations",
+    "observer_leadership",
 ];
 
 const ACCOUNT_RETENTION_REGISTRY: [&str; 15] = [
@@ -406,6 +407,7 @@ async fn migration_0025_readonly_role_can_inspect_but_cannot_mutate() {
         "sdk_states",
         "sdk_outbound_invocations",
         "_sqlx_migrations",
+        "observer_leadership",
     ] {
         sqlx::query(&format!("SELECT 1 FROM {table} LIMIT 1"))
             .execute(&readonly)
@@ -432,6 +434,63 @@ async fn migration_0025_readonly_role_can_inspect_but_cannot_mutate() {
         .execute(database.pool())
         .await
         .unwrap();
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn migration_0026_grants_observer_leadership_to_runtime_roles() {
+    let _guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+
+    for privilege in ["SELECT", "INSERT", "UPDATE"] {
+        let granted: bool = sqlx::query_scalar(
+            "SELECT has_table_privilege('paykit', 'public.observer_leadership', $1)",
+        )
+        .bind(privilege)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert!(granted, "paykit lacks {privilege} on observer_leadership");
+    }
+    for privilege in ["DELETE", "TRUNCATE"] {
+        let granted: bool = sqlx::query_scalar(
+            "SELECT has_table_privilege('paykit', 'public.observer_leadership', $1)",
+        )
+        .bind(privilege)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert!(
+            !granted,
+            "paykit unexpectedly has {privilege} on observer_leadership"
+        );
+    }
+
+    let readonly_select: bool = sqlx::query_scalar(
+        "SELECT has_table_privilege('paykit_readonly', 'public.observer_leadership', 'SELECT')",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        readonly_select,
+        "paykit_readonly lacks SELECT on observer_leadership"
+    );
+    for privilege in ["INSERT", "UPDATE", "DELETE"] {
+        let granted: bool = sqlx::query_scalar(
+            "SELECT has_table_privilege('paykit_readonly', 'public.observer_leadership', $1)",
+        )
+        .bind(privilege)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert!(
+            !granted,
+            "paykit_readonly unexpectedly has {privilege} on observer_leadership"
+        );
+    }
+
     database.cleanup().await;
 }
 
@@ -471,7 +530,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
         applied_versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25
+            25, 26
         ]
     );
 

@@ -455,19 +455,26 @@ impl ObservationBackend for InvoiceStore {
 
 /// Cluster-wide observer leadership boundary. Exactly one replica may run
 /// observation ticks at a time; implementations re-assert the underlying
-/// lock or lease on every call, so takeover is fail-closed: while another
-/// replica leads, `is_leader` returns `false` and this replica idles, and
-/// when the leader's lease expires (its session dies) a later call returns
-/// `true` here. A check that errors is treated as "not leader".
+/// lease on every call, so takeover is fail-closed: while another replica
+/// leads, `acquire` returns `None` and this replica probes Electrum without
+/// writing, and when the leader's lease expires a later call returns
+/// `Some`. A check that errors is treated as "not leader".
 #[async_trait]
 pub trait ObserverLeadership: Send + Sync {
-    async fn is_leader(&self) -> Result<bool, ObserverError>;
+    async fn acquire(&self) -> Result<Option<crate::persistence::ObserverLease>, ObserverError>;
+    async fn release(&self) -> Result<(), ObserverError>;
 }
 
 #[async_trait]
 impl ObserverLeadership for crate::persistence::PgObserverLeadership {
-    async fn is_leader(&self) -> Result<bool, ObserverError> {
-        crate::persistence::PgObserverLeadership::is_leader(self)
+    async fn acquire(&self) -> Result<Option<crate::persistence::ObserverLease>, ObserverError> {
+        crate::persistence::PgObserverLeadership::acquire(self)
+            .await
+            .map_err(map_persistence)
+    }
+
+    async fn release(&self) -> Result<(), ObserverError> {
+        crate::persistence::PgObserverLeadership::release(self)
             .await
             .map_err(map_persistence)
     }
@@ -1495,12 +1502,13 @@ async fn sentinel_phase(
 
 /// Long-running observer worker: one bounded tick per jittered poll interval,
 /// with exponential backoff while the endpoint reports `Unavailable`. Only
-/// the leadership holder ticks; other replicas idle (logged once per
-/// transition) and re-check every interval, so a dead leader is succeeded
-/// fail-closed without two replicas ever stamping the same tick.
+/// the leadership holder ticks observation writes; other replicas probe
+/// Electrum so `/health/ready` can pass and re-check every interval, so a
+/// dead leader is succeeded fail-closed without two replicas ever stamping
+/// the same tick.
 pub async fn observation_loop(
     port: Arc<dyn ElectrumPort>,
-    backend: Arc<dyn ObservationBackend>,
+    invoices: crate::persistence::InvoiceStore,
     leadership: Arc<dyn ObserverLeadership>,
     network: BitcoinNetwork,
     policy: ObserverPolicy,
@@ -1533,27 +1541,36 @@ pub async fn observation_loop(
         };
         first_tick = false;
         tokio::select! {
-            _ = runtime.cancelled() => break,
+            _ = runtime.cancelled() => {
+                let _ = leadership.release().await;
+                break;
+            }
             _ = tokio::time::sleep(delay) => {}
         }
         if !runtime.may_start_worker_claim() {
+            let _ = leadership.release().await;
             break;
         }
-        match leadership.is_leader().await {
-            Ok(true) => {
+        match leadership.acquire().await {
+            Ok(Some(lease)) => {
                 if !was_leader {
                     tracing::info!(
                         "observer leadership acquired; this replica is the active observer"
                     );
                     was_leader = true;
                 }
+                let backend = invoices.clone().with_observer_lease(lease);
+                let outcome =
+                    observe_tick(port.as_ref(), &backend, &network, &runtime, &mut state).await;
+                backoff.record_outcome(&outcome);
             }
-            Ok(false) => {
+            Ok(None) => {
                 if was_leader {
                     tracing::info!("another replica holds observer leadership; this replica idles");
                     was_leader = false;
                 }
-                continue;
+                let outcome = standby_probe(port.as_ref(), &runtime, &mut state).await;
+                backoff.record_outcome(&outcome);
             }
             Err(_) => {
                 // Fail closed: without a leadership verdict this replica must
@@ -1562,18 +1579,56 @@ pub async fn observation_loop(
                     tracing::warn!("observer leadership check failed; idling fail-closed");
                     was_leader = false;
                 }
-                continue;
             }
         }
-        let outcome = observe_tick(
-            port.as_ref(),
-            backend.as_ref(),
-            &network,
-            &runtime,
-            &mut state,
-        )
-        .await;
-        backoff.record_outcome(&outcome);
+    }
+}
+
+/// Standby readiness probe: charges the shared Electrum budget and records
+/// the tip so `/health/ready` can pass while another replica holds the
+/// observation lease. Never runs observation writes.
+async fn standby_probe(
+    port: &dyn ElectrumPort,
+    runtime: &Runtime,
+    state: &mut ObserverTickState,
+) -> ObserverTickOutcome {
+    let _probe_permit = match state.budget.try_reserve(PROBE_REQUESTS_PER_TICK) {
+        Ok(permit) => permit,
+        Err(exhausted) => {
+            runtime.metrics().electrum_budget_exhausted_tick();
+            tracing::info!(
+                reason = "budget_exhausted",
+                requested = exhausted.requested,
+                available = exhausted.available,
+                "shared electrum request budget cannot cover the standby probe; deferring"
+            );
+            return ObserverTickOutcome::Deferred;
+        }
+    };
+    match port.probe().await {
+        Ok(tip) => {
+            runtime.record_electrum_probe(ElectrumProbe::success(tip.height, tip.time_unix));
+            runtime.set_electrum_available(true);
+            ObserverTickOutcome::Observed {
+                processed: 0,
+                deferred: 0,
+                failed: 0,
+            }
+        }
+        Err(ObserverError::WrongNetwork) => {
+            runtime.record_electrum_probe(ElectrumProbe::genesis_mismatch());
+            runtime.set_electrum_available(false);
+            tracing::warn!(
+                error = "wrong_network",
+                "electrum endpoint genesis block does not match the configured bitcoin network"
+            );
+            ObserverTickOutcome::ProbeFailed(ObserverError::WrongNetwork)
+        }
+        Err(error) => {
+            runtime.record_electrum_probe_failure();
+            runtime.set_electrum_available(false);
+            ObserverTickOutcome::ProbeFailed(error)
+        }
     }
 }
 

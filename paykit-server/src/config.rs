@@ -66,6 +66,7 @@ impl Config {
             trusted_proxy_hops: environment.trusted_proxy_hops,
             railway_trusted_proxy_hops_default: environment.railway_trusted_proxy_hops_default,
             http_request_deadline: environment.http_request_deadline,
+            observer_lease_ttl: environment.observer_lease_ttl,
             ..Default::default()
         };
         let toml_trusted_proxy_hops_present = raw.rate_limits.trusted_proxy_hops.is_some();
@@ -143,6 +144,7 @@ impl Config {
                 max_history_items_per_window: raw.electrum.max_history_items_per_window,
                 claim_scan_window_deadline: raw.electrum.claim_scan_window_deadline,
                 max_concurrent_claim_scans: raw.electrum.max_concurrent_claim_scans,
+                observer_lease_ttl: raw.electrum.observer_lease_ttl,
             },
             sentinel: SentinelConfig::from(raw.sentinel),
             outbox: OutboxConfig::from(raw.outbox),
@@ -198,6 +200,10 @@ impl Config {
                 "electrum.baseline_completion_timeout",
                 self.electrum.baseline_completion_timeout,
             ),
+            (
+                "electrum.observer_lease_ttl",
+                self.electrum.observer_lease_ttl,
+            ),
             ("bitcoin.prepare_ttl", self.bitcoin.prepare_ttl),
             (
                 "bitcoin.max_request_expiry",
@@ -243,6 +249,11 @@ impl Config {
         if self.bitcoin.expiry_tail.as_secs() > MAX_POSTGRES_INTERVAL_SECONDS {
             return Err(ConfigError::DurationExceedsPostgresInterval(
                 "bitcoin.expiry_tail",
+            ));
+        }
+        if self.electrum.observer_lease_ttl.as_secs() > MAX_POSTGRES_INTERVAL_SECONDS {
+            return Err(ConfigError::DurationExceedsPostgresInterval(
+                "electrum.observer_lease_ttl",
             ));
         }
         // `sentinel.rescan_interval` flows to `make_interval(secs => i64)`
@@ -374,6 +385,10 @@ impl Config {
         }
         for (name, value) in [
             ("electrum.poll_interval", self.electrum.poll_interval),
+            (
+                "electrum.observer_lease_ttl",
+                self.electrum.observer_lease_ttl,
+            ),
             ("outbox.lease_duration", self.outbox.lease_duration),
             ("outbox.retry_initial", self.outbox.retry_initial),
             ("outbox.retry_max", self.outbox.retry_max),
@@ -386,6 +401,9 @@ impl Config {
             if value < Duration::from_secs(1) {
                 return Err(ConfigError::SubsecondPersistenceDuration(name));
             }
+        }
+        if self.electrum.observer_lease_ttl < self.electrum.poll_interval.saturating_mul(2) {
+            return Err(ConfigError::ObserverLeaseShorterThanPoll);
         }
         if self.outbox.retry_initial > self.outbox.retry_max {
             return Err(ConfigError::InconsistentRetries("outbox"));
@@ -514,6 +532,8 @@ pub struct ConfigEnvironment {
     pub railway_trusted_proxy_hops_default: bool,
     /// When set, overrides `limits.http_request_deadline`.
     pub http_request_deadline: Option<Duration>,
+    /// When set, overrides `electrum.observer_lease_ttl`.
+    pub observer_lease_ttl: Option<Duration>,
 }
 
 impl ConfigEnvironment {
@@ -538,6 +558,7 @@ impl ConfigEnvironment {
             trusted_proxy_hops: parse_optional_u32_env("PAYKIT_TRUSTED_PROXY_HOPS")?,
             railway_trusted_proxy_hops_default: std::env::var_os("RAILWAY_ENVIRONMENT").is_some(),
             http_request_deadline: parse_optional_duration_env("PAYKIT_HTTP_REQUEST_DEADLINE")?,
+            observer_lease_ttl: parse_optional_duration_env("PAYKIT_OBSERVER_LEASE_TTL")?,
         })
     }
 }
@@ -927,6 +948,9 @@ pub struct ElectrumConfig {
     /// the bound a claim fails `claim_scan_unavailable` immediately (no
     /// queueing, no Electrum call).
     pub max_concurrent_claim_scans: u32,
+    /// Observer leadership TTL. Renewed every poll. Must be at least twice
+    /// `poll_interval` so one missed renew does not drop the lease.
+    pub observer_lease_ttl: Duration,
 }
 
 #[derive(Debug)]
@@ -1184,6 +1208,10 @@ pub enum ConfigError {
     InvalidEnvInteger(&'static str),
     #[error("{0} is not a valid duration (for example 10s)")]
     InvalidEnvDuration(&'static str),
+    #[error(
+        "electrum.observer_lease_ttl must be at least twice electrum.poll_interval so a missed renew cannot drop the lease"
+    )]
+    ObserverLeaseShorterThanPoll,
 }
 
 fn decode_base64url_no_pad(value: &str, error: ConfigError) -> Result<Vec<u8>, ConfigError> {
@@ -1231,6 +1259,9 @@ fn apply_environment_overrides(
     }
     if let Some(value) = environment.http_request_deadline {
         config.limits.http_request_deadline = value;
+    }
+    if let Some(value) = environment.observer_lease_ttl {
+        config.electrum.observer_lease_ttl = value;
     }
 }
 
@@ -1504,6 +1535,8 @@ struct RawElectrumConfig {
     claim_scan_window_deadline: Duration,
     #[serde(default = "default_electrum_max_concurrent_claim_scans")]
     max_concurrent_claim_scans: u32,
+    #[serde(default = "default_observer_lease_ttl", with = "humantime_serde")]
+    observer_lease_ttl: Duration,
 }
 
 const fn default_electrum_max_requests_per_tick() -> u32 {
@@ -1814,6 +1847,9 @@ impl From<RawShutdownConfig> for ShutdownConfig {
 
 const fn default_electrum_poll_interval() -> Duration {
     Duration::from_secs(10)
+}
+const fn default_observer_lease_ttl() -> Duration {
+    Duration::from_secs(30)
 }
 const fn default_lease_duration() -> Duration {
     Duration::from_secs(30)
