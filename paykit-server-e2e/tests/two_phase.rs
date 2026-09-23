@@ -127,6 +127,17 @@ type ScriptedSnapshot = (Vec<OutPoint>, Vec<OutPoint>);
 struct ScriptedElectrum {
     outputs: Mutex<HashMap<String, (u64, OutPoint)>>,
     snapshot_unconfirmed: Mutex<HashMap<String, ScriptedSnapshot>>,
+    snapshot_gate: Mutex<Option<SnapshotGate>>,
+}
+
+/// A one-shot hold on the next creation-style snapshot: `entered` fires
+/// when the snapshot starts and it returns only after `release`, so a test
+/// can commit a void while an activation is between its state read and its
+/// state transaction.
+#[derive(Clone)]
+struct SnapshotGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
 }
 
 impl ScriptedElectrum {
@@ -134,7 +145,17 @@ impl ScriptedElectrum {
         Self {
             outputs: Mutex::new(HashMap::new()),
             snapshot_unconfirmed: Mutex::new(HashMap::new()),
+            snapshot_gate: Mutex::new(None),
         }
+    }
+
+    fn gate_next_snapshot(&self) -> SnapshotGate {
+        let gate = SnapshotGate {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self.snapshot_gate.lock().unwrap() = Some(gate.clone());
+        gate
     }
 
     fn fund(&self, address: &str, sats: u64, outpoint: OutPoint) {
@@ -170,6 +191,11 @@ impl ElectrumPort for ScriptedElectrum {
         _request_limiter: &RequestLimiter,
         _snapshot_slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Result<CreationSnapshot, ObserverError> {
+        let gate = self.snapshot_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
         let (unconfirmed_outputs, unconfirmed_inputs) = self
             .snapshot_unconfirmed
             .lock()
@@ -2214,4 +2240,112 @@ async fn prepare_replay_during_failed_baseline_returns_invoice_finalized() {
     assert_eq!(state, "void_baseline_failed");
     fixture.assert_single_allocation().await;
     fixture.cleanup().await;
+}
+
+/// A marketplace cancel voids the prepared invoice; any activate that
+/// arrives afterwards is the named finalized refusal and publishes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_late_activate_after_void_is_refused_and_never_publishes() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(71).await;
+    let body = prepare(&stack, REFERENCE_A).await;
+    let invoice_id = body["invoice_id"].as_str().unwrap().to_owned();
+    let total_sats = body["total_sats"].as_u64().unwrap();
+
+    let voided = void(&stack, &invoice_id).await;
+    assert_eq!(voided.status, StatusCode::OK);
+    assert_eq!(voided.json()["state"], "void_cancelled");
+
+    for _ in 0..2 {
+        let late = activate(&stack, &invoice_id, total_sats).await;
+        assert_eq!(late.status, StatusCode::CONFLICT);
+        assert_eq!(late.json()["error"]["code"], "invoice_finalized");
+    }
+    assert_eq!(
+        baseline_state(&stack.pool, &invoice_id).await,
+        "void_cancelled"
+    );
+    let statuses = outbox_statuses(&stack.pool, &invoice_id).await;
+    assert!(
+        statuses.iter().all(|status| status == "permanently_failed"),
+        "a voided invoice's publication rows are terminal: {statuses:?}"
+    );
+    assert!(
+        stack
+            .outbox
+            .claim(uuid::Uuid::new_v4(), 10, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Funding the address changes nothing: the invoice is never observed.
+    let address = stack.invoice_address(0);
+    stack.electrum.fund(
+        &address,
+        total_sats,
+        OutPoint::new(Txid::from_byte_array([91; 32]), 0),
+    );
+    assert!(stack.store.observation_plan().await.unwrap().is_empty());
+
+    stack.shutdown().await;
+}
+
+/// The void commits while an activation is between its `prepared` read and
+/// its state transaction (the tick-1 snapshot holds no row lock). The row
+/// lock decides: the activation is refused, the snapshot it took is not
+/// persisted, and nothing is queued for publication.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_void_during_an_in_flight_activate_wins_at_the_row_lock() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(72).await;
+    let body = prepare(&stack, REFERENCE_A).await;
+    let invoice_id = body["invoice_id"].as_str().unwrap().to_owned();
+    let total_sats = body["total_sats"].as_u64().unwrap();
+    let address = stack.invoice_address(0);
+    let tick_one = OutPoint::new(Txid::from_byte_array([92; 32]), 1);
+    stack
+        .electrum
+        .script_unconfirmed_at_snapshot(&address, vec![tick_one], Vec::new());
+    let baseline_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM invoice_baseline_outpoints WHERE invoice_id = $1")
+            .bind(uuid::Uuid::parse_str(&invoice_id).unwrap())
+            .fetch_one(&stack.pool)
+            .await
+            .unwrap();
+
+    let gate = stack.electrum.gate_next_snapshot();
+    let (activated, voided) = tokio::join!(activate(&stack, &invoice_id, total_sats), async {
+        gate.entered.notified().await;
+        let voided = void(&stack, &invoice_id).await;
+        gate.release.notify_one();
+        voided
+    });
+
+    assert_eq!(voided.status, StatusCode::OK);
+    assert_eq!(voided.json()["state"], "void_cancelled");
+    assert_eq!(activated.status, StatusCode::CONFLICT);
+    assert_eq!(activated.json()["error"]["code"], "invoice_finalized");
+    assert_eq!(
+        baseline_state(&stack.pool, &invoice_id).await,
+        "void_cancelled"
+    );
+    let baseline_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM invoice_baseline_outpoints WHERE invoice_id = $1")
+            .bind(uuid::Uuid::parse_str(&invoice_id).unwrap())
+            .fetch_one(&stack.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        baseline_after, baseline_before,
+        "the refused activation persisted no tick-1 rows"
+    );
+    let statuses = outbox_statuses(&stack.pool, &invoice_id).await;
+    assert!(
+        statuses.iter().all(|status| status == "permanently_failed"),
+        "nothing was queued for publication: {statuses:?}"
+    );
+    assert!(stack.store.observation_plan().await.unwrap().is_empty());
+
+    stack.shutdown().await;
 }
