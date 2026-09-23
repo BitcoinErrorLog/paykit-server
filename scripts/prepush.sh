@@ -41,15 +41,14 @@ if [ ! -t 0 ]; then
 fi
 
 # Sibling worktrees were sharing one Cargo target. The gate then ran
-# another tree's integration-test binary. This checkout gets its own
-# target, seeded from the shared one when that directory is present.
+# another tree's integration-test binary. This checkout gets its own.
 shared_target="${CARGO_TARGET_DIR:-}"
-private_target="${HOME}/work/.cargo-target/paykit-prepush-$(basename "$ROOT")"
+private_target="/Volumes/t7/vibes-dev/.cargo-target/paykit-server/$(basename "$ROOT")"
 if [ ! -d "$private_target" ] && [ -n "$shared_target" ] && [ -d "$shared_target" ] && [ "$shared_target" != "$private_target" ]; then
   seed="${private_target}.partial"
   rm -rf "$seed"
   mkdir -p "$(dirname "$private_target")"
-  if cp -cR "$shared_target" "$seed"; then
+  if cp -cR "$shared_target" "$seed" 2>/dev/null || cp -R "$shared_target" "$seed"; then
     mv "$seed" "$private_target"
   else
     rm -rf "$seed"
