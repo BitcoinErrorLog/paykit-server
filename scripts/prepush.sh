@@ -84,7 +84,7 @@ echo "prepush: cargo clippy"
 run_heavy cargo clippy --locked --workspace --all-targets -- -D warnings
 
 echo "prepush: cargo test"
-run_heavy cargo test --locked --workspace -- --no-fail-fast
+run_heavy cargo test --locked --workspace --no-fail-fast
 
 sha="$(git rev-parse HEAD)"
 seconds="$(( $(date +%s) - start ))"
