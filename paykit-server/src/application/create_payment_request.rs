@@ -293,8 +293,9 @@ impl MarketplacePaymentRequestService {
             tokio::time::timeout(marker_remaining, self.markers.discover(&request.reader))
                 .await
                 .map_err(|_| CreateInvoiceError::DeadlineExceeded)??;
-        let selected = select_reader_marker(discovered, &self.marker_priority)
-            .ok_or(CreateInvoiceError::ReaderNotPayable)?;
+        let selected =
+            select_reader_marker(discovered, &self.marker_priority, &self.local_receiver_path)
+                .ok_or(CreateInvoiceError::ReaderNotPayable)?;
         let credentials_remaining = elapsed_remaining(started, self.clock.now())?;
         let (xpub, account_index) = tokio::time::timeout(
             credentials_remaining,

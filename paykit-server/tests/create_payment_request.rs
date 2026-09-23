@@ -791,6 +791,16 @@ fn service_with_markers(
     markers: Vec<paykit_lib::PaykitReceiverMarker>,
     store: Arc<CapturingStore>,
 ) -> MarketplacePaymentRequestService {
+    service_with_markers_at("paykit/server", markers, store)
+}
+
+/// `server_receiver_path` is this server's own receiver path, where it
+/// publishes each claimed creator's inbox.
+fn service_with_markers_at(
+    server_receiver_path: &str,
+    markers: Vec<paykit_lib::PaykitReceiverMarker>,
+    store: Arc<CapturingStore>,
+) -> MarketplacePaymentRequestService {
     MarketplacePaymentRequestService::new(
         ok_session(),
         Arc::new(FakeMarkers {
@@ -798,7 +808,7 @@ fn service_with_markers(
             calls: AtomicUsize::default(),
         }),
         vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
-        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
+        paykit_lib::PaykitReceiverPath::new(server_receiver_path).unwrap(),
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         true,
@@ -808,6 +818,40 @@ fn service_with_markers(
         400_000,
         Arc::new(PaykitIntentBuilder::default()),
     )
+}
+
+/// A buyer who also sells here publishes this server's claim inbox beside
+/// their wallet's receiver. Both take Payment Requests and rank first under
+/// the `bitkit` priority, but no wallet answers on the inbox.
+#[tokio::test]
+async fn a_buyer_who_also_sells_here_gets_the_request_on_their_wallet() {
+    let claim_inbox = paykit_lib::PaykitReceiverMarker::new(
+        paykit_lib::PaykitReceiverPath::new("bitkit/server").unwrap(),
+        paykit_lib::PaykitReceiverCapabilities {
+            private_payments: true,
+            payment_requests: true,
+            receipts: false,
+            outgoing_payments: false,
+        },
+        paykit_lib::PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
+            .unwrap(),
+    );
+    let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    service_with_markers_at(
+        "bitkit/server",
+        vec![claim_inbox, capable_marker()],
+        store.clone(),
+    )
+    .create(request(50_000))
+    .await
+    .unwrap();
+
+    let captured = store.captured.lock().unwrap();
+    let selected = captured[0]
+        .payment_request_intent
+        .selected_reader_path()
+        .unwrap();
+    assert_eq!(selected.as_str(), "bitkit/wallet");
 }
 
 #[tokio::test]

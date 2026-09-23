@@ -1,9 +1,14 @@
 //! Deterministic selection of a reader's publicly discoverable Paykit receiver.
 //!
 //! Discovery deliberately returns every public candidate.  A marker is usable
-//! only when it advertises both private payments and Payment Requests; selection
-//! then applies the operator's first-segment priority and canonical full-path
-//! lexical tie break.
+//! only when it advertises both private payments and Payment Requests and is not
+//! at this server's own receiver path; selection then applies the operator's
+//! first-segment priority and canonical full-path lexical tie break.
+//!
+//! A reader who is also a claimed creator publishes this server's receiver path
+//! (for example `bitkit/server`) next to their wallet's (`bitkit/wallet`). That
+//! marker is a Paykit Server claim inbox, which no wallet answers on, so it is
+//! never a delivery target for the reader's Payment Requests.
 
 use paykit_lib::{PaykitReceiverMarker, PaykitReceiverPath};
 
@@ -20,11 +25,14 @@ pub struct SelectedReaderMarker {
 pub fn select_reader_marker(
     candidates: impl IntoIterator<Item = PaykitReceiverMarker>,
     priority: &[ReceiverPathPriority],
+    server_receiver_path: &PaykitReceiverPath,
 ) -> Option<SelectedReaderMarker> {
     let mut capable = candidates
         .into_iter()
         .filter(|marker| {
-            marker.capabilities.private_payments && marker.capabilities.payment_requests
+            marker.capabilities.private_payments
+                && marker.capabilities.payment_requests
+                && marker.receiver_path != *server_receiver_path
         })
         .collect::<Vec<_>>();
     capable.sort_by_key(|marker| rank(marker, priority));
@@ -84,6 +92,7 @@ mod tests {
                 marker("bitkit/server", false),
             ],
             &priority(&["bitkit"]),
+            &server_path(),
         )
         .unwrap();
         assert_eq!(selected.receiver_path.as_str(), "bitkit/wallet");
@@ -91,9 +100,38 @@ mod tests {
         let selected = select_reader_marker(
             [marker("other/wallet", true), marker("other/server", true)],
             &priority(&["bitkit"]),
+            &server_path(),
         )
         .unwrap();
         assert_eq!(selected.receiver_path.as_str(), "other/server");
+    }
+
+    fn server_path() -> PaykitReceiverPath {
+        PaykitReceiverPath::new("paykit/server").unwrap()
+    }
+
+    #[test]
+    fn never_selects_the_servers_own_claim_inbox_path() {
+        // A reader who also claimed a creator account on a server using
+        // `bitkit/server` publishes both markers; both rank first under the
+        // `bitkit` priority and the lexical tie-break used to pick the inbox.
+        let server = PaykitReceiverPath::new("bitkit/server").unwrap();
+        let selected = select_reader_marker(
+            [marker("bitkit/server", true), marker("bitkit/wallet", true)],
+            &priority(&["bitkit"]),
+            &server,
+        )
+        .unwrap();
+        assert_eq!(selected.receiver_path.as_str(), "bitkit/wallet");
+
+        assert_eq!(
+            select_reader_marker(
+                [marker("bitkit/server", true)],
+                &priority(&["bitkit"]),
+                &server
+            ),
+            None
+        );
     }
 
     #[test]
@@ -101,6 +139,7 @@ mod tests {
         let selected = select_reader_marker(
             [marker("bitkit/wallet", true), marker("other/server", true)],
             &priority(&["other", "bitkit"]),
+            &server_path(),
         )
         .unwrap();
         assert_eq!(selected.receiver_path.as_str(), "other/server");
