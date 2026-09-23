@@ -87,7 +87,8 @@ echo "prepush: cargo clippy"
 run_heavy cargo clippy --locked --workspace --all-targets -- -D warnings
 
 echo "prepush: cargo test"
-run_heavy cargo test --locked --workspace --no-fail-fast
+# Same split and --test-threads=1 as CI. --no-fail-fast still finishes the suite.
+run_heavy bash -c 'cargo test --locked -p paykit-server --no-fail-fast -- --test-threads=1 && cargo test --locked -p paykit-server-e2e --no-fail-fast -- --test-threads=1'
 
 sha="$(git rev-parse HEAD)"
 seconds="$(( $(date +%s) - start ))"
