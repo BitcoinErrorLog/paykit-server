@@ -21,6 +21,7 @@ pub enum ApiError {
     LockNotFound,
     BitcoinCreationDisabled,
     BitcoinOfferUnavailable,
+    ReaderNotPayable,
     PrepareExpired,
     InvoiceFinalized,
     ActivationTotalMismatch,
@@ -108,6 +109,11 @@ impl ApiError {
                 StatusCode::FORBIDDEN,
                 "bitcoin_creation_disabled",
                 "bitcoin payment request creation is disabled",
+            ),
+            Self::ReaderNotPayable => (
+                StatusCode::CONFLICT,
+                "reader_not_payable",
+                "the reader has no Paykit receiver that accepts payment requests",
             ),
             Self::BitcoinOfferUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,

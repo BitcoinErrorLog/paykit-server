@@ -107,6 +107,10 @@ pub enum CreateInvoiceError {
     BaselineInProgress,
     DeadlineExceeded,
     Unavailable,
+    /// The reader publishes no Paykit receiver that takes both private
+    /// payments and Payment Requests: nothing can deliver the request. This
+    /// is the reader's setup, not a transient dependency failure.
+    ReaderNotPayable,
     /// New Bitcoin binds are administratively disabled on this stack.
     BitcoinCreationDisabled,
     /// The runtime's Bitcoin offer is currently hidden (Electrum probe
