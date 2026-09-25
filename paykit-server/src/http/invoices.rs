@@ -85,6 +85,7 @@ fn invoice_error(error: CreateInvoiceError) -> Response {
         }
         CreateInvoiceError::InvoiceFinalized => ApiError::InvoiceFinalized.into_response(),
         CreateInvoiceError::PrepareExpired => ApiError::PrepareExpired.into_response(),
+        CreateInvoiceError::ReaderNotPayable => ApiError::ReaderNotPayable.into_response(),
         CreateInvoiceError::InvalidExpiry(reason) => crate::http::error::invalid_expiry(reason),
     }
 }

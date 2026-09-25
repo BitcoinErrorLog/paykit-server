@@ -771,13 +771,30 @@ async fn invalid_and_unavailable_sessions_return_without_store_mutation() {
     }
 }
 
-#[tokio::test]
-async fn a_reader_without_a_capable_marker_is_unavailable() {
-    let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
-    let service = MarketplacePaymentRequestService::new(
+/// The reader's only public marker cannot take Payment Requests (the Shop's
+/// messaging receiver: private payments only), or there is none at all.
+fn messaging_only_marker() -> paykit_lib::PaykitReceiverMarker {
+    paykit_lib::PaykitReceiverMarker::new(
+        paykit_lib::PaykitReceiverPath::new("marketplace/wallet").unwrap(),
+        paykit_lib::PaykitReceiverCapabilities {
+            private_payments: true,
+            payment_requests: false,
+            receipts: false,
+            outgoing_payments: false,
+        },
+        paykit_lib::PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
+            .unwrap(),
+    )
+}
+
+fn service_with_markers(
+    markers: Vec<paykit_lib::PaykitReceiverMarker>,
+    store: Arc<CapturingStore>,
+) -> MarketplacePaymentRequestService {
+    MarketplacePaymentRequestService::new(
         ok_session(),
         Arc::new(FakeMarkers {
-            markers: vec![],
+            markers,
             calls: AtomicUsize::default(),
         }),
         vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
@@ -785,16 +802,49 @@ async fn a_reader_without_a_capable_marker_is_unavailable() {
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         true,
-        store.clone(),
+        store,
         Arc::new(EmptyBaselineElectrum),
         50,
         400_000,
         Arc::new(PaykitIntentBuilder::default()),
-    );
-    assert_eq!(
-        service.create(request(50_000)).await,
-        Err(CreateInvoiceError::Unavailable)
-    );
+    )
+}
+
+#[tokio::test]
+async fn a_reader_without_a_payment_request_capable_marker_is_not_payable() {
+    for markers in [vec![], vec![messaging_only_marker()]] {
+        let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+        let service = service_with_markers(markers, store.clone());
+        assert_eq!(
+            service.create(request(50_000)).await,
+            Err(CreateInvoiceError::ReaderNotPayable)
+        );
+        assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_reader_not_payable_maps_to_409_reader_not_payable_on_the_marketplace_route() {
+    let locks_key = SigningKey::from_bytes(&[3; 32]);
+    let config = auth_config(&locks_key, None);
+    let auth = Arc::new(SignedLocksAuth::from_config(&config));
+    let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
+    let router = payment_requests_router(Arc::new(service_with_markers(
+        vec![messaging_only_marker()],
+        store.clone(),
+    )))
+    .layer(Extension(auth));
+
+    let response = router
+        .oneshot(signed_request(&locks_key, canonical_body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), 1024)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["error"]["code"], "reader_not_payable");
     assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
 }
 
