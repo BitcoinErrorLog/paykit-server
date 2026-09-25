@@ -1854,17 +1854,22 @@ const fn default_observer_lease_ttl() -> Duration {
 const fn default_lease_duration() -> Duration {
     Duration::from_secs(30)
 }
-const fn default_retry_initial() -> Duration {
+pub(crate) const fn default_retry_initial() -> Duration {
     Duration::from_secs(1)
 }
-const fn default_outbox_retry_max() -> Duration {
+pub(crate) const fn default_outbox_retry_max() -> Duration {
     Duration::from_secs(5 * 60)
 }
-const fn default_link_establishment_max_attempts() -> u32 {
+pub(crate) const fn default_link_establishment_max_attempts() -> u32 {
     20
 }
-const fn default_link_establishment_max_age() -> Duration {
-    Duration::from_secs(60 * 60)
+/// A link the reader's wallet never answers must fail while the
+/// marketplace's 30-minute payment window is still open, so the buyer is
+/// told and can retry. Exhaustion is checked at the next claim after this
+/// age, so the failure lands up to one `retry_max` later (about 18.5
+/// minutes with the defaults).
+pub(crate) const fn default_link_establishment_max_age() -> Duration {
+    Duration::from_secs(15 * 60)
 }
 
 const fn default_request_body_bytes() -> u64 {

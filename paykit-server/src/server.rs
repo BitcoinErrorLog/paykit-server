@@ -1048,6 +1048,45 @@ impl MarkerDiscovery for PubkyMarkerDiscovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The marketplace's Bitcoin payment window: a request whose Encrypted
+    /// Link the wallet never answers must be reported failed inside it.
+    const MARKETPLACE_PAYMENT_WINDOW: Duration = Duration::from_secs(30 * 60);
+    /// Time left for the marketplace poll and the buyer to see the failure
+    /// and retry before the window closes.
+    const FAILURE_MARGIN: Duration = Duration::from_secs(10 * 60);
+
+    /// When a link-establishment row is exhausted under the default policy:
+    /// each claim increments `attempt_count`, the next claim is due one
+    /// `retry_delay` later, and `exhaust_claim_if_due` closes the row at the
+    /// first claim at the attempt ceiling or past the age ceiling.
+    fn default_link_exhaustion_time() -> Duration {
+        let initial = crate::config::default_retry_initial();
+        let maximum = crate::config::default_outbox_retry_max();
+        let max_attempts =
+            i32::try_from(crate::config::default_link_establishment_max_attempts()).unwrap();
+        let max_age = crate::config::default_link_establishment_max_age();
+        let mut claimed_at = Duration::ZERO;
+        let mut attempt_count = 0_i32;
+        loop {
+            attempt_count += 1;
+            if attempt_count >= max_attempts || claimed_at >= max_age {
+                return claimed_at;
+            }
+            claimed_at += retry_delay(initial, maximum, attempt_count);
+        }
+    }
+
+    #[test]
+    fn an_unanswered_link_fails_inside_the_payment_window_with_margin() {
+        let exhausted_at = default_link_exhaustion_time();
+        assert!(
+            exhausted_at + FAILURE_MARGIN <= MARKETPLACE_PAYMENT_WINDOW,
+            "an unanswered link fails after {exhausted_at:?}, leaving less than \
+             {FAILURE_MARGIN:?} of the {MARKETPLACE_PAYMENT_WINDOW:?} payment window"
+        );
+        assert_eq!(exhausted_at, Duration::from_secs(1111));
+    }
     use crate::config::ConfigEnvironment;
 
     const CONFIG_KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";

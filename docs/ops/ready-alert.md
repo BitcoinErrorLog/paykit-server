@@ -11,7 +11,7 @@ Schedule it every 60 seconds and attach a persistent Railway volume at `/data`.
 The state file retains the five-minute terminal-transition window across cron
 containers. The checker fails closed for unreachable endpoints, non-success
 HTTP, malformed or unknown readiness fields, non-ready dependencies, and drift
-from the deployed 20-attempt / 3600-second link-establishment contract.
+from the deployed 20-attempt / 900-second link-establishment contract.
 
 Set `ALERT_WEBHOOK_URL` on the Railway service. The value is provisioned by
 John and must never be committed or printed. When it is absent the checker logs
