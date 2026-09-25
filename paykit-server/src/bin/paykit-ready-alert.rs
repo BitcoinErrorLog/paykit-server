@@ -12,7 +12,7 @@ const DEFAULT_URL: &str = "https://paykit-shop.pubky.app/health/ready";
 const WINDOW_SECONDS: u64 = 5 * 60;
 const CRITICAL_AGE_SECONDS: i64 = 900;
 const EXPECTED_MAX_ATTEMPTS: u32 = 20;
-const EXPECTED_MAX_AGE_SECONDS: u64 = 3600;
+const EXPECTED_MAX_AGE_SECONDS: u64 = 900;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -275,7 +275,7 @@ mod tests {
             outbox_oldest_terminal_failure_age_seconds: None,
             outbox_terminal_failures_by_class: BTreeMap::new(),
             outbox_link_establishment_max_attempts: 20,
-            outbox_link_establishment_max_age_seconds: 3600,
+            outbox_link_establishment_max_age_seconds: 900,
         }
     }
 
@@ -314,7 +314,7 @@ mod tests {
             evaluate(&report, &State::default(), 1).unwrap(),
             Decision::Failure
         );
-        report.outbox_link_establishment_max_age_seconds = 3600;
+        report.outbox_link_establishment_max_age_seconds = 900;
         report
             .outbox_terminal_failures_by_class
             .insert("unknown".into(), 1);
