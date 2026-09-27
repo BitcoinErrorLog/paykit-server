@@ -6,12 +6,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 start=$(date +%s)
-LOCK="/Volumes/t7/vibes-dev/.locks/heavy.lock"
-
-run_heavy() {
-  mkdir -p "$(dirname "$LOCK")"
-  lockf "$LOCK" "$@"
-}
+# shellcheck source=heavy-lock.sh
+source "$ROOT/scripts/heavy-lock.sh"
 
 if [ ! -t 0 ]; then
   skip=1
@@ -102,11 +98,11 @@ if [ "$encryption" != "scram-sha-256" ] || [ "$host_all" != "scram-sha-256" ]; t
 fi
 
 echo "prepush: cargo clippy"
-run_heavy cargo clippy --locked --workspace --all-targets -- -D warnings
+run_heavy cargo cargo clippy --locked --workspace --all-targets -- -D warnings
 
 echo "prepush: cargo test"
 # Same split and --test-threads=1 as CI. --no-fail-fast still finishes the suite.
-run_heavy bash -c 'cargo test --locked -p paykit-server --no-fail-fast -- --test-threads=1 && cargo test --locked -p paykit-server-e2e --no-fail-fast -- --test-threads=1'
+run_heavy cargo bash -c 'cargo test --locked -p paykit-server --no-fail-fast -- --test-threads=1 && cargo test --locked -p paykit-server-e2e --no-fail-fast -- --test-threads=1'
 
 sha="$(git rev-parse HEAD)"
 seconds="$(( $(date +%s) - start ))"
