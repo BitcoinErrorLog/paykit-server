@@ -1765,8 +1765,8 @@ impl InvoiceStore {
     /// tick, never performed by a request handler. Both guards are
     /// timestamp-derived from `expires_at` on the server clock: at
     /// `expires_at` an `observing` invoice moves to `expired_tail` (still
-    /// observed, deprioritized behind live targets; observations there
-    /// carry `late_settlement`), and at `expires_at + tail` it moves to
+    /// observed, deprioritized behind live targets; outputs first seen
+    /// there carry `late_settlement`), and at `expires_at + tail` it moves to
     /// `expired_final` and leaves `observation_plan()` for good. Exactly at
     /// `expires_at` the invoice is still `observing` (`now > expires_at`
     /// is the guard, not `>=`).
@@ -2293,7 +2293,7 @@ impl InvoiceStore {
             return Ok(false);
         };
         // §B.9: observation does not stop at expiry. An `expired_tail`
-        // invoice is still observed; anything recorded there is a late
+        // invoice is still observed; an output first seen there is a late
         // settlement and can never drive `paid` — the marketplace routes it
         // to `manual_review` on the flag. Every other state (prepared,
         // final, void, resolved) no-ops exactly as before.
@@ -2331,9 +2331,11 @@ impl InvoiceStore {
             return Ok(true);
         }
 
-        let approved_candidate_lateness: Option<Option<bool>> = sqlx::query_scalar(
-            "SELECT late_settlement FROM bitcoin_observation_candidates
-             WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND approved",
+        // A candidate row, approved or still pending, is the first sighting
+        // of an output first seen already confirmed.
+        let candidate: Option<(bool, Option<bool>)> = sqlx::query_as(
+            "SELECT approved, late_settlement FROM bitcoin_observation_candidates
+             WHERE invoice_id = $1 AND txid = $2 AND vout = $3",
         )
         .bind(invoice.id)
         .bind(&txid)
@@ -2341,7 +2343,7 @@ impl InvoiceStore {
         .fetch_optional(&mut **tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
-        let approved_candidate = approved_candidate_lateness.is_some();
+        let approved_candidate = candidate.is_some_and(|(approved, _)| approved);
         let baseline_entries = sqlx::query_as::<_, (String, String, i32)>(BASELINE_ENTRIES_SQL)
             .bind(invoice.id)
             .fetch_all(&mut **tx)
@@ -2379,6 +2381,44 @@ impl InvoiceStore {
         {
             return Ok(true);
         }
+
+        // An outpoint's value is fixed by consensus. A different amount for
+        // an outpoint already recorded as an observation, or as a candidate
+        // (which exists only at the exact required amount), is an observer
+        // integrity failure, never a correction of the first-seen amount.
+        // Checked before a candidate is written so that a mismatch can never
+        // reach candidate resolution.
+        let outpoint_lookup_hash = self
+            .crypto
+            .bitcoin_outpoint_lookup_hash(outpoint.as_bytes());
+        let existing_outpoint = sqlx::query_as::<_, BitcoinObservationRow>(
+            "SELECT id, invoice_id, observation_envelope, outpoint_lookup_hash,
+                    confirmations, present
+             FROM bitcoin_observations WHERE outpoint_lookup_hash = $1 FOR UPDATE",
+        )
+        .bind(outpoint_lookup_hash.as_bytes().as_slice())
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if existing_outpoint
+            .as_ref()
+            .is_some_and(|row| row.invoice_id != invoice.id)
+        {
+            return Err(PersistenceError::Conflict);
+        }
+        if let Some(row) = existing_outpoint.as_ref() {
+            let record = self.decrypt_observation(creator_hash, row)?;
+            if record.outpoint != outpoint
+                || row.outpoint_lookup_hash != outpoint_lookup_hash.as_bytes()
+                || record.observed_sats != observed_sats
+            {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+        }
+        if candidate.is_some() && observed_sats != required {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+
         if crate::bitcoin::amount_matches(present, observed_sats, required)
             && confirmations > 0
             && !approved_candidate
@@ -2419,36 +2459,6 @@ impl InvoiceStore {
             return Ok(true);
         }
 
-        let outpoint_lookup_hash = self
-            .crypto
-            .bitcoin_outpoint_lookup_hash(outpoint.as_bytes());
-        let existing_outpoint = sqlx::query_as::<_, BitcoinObservationRow>(
-            "SELECT id, invoice_id, observation_envelope, outpoint_lookup_hash,
-                    confirmations, present
-             FROM bitcoin_observations WHERE outpoint_lookup_hash = $1 FOR UPDATE",
-        )
-        .bind(outpoint_lookup_hash.as_bytes().as_slice())
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|_| PersistenceError::Unavailable)?;
-        if existing_outpoint
-            .as_ref()
-            .is_some_and(|row| row.invoice_id != invoice.id)
-        {
-            return Err(PersistenceError::Conflict);
-        }
-        if let Some(row) = existing_outpoint.as_ref() {
-            let record = self.decrypt_observation(creator_hash, row)?;
-            // An outpoint's value is fixed by consensus. A different amount
-            // for a recorded outpoint is an observer integrity failure, never
-            // a correction of the first-seen amount.
-            if record.outpoint != outpoint
-                || row.outpoint_lookup_hash != outpoint_lookup_hash.as_bytes()
-                || record.observed_sats != observed_sats
-            {
-                return Err(PersistenceError::CorruptOrMissing);
-            }
-        }
         let active = sqlx::query_as::<_, BitcoinObservationRow>(
             "SELECT id, invoice_id, observation_envelope, outpoint_lookup_hash,
                     confirmations, present
@@ -2502,28 +2512,35 @@ impl InvoiceStore {
         let observation_id = existing_outpoint
             .as_ref()
             .map_or_else(Uuid::new_v4, |row| row.id);
-        let observation_plaintext = postcard::to_allocvec(&BitcoinObservationV1 {
-            version: 1,
-            outpoint: outpoint.to_owned(),
-            observed_sats,
-        })
-        .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let observation_envelope = self
-            .crypto
-            .encrypt(
-                &EnvelopeContext::bitcoin_observation_for_invoice(
-                    creator_hash,
-                    observation_id,
-                    invoice.id,
-                ),
-                &observation_plaintext,
-            )
-            .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        // A candidate-approved output was first seen when its candidate was
-        // recorded; NULL is a candidate written before lateness was stored.
-        let late_settlement = match approved_candidate_lateness {
-            Some(Some(candidate_late)) => candidate_late,
-            Some(None) | None => seen_in_tail,
+        let observation_envelope = match existing_outpoint.as_ref() {
+            Some(row) => row.observation_envelope.clone(),
+            None => {
+                let observation_plaintext = postcard::to_allocvec(&BitcoinObservationV1 {
+                    version: 1,
+                    outpoint: outpoint.to_owned(),
+                    observed_sats,
+                })
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                self.crypto
+                    .encrypt(
+                        &EnvelopeContext::bitcoin_observation_for_invoice(
+                            creator_hash,
+                            observation_id,
+                            invoice.id,
+                        ),
+                        &observation_plaintext,
+                    )
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?
+                    .as_bytes()
+                    .to_vec()
+            }
+        };
+        // An output first seen already confirmed was first seen when its
+        // candidate was recorded; NULL is a candidate written before
+        // lateness was stored.
+        let late_settlement = match candidate {
+            Some((_, Some(candidate_late))) => candidate_late,
+            Some((_, None)) | None => seen_in_tail,
         };
         // The conflict arm only refreshes the current chain facts
         // (confirmations, presence, active binding). The envelope (outpoint
@@ -2540,7 +2557,7 @@ impl InvoiceStore {
         )
         .bind(observation_id)
         .bind(invoice.id)
-        .bind(observation_envelope.as_bytes())
+        .bind(observation_envelope.as_slice())
         .bind(outpoint_lookup_hash.as_bytes().as_slice())
         .bind(confirmations)
         .bind(present)

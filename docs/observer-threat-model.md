@@ -610,8 +610,10 @@ rather than silence, and the marketplace's money-outcome record is one-way.*
   re-sighting of the same outpoint keeps it. A different outpoint (a
   replacement) is a new payment fact with its own first sighting, because
   address-scoped `listunspent` cannot prove it conflicts with the earlier
-  one. A different amount reported for a recorded outpoint is an integrity
-  failure that excludes the invoice from further batches, never an update.
+  one. A different amount reported for an outpoint already recorded as an
+  observation or a candidate is an integrity failure that excludes the
+  invoice from further batches, never an update; it is refused before any
+  candidate is written, so it cannot reach candidate resolution.
 - **The status contract is versioned, and `allocation_mode` is mandatory
   (W1.14).** Every `/transactions/status` response carries
   `contract_version: "paykit.bitcoin_status/v2"` and an `allocation_mode`

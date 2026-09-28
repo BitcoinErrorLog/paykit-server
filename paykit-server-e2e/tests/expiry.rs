@@ -27,7 +27,8 @@
 //!   an output first seen in the tail stays late; a replacement outpoint
 //!   first seen in the tail is late; replays never rewrite the envelope,
 //!   `created_at` or lateness; a different amount for a recorded outpoint
-//!   is an integrity failure.
+//!   or candidate is an integrity failure that never reaches candidate
+//!   resolution.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -1933,5 +1934,149 @@ async fn a_different_amount_for_a_recorded_outpoint_is_an_integrity_failure() {
     let after = status(&stack, REFERENCE_A).await;
     assert_eq!(after, before);
     assert_eq!(after["amount_matched"], true);
+    stack.shutdown().await;
+}
+
+/// Reorg of a still-pending candidate: an output first seen confirmed inside
+/// the window, whose candidate is not yet resolved when a reorg returns it
+/// to the mempool after `expires_at`, is written as an observation that
+/// keeps the candidate's on-time first sighting, before and after the
+/// candidate resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn pending_candidate_reorged_to_mempool_after_expiry_stays_on_time() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(171).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let paid = test_outpoint(93, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 1, Some(310), true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        candidate_lateness(&stack.pool, &invoice_id).await,
+        Some(false)
+    );
+    tail_invoice(&stack, &invoice_id).await;
+
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 0, None, true)
+            .await
+            .unwrap()
+    );
+    let rows = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(rows.len(), 1);
+    assert!(!rows[0].0, "the pending candidate is the first sighting");
+    assert_eq!(status(&stack, REFERENCE_A).await["late_settlement"], false);
+
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 1, Some(311), true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    assert!(!late_settlement_flag(&stack.pool, &invoice_id).await);
+    let body = status(&stack, REFERENCE_A).await;
+    assert_eq!(body["late_settlement"], false);
+    assert_eq!(body["status"], "confirmed");
+    stack.shutdown().await;
+}
+
+/// A different amount for an outpoint is refused before any candidate is
+/// written, and a direct observation that contradicts a candidate's exact
+/// amount is refused too, so no mismatch can wedge candidate resolution.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_different_amount_never_reaches_candidate_resolution() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(172).await;
+    let corrupt = |result: Result<bool, paykit_server::persistence::PersistenceError>| {
+        matches!(
+            result,
+            Err(paykit_server::persistence::PersistenceError::CorruptOrMissing)
+        )
+    };
+    let candidate_count = |invoice_id: String| {
+        let pool = stack.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM bitcoin_observation_candidates WHERE invoice_id = $1",
+            )
+            .bind(uuid::Uuid::parse_str(&invoice_id).unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let (row_id, row_address, row_total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let row_outpoint = test_outpoint(94, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(&row_address, &row_outpoint, row_total - 1, 0, None, true)
+            .await
+            .unwrap()
+    );
+    assert!(corrupt(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(
+                &row_address,
+                &row_outpoint,
+                row_total,
+                1,
+                Some(301),
+                true
+            )
+            .await
+    ));
+    assert_eq!(candidate_count(row_id.clone()).await, 0);
+    assert!(stack.store.pending_candidates().await.unwrap().is_empty());
+
+    let (candidate_id, candidate_address, candidate_total) =
+        activated_invoice(&stack, REFERENCE_B, 1).await;
+    let candidate_outpoint = test_outpoint(95, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(
+                &candidate_address,
+                &candidate_outpoint,
+                candidate_total,
+                1,
+                Some(301),
+                true
+            )
+            .await
+            .unwrap()
+    );
+    assert!(corrupt(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(
+                &candidate_address,
+                &candidate_outpoint,
+                candidate_total - 1,
+                0,
+                None,
+                true
+            )
+            .await
+    ));
+    assert!(
+        observation_rows(&stack.pool, &candidate_id)
+            .await
+            .is_empty()
+    );
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    let body = status(&stack, REFERENCE_B).await;
+    assert_eq!(body["status"], "confirmed");
+    assert_eq!(body["amount_matched"], true);
     stack.shutdown().await;
 }
