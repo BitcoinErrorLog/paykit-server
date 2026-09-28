@@ -588,7 +588,7 @@ rather than silence, and the marketplace's money-outcome record is one-way.*
   but ordered after every live target in the §B.7 budget (the budget
   admits the plan's prefix, so ordering IS the deprioritisation);
   `expired_final` leaves `observation_plan()` for good.
-- **A late settlement never settles.** Any eligible observation recorded
+- **A late settlement never settles.** Any eligible output first seen
   while the invoice is `expired_tail` is written with
   `late_settlement = true` and can never drive `paid` — including for a
   `shared_manual` creator and including at `confirmed` with the exact
@@ -599,6 +599,19 @@ rather than silence, and the marketplace's money-outcome record is one-way.*
   human, not silence. Nothing is silently dropped: the observation is
   recorded factually (`confirmed`, `amount_matched`), and the flag — not
   the absence of a record — is what blocks settlement.
+- **First-seen facts are monotonic.** Lateness, the outpoint, its amount
+  and the observation's `created_at` are fixed at the output's first
+  sighting. An output first seen while `observing` stays on time when it is
+  re-observed, disappears and reappears, or confirms during
+  `expired_tail`; an output first seen in the tail stays late. For an
+  output first seen already confirmed, the first sighting is its
+  `bitcoin_observation_candidates` row, which carries the lateness into the
+  observation written after transaction resolution; a lower-height
+  re-sighting of the same outpoint keeps it. A different outpoint (a
+  replacement) is a new payment fact with its own first sighting, because
+  address-scoped `listunspent` cannot prove it conflicts with the earlier
+  one. A different amount reported for a recorded outpoint is an integrity
+  failure that excludes the invoice from further batches, never an update.
 - **The status contract is versioned, and `allocation_mode` is mandatory
   (W1.14).** Every `/transactions/status` response carries
   `contract_version: "paykit.bitcoin_status/v2"` and an `allocation_mode`

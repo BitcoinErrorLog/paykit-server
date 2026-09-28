@@ -868,7 +868,7 @@ pub struct BitcoinConfig {
     /// `expired_tail → expired_final` at `expires_at + expiry_tail`, both
     /// timestamp-derived from `expires_at` on the server clock. Through the
     /// tail the invoice is still observed, deprioritized behind live
-    /// targets; observations recorded there carry `late_settlement`.
+    /// targets; outputs first seen there carry `late_settlement`.
     pub expiry_tail: Duration,
 }
 

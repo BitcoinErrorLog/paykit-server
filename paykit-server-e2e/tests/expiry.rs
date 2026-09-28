@@ -20,7 +20,14 @@
 //! - an eligible observation in the tail is recorded with
 //!   `late_settlement = true` and can never drive settlement — for an
 //!   `exclusive` creator and for a `shared_manual` creator at the exact
-//!   amount, with the flag carried on `/transactions/status`.
+//!   amount, with the flag carried on `/transactions/status`;
+//! - first-seen facts are monotonic: an output first seen inside the
+//!   window stays on time when it is re-observed, disappears and
+//!   reappears, or confirms in the tail (directly or through a candidate);
+//!   an output first seen in the tail stays late; a replacement outpoint
+//!   first seen in the tail is late; replays never rewrite the envelope,
+//!   `created_at` or lateness; a different amount for a recorded outpoint
+//!   is an integrity failure.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -1399,5 +1406,532 @@ async fn late_settlement_holds_for_a_shared_manual_creator_with_exact_amount() {
     assert_eq!(late_status["late_settlement"], true);
     assert_eq!(late_status["status"], "confirmed");
     assert_eq!(late_status["amount_matched"], true);
+    stack.shutdown().await;
+}
+
+fn test_outpoint(byte: u8, vout: u32) -> BitcoinOutpoint {
+    BitcoinOutpoint::from_bitcoin(OutPoint::new(Txid::from_byte_array([byte; 32]), vout))
+}
+
+/// The first-seen facts of one invoice's observation rows, oldest first:
+/// (late_settlement, created_at, observation_envelope, confirmations,
+/// present, active).
+type ObservationFacts = (bool, time::OffsetDateTime, Vec<u8>, i32, bool, bool);
+
+async fn observation_rows(pool: &PgPool, invoice_id: &str) -> Vec<ObservationFacts> {
+    sqlx::query_as(
+        "SELECT late_settlement, created_at, observation_envelope, confirmations, present, active
+         FROM bitcoin_observations WHERE invoice_id = $1 ORDER BY created_at, id",
+    )
+    .bind(uuid::Uuid::parse_str(invoice_id).unwrap())
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+async fn candidate_lateness(pool: &PgPool, invoice_id: &str) -> Option<bool> {
+    sqlx::query_scalar(
+        "SELECT late_settlement FROM bitcoin_observation_candidates WHERE invoice_id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(invoice_id).unwrap())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Drives every pending candidate through the production resolution path
+/// with inputs outside the creation baseline, as the observer's
+/// transaction fetch would.
+async fn resolve_pending_candidates(stack: &BootedStack) -> usize {
+    let candidates = stack.store.pending_candidates().await.unwrap();
+    for candidate in &candidates {
+        stack
+            .store
+            .resolve_candidate(
+                candidate,
+                &[OutPoint::new(Txid::from_byte_array([250; 32]), 0)],
+            )
+            .await
+            .unwrap();
+    }
+    candidates.len()
+}
+
+/// Moves one activated invoice into `expired_tail` through the production
+/// expiry pass.
+async fn tail_invoice(stack: &BootedStack, invoice_id: &str) {
+    shift_expires_at(&stack.pool, invoice_id, -60).await;
+    apply_transitions(stack).await;
+    assert_eq!(
+        baseline_state(&stack.pool, invoice_id).await,
+        "expired_tail"
+    );
+}
+
+/// Order 131a7457: an output seen at 0 confirmations inside the window,
+/// re-observed after `expires_at` and confirmed in the tail through the
+/// observer's candidate path, stays on time. Every first-seen fact of the
+/// row (lateness, amount envelope, `created_at`) survives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn first_seen_before_expiry_confirmed_after_expiry_stays_on_time() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(163).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let paid = test_outpoint(81, 0);
+
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(&address, &paid, total, 0, None, true)
+            .await
+            .unwrap()
+    );
+    let first = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(first.len(), 1);
+    assert!(!first[0].0, "seen inside the window: on time");
+
+    tail_invoice(&stack, &invoice_id).await;
+    // The unconfirmed re-observations the observer keeps making in the tail.
+    for _ in 0..2 {
+        assert!(
+            stack
+                .store
+                .apply_bitcoin_observation_at_height(&address, &paid, total, 0, None, true)
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(status(&stack, REFERENCE_A).await["late_settlement"], false);
+
+    // The confirmation arrives in the tail through the candidate path.
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 1, Some(301), true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+
+    let rows = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(rows.len(), 1, "the same outpoint never gains a second row");
+    let (late, created_at, envelope, confirmations, present, active) = &rows[0];
+    assert!(
+        !late,
+        "an output first seen before expiry must stay on time"
+    );
+    assert_eq!(*created_at, first[0].1, "first-seen time is immutable");
+    assert_eq!(
+        envelope, &first[0].2,
+        "the first-seen amount envelope is kept"
+    );
+    assert_eq!((*confirmations, *present, *active), (1, true, true));
+    let body = status(&stack, REFERENCE_A).await;
+    assert_eq!(body["late_settlement"], false);
+    assert_eq!(body["status"], "confirmed");
+    assert_eq!(body["amount_matched"], true);
+    assert_eq!(
+        baseline_state(&stack.pool, &invoice_id).await,
+        "expired_tail"
+    );
+    stack.shutdown().await;
+}
+
+/// An output first seen already confirmed inside the window becomes a
+/// candidate; when its transaction is resolved only after `expires_at`, the
+/// observation inherits the candidate's on-time first sighting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn candidate_first_seen_before_expiry_resolved_after_expiry_stays_on_time() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(164).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let paid = test_outpoint(82, 0);
+
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 1, Some(301), true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        candidate_lateness(&stack.pool, &invoice_id).await,
+        Some(false)
+    );
+    assert!(observation_rows(&stack.pool, &invoice_id).await.is_empty());
+
+    tail_invoice(&stack, &invoice_id).await;
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+
+    let rows = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(rows.len(), 1);
+    assert!(
+        !rows[0].0,
+        "the candidate's on-time sighting is the first sighting"
+    );
+    let body = status(&stack, REFERENCE_A).await;
+    assert_eq!(body["late_settlement"], false);
+    assert_eq!(body["status"], "confirmed");
+    stack.shutdown().await;
+}
+
+/// A genuinely late payment stays late through every later event: first
+/// seen unconfirmed in the tail and confirmed there, and first seen
+/// confirmed in the tail through the candidate path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn first_seen_in_tail_stays_late_through_confirmation() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(165).await;
+
+    let (unconfirmed_id, unconfirmed_address, unconfirmed_total) =
+        activated_invoice(&stack, REFERENCE_A, 0).await;
+    tail_invoice(&stack, &unconfirmed_id).await;
+    let late_paid = test_outpoint(83, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(
+                &unconfirmed_address,
+                &late_paid,
+                unconfirmed_total,
+                0,
+                None,
+                true
+            )
+            .await
+            .unwrap()
+    );
+    assert!(late_settlement_flag(&stack.pool, &unconfirmed_id).await);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(
+                &unconfirmed_address,
+                &late_paid,
+                unconfirmed_total,
+                1,
+                Some(301),
+                true
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    assert!(late_settlement_flag(&stack.pool, &unconfirmed_id).await);
+    let body = status(&stack, REFERENCE_A).await;
+    assert_eq!(body["late_settlement"], true);
+    assert_eq!(body["status"], "confirmed");
+
+    let (confirmed_id, confirmed_address, confirmed_total) =
+        activated_invoice(&stack, REFERENCE_B, 1).await;
+    tail_invoice(&stack, &confirmed_id).await;
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(
+                &confirmed_address,
+                &test_outpoint(84, 0),
+                confirmed_total,
+                1,
+                Some(301),
+                true
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        candidate_lateness(&stack.pool, &confirmed_id).await,
+        Some(true),
+        "a candidate first seen in the tail records late"
+    );
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    assert!(late_settlement_flag(&stack.pool, &confirmed_id).await);
+    assert_eq!(status(&stack, REFERENCE_B).await["late_settlement"], true);
+    stack.shutdown().await;
+}
+
+/// Reorg: an on-time output that drops out of the address's unspent set
+/// and reappears confirmed after `expires_at` is the same payment fact and
+/// stays on time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn on_time_output_that_disappears_and_reappears_after_expiry_stays_on_time() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(166).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let paid = test_outpoint(85, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(&address, &paid, total, 0, None, true)
+            .await
+            .unwrap()
+    );
+    tail_invoice(&stack, &invoice_id).await;
+
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 0, None, false)
+            .await
+            .unwrap()
+    );
+    let gone = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(gone.len(), 1);
+    assert!(!gone[0].4, "the disappearance is recorded");
+    assert!(!gone[0].0);
+    assert_eq!(status(&stack, REFERENCE_A).await["status"], "undetected");
+
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 1, Some(302), true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    let rows = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(rows.len(), 1);
+    assert!(!rows[0].0, "a reappearing on-time output stays on time");
+    assert!(rows[0].4);
+    assert_eq!(rows[0].1, gone[0].1);
+    let body = status(&stack, REFERENCE_A).await;
+    assert_eq!(body["late_settlement"], false);
+    assert_eq!(body["status"], "confirmed");
+    stack.shutdown().await;
+}
+
+/// Reorg of a confirmed-first candidate: the same outpoint re-mined at a
+/// lower height after `expires_at` replaces the candidate's height but
+/// keeps its on-time first sighting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn candidate_reorged_to_lower_height_after_expiry_keeps_first_seen_lateness() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(167).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let paid = test_outpoint(86, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 1, Some(310), true)
+            .await
+            .unwrap()
+    );
+    tail_invoice(&stack, &invoice_id).await;
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 6, Some(305), true)
+            .await
+            .unwrap()
+    );
+    let height: i32 = sqlx::query_scalar(
+        "SELECT confirmed_height FROM bitcoin_observation_candidates WHERE invoice_id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&invoice_id).unwrap())
+    .fetch_one(&stack.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        height, 305,
+        "the lower-height sighting replaced the candidate"
+    );
+    assert_eq!(
+        candidate_lateness(&stack.pool, &invoice_id).await,
+        Some(false)
+    );
+
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    assert!(!late_settlement_flag(&stack.pool, &invoice_id).await);
+    assert_eq!(status(&stack, REFERENCE_A).await["late_settlement"], false);
+    stack.shutdown().await;
+}
+
+/// Replacement: a different outpoint first seen after `expires_at` is a new
+/// payment fact and is late, both as a direct replacement of an on-time
+/// unconfirmed binding and as a lower-height candidate replacing an on-time
+/// candidate. The replaced on-time row keeps its own first-seen facts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn replacement_first_seen_after_expiry_is_late() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(168).await;
+
+    let (direct_id, direct_address, direct_total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(
+                &direct_address,
+                &test_outpoint(87, 0),
+                direct_total,
+                0,
+                None,
+                true
+            )
+            .await
+            .unwrap()
+    );
+    tail_invoice(&stack, &direct_id).await;
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(
+                &direct_address,
+                &test_outpoint(88, 0),
+                direct_total,
+                1,
+                Some(301),
+                true
+            )
+            .await
+            .unwrap()
+    );
+    let rows = observation_rows(&stack.pool, &direct_id).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        (rows[0].0, rows[0].5),
+        (false, false),
+        "original: on time, inactive"
+    );
+    assert_eq!(
+        (rows[1].0, rows[1].5),
+        (true, true),
+        "replacement: late, active"
+    );
+    assert_eq!(status(&stack, REFERENCE_A).await["late_settlement"], true);
+
+    let (candidate_id, candidate_address, candidate_total) =
+        activated_invoice(&stack, REFERENCE_B, 1).await;
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(
+                &candidate_address,
+                &test_outpoint(89, 0),
+                candidate_total,
+                1,
+                Some(310),
+                true
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        candidate_lateness(&stack.pool, &candidate_id).await,
+        Some(false)
+    );
+    tail_invoice(&stack, &candidate_id).await;
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(
+                &candidate_address,
+                &test_outpoint(90, 0),
+                candidate_total,
+                6,
+                Some(305),
+                true
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        candidate_lateness(&stack.pool, &candidate_id).await,
+        Some(true),
+        "a different outpoint does not inherit the replaced candidate's lateness"
+    );
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    assert!(late_settlement_flag(&stack.pool, &candidate_id).await);
+    assert_eq!(status(&stack, REFERENCE_B).await["late_settlement"], true);
+    stack.shutdown().await;
+}
+
+/// Replays of an identical observation, before and after `expires_at`,
+/// change only the current chain facts; the stored envelope bytes,
+/// `created_at` and lateness are the first sighting's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn replayed_observations_never_rewrite_first_seen_facts() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(169).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let paid = test_outpoint(91, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(&address, &paid, total, 0, None, true)
+            .await
+            .unwrap()
+    );
+    let first = observation_rows(&stack.pool, &invoice_id).await;
+    for _ in 0..3 {
+        assert!(
+            stack
+                .store
+                .apply_bitcoin_observation(&address, &paid, total, 0, None, true)
+                .await
+                .unwrap()
+        );
+    }
+    tail_invoice(&stack, &invoice_id).await;
+    for confirmations in [0, 2, 2] {
+        let height = (confirmations > 0).then_some(301);
+        assert!(
+            stack
+                .store
+                .apply_bitcoin_observation(&address, &paid, total, confirmations, height, true)
+                .await
+                .unwrap()
+        );
+    }
+    let rows = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, first[0].0);
+    assert_eq!(rows[0].1, first[0].1);
+    assert_eq!(
+        rows[0].2, first[0].2,
+        "a replay must not re-encrypt the envelope"
+    );
+    assert_eq!(rows[0].3, 2);
+    assert!(!rows[0].0);
+    assert_eq!(status(&stack, REFERENCE_A).await["late_settlement"], false);
+    stack.shutdown().await;
+}
+
+/// An outpoint's value is fixed by consensus: a different amount reported
+/// for a recorded outpoint is refused as an integrity failure and leaves
+/// the first-seen row and the invoice's payment facts untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn a_different_amount_for_a_recorded_outpoint_is_an_integrity_failure() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(170).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let paid = test_outpoint(92, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(&address, &paid, total, 0, None, true)
+            .await
+            .unwrap()
+    );
+    let first = observation_rows(&stack.pool, &invoice_id).await;
+    let before = status(&stack, REFERENCE_A).await;
+
+    for sats in [total + 1, total - 1] {
+        let result = stack
+            .store
+            .apply_bitcoin_observation(&address, &paid, sats, 0, None, true)
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(paykit_server::persistence::PersistenceError::CorruptOrMissing)
+            ),
+            "a rewritten amount must be refused, got {result:?}"
+        );
+    }
+    let rows = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(rows, first, "the first-seen row is untouched");
+    let after = status(&stack, REFERENCE_A).await;
+    assert_eq!(after, before);
+    assert_eq!(after["amount_matched"], true);
     stack.shutdown().await;
 }
