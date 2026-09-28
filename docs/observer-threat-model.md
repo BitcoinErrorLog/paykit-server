@@ -604,16 +604,27 @@ rather than silence, and the marketplace's money-outcome record is one-way.*
   sighting. An output first seen while `observing` stays on time when it is
   re-observed, disappears and reappears, or confirms during
   `expired_tail`; an output first seen in the tail stays late. For an
-  output first seen already confirmed, the first sighting is its
-  `bitcoin_observation_candidates` row, which carries the lateness into the
-  observation written after transaction resolution; a lower-height
-  re-sighting of the same outpoint keeps it. A different outpoint (a
-  replacement) is a new payment fact with its own first sighting, because
-  address-scoped `listunspent` cannot prove it conflicts with the earlier
-  one. A different amount reported for an outpoint already recorded as an
-  observation or a candidate is an integrity failure that excludes the
-  invoice from further batches, never an update; it is refused before any
-  candidate is written, so it cannot reach candidate resolution.
+  output first seen already confirmed, the first sighting is its own
+  `bitcoin_observation_candidates` row (one per outpoint), whose lateness
+  and `created_at` carry into the observation written when its transaction
+  is resolved; a lower-height re-sighting of the same outpoint keeps them.
+  A different outpoint (a replacement) is a new payment fact with its own
+  first sighting, because address-scoped `listunspent` cannot prove it
+  conflicts with the earlier one.
+- **No report hides or drops a payment.** A report that contradicts a
+  recorded fact (a different amount for a recorded outpoint or candidate,
+  or an outpoint already recorded under another invoice) is refused and
+  counted in `bitcoin_observation_refusals` (readable by `paykit_readonly`,
+  first refusal logged at ERROR). It never quarantines the invoice or
+  aborts the observer batch, so the invoice's valid payment keeps being
+  observed and resolved. An output that cannot take the binding because the
+  current binding is final or a confirmed exact payment is recorded as an
+  inactive observation with its own first-seen facts and logged at WARN; it
+  does not change the invoice's payment status. Candidate approval commits
+  together with its observation, a candidate whose resolution fails in
+  persistence rotates behind the others, candidates of a final invoice
+  still resolve, and an invoice with a pending candidate stays
+  `expired_tail` until the candidate resolves or becomes unfetchable.
 - **The status contract is versioned, and `allocation_mode` is mandatory
   (W1.14).** Every `/transactions/status` response carries
   `contract_version: "paykit.bitcoin_status/v2"` and an `allocation_mode`
