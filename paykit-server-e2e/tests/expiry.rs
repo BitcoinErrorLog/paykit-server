@@ -2262,12 +2262,25 @@ async fn additional_output_after_finality_is_recorded_not_dropped() {
     let stack = boot(175).await;
     let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
     let bound = test_outpoint(121, 0);
+    let pending = test_outpoint(124, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &pending, total, 1, Some(304), true)
+            .await
+            .unwrap()
+    );
     assert!(
         stack
             .store
             .apply_bitcoin_observation(&address, &bound, total, 6, Some(301), true)
             .await
             .unwrap()
+    );
+    assert_eq!(
+        resolve_pending_candidates(&stack).await,
+        1,
+        "a candidate pending when the binding became final still resolves"
     );
     let final_status = status(&stack, REFERENCE_A).await;
     assert_eq!(final_status["confirmations"], 6);
@@ -2301,13 +2314,16 @@ async fn additional_output_after_finality_is_recorded_not_dropped() {
             .unwrap()
     );
     let rows = observation_rows(&stack.pool, &invoice_id).await;
-    assert_eq!(rows.len(), 3, "every output is recorded");
+    assert_eq!(rows.len(), 4, "every output is recorded");
     assert_eq!(
-        (rows[0].3, rows[0].5),
-        (6, true),
+        rows.iter().filter(|row| row.5).count(),
+        1,
+        "only the final binding is active"
+    );
+    assert!(
+        rows.iter().any(|row| row.5 && row.3 == 6),
         "the final binding is unchanged"
     );
-    assert!(!rows[1].5 && !rows[2].5, "additional outputs are unbound");
     assert_eq!(status(&stack, REFERENCE_A).await, final_status);
     stack.shutdown().await;
 }
