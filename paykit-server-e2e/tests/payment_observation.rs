@@ -1807,17 +1807,36 @@ async fn underpayment_is_nonfinal_replaceable_and_outpoints_stay_globally_unique
         facts(&database, invoice_id).await,
         ("confirmed".into(), 20, false)
     );
+    assert_eq!(
+        store
+            .apply_bitcoin_observation(
+                &address,
+                &persisted_outpoint("underpaid"),
+                100,
+                0,
+                None,
+                true,
+            )
+            .await
+            .unwrap_err(),
+        PersistenceError::CorruptOrMissing,
+        "a recorded outpoint's amount is immutable"
+    );
     store
         .apply_bitcoin_observation(
             &address,
             &persisted_outpoint("underpaid"),
-            100,
+            99,
             0,
             None,
             true,
         )
         .await
         .unwrap();
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("detected".into(), 0, false)
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM bitcoin_observations WHERE invoice_id = $1",
