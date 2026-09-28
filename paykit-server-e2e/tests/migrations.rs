@@ -39,7 +39,7 @@ fn migrator_through(version: i64) -> Migrator {
     }
 }
 
-const REQUIRED_TABLES: [&str; 17] = [
+const REQUIRED_TABLES: [&str; 18] = [
     "deployment_metadata",
     "creators",
     "sdk_states",
@@ -57,9 +57,10 @@ const REQUIRED_TABLES: [&str; 17] = [
     "sdk_outbound_invocations",
     "setup_flow_cancellations",
     "observer_leadership",
+    "bitcoin_observation_refusals",
 ];
 
-const ACCOUNT_RETENTION_REGISTRY: [&str; 15] = [
+const ACCOUNT_RETENTION_REGISTRY: [&str; 16] = [
     "deployment_metadata",
     "creators",
     "sdk_states",
@@ -75,6 +76,7 @@ const ACCOUNT_RETENTION_REGISTRY: [&str; 15] = [
     "sentinel_events",
     "outbox_terminal_events",
     "sdk_outbound_invocations",
+    "bitcoin_observation_refusals",
 ];
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
@@ -271,7 +273,7 @@ fn release_checksum_manifest_pins_unapplied_migrations() {
     let migration_0026 =
         include_bytes!("../../paykit-server/migrations/0026_observer_leadership_lease.sql");
     let migration_0027 =
-        include_bytes!("../../paykit-server/migrations/0027_candidate_first_seen_lateness.sql");
+        include_bytes!("../../paykit-server/migrations/0027_first_seen_payment_facts.sql");
     let checksum_0024 = format!("{:x}", Sha512::digest(migration_0024));
     let checksum_0025 = format!("{:x}", Sha512::digest(migration_0025));
     let checksum_0026 = format!("{:x}", Sha512::digest(migration_0026));
@@ -1958,9 +1960,11 @@ async fn payment_request_expiry_migration_backfills_and_constrains() {
 /// 0027 adds a nullable first-seen `late_settlement` to candidates. A
 /// candidate of an invoice that never entered the tail is backfilled on
 /// time; a candidate of an invoice that has entered the tail stays NULL
-/// (the observation write then falls back to the invoice state).
+/// (the observation write then falls back to the invoice state). Candidates
+/// are keyed per outpoint afterwards, and refusals have their own table
+/// that the runtime and operations roles can use.
 #[tokio::test]
-async fn candidate_lateness_migration_backfills_only_provably_on_time_rows() {
+async fn first_seen_facts_migration_backfills_rekeys_candidates_and_adds_refusals() {
     let _migration_test_guard = migration_test_lock().lock().await;
     let database = TestDatabase::create().await;
     let pool = database.pool();
@@ -2041,8 +2045,41 @@ async fn candidate_lateness_migration_backfills_only_provably_on_time_rows() {
     .unwrap();
     assert_eq!(
         nullable, "YES",
-        "a pre-0027 binary must still insert candidates"
+        "rows written before 0027 carry no lateness"
     );
+
+    sqlx::query(
+        "INSERT INTO bitcoin_observation_candidates
+         (invoice_id, txid, vout, confirmations, confirmed_height, late_settlement)
+         VALUES ($1, $2, 0, 1, 501, TRUE)",
+    )
+    .bind(live)
+    .bind("cc".repeat(32))
+    .execute(pool)
+    .await
+    .expect("a second outpoint for the same invoice is its own candidate");
+    let duplicate = sqlx::query(
+        "INSERT INTO bitcoin_observation_candidates
+         (invoice_id, txid, vout, confirmations, confirmed_height)
+         VALUES ($1, $2, 0, 1, 502)",
+    )
+    .bind(live)
+    .bind("cc".repeat(32))
+    .execute(pool)
+    .await;
+    assert_unique_violation(duplicate);
+
+    let refusal_grants: (bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT has_table_privilege('paykit', 'bitcoin_observation_refusals', 'SELECT'),
+                has_table_privilege('paykit', 'bitcoin_observation_refusals', 'INSERT'),
+                has_table_privilege('paykit', 'bitcoin_observation_refusals', 'UPDATE'),
+                has_table_privilege('paykit', 'bitcoin_observation_refusals', 'DELETE'),
+                has_table_privilege('paykit_readonly', 'bitcoin_observation_refusals', 'SELECT')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(refusal_grants, (true, true, true, false, true));
 
     database.cleanup().await;
 }
