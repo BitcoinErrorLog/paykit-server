@@ -624,7 +624,11 @@ rather than silence, and the marketplace's money-outcome record is one-way.*
   together with its observation, a candidate whose resolution fails in
   persistence rotates behind the others, candidates of a final invoice
   still resolve, and an invoice with a pending candidate stays
-  `expired_tail` until the candidate resolves or becomes unfetchable.
+  `expired_tail` until the candidate resolves or becomes unfetchable, for at
+  most 24 hours after the candidate was first seen (longer than the whole
+  fetch retry schedule). A candidate whose resolution keeps failing in
+  persistence is logged at ERROR when the failures start and again when the
+  hold releases; its row stays `pending` for manual handling.
 - **The status contract is versioned, and `allocation_mode` is mandatory
   (W1.14).** Every `/transactions/status` response carries
   `contract_version: "paykit.bitcoin_status/v2"` and an `allocation_mode`

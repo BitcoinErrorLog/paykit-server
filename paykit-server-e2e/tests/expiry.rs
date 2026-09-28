@@ -2330,7 +2330,8 @@ async fn additional_output_after_finality_is_recorded_not_dropped() {
 
 /// An invoice whose candidate is still pending at the end of the tail stays
 /// `expired_tail` until the candidate is resolved, so an output first seen
-/// in the tail is not dropped by the end of observation.
+/// in the tail is not dropped by the end of observation. The hold is bounded
+/// by `CANDIDATE_TAIL_HOLD_SECONDS` after the candidate's first sighting.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn pending_candidate_holds_the_tail_open_until_resolved() {
     let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
@@ -2359,6 +2360,52 @@ async fn pending_candidate_holds_the_tail_open_until_resolved() {
         baseline_state(&stack.pool, &invoice_id).await,
         "expired_final"
     );
+
+    // The hold is bounded: a candidate first seen longer ago than the hold
+    // (its resolution kept failing) no longer keeps the invoice open, and it
+    // stays recorded as pending.
+    let (stuck_id, stuck_address, stuck_total) = activated_invoice(&stack, REFERENCE_B, 1).await;
+    tail_invoice(&stack, &stuck_id).await;
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(
+                &stuck_address,
+                &test_outpoint(132, 0),
+                stuck_total,
+                1,
+                Some(301),
+                true
+            )
+            .await
+            .unwrap()
+    );
+    shift_expires_at(&stack.pool, &stuck_id, -(24 * 3600 + 60)).await;
+    apply_transitions(&stack).await;
+    assert_eq!(baseline_state(&stack.pool, &stuck_id).await, "expired_tail");
+    sqlx::query(
+        "UPDATE bitcoin_observation_candidates
+         SET created_at = NOW() - make_interval(secs => $2 + 60)
+         WHERE invoice_id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&stuck_id).unwrap())
+    .bind(paykit_server::persistence::CANDIDATE_TAIL_HOLD_SECONDS)
+    .execute(&stack.pool)
+    .await
+    .unwrap();
+    apply_transitions(&stack).await;
+    assert_eq!(
+        baseline_state(&stack.pool, &stuck_id).await,
+        "expired_final"
+    );
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM bitcoin_observation_candidates WHERE invoice_id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&stuck_id).unwrap())
+    .fetch_one(&stack.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "pending", "the unresolved candidate stays recorded");
     stack.shutdown().await;
 }
 

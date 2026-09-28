@@ -1772,8 +1772,12 @@ impl InvoiceStore {
     /// is the guard, not `>=`).
     ///
     /// An invoice with a pending candidate stays `expired_tail` until the
-    /// candidate is resolved or becomes unfetchable: an output first seen
-    /// in the tail is never dropped by the end of observation.
+    /// candidate is resolved or becomes unfetchable, for at most
+    /// [`CANDIDATE_TAIL_HOLD_SECONDS`] after the candidate was first seen.
+    /// That bound exceeds the full fetch retry schedule, so only a candidate
+    /// whose resolution keeps failing in persistence can outlast it; the
+    /// invoice then finalizes, the candidate row stays `pending`, and the
+    /// release is logged for manual review.
     ///
     /// Every invoice that reaches `expired_final` has its non-handed-off
     /// outbox rows terminalized in the SAME transaction with the closed
@@ -1808,20 +1812,36 @@ impl InvoiceStore {
                    SELECT 1 FROM bitcoin_observation_candidates AS candidates
                    WHERE candidates.invoice_id = invoices.id
                      AND candidates.state = 'pending'
+                     AND candidates.created_at > NOW() - make_interval(secs => $2)
                )
              RETURNING id",
         )
         .bind(tail_seconds)
+        .bind(CANDIDATE_TAIL_HOLD_SECONDS)
         .fetch_all(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         for invoice_id in &finalized_ids {
             terminalize_invoice_outbox(&mut transaction, *invoice_id, "invoice_expired").await?;
         }
+        let released_with_pending: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT invoice_id FROM bitcoin_observation_candidates
+             WHERE invoice_id = ANY($1) AND state = 'pending'",
+        )
+        .bind(&finalized_ids)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
         transaction
             .commit()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
+        for invoice_id in released_with_pending {
+            tracing::error!(
+                invoice_id = %invoice_id,
+                "invoice left the observation tail with an unresolved payment candidate; manual review required"
+            );
+        }
         Ok(ExpiryTransitions {
             tailed: tailed.rows_affected(),
             finalized: u64::try_from(finalized_ids.len()).unwrap_or(u64::MAX),
@@ -1907,22 +1927,35 @@ impl InvoiceStore {
             // that keeps failing cannot hold the head of the queue that the
             // observer drains one candidate per tick.
             let mut tx = self.begin_observer_write().await?;
-            sqlx::query(
-                "UPDATE bitcoin_observation_candidates
+            let streak_started: Option<bool> = sqlx::query_scalar(
+                "WITH prior AS (
+                     SELECT last_error_kind FROM bitcoin_observation_candidates
+                     WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND state = 'pending'
+                     FOR UPDATE
+                 )
+                 UPDATE bitcoin_observation_candidates
                  SET last_attempt_at = NOW(), last_error_kind = $4,
                      next_attempt_at = NOW() + INTERVAL '30 seconds', updated_at = NOW()
-                 WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND state = 'pending'",
+                 FROM prior
+                 WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND state = 'pending'
+                 RETURNING prior.last_error_kind IS DISTINCT FROM $4",
             )
             .bind(candidate.invoice_id)
             .bind(&txid)
             .bind(vout)
             .bind(error_kind)
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
             tx.commit()
                 .await
                 .map_err(|_| PersistenceError::Unavailable)?;
+            if streak_started == Some(true) {
+                tracing::error!(
+                    invoice_id = %candidate.invoice_id,
+                    "payment candidate resolution failed in persistence; retrying without a strike"
+                );
+            }
             return Ok(());
         }
         let mut tx = self.begin_observer_write().await?;
@@ -3181,6 +3214,12 @@ fn parse_canonical_bitcoin_outpoint(value: &str) -> Result<BitcoinOutpoint, Pers
     }
     Ok(outpoint)
 }
+
+/// Longest time a pending candidate keeps its invoice in `expired_tail`
+/// after the candidate was first seen. It exceeds the full fetch retry
+/// schedule (about five hours), so every fetchable candidate resolves or
+/// becomes unfetchable inside it.
+pub const CANDIDATE_TAIL_HOLD_SECONDS: i64 = 24 * 60 * 60;
 
 /// Records one refused observation report for manual handling. Refusals are
 /// counted per invoice, outpoint and reason; the first one is logged.
