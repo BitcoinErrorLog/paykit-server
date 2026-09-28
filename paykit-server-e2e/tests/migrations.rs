@@ -14,7 +14,6 @@ use paykit_server::{
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
-use sha2::{Digest, Sha512};
 use sqlx::{
     Connection, PgConnection, PgPool, Row,
     migrate::Migrator,
@@ -265,24 +264,9 @@ fn migration_catalog_has_one_contiguous_canonical_version_per_file() {
 #[test]
 fn release_checksum_manifest_pins_unapplied_migrations() {
     let manifest = include_str!("../../paykit-server/migrations/RELEASE_CHECKSUMS.txt");
-    let migration_0024 =
-        include_bytes!("../../paykit-server/migrations/0024_sdk_outbound_invocation.sql");
-    let migration_0025 = include_bytes!(
-        "../../paykit-server/migrations/0025_operations_inspection_and_setup_cancellation.sql"
-    );
-    let migration_0026 =
-        include_bytes!("../../paykit-server/migrations/0026_observer_leadership_lease.sql");
-    let migration_0027 =
-        include_bytes!("../../paykit-server/migrations/0027_first_seen_payment_facts.sql");
-    let checksum_0024 = format!("{:x}", Sha512::digest(migration_0024));
-    let checksum_0025 = format!("{:x}", Sha512::digest(migration_0025));
-    let checksum_0026 = format!("{:x}", Sha512::digest(migration_0026));
-    let checksum_0027 = format!("{:x}", Sha512::digest(migration_0027));
-    assert_eq!(
-        manifest.trim(),
-        format!(
-            "0024 {checksum_0024}\n0025 {checksum_0025}\n0026 {checksum_0026}\n0027 {checksum_0027}"
-        )
+    assert!(
+        manifest.trim().is_empty(),
+        "every shipped migration is applied in production; RELEASE must be empty until the next migration lands"
     );
 }
 
