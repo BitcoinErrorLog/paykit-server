@@ -1765,11 +1765,19 @@ impl InvoiceStore {
     /// tick, never performed by a request handler. Both guards are
     /// timestamp-derived from `expires_at` on the server clock: at
     /// `expires_at` an `observing` invoice moves to `expired_tail` (still
-    /// observed, deprioritized behind live targets; observations there
-    /// carry `late_settlement`), and at `expires_at + tail` it moves to
+    /// observed, deprioritized behind live targets; outputs first seen
+    /// there carry `late_settlement`), and at `expires_at + tail` it moves to
     /// `expired_final` and leaves `observation_plan()` for good. Exactly at
     /// `expires_at` the invoice is still `observing` (`now > expires_at`
     /// is the guard, not `>=`).
+    ///
+    /// An invoice with a pending candidate stays `expired_tail` until the
+    /// candidate is resolved or becomes unfetchable, for at most
+    /// [`CANDIDATE_TAIL_HOLD_SECONDS`] after the candidate was first seen.
+    /// That bound exceeds the full fetch retry schedule, so only a candidate
+    /// whose resolution keeps failing in persistence can outlast it; the
+    /// invoice then finalizes, the candidate row stays `pending`, and the
+    /// release is logged for manual review.
     ///
     /// Every invoice that reaches `expired_final` has its non-handed-off
     /// outbox rows terminalized in the SAME transaction with the closed
@@ -1800,19 +1808,40 @@ impl InvoiceStore {
              SET baseline_state = 'expired_final', expired_final_at = NOW(), updated_at = NOW()
              WHERE baseline_state = 'expired_tail'
                AND expires_at + make_interval(secs => $1) < NOW()
+               AND NOT EXISTS (
+                   SELECT 1 FROM bitcoin_observation_candidates AS candidates
+                   WHERE candidates.invoice_id = invoices.id
+                     AND candidates.state = 'pending'
+                     AND candidates.created_at > NOW() - make_interval(secs => $2)
+               )
              RETURNING id",
         )
         .bind(tail_seconds)
+        .bind(CANDIDATE_TAIL_HOLD_SECONDS)
         .fetch_all(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         for invoice_id in &finalized_ids {
             terminalize_invoice_outbox(&mut transaction, *invoice_id, "invoice_expired").await?;
         }
+        let released_with_pending: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT invoice_id FROM bitcoin_observation_candidates
+             WHERE invoice_id = ANY($1) AND state = 'pending'",
+        )
+        .bind(&finalized_ids)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
         transaction
             .commit()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
+        for invoice_id in released_with_pending {
+            tracing::error!(
+                invoice_id = %invoice_id,
+                "invoice left the observation tail with an unresolved payment candidate; manual review required"
+            );
+        }
         Ok(ExpiryTransitions {
             tailed: tailed.rows_affected(),
             finalized: u64::try_from(finalized_ids.len()).unwrap_or(u64::MAX),
@@ -1862,8 +1891,6 @@ impl InvoiceStore {
                 AND candidates.next_attempt_at <= NOW()
                 AND invoices.baseline_state IN ('observing', 'expired_tail')
                AND NOT invoices.integrity_failed
-               AND NOT (invoices.payment_status = 'confirmed'
-                        AND invoices.confirmation_count = 6 AND invoices.amount_matched)
              ORDER BY candidates.next_attempt_at, candidates.confirmed_height,
                       candidates.created_at",
         )
@@ -1896,23 +1923,39 @@ impl InvoiceStore {
             // A persistence failure is not a fetch attempt: it never
             // increments `attempt_count`, never transitions the candidate
             // to `unfetchable`, and never moves the invoice to
-            // `manual_review`; only diagnostic state is recorded.
+            // `manual_review`. It does move `next_attempt_at`, so a candidate
+            // that keeps failing cannot hold the head of the queue that the
+            // observer drains one candidate per tick.
             let mut tx = self.begin_observer_write().await?;
-            sqlx::query(
-                "UPDATE bitcoin_observation_candidates
-                 SET last_attempt_at = NOW(), last_error_kind = $4, updated_at = NOW()
-                 WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND state = 'pending'",
+            let streak_started: Option<bool> = sqlx::query_scalar(
+                "WITH prior AS (
+                     SELECT last_error_kind FROM bitcoin_observation_candidates
+                     WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND state = 'pending'
+                     FOR UPDATE
+                 )
+                 UPDATE bitcoin_observation_candidates
+                 SET last_attempt_at = NOW(), last_error_kind = $4,
+                     next_attempt_at = NOW() + INTERVAL '30 seconds', updated_at = NOW()
+                 FROM prior
+                 WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND state = 'pending'
+                 RETURNING prior.last_error_kind IS DISTINCT FROM $4",
             )
             .bind(candidate.invoice_id)
             .bind(&txid)
             .bind(vout)
             .bind(error_kind)
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
             tx.commit()
                 .await
                 .map_err(|_| PersistenceError::Unavailable)?;
+            if streak_started == Some(true) {
+                tracing::error!(
+                    invoice_id = %candidate.invoice_id,
+                    "payment candidate resolution failed in persistence; retrying without a strike"
+                );
+            }
             return Ok(());
         }
         let mut tx = self.begin_observer_write().await?;
@@ -2031,11 +2074,19 @@ impl InvoiceStore {
             .execute(&mut *tx)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
-            sqlx::query("DELETE FROM bitcoin_observation_candidates WHERE invoice_id = $1")
-                .bind(candidate.invoice_id)
-                .execute(&mut *tx)
-                .await
-                .map_err(|_| PersistenceError::Unavailable)?;
+            sqlx::query(
+                "DELETE FROM bitcoin_observation_candidates
+                 WHERE invoice_id = $1 AND txid = $2 AND vout = $3",
+            )
+            .bind(candidate.invoice_id)
+            .bind(candidate.outpoint.txid.to_string())
+            .bind(
+                i32::try_from(candidate.outpoint.vout)
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
             sqlx::query(
                 "UPDATE invoices SET baseline_state = 'manual_review', updated_at = NOW()
                  WHERE id = $1 AND baseline_state = 'observing'",
@@ -2094,20 +2145,25 @@ impl InvoiceStore {
                 u32::try_from(row.1).map_err(|_| PersistenceError::CorruptOrMissing)?,
             ));
         }
-        tx.commit()
-            .await
-            .map_err(|_| PersistenceError::Unavailable)?;
+        // Approval and the observation write commit together: a failed write
+        // leaves the candidate pending for another attempt instead of approved
+        // with no observation.
         if let Some((address, sats, confirmations, height)) = approved_binding {
-            self.apply_bitcoin_observation_at_height(
+            self.apply_bitcoin_observation_in_tx(
+                &mut tx,
                 &address,
                 &BitcoinOutpoint::from_bitcoin(candidate.outpoint),
                 sats,
                 confirmations,
                 Some(height),
                 true,
+                true,
             )
             .await?;
         }
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         Ok(())
     }
 
@@ -2293,14 +2349,17 @@ impl InvoiceStore {
             return Ok(false);
         };
         // §B.9: observation does not stop at expiry. An `expired_tail`
-        // invoice is still observed; anything recorded there is a late
+        // invoice is still observed; an output first seen there is a late
         // settlement and can never drive `paid` — the marketplace routes it
         // to `manual_review` on the flag. Every other state (prepared,
         // final, void, resolved) no-ops exactly as before.
         if invoice.baseline_state != "observing" && invoice.baseline_state != "expired_tail" {
             return Ok(true);
         }
-        let late_settlement = invoice.baseline_state == "expired_tail";
+        // Lateness is decided once, at an output's first sighting, and is
+        // never rewritten: an output first seen while `observing` stays on
+        // time when it is re-observed or confirms during `expired_tail`.
+        let seen_in_tail = invoice.baseline_state == "expired_tail";
         let creator_hash = lookup_hash_from_storage(&invoice.creator_lookup_hash)?;
         let payment_record_plaintext = self
             .crypto
@@ -2319,27 +2378,23 @@ impl InvoiceStore {
             return Err(PersistenceError::CorruptOrMissing);
         }
         let required = payment_record.required_sats();
-        // Final matching outputs are no longer monitored. Keep their persisted
-        // six-confirmation fact immutable even if a stale observer reports later.
-        if invoice.payment_status == "confirmed"
+        let invoice_final = invoice.payment_status == "confirmed"
             && invoice.confirmation_count == 6
-            && invoice.amount_matched
-        {
-            return Ok(true);
-        }
+            && invoice.amount_matched;
 
-        let approved_candidate: bool = sqlx::query_scalar(
-            "SELECT EXISTS(
-                SELECT 1 FROM bitcoin_observation_candidates
-                WHERE invoice_id = $1 AND txid = $2 AND vout = $3 AND approved
-             )",
+        // A candidate row, approved or still pending, is the first sighting
+        // of an output first seen already confirmed.
+        let candidate: Option<(bool, Option<bool>, time::OffsetDateTime)> = sqlx::query_as(
+            "SELECT approved, late_settlement, created_at FROM bitcoin_observation_candidates
+             WHERE invoice_id = $1 AND txid = $2 AND vout = $3",
         )
         .bind(invoice.id)
         .bind(&txid)
         .bind(vout)
-        .fetch_one(&mut **tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        let approved_candidate = candidate.is_some_and(|(approved, _, _)| approved);
         let baseline_entries = sqlx::query_as::<_, (String, String, i32)>(BASELINE_ENTRIES_SQL)
             .bind(invoice.id)
             .fetch_all(&mut **tx)
@@ -2355,6 +2410,8 @@ impl InvoiceStore {
         if payment_record.baseline_set_hash() != &<[u8; 32]>::from(hasher.finalize()) {
             return Err(PersistenceError::CorruptOrMissing);
         }
+        // Outputs that already existed when the invoice was created are not
+        // payments to it.
         let baseline_member: bool = sqlx::query_scalar(
             "SELECT EXISTS(
                 SELECT 1 FROM invoice_baseline_outpoints
@@ -2377,37 +2434,11 @@ impl InvoiceStore {
         {
             return Ok(true);
         }
-        if crate::bitcoin::amount_matches(present, observed_sats, required)
-            && confirmations > 0
-            && !approved_candidate
-            && require_candidate
-        {
-            let height = confirmed_height.ok_or(PersistenceError::CorruptOrMissing)?;
-            sqlx::query(
-                "INSERT INTO bitcoin_observation_candidates
-                    (invoice_id, txid, vout, confirmations, confirmed_height)
-                 VALUES ($1, $2, $3, $4, $5)
-                 ON CONFLICT (invoice_id) DO UPDATE SET
-                    txid = EXCLUDED.txid, vout = EXCLUDED.vout,
-                    confirmations = EXCLUDED.confirmations,
-                    confirmed_height = EXCLUDED.confirmed_height,
-                    approved = FALSE, attempt_count = 0, last_attempt_at = NULL,
-                    next_attempt_at = NOW(), last_error_kind = NULL,
-                    state = 'pending', updated_at = NOW()
-                 WHERE EXCLUDED.confirmed_height
-                    < bitcoin_observation_candidates.confirmed_height",
-            )
-            .bind(invoice.id)
-            .bind(&txid)
-            .bind(vout)
-            .bind(confirmations)
-            .bind(i32::try_from(height).map_err(|_| PersistenceError::CorruptOrMissing)?)
-            .execute(&mut **tx)
-            .await
-            .map_err(|_| PersistenceError::Unavailable)?;
-            return Ok(true);
-        }
 
+        // An outpoint's value and its owning address are fixed by consensus.
+        // A report that contradicts a recorded first-seen fact is refused and
+        // kept in `bitcoin_observation_refusals` for manual handling. It never
+        // quarantines the invoice, so it cannot hide a valid payment to it.
         let outpoint_lookup_hash = self
             .crypto
             .bitcoin_outpoint_lookup_hash(outpoint.as_bytes());
@@ -2424,7 +2455,14 @@ impl InvoiceStore {
             .as_ref()
             .is_some_and(|row| row.invoice_id != invoice.id)
         {
-            return Err(PersistenceError::Conflict);
+            record_observation_refusal(
+                tx,
+                invoice.id,
+                &outpoint_lookup_hash,
+                "outpoint_owned_by_other_invoice",
+            )
+            .await?;
+            return Ok(true);
         }
         if let Some(row) = existing_outpoint.as_ref() {
             let record = self.decrypt_observation(creator_hash, row)?;
@@ -2433,7 +2471,24 @@ impl InvoiceStore {
             {
                 return Err(PersistenceError::CorruptOrMissing);
             }
+            if record.observed_sats != observed_sats {
+                record_observation_refusal(
+                    tx,
+                    invoice.id,
+                    &outpoint_lookup_hash,
+                    "amount_conflict",
+                )
+                .await?;
+                return Ok(true);
+            }
         }
+        // A candidate exists only at the exact required amount.
+        if candidate.is_some() && observed_sats != required {
+            record_observation_refusal(tx, invoice.id, &outpoint_lookup_hash, "amount_conflict")
+                .await?;
+            return Ok(true);
+        }
+
         let active = sqlx::query_as::<_, BitcoinObservationRow>(
             "SELECT id, invoice_id, observation_envelope, outpoint_lookup_hash,
                     confirmations, present
@@ -2447,28 +2502,115 @@ impl InvoiceStore {
             .as_ref()
             .map(|row| self.decrypt_observation(creator_hash, row))
             .transpose()?;
-
-        let action = active
-            .as_ref()
-            .zip(active_record.as_ref())
-            .map(|(row, record)| {
-                DirectBinding::new(
-                    &record.outpoint,
-                    record.observed_sats,
-                    u32::try_from(row.confirmations).unwrap_or_default(),
-                    row.present,
-                )
-                .action_for_values(
-                    &outpoint,
-                    observed_sats,
-                    incoming_confirmations,
-                    present,
-                    required,
-                )
-            });
-        if action == Some(ObservationAction::Ignore) {
+        // A final binding's six-confirmation fact is immutable even if a
+        // stale observer reports it again.
+        if invoice_final
+            && active_record
+                .as_ref()
+                .is_some_and(|record| record.outpoint == outpoint)
+        {
             return Ok(true);
         }
+        let action = if invoice_final {
+            Some(ObservationAction::Ignore)
+        } else {
+            active
+                .as_ref()
+                .zip(active_record.as_ref())
+                .map(|(row, record)| {
+                    DirectBinding::new(
+                        &record.outpoint,
+                        record.observed_sats,
+                        u32::try_from(row.confirmations).unwrap_or_default(),
+                        row.present,
+                    )
+                    .action_for_values(
+                        &outpoint,
+                        observed_sats,
+                        incoming_confirmations,
+                        present,
+                        required,
+                    )
+                })
+        };
+
+        // First-seen facts of this outpoint. An output first seen already
+        // confirmed was first seen when its candidate was recorded; NULL is a
+        // candidate written before lateness was stored.
+        let (late_settlement, first_seen_at) = match candidate {
+            Some((_, Some(candidate_late), created_at)) => (candidate_late, Some(created_at)),
+            Some((_, None, created_at)) => (seen_in_tail, Some(created_at)),
+            None => (seen_in_tail, None),
+        };
+
+        // An output that cannot take the binding (the current one is final
+        // or a confirmed exact payment) is still a payment to this invoice:
+        // it is recorded as an inactive observation with its own first-seen
+        // facts and never changes the invoice's payment status.
+        if action == Some(ObservationAction::Ignore) {
+            if !present && existing_outpoint.is_none() {
+                return Ok(true);
+            }
+            let inserted = self
+                .write_observation_row(
+                    tx,
+                    creator_hash,
+                    invoice.id,
+                    existing_outpoint.as_ref(),
+                    &outpoint,
+                    observed_sats,
+                    &outpoint_lookup_hash,
+                    confirmations,
+                    present,
+                    false,
+                    late_settlement,
+                    first_seen_at,
+                )
+                .await?;
+            if inserted {
+                tracing::warn!(
+                    invoice_id = %invoice.id,
+                    late_settlement,
+                    "additional payment output recorded without taking the invoice binding"
+                );
+            }
+            return Ok(true);
+        }
+
+        if crate::bitcoin::amount_matches(present, observed_sats, required)
+            && confirmations > 0
+            && !approved_candidate
+            && require_candidate
+        {
+            let height = confirmed_height.ok_or(PersistenceError::CorruptOrMissing)?;
+            // One candidate per outpoint. A lower-height sighting of the same
+            // outpoint (a reorg) moves its height and restarts resolution; its
+            // first-seen lateness and `created_at` never change.
+            sqlx::query(
+                "INSERT INTO bitcoin_observation_candidates
+                    (invoice_id, txid, vout, confirmations, confirmed_height, late_settlement)
+                 VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT (invoice_id, txid, vout) DO UPDATE SET
+                    confirmations = EXCLUDED.confirmations,
+                    confirmed_height = EXCLUDED.confirmed_height,
+                    attempt_count = 0, last_attempt_at = NULL,
+                    next_attempt_at = NOW(), last_error_kind = NULL,
+                    state = 'pending', updated_at = NOW()
+                 WHERE EXCLUDED.confirmed_height
+                    < bitcoin_observation_candidates.confirmed_height",
+            )
+            .bind(invoice.id)
+            .bind(&txid)
+            .bind(vout)
+            .bind(confirmations)
+            .bind(i32::try_from(height).map_err(|_| PersistenceError::CorruptOrMissing)?)
+            .bind(seen_in_tail)
+            .execute(&mut **tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            return Ok(true);
+        }
+
         // An unseen output with no existing binding is not an observation and
         // must not manufacture a binding for an otherwise undetected invoice.
         if active.is_none() && !present {
@@ -2484,50 +2626,21 @@ impl InvoiceStore {
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
         }
-        let observation_id = existing_outpoint
-            .as_ref()
-            .map_or_else(Uuid::new_v4, |row| row.id);
-        let observation_plaintext = postcard::to_allocvec(&BitcoinObservationV1 {
-            version: 1,
-            outpoint: outpoint.to_owned(),
+        self.write_observation_row(
+            tx,
+            creator_hash,
+            invoice.id,
+            existing_outpoint.as_ref(),
+            &outpoint,
             observed_sats,
-        })
-        .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let observation_envelope = self
-            .crypto
-            .encrypt(
-                &EnvelopeContext::bitcoin_observation_for_invoice(
-                    creator_hash,
-                    observation_id,
-                    invoice.id,
-                ),
-                &observation_plaintext,
-            )
-            .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let observation_write = sqlx::query(
-            "INSERT INTO bitcoin_observations \
-            (id, invoice_id, observation_envelope, outpoint_lookup_hash,
-            confirmations, present, active, late_settlement) \
-            VALUES ($1, $2, $3, $4, $5, $6, TRUE, $7) \
-            ON CONFLICT (outpoint_lookup_hash) DO UPDATE SET
-            observation_envelope = EXCLUDED.observation_envelope,
-            confirmations = EXCLUDED.confirmations, present = EXCLUDED.present, active = TRUE, \
-            late_settlement = EXCLUDED.late_settlement, \
-            updated_at = NOW() WHERE bitcoin_observations.invoice_id = EXCLUDED.invoice_id",
+            &outpoint_lookup_hash,
+            confirmations,
+            present,
+            true,
+            late_settlement,
+            first_seen_at,
         )
-        .bind(observation_id)
-        .bind(invoice.id)
-        .bind(observation_envelope.as_bytes())
-        .bind(outpoint_lookup_hash.as_bytes().as_slice())
-        .bind(confirmations)
-        .bind(present)
-        .bind(late_settlement)
-        .execute(&mut **tx)
-        .await
-        .map_err(|_| PersistenceError::Conflict)?;
-        if observation_write.rows_affected() != 1 {
-            return Err(PersistenceError::Conflict);
-        }
+        .await?;
         // §B.8.2: the match is exact. An overpayment reports confirmed with
         // amount_matched = false; the invoice stays `observing`, and the
         // marketplace service (marketplace-service
@@ -2555,6 +2668,80 @@ impl InvoiceStore {
             .bind(status).bind(i32::try_from(reported_confirmations).map_err(|_| PersistenceError::CorruptOrMissing)?).bind(amount_matched).bind(invoice.id)
             .execute(&mut **tx).await.map_err(|_| PersistenceError::Unavailable)?;
         Ok(true)
+    }
+
+    /// Inserts an observation row with its first-seen facts, or refreshes the
+    /// current chain facts of an existing one. The conflict arm never
+    /// rewrites the envelope (outpoint and amount), `late_settlement` or
+    /// `created_at`; `bind` makes the row the invoice's active binding, and a
+    /// non-binding write leaves the row's `active` flag unchanged. Returns
+    /// whether a new row was inserted.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_observation_row(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        creator_hash: LookupHash,
+        invoice_id: Uuid,
+        existing: Option<&BitcoinObservationRow>,
+        outpoint: &str,
+        observed_sats: u64,
+        outpoint_lookup_hash: &LookupHash,
+        confirmations: i32,
+        present: bool,
+        bind: bool,
+        late_settlement: bool,
+        first_seen_at: Option<time::OffsetDateTime>,
+    ) -> Result<bool, PersistenceError> {
+        let observation_id = existing.map_or_else(Uuid::new_v4, |row| row.id);
+        let observation_envelope = match existing {
+            Some(row) => row.observation_envelope.clone(),
+            None => {
+                let observation_plaintext = postcard::to_allocvec(&BitcoinObservationV1 {
+                    version: 1,
+                    outpoint: outpoint.to_owned(),
+                    observed_sats,
+                })
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                self.crypto
+                    .encrypt(
+                        &EnvelopeContext::bitcoin_observation_for_invoice(
+                            creator_hash,
+                            observation_id,
+                            invoice_id,
+                        ),
+                        &observation_plaintext,
+                    )
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?
+                    .as_bytes()
+                    .to_vec()
+            }
+        };
+        let observation_write = sqlx::query(
+            "INSERT INTO bitcoin_observations \
+            (id, invoice_id, observation_envelope, outpoint_lookup_hash,
+            confirmations, present, active, late_settlement, created_at) \
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, NOW())) \
+            ON CONFLICT (outpoint_lookup_hash) DO UPDATE SET
+            confirmations = EXCLUDED.confirmations, present = EXCLUDED.present, \
+            active = CASE WHEN $7 THEN TRUE ELSE bitcoin_observations.active END, \
+            updated_at = NOW() WHERE bitcoin_observations.invoice_id = EXCLUDED.invoice_id",
+        )
+        .bind(observation_id)
+        .bind(invoice_id)
+        .bind(observation_envelope.as_slice())
+        .bind(outpoint_lookup_hash.as_bytes().as_slice())
+        .bind(confirmations)
+        .bind(present)
+        .bind(bind)
+        .bind(late_settlement)
+        .bind(first_seen_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(|_| PersistenceError::Conflict)?;
+        if observation_write.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict);
+        }
+        Ok(existing.is_none())
     }
 
     /// Atomically resolves the creator, checks replay, allocates/reuses a
@@ -3026,6 +3213,44 @@ fn parse_canonical_bitcoin_outpoint(value: &str) -> Result<BitcoinOutpoint, Pers
         return Err(PersistenceError::CorruptOrMissing);
     }
     Ok(outpoint)
+}
+
+/// Longest time a pending candidate keeps its invoice in `expired_tail`
+/// after the candidate was first seen. It exceeds the full fetch retry
+/// schedule (about five hours), so every fetchable candidate resolves or
+/// becomes unfetchable inside it.
+pub const CANDIDATE_TAIL_HOLD_SECONDS: i64 = 24 * 60 * 60;
+
+/// Records one refused observation report for manual handling. Refusals are
+/// counted per invoice, outpoint and reason; the first one is logged.
+async fn record_observation_refusal(
+    tx: &mut Transaction<'_, Postgres>,
+    invoice_id: Uuid,
+    outpoint_lookup_hash: &LookupHash,
+    reason: &'static str,
+) -> Result<(), PersistenceError> {
+    let first: bool = sqlx::query_scalar(
+        "INSERT INTO bitcoin_observation_refusals (invoice_id, outpoint_lookup_hash, reason)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (invoice_id, outpoint_lookup_hash, reason) DO UPDATE SET
+            last_refused_at = NOW(),
+            refusal_count = bitcoin_observation_refusals.refusal_count + 1
+         RETURNING refusal_count = 1",
+    )
+    .bind(invoice_id)
+    .bind(outpoint_lookup_hash.as_bytes().as_slice())
+    .bind(reason)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|_| PersistenceError::Unavailable)?;
+    if first {
+        tracing::error!(
+            invoice_id = %invoice_id,
+            reason,
+            "observation report contradicts a recorded payment fact; refused and kept for manual review"
+        );
+    }
+    Ok(())
 }
 
 #[derive(sqlx::FromRow)]

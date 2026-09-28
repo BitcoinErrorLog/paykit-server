@@ -20,7 +20,15 @@
 //! - an eligible observation in the tail is recorded with
 //!   `late_settlement = true` and can never drive settlement — for an
 //!   `exclusive` creator and for a `shared_manual` creator at the exact
-//!   amount, with the flag carried on `/transactions/status`.
+//!   amount, with the flag carried on `/transactions/status`;
+//! - first-seen facts are monotonic: an output first seen inside the
+//!   window stays on time when it is re-observed, disappears and
+//!   reappears, or confirms in the tail (directly or through a candidate);
+//!   an output first seen in the tail stays late; a replacement outpoint
+//!   first seen in the tail is late; replays never rewrite the envelope,
+//!   `created_at` or lateness; a different amount for a recorded outpoint
+//!   or candidate is an integrity failure that never reaches candidate
+//!   resolution.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -72,8 +80,9 @@ use paykit_server::{
     runtime::{ElectrumProbe, Runtime},
     startup::initialize_database,
     workers::observer::{
-        CreationSnapshot, ElectrumPort, ObservationReport, ObserverError, ObserverPolicy,
-        ObserverTickOutcome, ObserverTickState, RequestLimiter, TipProbe, observe_tick,
+        CandidateFailureKind, CreationSnapshot, ElectrumPort, ObservationBackend,
+        ObservationReport, ObserverError, ObserverPolicy, ObserverTickOutcome, ObserverTickState,
+        RequestLimiter, TipProbe, observe_tick,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -1399,5 +1408,1159 @@ async fn late_settlement_holds_for_a_shared_manual_creator_with_exact_amount() {
     assert_eq!(late_status["late_settlement"], true);
     assert_eq!(late_status["status"], "confirmed");
     assert_eq!(late_status["amount_matched"], true);
+    stack.shutdown().await;
+}
+
+fn test_outpoint(byte: u8, vout: u32) -> BitcoinOutpoint {
+    BitcoinOutpoint::from_bitcoin(OutPoint::new(Txid::from_byte_array([byte; 32]), vout))
+}
+
+/// The first-seen facts of one invoice's observation rows, oldest first:
+/// (late_settlement, created_at, observation_envelope, confirmations,
+/// present, active).
+type ObservationFacts = (bool, time::OffsetDateTime, Vec<u8>, i32, bool, bool);
+
+async fn observation_rows(pool: &PgPool, invoice_id: &str) -> Vec<ObservationFacts> {
+    sqlx::query_as(
+        "SELECT late_settlement, created_at, observation_envelope, confirmations, present, active
+         FROM bitcoin_observations WHERE invoice_id = $1 ORDER BY created_at, id",
+    )
+    .bind(uuid::Uuid::parse_str(invoice_id).unwrap())
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+async fn candidate_lateness(
+    pool: &PgPool,
+    invoice_id: &str,
+    outpoint: &BitcoinOutpoint,
+) -> Option<bool> {
+    sqlx::query_scalar(
+        "SELECT late_settlement FROM bitcoin_observation_candidates
+         WHERE invoice_id = $1 AND txid = $2 AND vout = $3",
+    )
+    .bind(uuid::Uuid::parse_str(invoice_id).unwrap())
+    .bind(outpoint.txid())
+    .bind(i32::try_from(outpoint.vout()).unwrap())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Drives every pending candidate through the production resolution path
+/// with inputs outside the creation baseline, as the observer's
+/// transaction fetch would.
+async fn resolve_pending_candidates(stack: &BootedStack) -> usize {
+    let candidates = stack.store.pending_candidates().await.unwrap();
+    for candidate in &candidates {
+        stack
+            .store
+            .resolve_candidate(
+                candidate,
+                &[OutPoint::new(Txid::from_byte_array([250; 32]), 0)],
+            )
+            .await
+            .unwrap();
+    }
+    candidates.len()
+}
+
+/// Moves one activated invoice into `expired_tail` through the production
+/// expiry pass.
+async fn tail_invoice(stack: &BootedStack, invoice_id: &str) {
+    shift_expires_at(&stack.pool, invoice_id, -60).await;
+    apply_transitions(stack).await;
+    assert_eq!(
+        baseline_state(&stack.pool, invoice_id).await,
+        "expired_tail"
+    );
+}
+
+/// Order 131a7457: an output seen at 0 confirmations inside the window,
+/// re-observed after `expires_at` and confirmed in the tail through the
+/// observer's candidate path, stays on time. Every first-seen fact of the
+/// row (lateness, amount envelope, `created_at`) survives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn first_seen_before_expiry_confirmed_after_expiry_stays_on_time() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(163).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let paid = test_outpoint(81, 0);
+
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(&address, &paid, total, 0, None, true)
+            .await
+            .unwrap()
+    );
+    let first = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(first.len(), 1);
+    assert!(!first[0].0, "seen inside the window: on time");
+
+    tail_invoice(&stack, &invoice_id).await;
+    // The unconfirmed re-observations the observer keeps making in the tail.
+    for _ in 0..2 {
+        assert!(
+            stack
+                .store
+                .apply_bitcoin_observation_at_height(&address, &paid, total, 0, None, true)
+                .await
+                .unwrap()
+        );
+    }
+    assert_eq!(status(&stack, REFERENCE_A).await["late_settlement"], false);
+
+    // The confirmation arrives in the tail through the candidate path.
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 1, Some(301), true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+
+    let rows = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(rows.len(), 1, "the same outpoint never gains a second row");
+    let (late, created_at, envelope, confirmations, present, active) = &rows[0];
+    assert!(
+        !late,
+        "an output first seen before expiry must stay on time"
+    );
+    assert_eq!(*created_at, first[0].1, "first-seen time is immutable");
+    assert_eq!(
+        envelope, &first[0].2,
+        "the first-seen amount envelope is kept"
+    );
+    assert_eq!((*confirmations, *present, *active), (1, true, true));
+    let body = status(&stack, REFERENCE_A).await;
+    assert_eq!(body["late_settlement"], false);
+    assert_eq!(body["status"], "confirmed");
+    assert_eq!(body["amount_matched"], true);
+    assert_eq!(
+        baseline_state(&stack.pool, &invoice_id).await,
+        "expired_tail"
+    );
+    stack.shutdown().await;
+}
+
+/// An output first seen already confirmed inside the window becomes a
+/// candidate; when its transaction is resolved only after `expires_at`, the
+/// observation inherits the candidate's on-time first sighting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn candidate_first_seen_before_expiry_resolved_after_expiry_stays_on_time() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(164).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let paid = test_outpoint(82, 0);
+
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 1, Some(301), true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        candidate_lateness(&stack.pool, &invoice_id, &paid).await,
+        Some(false)
+    );
+    assert!(observation_rows(&stack.pool, &invoice_id).await.is_empty());
+
+    let candidate_seen_at: time::OffsetDateTime = sqlx::query_scalar(
+        "SELECT created_at FROM bitcoin_observation_candidates WHERE invoice_id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&invoice_id).unwrap())
+    .fetch_one(&stack.pool)
+    .await
+    .unwrap();
+    tail_invoice(&stack, &invoice_id).await;
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+
+    let rows = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].1, candidate_seen_at,
+        "the observation keeps the candidate's first-sighting time"
+    );
+    assert!(
+        !rows[0].0,
+        "the candidate's on-time sighting is the first sighting"
+    );
+    let body = status(&stack, REFERENCE_A).await;
+    assert_eq!(body["late_settlement"], false);
+    assert_eq!(body["status"], "confirmed");
+    stack.shutdown().await;
+}
+
+/// A genuinely late payment stays late through every later event: first
+/// seen unconfirmed in the tail and confirmed there, and first seen
+/// confirmed in the tail through the candidate path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn first_seen_in_tail_stays_late_through_confirmation() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(165).await;
+
+    let (unconfirmed_id, unconfirmed_address, unconfirmed_total) =
+        activated_invoice(&stack, REFERENCE_A, 0).await;
+    tail_invoice(&stack, &unconfirmed_id).await;
+    let late_paid = test_outpoint(83, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(
+                &unconfirmed_address,
+                &late_paid,
+                unconfirmed_total,
+                0,
+                None,
+                true
+            )
+            .await
+            .unwrap()
+    );
+    assert!(late_settlement_flag(&stack.pool, &unconfirmed_id).await);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(
+                &unconfirmed_address,
+                &late_paid,
+                unconfirmed_total,
+                1,
+                Some(301),
+                true
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    assert!(late_settlement_flag(&stack.pool, &unconfirmed_id).await);
+    let body = status(&stack, REFERENCE_A).await;
+    assert_eq!(body["late_settlement"], true);
+    assert_eq!(body["status"], "confirmed");
+
+    let (confirmed_id, confirmed_address, confirmed_total) =
+        activated_invoice(&stack, REFERENCE_B, 1).await;
+    tail_invoice(&stack, &confirmed_id).await;
+    let late_confirmed = test_outpoint(84, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(
+                &confirmed_address,
+                &late_confirmed,
+                confirmed_total,
+                1,
+                Some(301),
+                true
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        candidate_lateness(&stack.pool, &confirmed_id, &late_confirmed).await,
+        Some(true),
+        "a candidate first seen in the tail records late"
+    );
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    assert!(late_settlement_flag(&stack.pool, &confirmed_id).await);
+    assert_eq!(status(&stack, REFERENCE_B).await["late_settlement"], true);
+    stack.shutdown().await;
+}
+
+/// Reorg: an on-time output that drops out of the address's unspent set
+/// and reappears confirmed after `expires_at` is the same payment fact and
+/// stays on time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn on_time_output_that_disappears_and_reappears_after_expiry_stays_on_time() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(166).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let paid = test_outpoint(85, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(&address, &paid, total, 0, None, true)
+            .await
+            .unwrap()
+    );
+    tail_invoice(&stack, &invoice_id).await;
+
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 0, None, false)
+            .await
+            .unwrap()
+    );
+    let gone = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(gone.len(), 1);
+    assert!(!gone[0].4, "the disappearance is recorded");
+    assert!(!gone[0].0);
+    assert_eq!(status(&stack, REFERENCE_A).await["status"], "undetected");
+
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 1, Some(302), true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    let rows = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(rows.len(), 1);
+    assert!(!rows[0].0, "a reappearing on-time output stays on time");
+    assert!(rows[0].4);
+    assert_eq!(rows[0].1, gone[0].1);
+    let body = status(&stack, REFERENCE_A).await;
+    assert_eq!(body["late_settlement"], false);
+    assert_eq!(body["status"], "confirmed");
+    stack.shutdown().await;
+}
+
+/// Reorg of a confirmed-first candidate: the same outpoint re-mined at a
+/// lower height after `expires_at` replaces the candidate's height but
+/// keeps its on-time first sighting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn candidate_reorged_to_lower_height_after_expiry_keeps_first_seen_lateness() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(167).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let paid = test_outpoint(86, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 1, Some(310), true)
+            .await
+            .unwrap()
+    );
+    tail_invoice(&stack, &invoice_id).await;
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 6, Some(305), true)
+            .await
+            .unwrap()
+    );
+    let height: i32 = sqlx::query_scalar(
+        "SELECT confirmed_height FROM bitcoin_observation_candidates WHERE invoice_id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&invoice_id).unwrap())
+    .fetch_one(&stack.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        height, 305,
+        "the lower-height sighting replaced the candidate"
+    );
+    assert_eq!(
+        candidate_lateness(&stack.pool, &invoice_id, &paid).await,
+        Some(false)
+    );
+
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    assert!(!late_settlement_flag(&stack.pool, &invoice_id).await);
+    assert_eq!(status(&stack, REFERENCE_A).await["late_settlement"], false);
+    stack.shutdown().await;
+}
+
+/// Replacement: a different outpoint first seen after `expires_at` is a new
+/// payment fact and is late, both as a direct replacement of an on-time
+/// unconfirmed binding and as a lower-height candidate next to an on-time
+/// candidate. The on-time output keeps its own first-seen facts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn replacement_first_seen_after_expiry_is_late() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(168).await;
+
+    let (direct_id, direct_address, direct_total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(
+                &direct_address,
+                &test_outpoint(87, 0),
+                direct_total,
+                0,
+                None,
+                true
+            )
+            .await
+            .unwrap()
+    );
+    tail_invoice(&stack, &direct_id).await;
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(
+                &direct_address,
+                &test_outpoint(88, 0),
+                direct_total,
+                1,
+                Some(301),
+                true
+            )
+            .await
+            .unwrap()
+    );
+    let rows = observation_rows(&stack.pool, &direct_id).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        (rows[0].0, rows[0].5),
+        (false, false),
+        "original: on time, inactive"
+    );
+    assert_eq!(
+        (rows[1].0, rows[1].5),
+        (true, true),
+        "replacement: late, active"
+    );
+    assert_eq!(status(&stack, REFERENCE_A).await["late_settlement"], true);
+
+    let (candidate_id, candidate_address, candidate_total) =
+        activated_invoice(&stack, REFERENCE_B, 1).await;
+    let on_time = test_outpoint(89, 0);
+    let late = test_outpoint(90, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(
+                &candidate_address,
+                &on_time,
+                candidate_total,
+                1,
+                Some(310),
+                true
+            )
+            .await
+            .unwrap()
+    );
+    tail_invoice(&stack, &candidate_id).await;
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(
+                &candidate_address,
+                &late,
+                candidate_total,
+                6,
+                Some(305),
+                true
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        candidate_lateness(&stack.pool, &candidate_id, &on_time).await,
+        Some(false),
+        "the on-time candidate keeps its own fact"
+    );
+    assert_eq!(
+        candidate_lateness(&stack.pool, &candidate_id, &late).await,
+        Some(true),
+        "a different outpoint does not inherit another candidate's lateness"
+    );
+    assert_eq!(resolve_pending_candidates(&stack).await, 2);
+    let rows = observation_rows(&stack.pool, &candidate_id).await;
+    assert_eq!(rows.len(), 2, "both payments are recorded");
+    assert_eq!((rows[0].0, rows[0].5), (false, true), "on time, bound");
+    assert_eq!(
+        (rows[1].0, rows[1].5),
+        (true, false),
+        "late, recorded unbound"
+    );
+    assert_eq!(status(&stack, REFERENCE_B).await["late_settlement"], false);
+    stack.shutdown().await;
+}
+
+/// Replays of an identical observation, before and after `expires_at`,
+/// change only the current chain facts; the stored envelope bytes,
+/// `created_at` and lateness are the first sighting's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn replayed_observations_never_rewrite_first_seen_facts() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(169).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let paid = test_outpoint(91, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(&address, &paid, total, 0, None, true)
+            .await
+            .unwrap()
+    );
+    let first = observation_rows(&stack.pool, &invoice_id).await;
+    for _ in 0..3 {
+        assert!(
+            stack
+                .store
+                .apply_bitcoin_observation(&address, &paid, total, 0, None, true)
+                .await
+                .unwrap()
+        );
+    }
+    tail_invoice(&stack, &invoice_id).await;
+    for confirmations in [0, 2, 2] {
+        let height = (confirmations > 0).then_some(301);
+        assert!(
+            stack
+                .store
+                .apply_bitcoin_observation(&address, &paid, total, confirmations, height, true)
+                .await
+                .unwrap()
+        );
+    }
+    let rows = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, first[0].0);
+    assert_eq!(rows[0].1, first[0].1);
+    assert_eq!(
+        rows[0].2, first[0].2,
+        "a replay must not re-encrypt the envelope"
+    );
+    assert_eq!(rows[0].3, 2);
+    assert!(!rows[0].0);
+    assert_eq!(status(&stack, REFERENCE_A).await["late_settlement"], false);
+    stack.shutdown().await;
+}
+
+/// Reorg of a still-pending candidate: an output first seen confirmed inside
+/// the window, whose candidate is not yet resolved when a reorg returns it
+/// to the mempool after `expires_at`, is written as an observation that
+/// keeps the candidate's on-time first sighting, before and after the
+/// candidate resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn pending_candidate_reorged_to_mempool_after_expiry_stays_on_time() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(171).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let paid = test_outpoint(93, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 1, Some(310), true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        candidate_lateness(&stack.pool, &invoice_id, &paid).await,
+        Some(false)
+    );
+    tail_invoice(&stack, &invoice_id).await;
+
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 0, None, true)
+            .await
+            .unwrap()
+    );
+    let rows = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(rows.len(), 1);
+    assert!(!rows[0].0, "the pending candidate is the first sighting");
+    assert_eq!(status(&stack, REFERENCE_A).await["late_settlement"], false);
+
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 1, Some(311), true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    assert!(!late_settlement_flag(&stack.pool, &invoice_id).await);
+    let body = status(&stack, REFERENCE_A).await;
+    assert_eq!(body["late_settlement"], false);
+    assert_eq!(body["status"], "confirmed");
+    stack.shutdown().await;
+}
+
+fn reported_output(
+    address: &str,
+    byte: u8,
+    sats: u64,
+    confirmations: u32,
+    confirmed_height: Option<u32>,
+) -> paykit_server::bitcoin::ObservedOutput {
+    paykit_server::bitcoin::ObservedOutput {
+        network: BitcoinNetwork::Testnet,
+        address: address.to_owned(),
+        outpoint: OutPoint::new(Txid::from_byte_array([byte; 32]), 0),
+        sats,
+        confirmations,
+        confirmed_height,
+        present: true,
+    }
+}
+
+/// One production observer batch: the plan's targets and
+/// `ObservationBackend::apply_observations`, the path `observe_tick` uses,
+/// including the batch wrapper that quarantines integrity failures.
+async fn observe_batch(
+    stack: &BootedStack,
+    outputs: Vec<paykit_server::bitcoin::ObservedOutput>,
+) -> Result<usize, ObserverError> {
+    let targets: Vec<ObservationTarget> = stack
+        .store
+        .observation_plan()
+        .await
+        .unwrap()
+        .iter()
+        .map(|planned| planned.target().clone())
+        .collect();
+    ObservationBackend::apply_observations(
+        &stack.store,
+        &BitcoinNetwork::Testnet,
+        &targets,
+        outputs,
+    )
+    .await
+}
+
+async fn refusals(pool: &PgPool, invoice_id: &str) -> Vec<(String, i32)> {
+    sqlx::query_as(
+        "SELECT reason, refusal_count FROM bitcoin_observation_refusals
+         WHERE invoice_id = $1 ORDER BY reason",
+    )
+    .bind(uuid::Uuid::parse_str(invoice_id).unwrap())
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+async fn integrity_failed(pool: &PgPool, invoice_id: &str) -> bool {
+    sqlx::query_scalar("SELECT integrity_failed FROM invoices WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(invoice_id).unwrap())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// A report that contradicts a recorded amount is refused through the
+/// production batch without quarantining the invoice. The valid payment,
+/// whether still a pending candidate or already an observation, stays
+/// observed and resolvable and reaches `confirmed` at the exact amount; the
+/// refusal is counted for manual handling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn amount_conflict_is_refused_without_hiding_the_invoice_payment() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(173).await;
+
+    // A pending candidate, then a contradicting unconfirmed report.
+    let (candidate_id, candidate_address, candidate_total) =
+        activated_invoice(&stack, REFERENCE_A, 0).await;
+    assert_eq!(
+        observe_batch(
+            &stack,
+            vec![reported_output(
+                &candidate_address,
+                101,
+                candidate_total,
+                1,
+                Some(301)
+            )]
+        )
+        .await,
+        Ok(1)
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            observe_batch(
+                &stack,
+                vec![reported_output(
+                    &candidate_address,
+                    101,
+                    candidate_total - 1,
+                    0,
+                    None
+                )]
+            )
+            .await,
+            Ok(1)
+        );
+    }
+    assert!(!integrity_failed(&stack.pool, &candidate_id).await);
+    assert_eq!(
+        refusals(&stack.pool, &candidate_id).await,
+        vec![("amount_conflict".to_owned(), 2)]
+    );
+    assert!(plan_addresses(&stack).await.contains(&candidate_address));
+    assert!(
+        observation_rows(&stack.pool, &candidate_id)
+            .await
+            .is_empty()
+    );
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    let body = status(&stack, REFERENCE_A).await;
+    assert_eq!(body["status"], "confirmed");
+    assert_eq!(body["amount_matched"], true);
+    assert_eq!(body["late_settlement"], false);
+
+    // A recorded observation, then a contradicting report.
+    let (row_id, row_address, row_total) = activated_invoice(&stack, REFERENCE_B, 1).await;
+    assert_eq!(
+        observe_batch(
+            &stack,
+            vec![reported_output(&row_address, 102, row_total, 0, None)]
+        )
+        .await,
+        Ok(1)
+    );
+    let first = observation_rows(&stack.pool, &row_id).await;
+    assert_eq!(
+        observe_batch(
+            &stack,
+            vec![reported_output(&row_address, 102, row_total + 5, 0, None)]
+        )
+        .await,
+        Ok(1)
+    );
+    assert!(!integrity_failed(&stack.pool, &row_id).await);
+    assert_eq!(
+        refusals(&stack.pool, &row_id).await,
+        vec![("amount_conflict".to_owned(), 1)]
+    );
+    assert_eq!(observation_rows(&stack.pool, &row_id).await, first);
+    let detected = status(&stack, REFERENCE_B).await;
+    assert_eq!(detected["status"], "detected");
+    assert_eq!(detected["amount_matched"], true);
+    assert_eq!(
+        observe_batch(
+            &stack,
+            vec![reported_output(&row_address, 102, row_total, 1, Some(302))]
+        )
+        .await,
+        Ok(1)
+    );
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    let confirmed = status(&stack, REFERENCE_B).await;
+    assert_eq!(confirmed["status"], "confirmed");
+    assert_eq!(confirmed["amount_matched"], true);
+    stack.shutdown().await;
+}
+
+/// A different output first seen confirmed after `expires_at`, at the same
+/// or a higher height than an on-time candidate, is recorded late. When the
+/// on-time candidate is orphaned and exhausts its fetch attempts, the late
+/// output binds and the status reports `late_settlement`; when the on-time
+/// candidate resolves, the late output is still recorded, unbound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn late_replacement_at_same_or_higher_height_is_recorded_late() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(174).await;
+    let cases = [
+        (REFERENCE_A, 0_i64, 111_u8, 112_u8, 310_u32, true),
+        (REFERENCE_B, 1, 113, 114, 320, true),
+        (REFERENCE_C, 2, 115, 116, 315, false),
+    ];
+    let mut invoices = Vec::new();
+    for (reference, child, on_time_byte, _, _, _) in cases {
+        let (invoice_id, address, total) = activated_invoice(&stack, reference, child).await;
+        assert_eq!(
+            observe_batch(
+                &stack,
+                vec![reported_output(&address, on_time_byte, total, 1, Some(310))]
+            )
+            .await,
+            Ok(1)
+        );
+        tail_invoice(&stack, &invoice_id).await;
+        invoices.push((invoice_id, address, total));
+    }
+    for ((_, _, _, late_byte, late_height, _), (_, address, total)) in cases.iter().zip(&invoices) {
+        assert_eq!(
+            observe_batch(
+                &stack,
+                vec![reported_output(
+                    address,
+                    *late_byte,
+                    *total,
+                    1,
+                    Some(*late_height)
+                )]
+            )
+            .await,
+            Ok(1)
+        );
+    }
+    for ((_, _, on_time_byte, late_byte, _, _), (invoice_id, _, _)) in cases.iter().zip(&invoices) {
+        assert_eq!(
+            candidate_lateness(&stack.pool, invoice_id, &test_outpoint(*on_time_byte, 0)).await,
+            Some(false)
+        );
+        assert_eq!(
+            candidate_lateness(&stack.pool, invoice_id, &test_outpoint(*late_byte, 0)).await,
+            Some(true),
+            "the late output is recorded, never dropped"
+        );
+    }
+
+    // The on-time output of the first two invoices was orphaned.
+    for ((_, _, on_time_byte, _, _, orphaned), (invoice_id, _, _)) in cases.iter().zip(&invoices) {
+        if !orphaned {
+            continue;
+        }
+        let candidate = paykit_server::persistence::PendingCandidate {
+            invoice_id: uuid::Uuid::parse_str(invoice_id).unwrap(),
+            outpoint: OutPoint::new(Txid::from_byte_array([*on_time_byte; 32]), 0),
+        };
+        for _ in 0..12 {
+            ObservationBackend::record_candidate_failure(
+                &stack.store,
+                &candidate,
+                CandidateFailureKind::Fetch,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            baseline_state(&stack.pool, invoice_id).await,
+            "expired_tail"
+        );
+    }
+    resolve_pending_candidates(&stack).await;
+
+    for (reference, (_, _, _, _, _, orphaned), (invoice_id, _, _)) in [
+        (REFERENCE_A, cases[0], &invoices[0]),
+        (REFERENCE_B, cases[1], &invoices[1]),
+        (REFERENCE_C, cases[2], &invoices[2]),
+    ] {
+        let rows = observation_rows(&stack.pool, invoice_id).await;
+        let body = status(&stack, reference).await;
+        assert_eq!(body["status"], "confirmed");
+        if orphaned {
+            assert_eq!(rows.len(), 1);
+            assert_eq!((rows[0].0, rows[0].5), (true, true), "late output bound");
+            assert_eq!(body["late_settlement"], true);
+        } else {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                (rows[0].0, rows[0].5),
+                (false, true),
+                "on-time output bound"
+            );
+            assert_eq!(
+                (rows[1].0, rows[1].5),
+                (true, false),
+                "late output recorded"
+            );
+            assert_eq!(body["late_settlement"], false);
+        }
+    }
+    stack.shutdown().await;
+}
+
+/// Outputs reported after the binding is final are recorded as unbound
+/// observations, through both the direct and the candidate path, and never
+/// change the final payment facts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn additional_output_after_finality_is_recorded_not_dropped() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(175).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let bound = test_outpoint(121, 0);
+    let pending = test_outpoint(124, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &pending, total, 1, Some(304), true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(&address, &bound, total, 6, Some(301), true)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        resolve_pending_candidates(&stack).await,
+        1,
+        "a candidate pending when the binding became final still resolves"
+    );
+    let final_status = status(&stack, REFERENCE_A).await;
+    assert_eq!(final_status["confirmations"], 6);
+
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(&address, &bound, total, 1, Some(305), true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(&address, &test_outpoint(122, 0), total, 1, Some(302), true)
+            .await
+            .unwrap()
+    );
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(
+                &address,
+                &test_outpoint(123, 0),
+                total - 3,
+                2,
+                Some(303),
+                true
+            )
+            .await
+            .unwrap()
+    );
+    let rows = observation_rows(&stack.pool, &invoice_id).await;
+    assert_eq!(rows.len(), 4, "every output is recorded");
+    assert_eq!(
+        rows.iter().filter(|row| row.5).count(),
+        1,
+        "only the final binding is active"
+    );
+    assert!(
+        rows.iter().any(|row| row.5 && row.3 == 6),
+        "the final binding is unchanged"
+    );
+    assert_eq!(status(&stack, REFERENCE_A).await, final_status);
+    stack.shutdown().await;
+}
+
+/// An invoice whose candidate is still pending at the end of the tail stays
+/// `expired_tail` until the candidate is resolved, so an output first seen
+/// in the tail is not dropped by the end of observation. The hold is bounded
+/// by `CANDIDATE_TAIL_HOLD_SECONDS` after the candidate's first sighting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn pending_candidate_holds_the_tail_open_until_resolved() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(176).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    tail_invoice(&stack, &invoice_id).await;
+    let paid = test_outpoint(131, 0);
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(&address, &paid, total, 1, Some(301), true)
+            .await
+            .unwrap()
+    );
+    shift_expires_at(&stack.pool, &invoice_id, -(24 * 3600 + 60)).await;
+    apply_transitions(&stack).await;
+    assert_eq!(
+        baseline_state(&stack.pool, &invoice_id).await,
+        "expired_tail"
+    );
+
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    assert!(late_settlement_flag(&stack.pool, &invoice_id).await);
+    apply_transitions(&stack).await;
+    assert_eq!(
+        baseline_state(&stack.pool, &invoice_id).await,
+        "expired_final"
+    );
+
+    // The hold is bounded: a candidate first seen longer ago than the hold
+    // (its resolution kept failing) no longer keeps the invoice open, and it
+    // stays recorded as pending.
+    let (stuck_id, stuck_address, stuck_total) = activated_invoice(&stack, REFERENCE_B, 1).await;
+    tail_invoice(&stack, &stuck_id).await;
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation_at_height(
+                &stuck_address,
+                &test_outpoint(132, 0),
+                stuck_total,
+                1,
+                Some(301),
+                true
+            )
+            .await
+            .unwrap()
+    );
+    shift_expires_at(&stack.pool, &stuck_id, -(24 * 3600 + 60)).await;
+    apply_transitions(&stack).await;
+    assert_eq!(baseline_state(&stack.pool, &stuck_id).await, "expired_tail");
+    sqlx::query(
+        "UPDATE bitcoin_observation_candidates
+         SET created_at = NOW() - make_interval(secs => $2 + 60)
+         WHERE invoice_id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&stuck_id).unwrap())
+    .bind(paykit_server::persistence::CANDIDATE_TAIL_HOLD_SECONDS)
+    .execute(&stack.pool)
+    .await
+    .unwrap();
+    apply_transitions(&stack).await;
+    assert_eq!(
+        baseline_state(&stack.pool, &stuck_id).await,
+        "expired_final"
+    );
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM bitcoin_observation_candidates WHERE invoice_id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&stuck_id).unwrap())
+    .fetch_one(&stack.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "pending", "the unresolved candidate stays recorded");
+    stack.shutdown().await;
+}
+
+/// An outpoint already recorded under another invoice is refused for the
+/// reporting invoice and counted, and the rest of the batch still applies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn cross_invoice_outpoint_is_refused_without_aborting_the_batch() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(177).await;
+    let (owner_id, owner_address, owner_total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let (other_id, other_address, other_total) = activated_invoice(&stack, REFERENCE_B, 1).await;
+    assert!(
+        stack
+            .store
+            .apply_bitcoin_observation(
+                &owner_address,
+                &test_outpoint(141, 0),
+                owner_total,
+                0,
+                None,
+                true
+            )
+            .await
+            .unwrap()
+    );
+    let mut batch = vec![
+        reported_output(&other_address, 141, other_total, 0, None),
+        reported_output(&other_address, 142, other_total, 0, None),
+    ];
+    batch.sort_by_key(|output| output.outpoint.txid);
+    assert_eq!(observe_batch(&stack, batch).await, Ok(2));
+    assert_eq!(
+        refusals(&stack.pool, &other_id).await,
+        vec![("outpoint_owned_by_other_invoice".to_owned(), 1)]
+    );
+    assert!(!integrity_failed(&stack.pool, &other_id).await);
+    let other_rows = observation_rows(&stack.pool, &other_id).await;
+    assert_eq!(other_rows.len(), 1, "the valid output still applied");
+    assert_eq!(status(&stack, REFERENCE_B).await["status"], "detected");
+    assert_eq!(observation_rows(&stack.pool, &owner_id).await.len(), 1);
+    stack.shutdown().await;
+}
+
+/// A candidate whose resolution keeps failing in persistence rotates behind
+/// other candidates instead of holding the one-per-tick queue head, and
+/// approval commits only together with its observation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn candidate_failures_neither_block_the_queue_nor_leave_half_approvals() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(178).await;
+    let (stuck_id, stuck_address, stuck_total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let (next_id, next_address, next_total) = activated_invoice(&stack, REFERENCE_B, 1).await;
+    for (address, byte, total) in [
+        (&stuck_address, 151_u8, stuck_total),
+        (&next_address, 152, next_total),
+    ] {
+        assert!(
+            stack
+                .store
+                .apply_bitcoin_observation_at_height(
+                    address,
+                    &test_outpoint(byte, 0),
+                    total,
+                    1,
+                    Some(301),
+                    true
+                )
+                .await
+                .unwrap()
+        );
+    }
+    let queue = stack.store.pending_candidates().await.unwrap();
+    assert_eq!(queue[0].invoice_id.to_string(), stuck_id);
+
+    sqlx::query(
+        "CREATE FUNCTION refuse_observation_insert() RETURNS trigger AS $$
+         BEGIN RAISE EXCEPTION 'injected observation write failure'; END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(&stack.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER refuse_observation_insert BEFORE INSERT ON bitcoin_observations
+         FOR EACH ROW EXECUTE FUNCTION refuse_observation_insert()",
+    )
+    .execute(&stack.pool)
+    .await
+    .unwrap();
+    assert!(
+        stack
+            .store
+            .resolve_candidate(
+                &queue[0],
+                &[OutPoint::new(Txid::from_byte_array([250; 32]), 0)]
+            )
+            .await
+            .is_err()
+    );
+    let (approved, state): (bool, String) = sqlx::query_as(
+        "SELECT approved, state FROM bitcoin_observation_candidates WHERE invoice_id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&stuck_id).unwrap())
+    .fetch_one(&stack.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (approved, state.as_str()),
+        (false, "pending"),
+        "a failed observation write rolls the approval back"
+    );
+    ObservationBackend::record_candidate_failure(
+        &stack.store,
+        &queue[0],
+        CandidateFailureKind::Persistence,
+    )
+    .await
+    .unwrap();
+    let queue = stack.store.pending_candidates().await.unwrap();
+    assert_eq!(queue.len(), 1);
+    assert_eq!(
+        queue[0].invoice_id.to_string(),
+        next_id,
+        "the failing candidate no longer holds the queue head"
+    );
+
+    sqlx::query("DROP TRIGGER refuse_observation_insert ON bitcoin_observations")
+        .execute(&stack.pool)
+        .await
+        .unwrap();
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    sqlx::query("UPDATE bitcoin_observation_candidates SET next_attempt_at = NOW()")
+        .execute(&stack.pool)
+        .await
+        .unwrap();
+    assert_eq!(resolve_pending_candidates(&stack).await, 1);
+    assert_eq!(status(&stack, REFERENCE_A).await["status"], "confirmed");
+    assert_eq!(status(&stack, REFERENCE_B).await["status"], "confirmed");
+    stack.shutdown().await;
+}
+
+/// An output index Postgres cannot store is an invalid provider report: the
+/// whole batch is refused before any write and no invoice is quarantined.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn unrepresentable_output_index_is_rejected_before_any_write() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let stack = boot(179).await;
+    let (invoice_id, address, total) = activated_invoice(&stack, REFERENCE_A, 0).await;
+    let mut output = reported_output(&address, 161, total, 0, None);
+    output.outpoint.vout = u32::try_from(i32::MAX).unwrap() + 1;
+    assert_eq!(
+        observe_batch(&stack, vec![output]).await,
+        Err(ObserverError::InvalidObservation)
+    );
+    assert!(!integrity_failed(&stack.pool, &invoice_id).await);
+    assert!(observation_rows(&stack.pool, &invoice_id).await.is_empty());
     stack.shutdown().await;
 }

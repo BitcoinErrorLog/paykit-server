@@ -2491,6 +2491,10 @@ fn validate_batch(
                 return Err(ObserverError::WrongNetwork);
             }
             if i32::try_from(output.confirmations).is_err()
+                || i32::try_from(output.outpoint.vout).is_err()
+                || output
+                    .confirmed_height
+                    .is_some_and(|height| i32::try_from(height).is_err())
                 || (!output.present && output.confirmations != 0)
                 || (output.confirmations == 0) != output.confirmed_height.is_none()
             {

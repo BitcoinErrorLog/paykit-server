@@ -39,7 +39,7 @@ fn migrator_through(version: i64) -> Migrator {
     }
 }
 
-const REQUIRED_TABLES: [&str; 17] = [
+const REQUIRED_TABLES: [&str; 18] = [
     "deployment_metadata",
     "creators",
     "sdk_states",
@@ -57,9 +57,10 @@ const REQUIRED_TABLES: [&str; 17] = [
     "sdk_outbound_invocations",
     "setup_flow_cancellations",
     "observer_leadership",
+    "bitcoin_observation_refusals",
 ];
 
-const ACCOUNT_RETENTION_REGISTRY: [&str; 15] = [
+const ACCOUNT_RETENTION_REGISTRY: [&str; 16] = [
     "deployment_metadata",
     "creators",
     "sdk_states",
@@ -75,6 +76,7 @@ const ACCOUNT_RETENTION_REGISTRY: [&str; 15] = [
     "sentinel_events",
     "outbox_terminal_events",
     "sdk_outbound_invocations",
+    "bitcoin_observation_refusals",
 ];
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
@@ -242,7 +244,7 @@ fn migration_catalog_has_one_contiguous_canonical_version_per_file() {
     let mut versions = migration_versions(names).unwrap();
     versions.sort_unstable();
 
-    assert_eq!(versions, (1..=26).collect::<Vec<_>>());
+    assert_eq!(versions, (1..=27).collect::<Vec<_>>());
     assert_eq!(
         versions.len(),
         versions.iter().collect::<HashSet<_>>().len()
@@ -270,12 +272,17 @@ fn release_checksum_manifest_pins_unapplied_migrations() {
     );
     let migration_0026 =
         include_bytes!("../../paykit-server/migrations/0026_observer_leadership_lease.sql");
+    let migration_0027 =
+        include_bytes!("../../paykit-server/migrations/0027_first_seen_payment_facts.sql");
     let checksum_0024 = format!("{:x}", Sha512::digest(migration_0024));
     let checksum_0025 = format!("{:x}", Sha512::digest(migration_0025));
     let checksum_0026 = format!("{:x}", Sha512::digest(migration_0026));
+    let checksum_0027 = format!("{:x}", Sha512::digest(migration_0027));
     assert_eq!(
         manifest.trim(),
-        format!("0024 {checksum_0024}\n0025 {checksum_0025}\n0026 {checksum_0026}")
+        format!(
+            "0024 {checksum_0024}\n0025 {checksum_0025}\n0026 {checksum_0026}\n0027 {checksum_0027}"
+        )
     );
 }
 
@@ -533,7 +540,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
         applied_versions,
         vec![
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-            25, 26
+            25, 26, 27
         ]
     );
 
@@ -645,7 +652,7 @@ async fn migration_0024_upgrades_exact_deployed_0023_schema() {
         .fetch_one(pool)
         .await
         .unwrap();
-    assert_eq!(after, 26);
+    assert_eq!(after, 27);
     let recovery_columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns \
          WHERE table_schema = 'public' AND table_name = 'outbox' \
@@ -1946,6 +1953,133 @@ async fn payment_request_expiry_migration_backfills_and_constrains() {
     .await
     .unwrap();
     assert!(!late, "late_settlement must default false");
+
+    database.cleanup().await;
+}
+
+/// 0027 adds a nullable first-seen `late_settlement` to candidates. A
+/// candidate of an invoice that never entered the tail is backfilled on
+/// time; a candidate of an invoice that has entered the tail stays NULL
+/// (the observation write then falls back to the invoice state). Candidates
+/// are keyed per outpoint afterwards, and refusals have their own table
+/// that the runtime and operations roles can use.
+#[tokio::test]
+async fn first_seen_facts_migration_backfills_rekeys_candidates_and_adds_refusals() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    migrator_through(26).run(pool).await.unwrap();
+    let creator_id = insert_creator(pool).await;
+    let insert = |label: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Uuid>(
+                "INSERT INTO invoices
+                 (creator_id, reader_lookup_hash, bundle_lookup_hash,
+                  payment_request_lookup_hash, invoice_envelope, payment_record_envelope,
+                  bitcoin_address_lookup_hash, derivation_index_lookup_hash, payment_status,
+                  baseline_state, expires_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'undetected', 'observing',
+                         NOW() + INTERVAL '1 hour')
+                 RETURNING id",
+            )
+            .bind(creator_id)
+            .bind(format!("reader-{label}").into_bytes())
+            .bind(format!("bundle-{label}").into_bytes())
+            .bind(format!("request-{label}").into_bytes())
+            .bind(b"encrypted-invoice".as_slice())
+            .bind(b"encrypted-payment-record".as_slice())
+            .bind(Uuid::new_v4().as_bytes().as_slice())
+            .bind(Uuid::new_v4().as_bytes().as_slice())
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let live = insert("live").await;
+    let tailed = insert("tailed").await;
+    sqlx::query(
+        "UPDATE invoices SET baseline_state = 'expired_tail', expired_tail_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(tailed)
+    .execute(pool)
+    .await
+    .unwrap();
+    for (invoice_id, txid) in [(live, "aa"), (tailed, "bb")] {
+        sqlx::query(
+            "INSERT INTO bitcoin_observation_candidates
+             (invoice_id, txid, vout, confirmations, confirmed_height)
+             VALUES ($1, $2, 0, 1, 500)",
+        )
+        .bind(invoice_id)
+        .bind(txid.repeat(32))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    migrator_through(27).run(pool).await.unwrap();
+
+    let lateness = |invoice_id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<bool>>(
+                "SELECT late_settlement FROM bitcoin_observation_candidates WHERE invoice_id = $1",
+            )
+            .bind(invoice_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(lateness(live).await, Some(false));
+    assert_eq!(lateness(tailed).await, None);
+    let nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'bitcoin_observation_candidates'
+           AND column_name = 'late_settlement'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        nullable, "YES",
+        "rows written before 0027 carry no lateness"
+    );
+
+    sqlx::query(
+        "INSERT INTO bitcoin_observation_candidates
+         (invoice_id, txid, vout, confirmations, confirmed_height, late_settlement)
+         VALUES ($1, $2, 0, 1, 501, TRUE)",
+    )
+    .bind(live)
+    .bind("cc".repeat(32))
+    .execute(pool)
+    .await
+    .expect("a second outpoint for the same invoice is its own candidate");
+    let duplicate = sqlx::query(
+        "INSERT INTO bitcoin_observation_candidates
+         (invoice_id, txid, vout, confirmations, confirmed_height)
+         VALUES ($1, $2, 0, 1, 502)",
+    )
+    .bind(live)
+    .bind("cc".repeat(32))
+    .execute(pool)
+    .await;
+    assert_unique_violation(duplicate);
+
+    let refusal_grants: (bool, bool, bool, bool, bool) = sqlx::query_as(
+        "SELECT has_table_privilege('paykit', 'bitcoin_observation_refusals', 'SELECT'),
+                has_table_privilege('paykit', 'bitcoin_observation_refusals', 'INSERT'),
+                has_table_privilege('paykit', 'bitcoin_observation_refusals', 'UPDATE'),
+                has_table_privilege('paykit', 'bitcoin_observation_refusals', 'DELETE'),
+                has_table_privilege('paykit_readonly', 'bitcoin_observation_refusals', 'SELECT')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(refusal_grants, (true, true, true, false, true));
 
     database.cleanup().await;
 }

@@ -169,6 +169,16 @@ async fn other_creator_invoice(
         .unwrap()
         .invoice_id()
 }
+async fn refusal_reasons(database: &TestDatabase, invoice_id: uuid::Uuid) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT reason FROM bitcoin_observation_refusals WHERE invoice_id = $1 ORDER BY reason",
+    )
+    .bind(invoice_id)
+    .fetch_all(database.pool())
+    .await
+    .unwrap()
+}
+
 async fn facts(database: &TestDatabase, invoice_id: uuid::Uuid) -> (String, i32, bool) {
     let row = sqlx::query(
         "SELECT payment_status, confirmation_count, amount_matched FROM invoices WHERE id = $1",
@@ -1453,7 +1463,7 @@ async fn unrepresentable_confirmation_late_in_batch_causes_no_database_write() {
 }
 
 #[tokio::test]
-async fn persistence_conflict_late_in_batch_keeps_earlier_invoice_commit() {
+async fn cross_invoice_outpoint_late_in_batch_is_refused_and_earlier_commit_kept() {
     let database = TestDatabase::create().await;
     let (store, invoice_id) = batch_invoice(&database).await;
     create_other_creator(&database).await;
@@ -1508,11 +1518,16 @@ async fn persistence_conflict_late_in_batch_keeps_earlier_invoice_commit() {
             &[invoice_target()],
         )
         .await,
-        Err(ObserverError::Persistence)
+        Ok(2),
+        "a cross-invoice outpoint is refused without aborting the batch"
     );
     assert_eq!(
         facts(&database, invoice_id).await,
         ("detected".into(), 0, true)
+    );
+    assert_eq!(
+        refusal_reasons(&database, invoice_id).await,
+        vec!["outpoint_owned_by_other_invoice".to_owned()]
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -1807,17 +1822,44 @@ async fn underpayment_is_nonfinal_replaceable_and_outpoints_stay_globally_unique
         facts(&database, invoice_id).await,
         ("confirmed".into(), 20, false)
     );
+    assert!(
+        store
+            .apply_bitcoin_observation(
+                &address,
+                &persisted_outpoint("underpaid"),
+                100,
+                0,
+                None,
+                true,
+            )
+            .await
+            .unwrap(),
+        "a different amount for a recorded outpoint is refused, not an error"
+    );
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 20, false),
+        "a recorded outpoint's amount is immutable"
+    );
+    assert_eq!(
+        refusal_reasons(&database, invoice_id).await,
+        vec!["amount_conflict".to_owned()]
+    );
     store
         .apply_bitcoin_observation(
             &address,
             &persisted_outpoint("underpaid"),
-            100,
+            99,
             0,
             None,
             true,
         )
         .await
         .unwrap();
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("detected".into(), 0, false)
+    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM bitcoin_observations WHERE invoice_id = $1",
@@ -1869,21 +1911,26 @@ async fn underpayment_is_nonfinal_replaceable_and_outpoints_stay_globally_unique
         "other-bitcoin-address-0",
     )
     .await;
-    let error = store
-        .apply_bitcoin_observation(
-            "other-bitcoin-address-0",
-            &persisted_outpoint("replacement"),
-            100,
-            0,
-            None,
-            true,
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(error, PersistenceError::Conflict);
+    assert!(
+        store
+            .apply_bitcoin_observation(
+                "other-bitcoin-address-0",
+                &persisted_outpoint("replacement"),
+                100,
+                0,
+                None,
+                true,
+            )
+            .await
+            .unwrap()
+    );
     assert_eq!(
         facts(&database, other_id).await,
         ("undetected".into(), 0, false)
+    );
+    assert_eq!(
+        refusal_reasons(&database, other_id).await,
+        vec!["outpoint_owned_by_other_invoice".to_owned()]
     );
 
     database.cleanup().await;
