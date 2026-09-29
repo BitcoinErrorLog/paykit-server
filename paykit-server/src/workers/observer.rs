@@ -1648,6 +1648,16 @@ const ADDRESS_DEADLINE_PHASES: u32 = 3;
 const MAX_BLOCKING_TRANSPORT_ATTEMPTS: usize = 64;
 
 #[cfg(test)]
+type TestTcpConnect = Arc<
+    dyn Fn(
+            std::net::SocketAddr,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = std::io::Result<tokio::net::TcpStream>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+#[cfg(test)]
 #[derive(Default)]
 struct TestPhaseDelays {
     connect: Mutex<Vec<Duration>>,
@@ -1656,6 +1666,9 @@ struct TestPhaseDelays {
     connect_gate: Option<Arc<TestPhaseGate>>,
     tls_gate: Option<Arc<TestPhaseGate>>,
     request_gate: Option<Arc<TestPhaseGate>>,
+    /// Replaces `TcpStream::connect` inside the TCP phase. Absent in every
+    /// production adapter.
+    connect_override: Option<TestTcpConnect>,
 }
 
 #[cfg(test)]
@@ -1848,9 +1861,21 @@ impl ElectrumAdapter {
         let max_response_bytes = self.max_response_bytes;
 
         let connect_deadline = self.phase_deadline(overall_deadline);
+        #[cfg(test)]
+        let connect_override = self
+            .test_phase_delays
+            .as_ref()
+            .and_then(|delays| delays.connect_override.clone());
         let pending = tokio::time::timeout_at(connect_deadline, async {
             #[cfg(test)]
             self.delay_test_phase(TestPhase::Connect).await;
+            #[cfg(test)]
+            if let Some(connect_override) = &connect_override {
+                return electrum::connect_tcp_async_using(&endpoint, |address| {
+                    connect_override(address)
+                })
+                .await;
+            }
             electrum::connect_tcp_async(&endpoint).await
         })
         .await
@@ -2544,8 +2569,8 @@ fn map_persistence(_: PersistenceError) -> ObserverError {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{BufRead, BufReader, Write},
-        net::{TcpListener, TcpStream},
+        io::{BufRead, BufReader, Read, Write},
+        net::{Shutdown, TcpListener, TcpStream},
         sync::atomic::{AtomicBool, Ordering},
         thread,
     };
@@ -2699,6 +2724,196 @@ mod tests {
 
         tokio::time::resume();
         let probe = adapter.probe().await.expect("a later probe reconnects");
+        assert_eq!(probe.height, 0);
+    }
+
+    /// Local listener that accepts and never sends a byte.
+    struct SilentListener {
+        address: std::net::SocketAddr,
+        accepted: Arc<Notify>,
+        closed: Arc<Notify>,
+        stop: Arc<AtomicBool>,
+        streams: Arc<Mutex<Vec<TcpStream>>>,
+        accept_handle: Option<thread::JoinHandle<()>>,
+        readers: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
+    }
+
+    impl SilentListener {
+        fn start() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let accepted = Arc::new(Notify::new());
+            let closed = Arc::new(Notify::new());
+            let stop = Arc::new(AtomicBool::new(false));
+            let streams = Arc::new(Mutex::new(Vec::new()));
+            let readers = Arc::new(Mutex::new(Vec::new()));
+            let accept_handle = {
+                let accepted = accepted.clone();
+                let closed = closed.clone();
+                let stop = stop.clone();
+                let streams = streams.clone();
+                let readers = readers.clone();
+                thread::spawn(move || {
+                    while let Ok((stream, _)) = listener.accept() {
+                        if stop.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        streams.lock().unwrap().push(stream.try_clone().unwrap());
+                        let closed = closed.clone();
+                        readers.lock().unwrap().push(thread::spawn(move || {
+                            let mut stream = stream;
+                            let mut buf = [0u8; 1];
+                            let _ = stream.read(&mut buf);
+                            closed.notify_one();
+                        }));
+                        accepted.notify_one();
+                    }
+                })
+            };
+            Self {
+                address,
+                accepted,
+                closed,
+                stop,
+                streams,
+                accept_handle: Some(accept_handle),
+                readers,
+            }
+        }
+    }
+
+    impl Drop for SilentListener {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            for stream in self.streams.lock().unwrap().drain(..) {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            let _ = TcpStream::connect(self.address);
+            if let Some(handle) = self.accept_handle.take() {
+                handle.join().unwrap();
+            }
+            for handle in std::mem::take(&mut *self.readers.lock().unwrap()) {
+                handle.join().unwrap();
+            }
+        }
+    }
+
+    struct ReleaseOnDrop(Arc<AtomicBool>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn test_address_b() -> Address {
+        let public_key = CompressedPublicKey::from_str(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap();
+        Address::p2wpkh(&public_key, bitcoin::Network::Regtest)
+    }
+
+    /// First TCP phase connects to a local listener that accepts and never
+    /// answers, then does not resolve. Later phases use the healthy endpoint.
+    fn stalled_connect_override(
+        blackhole: std::net::SocketAddr,
+        released: Arc<AtomicBool>,
+    ) -> TestTcpConnect {
+        let once = Arc::new(AtomicBool::new(true));
+        Arc::new(move |address| {
+            let once = once.clone();
+            let released = released.clone();
+            Box::pin(async move {
+                if once.swap(false, Ordering::SeqCst) {
+                    let _release = ReleaseOnDrop(released);
+                    let mut stream = tokio::net::TcpStream::connect(blackhole)
+                        .await
+                        .expect("silent listener is local");
+                    let mut buf = [0u8; 1];
+                    // The peer has accepted and will not send. This read keeps
+                    // the transport connect phase from returning a socket.
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    std::future::pending::<std::io::Result<tokio::net::TcpStream>>().await
+                } else {
+                    tokio::net::TcpStream::connect(address).await
+                }
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn stalled_tcp_connect_deadline_observes_the_next_batch() {
+        let healthy = ProbeServer::start();
+        let silent = SilentListener::start();
+        let released = Arc::new(AtomicBool::new(false));
+        let address_deadline = Duration::from_secs(1);
+        let delays = Arc::new(TestPhaseDelays {
+            connect_override: Some(stalled_connect_override(silent.address, released.clone())),
+            ..TestPhaseDelays::default()
+        });
+        let adapter = ElectrumAdapter::configured(
+            healthy.endpoint.clone(),
+            BitcoinNetwork::Regtest,
+            Duration::from_secs(30),
+            200,
+            address_deadline,
+            electrum::DEFAULT_MAX_RESPONSE_BYTES,
+        )
+        .unwrap()
+        .with_test_phase_delays(delays);
+        let first = test_address();
+        let second = test_address_b();
+        let targets = [
+            ObservationTarget::new(first.to_string(), None),
+            ObservationTarget::new(second.to_string(), None),
+        ];
+
+        let pending = {
+            let adapter = adapter.clone();
+            let targets = targets.clone();
+            tokio::spawn(async move { adapter.observations(0, &targets).await })
+        };
+        silent.accepted.notified().await;
+        assert!(
+            !pending.is_finished(),
+            "the connect phase must still be outstanding after the listener accepts"
+        );
+
+        let started = std::time::Instant::now();
+        let stalled = tokio::time::timeout(Duration::from_secs(3), pending)
+            .await
+            .expect("removing the connect deadline leaves this batch waiting on the silent peer")
+            .unwrap();
+        assert_eq!(
+            stalled,
+            Err(ObserverError::Unavailable),
+            "a connect that never completes is endpoint unavailable"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "connect deadline fired in {:?}, inside the 30s socket timeout",
+            started.elapsed()
+        );
+        assert!(
+            released.load(Ordering::SeqCst),
+            "the deadline must drop the stalled connect instead of reusing it"
+        );
+        tokio::time::timeout(Duration::from_secs(2), silent.closed.notified())
+            .await
+            .expect("the silent listener must observe the stalled socket close");
+
+        let report = adapter.observations(0, &targets).await.unwrap();
+        assert_eq!(
+            report.observed,
+            vec![first.to_string(), second.to_string()],
+            "the observer moves on and the next batch is not blocked"
+        );
+        assert!(report.failed.is_empty());
+        let probe = adapter
+            .probe()
+            .await
+            .expect("the later probe opens a fresh connection");
         assert_eq!(probe.height, 0);
     }
 

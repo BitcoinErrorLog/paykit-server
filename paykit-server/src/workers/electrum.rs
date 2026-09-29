@@ -27,6 +27,7 @@
 //! this wrapper.
 
 use std::{
+    future::Future,
     io::{self, Read, Write},
     net::{SocketAddr, TcpStream, ToSocketAddrs},
     sync::Arc,
@@ -336,6 +337,21 @@ pub fn connect(
 /// connect future. Dropping this future at its phase deadline closes the
 /// in-progress socket instead of leaving a `spawn_blocking` connect behind.
 pub async fn connect_tcp_async(endpoint: &str) -> io::Result<PendingConnection> {
+    connect_tcp_async_using(endpoint, |address| tokio::net::TcpStream::connect(address)).await
+}
+
+/// Same TCP phase as `connect_tcp_async`, with the per-address connector
+/// supplied by the caller. Production passes `TcpStream::connect`. Tests
+/// pass a connector that reaches a local listener and then never resolves,
+/// so a stalled connect is deterministic without a public network.
+pub(crate) async fn connect_tcp_async_using<F, Fut>(
+    endpoint: &str,
+    mut connect_one: F,
+) -> io::Result<PendingConnection>
+where
+    F: FnMut(SocketAddr) -> Fut,
+    Fut: Future<Output = io::Result<tokio::net::TcpStream>>,
+{
     let endpoint = ElectrumEndpoint::parse(endpoint)?;
     let addresses: Vec<SocketAddr> =
         tokio::net::lookup_host((endpoint.host.as_str(), endpoint.port))
@@ -343,7 +359,7 @@ pub async fn connect_tcp_async(endpoint: &str) -> io::Result<PendingConnection> 
             .collect();
     let mut last_error = None;
     for address in addresses {
-        match tokio::net::TcpStream::connect(address).await {
+        match connect_one(address).await {
             Ok(stream) => {
                 let tcp = stream.into_std()?;
                 tcp.set_nonblocking(false)?;
