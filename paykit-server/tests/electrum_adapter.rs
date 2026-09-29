@@ -113,6 +113,9 @@ struct StalledTlsServer {
     wake_address: SocketAddr,
     shutdown: Arc<AtomicBool>,
     gate: Arc<(Mutex<bool>, Condvar)>,
+    /// Fires once the listener has accepted and is holding the socket
+    /// without writing a TLS record.
+    accepted: Arc<tokio::sync::Notify>,
     accept_handle: Option<thread::JoinHandle<()>>,
     connection_handles: Arc<Mutex<Vec<thread::JoinHandle<()>>>>,
 }
@@ -124,10 +127,12 @@ impl StalledTlsServer {
         let endpoint = format!("ssl://{wake_address}");
         let shutdown = Arc::new(AtomicBool::new(false));
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let accepted = Arc::new(tokio::sync::Notify::new());
         let connection_handles = Arc::new(Mutex::new(Vec::new()));
         let accept_handle = {
             let shutdown = shutdown.clone();
             let gate = gate.clone();
+            let accepted = accepted.clone();
             let connection_handles = connection_handles.clone();
             thread::spawn(move || {
                 while let Ok((stream, _)) = listener.accept() {
@@ -146,6 +151,7 @@ impl StalledTlsServer {
                                 released = condvar.wait(released).unwrap();
                             }
                         }));
+                    accepted.notify_one();
                 }
             })
         };
@@ -154,6 +160,7 @@ impl StalledTlsServer {
             wake_address,
             shutdown,
             gate,
+            accepted,
             accept_handle: Some(accept_handle),
             connection_handles,
         }
@@ -214,6 +221,117 @@ async fn tls_handshake_failure_is_eager_endpoint_unavailable_not_an_address_dead
             panic!("TLS handshake was deferred until the first address RPC");
         }
     }
+}
+
+#[tokio::test]
+async fn stalled_tls_handshake_deadline_observes_the_next_batch() {
+    let stalled = StalledTlsServer::start();
+    let first = fixture_address();
+    let second = Address::p2wpkh(
+        &CompressedPublicKey::from_str(
+            "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
+        )
+        .unwrap(),
+        Network::Regtest,
+    );
+    let healthy = ProtocolServer::start_multi(
+        Network::Regtest,
+        vec![
+            (
+                first.script_pubkey(),
+                serde_json::json!([unspent_entry(21, 11_000, TIP_HEIGHT)]),
+            ),
+            (
+                second.script_pubkey(),
+                serde_json::json!([unspent_entry(22, 12_000, TIP_HEIGHT)]),
+            ),
+        ],
+    )
+    .await;
+    // The socket timeout is far longer than the phase deadline. A removed
+    // handshake deadline would sit in `complete_io` until that socket
+    // timeout, and a lazy `StreamOwned::new` would reach the per-address
+    // deadline path instead of endpoint unavailable.
+    let address_deadline = Duration::from_secs(1);
+    let stalled_adapter = ElectrumAdapter::configured(
+        stalled.endpoint.clone(),
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(30),
+        200,
+        address_deadline,
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .unwrap();
+    let healthy_adapter = ElectrumAdapter::configured(
+        healthy.endpoint(),
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(1),
+        200,
+        Duration::from_secs(5),
+        DEFAULT_MAX_RESPONSE_BYTES,
+    )
+    .unwrap();
+    let stalled_targets = [
+        ObservationTarget::new(first.to_string(), None),
+        ObservationTarget::new(second.to_string(), None),
+    ];
+    let next_targets = stalled_targets.clone();
+
+    let started = std::time::Instant::now();
+    let stalled_call = {
+        let targets = stalled_targets.clone();
+        tokio::spawn(async move {
+            stalled_adapter
+                .observations(TIP_HEIGHT as u32, &targets)
+                .await
+        })
+    };
+    stalled.accepted.notified().await;
+    assert!(
+        !stalled_call.is_finished(),
+        "the handshake must still be outstanding after the listener accepts"
+    );
+
+    let next_batch = healthy_adapter
+        .observations(TIP_HEIGHT as u32, &next_targets)
+        .await
+        .unwrap();
+    assert!(
+        !stalled_call.is_finished(),
+        "the next batch must be observed while the TLS handshake is still inside its deadline"
+    );
+    assert_eq!(
+        next_batch.observed,
+        vec![first.to_string(), second.to_string()],
+        "the observer moves on to the next targets and that batch is not blocked"
+    );
+    assert!(next_batch.failed.is_empty());
+    assert_eq!(next_batch.outputs.len(), 2);
+
+    let stalled_result = tokio::time::timeout(Duration::from_secs(3), stalled_call)
+        .await
+        .expect("removing the TLS deadline leaves the batch waiting on the silent handshake")
+        .unwrap();
+    assert_eq!(
+        stalled_result,
+        Err(ObserverError::Unavailable),
+        "an eager handshake that never completes is endpoint unavailable, not an address deadline"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "TLS deadline fired in {:?}, inside the 30s socket timeout",
+        started.elapsed()
+    );
+
+    let followed = healthy_adapter
+        .observations(TIP_HEIGHT as u32, &next_targets)
+        .await
+        .unwrap();
+    assert_eq!(
+        followed.observed,
+        vec![first.to_string(), second.to_string()],
+        "a batch after the deadline still completes"
+    );
 }
 
 fn claim_scan_script() -> bitcoin::ScriptBuf {
