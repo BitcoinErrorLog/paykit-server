@@ -337,7 +337,7 @@ pub fn connect(
 /// connect future. Dropping this future at its phase deadline closes the
 /// in-progress socket instead of leaving a `spawn_blocking` connect behind.
 pub async fn connect_tcp_async(endpoint: &str) -> io::Result<PendingConnection> {
-    connect_tcp_async_using(endpoint, |address| tokio::net::TcpStream::connect(address)).await
+    connect_tcp_async_using(endpoint, tokio::net::TcpStream::connect).await
 }
 
 /// Same TCP phase as `connect_tcp_async`, with the per-address connector
