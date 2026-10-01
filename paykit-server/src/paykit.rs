@@ -398,6 +398,30 @@ impl Adapter for PaykitAdapter {
 
     async fn ensure_link_with_peer(&self, reader: &str, path: &str) -> Result<(), HandoffError> {
         let (reader, path) = parse_peer(reader, path)?;
+        // A reader whose wallet dropped its side of the link publishes a
+        // recovery marker and waits for a new handshake. Observing the marker
+        // marks this side recovery-required, so the ensure below starts that
+        // handshake instead of reporting the old link as usable and handing
+        // requests to a link the reader no longer reads. A failed lookup may
+        // have hidden such a marker, so it stops the handoff before anything
+        // is enqueued and always leaves the row retryable; link-establishment
+        // exhaustion bounds the retries.
+        if let Err(error) = self
+            .sdk
+            .observe_encrypted_link_recovery_marker(reader.clone(), path.clone())
+            .await
+        {
+            let cause = match classify(error) {
+                HandoffError::Retryable(cause) => cause,
+                HandoffError::Permanent => RetryableHandoffCause::Other,
+            };
+            tracing::warn!(
+                stage = "link_recovery_check",
+                cause = ?cause,
+                "Paykit recovery marker check failed; the handoff will retry"
+            );
+            return Err(HandoffError::Retryable(cause));
+        }
         self.sdk
             .ensure_link_with_peer(reader, path, 1)
             .await

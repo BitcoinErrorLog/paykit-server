@@ -32,7 +32,8 @@ use locks_core::{
 use paykit_lib::{PaykitReceiverCapabilities, PaykitReceiverPath};
 use paykit_sdk::{
     InMemoryStorage, LinkedPeerState, PaykitSdk, PaykitSdkConfig, PubkyLocalSecretKey,
-    PubkyPublicKey, PubkySessionBootstrap, ReceiverNoiseSecretKey, storage::StorageState,
+    PubkyPublicKey, PubkySessionAccess, PubkySessionBootstrap, ReceiverNoiseSecretKey,
+    storage::StorageState,
 };
 use paykit_server::{
     Server,
@@ -401,6 +402,16 @@ async fn create_peer(
     bootstrap: &PubkySessionBootstrap,
     homeserver: &PubkyPublicKey,
 ) -> (ReaderPubky, PubkyPublicKey, PeerSdk) {
+    let (reader, key, sdk, _access) = create_peer_with_access(bootstrap, homeserver).await;
+    (reader, key, sdk)
+}
+
+/// `create_peer`, also returning the reader's session access so a test can
+/// write to the reader's homeserver outside the SDK.
+async fn create_peer_with_access(
+    bootstrap: &PubkySessionBootstrap,
+    homeserver: &PubkyPublicKey,
+) -> (ReaderPubky, PubkyPublicKey, PeerSdk, PubkySessionAccess) {
     let path = PaykitReceiverPath::new("bitkit/server").unwrap();
     let account = bootstrap
         .sign_up(
@@ -413,6 +424,7 @@ async fn create_peer(
         .await
         .unwrap();
     let key = account.public_key.clone();
+    let access = account.access.clone();
     let sdk = PaykitSdk::new(
         InMemoryStorage::default(),
         TestSessionProvider::new(account.access),
@@ -429,7 +441,12 @@ async fn create_peer(
     })
     .await
     .unwrap();
-    (parse_reader(&format!("pubky{key}")).unwrap(), key, sdk)
+    (
+        parse_reader(&format!("pubky{key}")).unwrap(),
+        key,
+        sdk,
+        access,
+    )
 }
 
 async fn link(
@@ -1779,6 +1796,414 @@ async fn concurrent_identical_creations_run_exactly_one_baseline_snapshot() {
     )
     .await;
     assert_eq!(replay.status, StatusCode::OK);
+
+    let _ = shutdown_tx.send(());
+    running.await.unwrap().unwrap();
+    pool.close().await;
+    database.cleanup().await;
+}
+
+/// `(status, attempt_count)` of every outbox row, oldest first.
+async fn outbox_rows(pool: &PgPool) -> Vec<(String, i32)> {
+    sqlx::query_as("SELECT status, attempt_count FROM outbox ORDER BY created_at, id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// Waits until every outbox row is `delivered`, and reports whether they got
+/// there within `timeout`.
+async fn outbox_settles_within(pool: &PgPool, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if outbox_rows(pool)
+            .await
+            .iter()
+            .all(|(status, _)| status == "delivered")
+        {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Prepares and activates one Locks invoice, which queues its handoff.
+async fn open_invoice(
+    address: SocketAddr,
+    signing_key: &SigningKey,
+    stack_id: &str,
+    fixture: &CreatorFixture,
+    reader: &ReaderPubky,
+    bundle: &str,
+) {
+    let prepared = send_http(
+        address,
+        invoice_request(signing_key, fixture, reader, bundle),
+    )
+    .await;
+    assert_eq!(
+        prepared.status,
+        StatusCode::OK,
+        "prepare body: {}",
+        String::from_utf8_lossy(&prepared.body)
+    );
+    let prepared: serde_json::Value = serde_json::from_slice(&prepared.body).unwrap();
+    let activation = send_http(
+        address,
+        activate_request(
+            signing_key,
+            prepared["invoice_id"].as_str().unwrap(),
+            stack_id,
+            prepared["total_sats"].as_u64().unwrap(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        activation.status,
+        StatusCode::OK,
+        "activation body: {}",
+        String::from_utf8_lossy(&activation.body)
+    );
+}
+
+/// The reader's wallet: keeps its side of the handshake moving, reads the
+/// link and returns once the request for `bundle` has arrived.
+async fn wait_for_request(
+    peer: &PeerSdk,
+    creator_key: &PubkyPublicKey,
+    bundle: &str,
+    pool: &PgPool,
+) {
+    let creator_path = PaykitReceiverPath::new("paykit/server").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let state = peer
+            .ensure_link_with_peer(creator_key.clone(), creator_path.clone(), 1)
+            .await
+            .map(|report| report.state);
+        if matches!(state, Ok(LinkedPeerState::Linked)) {
+            peer.receive_private_messages(creator_key.clone(), creator_path.clone())
+                .await
+                .unwrap();
+            if peer
+                .payment_requests_with(creator_key, &creator_path)
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| {
+                    request.terms.as_ref().is_some_and(|terms| {
+                        terms.metadata.get("bundle_id") == Some(&serde_json::json!(bundle))
+                    })
+                })
+            {
+                return;
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "request for {bundle} never arrived: link={state:?} outbox={:?}",
+                outbox_rows(pool).await
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A wallet that dropped its side of the server link publishes a recovery
+/// marker and waits for a new handshake. The server must not hand the next
+/// request to the abandoned link (and mark it `delivered`); it relinks, and
+/// the request arrives once the wallet is back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn server_relinks_when_the_reader_publishes_a_recovery_marker() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    paykit_server::persistence::run_migrations(database.pool())
+        .await
+        .unwrap();
+    let signing_key = SigningKey::from_bytes(&[72; 32]);
+    let server_config = config(database.database_url(), &signing_key, "100ms");
+    let initialized = initialize_database(&server_config).await.unwrap();
+    let pool = initialized.pool.clone();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "paykit-server").unwrap();
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(&pool, crypto.clone());
+    let (reader, _peer_key, peer_sdk) = create_peer(&bootstrap, &homeserver).await;
+    let creator = create_creator(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        &pool,
+        crypto.clone(),
+        CreatorSpec {
+            seed: 72,
+            account_index: 0,
+            amount_sats: 2_000,
+            counter_seed: 100,
+        },
+    )
+    .await;
+    let creator_key = PubkyPublicKey::from_raw_or_app_key(creator.creator.to_string()).unwrap();
+
+    let observer = Arc::new(DeterministicElectrum::new(&[&creator]));
+    let server = Server::build_with_transports(
+        server_config,
+        pool.clone(),
+        initialized.stack_identity.clone(),
+        pubky,
+        observer,
+    )
+    .await
+    .unwrap();
+    let runtime = server.runtime();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(server.run_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_until_listening(address).await;
+    wait_until_ready(address).await;
+    publish_offerable_probes(&runtime).await;
+    let stack_id = initialized.stack_identity.stack_id();
+
+    // The first unlock links the reader's wallet to the creator's server link.
+    open_invoice(
+        address,
+        &signing_key,
+        &stack_id,
+        &creator,
+        &reader,
+        BUNDLE_A,
+    )
+    .await;
+    wait_for_request(&peer_sdk, &creator_key, BUNDLE_A, &pool).await;
+    assert!(
+        outbox_settles_within(&pool, Duration::from_secs(10)).await,
+        "first unlock never settled: {:?}",
+        outbox_rows(&pool).await
+    );
+
+    // The wallet drops its side of the link and asks for a new handshake, as
+    // Bitkit does after a failed link restore. Marker times have second
+    // precision; one from the second of the server's last link checkpoint
+    // counts as stale.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    peer_sdk
+        .publish_encrypted_link_recovery_marker(
+            creator_key.clone(),
+            PaykitReceiverPath::new("paykit/server").unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // The next unlock, while the wallet is away: the server must not hand
+    // the request to the link the wallet abandoned.
+    open_invoice(
+        address,
+        &signing_key,
+        &stack_id,
+        &creator,
+        &reader,
+        BUNDLE_B,
+    )
+    .await;
+    assert!(
+        !outbox_settles_within(&pool, Duration::from_secs(5)).await,
+        "the request was handed to the abandoned link: {:?}",
+        outbox_rows(&pool).await
+    );
+
+    // Once the wallet is back, the new link carries the request.
+    wait_for_request(&peer_sdk, &creator_key, BUNDLE_B, &pool).await;
+
+    let _ = shutdown_tx.send(());
+    running.await.unwrap().unwrap();
+    pool.close().await;
+    database.cleanup().await;
+}
+
+/// Writes an unreadable payload where the reader's recovery marker for the
+/// creator's server link lives, so the server's marker lookup fails while a
+/// marker is present.
+async fn publish_unreadable_recovery_marker(
+    peer: &PeerSdk,
+    access: &PubkySessionAccess,
+    reader_key: &PubkyPublicKey,
+    creator_key: &PubkyPublicKey,
+) {
+    let server_path = PaykitReceiverPath::new("paykit/server").unwrap();
+    let creator_marker = peer
+        .paykit_receiver_marker(creator_key.clone(), server_path.clone())
+        .await
+        .unwrap()
+        .expect("the creator publishes a receiver marker");
+    let (write_path, _) = paykit_lib::encrypted_link_recovery_marker_paths(
+        access.receiver_noise_secret_key.as_bytes(),
+        &reader_key.to_public_key().unwrap(),
+        &creator_key.to_public_key().unwrap(),
+        &creator_marker.noise_public_key,
+        &PaykitReceiverPath::new("bitkit/server").unwrap(),
+        &server_path,
+    );
+    access
+        .session
+        .storage()
+        .put(write_path, String::from(r#"{"version":1}"#))
+        .await
+        .unwrap();
+}
+
+/// `(status, attempt_count, error_class)` of every outbox row, oldest first.
+async fn outbox_retry_rows(pool: &PgPool) -> Vec<(String, i32, Option<String>)> {
+    sqlx::query_as("SELECT status, attempt_count, error_class FROM outbox ORDER BY created_at, id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// A failed recovery-marker lookup may hide a marker the reader published,
+/// so the server must not fall back to the old link: nothing is enqueued and
+/// the handoff stays retryable at link establishment. Once the lookup reads a
+/// valid marker, the server relinks and the request arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn failed_recovery_marker_lookup_keeps_the_handoff_retryable() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    paykit_server::persistence::run_migrations(database.pool())
+        .await
+        .unwrap();
+    let signing_key = SigningKey::from_bytes(&[73; 32]);
+    let server_config = config(database.database_url(), &signing_key, "100ms");
+    let initialized = initialize_database(&server_config).await.unwrap();
+    let pool = initialized.pool.clone();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "paykit-server").unwrap();
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(&pool, crypto.clone());
+    let (reader, peer_key, peer_sdk, peer_access) =
+        create_peer_with_access(&bootstrap, &homeserver).await;
+    let creator = create_creator(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        &pool,
+        crypto.clone(),
+        CreatorSpec {
+            seed: 73,
+            account_index: 0,
+            amount_sats: 2_000,
+            counter_seed: 100,
+        },
+    )
+    .await;
+    let creator_key = PubkyPublicKey::from_raw_or_app_key(creator.creator.to_string()).unwrap();
+
+    let observer = Arc::new(DeterministicElectrum::new(&[&creator]));
+    let server = Server::build_with_transports(
+        server_config,
+        pool.clone(),
+        initialized.stack_identity.clone(),
+        pubky,
+        observer,
+    )
+    .await
+    .unwrap();
+    let runtime = server.runtime();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let running = tokio::spawn(server.run_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+    wait_until_listening(address).await;
+    wait_until_ready(address).await;
+    publish_offerable_probes(&runtime).await;
+    let stack_id = initialized.stack_identity.stack_id();
+
+    open_invoice(
+        address,
+        &signing_key,
+        &stack_id,
+        &creator,
+        &reader,
+        BUNDLE_A,
+    )
+    .await;
+    wait_for_request(&peer_sdk, &creator_key, BUNDLE_A, &pool).await;
+    assert!(
+        outbox_settles_within(&pool, Duration::from_secs(10)).await,
+        "first unlock never settled: {:?}",
+        outbox_rows(&pool).await
+    );
+    let first_unlock_rows = outbox_rows(&pool).await.len();
+    let sdk_state = SdkStateStore::new(&pool, crypto.clone());
+    let next_outbound_before = sdk_state
+        .load(&creator.creator)
+        .await
+        .unwrap()
+        .next_outbound_private_message_id;
+
+    publish_unreadable_recovery_marker(&peer_sdk, &peer_access, &peer_key, &creator_key).await;
+    open_invoice(
+        address,
+        &signing_key,
+        &stack_id,
+        &creator,
+        &reader,
+        BUNDLE_B,
+    )
+    .await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let rows = outbox_retry_rows(&pool).await;
+        let second_unlock = &rows[first_unlock_rows..];
+        assert!(
+            second_unlock
+                .iter()
+                .all(|(status, ..)| status != "handed_off" && status != "delivered"),
+            "the request was handed off while the marker lookup failed: {rows:?}"
+        );
+        if second_unlock.iter().any(|(status, attempts, class)| {
+            status == "retryable"
+                && *attempts >= 2
+                && class.as_deref() == Some("link_establishment")
+        }) {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("the handoff never retried at link establishment: {rows:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        sdk_state
+            .load(&creator.creator)
+            .await
+            .unwrap()
+            .next_outbound_private_message_id,
+        next_outbound_before,
+        "a request was enqueued while the marker lookup failed"
+    );
+
+    // The lookup recovers: the reader replaces the unreadable payload with a
+    // valid marker, and a retry relinks and delivers.
+    peer_sdk
+        .publish_encrypted_link_recovery_marker(
+            creator_key.clone(),
+            PaykitReceiverPath::new("paykit/server").unwrap(),
+        )
+        .await
+        .unwrap();
+    wait_for_request(&peer_sdk, &creator_key, BUNDLE_B, &pool).await;
 
     let _ = shutdown_tx.send(());
     running.await.unwrap().unwrap();
