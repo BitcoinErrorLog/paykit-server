@@ -24,8 +24,7 @@ log_authorization_url = false
 # Stable grant owner checked by Paykit Server and by the local-demo companion
 # Cargo example. Required exactly as shown; missing or other values are rejected.
 client_id = "app.paykit.server"
-receiver_path = "bitkit/server"
-receiver_path_priority = ["bitkit"]
+app_id = "paykit-server"
 # "testnet" targets the pinned Pubky client's fixed localhost testnet ports.
 # Run the Pubky static testnet; this is not a hosted public network.
 network = "testnet"

@@ -9,9 +9,8 @@ use serde_json::{Value, json};
 
 const STATE_ENV: &str = "PAYKIT_READER_STATE_PATH";
 const TESTNET_HOST_ENV: &str = "PAYKIT_READER_PUBKY_TESTNET_HOST";
-const LOCAL_PATH_ENV: &str = "PAYKIT_READER_RECEIVER_PATH";
+const APP_ID_ENV: &str = "PAYKIT_READER_APP_ID";
 const SERVER_PUBKY_ENV: &str = "PAYKIT_READER_SERVER_PUBKY";
-const SERVER_PATH_ENV: &str = "PAYKIT_READER_SERVER_PATH";
 const SERVER_PUBKY: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 
 fn valid_input(operation: &str) -> Value {
@@ -26,9 +25,8 @@ fn configure_valid(command: &mut Command, state_path: &str) {
     command
         .env(STATE_ENV, state_path)
         .env(TESTNET_HOST_ENV, "localhost")
-        .env(LOCAL_PATH_ENV, "bitkit/wallet")
-        .env(SERVER_PUBKY_ENV, SERVER_PUBKY)
-        .env(SERVER_PATH_ENV, "paykit/server");
+        .env(APP_ID_ENV, "bitkit")
+        .env(SERVER_PUBKY_ENV, SERVER_PUBKY);
 }
 
 fn run_helper(input: &Value, configure: impl FnOnce(&mut Command)) -> Output {
@@ -36,9 +34,8 @@ fn run_helper(input: &Value, configure: impl FnOnce(&mut Command)) -> Output {
     command
         .env_remove(STATE_ENV)
         .env_remove(TESTNET_HOST_ENV)
-        .env_remove(LOCAL_PATH_ENV)
+        .env_remove(APP_ID_ENV)
         .env_remove(SERVER_PUBKY_ENV)
-        .env_remove(SERVER_PATH_ENV)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -104,13 +101,7 @@ fn reader_helper_requires_an_unpadded_base64url_secret_of_exactly_32_bytes() {
 #[test]
 fn reader_helper_requires_all_approved_environment_fields() {
     let state_path = format!("/tmp/paykit-reader-state-{}", uuid::Uuid::new_v4());
-    for omitted in [
-        STATE_ENV,
-        TESTNET_HOST_ENV,
-        LOCAL_PATH_ENV,
-        SERVER_PUBKY_ENV,
-        SERVER_PATH_ENV,
-    ] {
+    for omitted in [STATE_ENV, TESTNET_HOST_ENV, APP_ID_ENV, SERVER_PUBKY_ENV] {
         let output = run_helper(&valid_input("prepare"), |command| {
             configure_valid(command, &state_path);
             command.env_remove(omitted);

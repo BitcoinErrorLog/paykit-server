@@ -60,7 +60,7 @@ fn decrypt_rejects_context_swaps_wrong_key_and_malformed_envelopes() {
         .expect("encrypts");
 
     let swapped_row = EnvelopeContext::creator_credentials(lookup_hash, Uuid::new_v4());
-    let swapped_type = EnvelopeContext::sdk_state(lookup_hash, row);
+    let swapped_type = EnvelopeContext::reader_assignment(lookup_hash, row);
     let swapped_lookup_hash = EnvelopeContext::creator_credentials(
         crypto.lookup_hash(another_creator().to_string().as_bytes()),
         row,

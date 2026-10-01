@@ -32,3 +32,4 @@ serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 tower = { version = "0.5", features = ["util"] }
+http-relay = { version = "0.7", default-features = false, features = ["server"] }

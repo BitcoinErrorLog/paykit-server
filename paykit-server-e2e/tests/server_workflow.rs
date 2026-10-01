@@ -26,20 +26,17 @@ use locks_core::{
         VerifierType,
     },
 };
-use paykit_lib::{PaykitReceiverCapabilities, PaykitReceiverPath};
-use paykit_sdk::{
-    InMemoryStorage, LinkedPeerState, PaykitSdk, PaykitSdkConfig, PubkyLocalSecretKey,
-    PubkyPublicKey, PubkySessionBootstrap, ReceiverNoiseSecretKey, storage::StorageState,
-};
+
+use paykit_sdk::{LinkedPeerState, PubkyLocalSecretKey, PubkyPublicKey, PubkySessionBootstrap};
 use paykit_server::{
     Server,
     application::create_invoice::derive_bip84_p2wpkh_address,
-    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    application::semantic_intent::DeliveryIntentV1,
     bitcoin::{ObservationTarget, ObservedOutput},
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
-    persistence::{CreatorCredentials, CreatorStore, PostgresStorageAdapter, SdkStateStore},
+    persistence::{CreatorCredentials, CreatorStore},
     startup::initialize_database,
     workers::observer::{ElectrumPort, ObserverError},
 };
@@ -52,15 +49,13 @@ use tower::ServiceExt;
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
 
-use sdk_fixtures::{TestPaymentAdapter, TestSessionProvider};
-
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 const BUNDLE_A: &str = "000G40R40M30E209185GR38E1W";
 const BUNDLE_B: &str = "000G40R40M30E209185GR38E2W";
 static PUBKY_TESTNET_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-type CreatorSdk = PaykitSdk<PostgresStorageAdapter, TestSessionProvider, TestPaymentAdapter>;
-type PeerSdk = PaykitSdk<InMemoryStorage, TestSessionProvider, TestPaymentAdapter>;
+type CreatorSdk = sdk_fixtures::HostedSdk;
+type PeerSdk = sdk_fixtures::HostedSdk;
 
 struct CreatorFixture {
     creator: CreatorPubky,
@@ -80,7 +75,7 @@ struct CreatorSpec {
     counter_seed: u64,
 }
 
-type OutboxDiagnostic = (String, bool, i32, Option<String>);
+type OutboxDiagnostic = (String, i32, Option<String>);
 
 struct DeterministicElectrum {
     outputs: HashMap<String, (u64, OutPoint)>,
@@ -186,8 +181,6 @@ async fn create_creator(
     bootstrap: &PubkySessionBootstrap,
     homeserver: &PubkyPublicKey,
     store: &CreatorStore,
-    pool: &PgPool,
-    crypto: Arc<Crypto>,
     spec: CreatorSpec,
 ) -> CreatorFixture {
     let CreatorSpec {
@@ -196,22 +189,19 @@ async fn create_creator(
         amount_sats,
         counter_seed,
     } = spec;
-    let receiver_path = PaykitReceiverPath::new("paykit/server").unwrap();
     let keypair = Keypair::random();
     let account = bootstrap
         .sign_up(
             &PubkyLocalSecretKey::new(keypair.secret_key()),
-            ReceiverNoiseSecretKey::random(),
             homeserver,
             None,
-            &PaykitSdkConfig::new(receiver_path.clone()).required_session_capabilities(),
+            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
     let lock_writer = bootstrap
         .sign_in(
             &PubkyLocalSecretKey::new(keypair.secret_key()),
-            ReceiverNoiseSecretKey::random(),
             "/pub/locks.app/:rw",
         )
         .await
@@ -231,39 +221,31 @@ async fn create_creator(
         .await
         .unwrap();
     let lock_resource = format!("{creator}{lock_path}");
-    let state = StorageState {
-        next_outbound_private_message_id: counter_seed,
-        ..StorageState::default()
-    };
-    let row = store
-        .create(
-            &CreatorCredentials::new(
-                creator.clone(),
-                session_secret,
-                account.access.receiver_noise_secret_key.clone(),
-                xpub.clone(),
-                account_index,
-            ),
-            &state,
-        )
+    store
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            session_secret,
+            PubkyLocalSecretKey::new(keypair.secret_key())
+                .derive_paykit_identity_secret_key(1)
+                .unwrap(),
+            xpub.clone(),
+            account_index,
+        ))
         .await
         .unwrap();
-    let sdk = PaykitSdk::new(
-        PostgresStorageAdapter::new(pool, crypto, row.id()),
-        TestSessionProvider::new(account.access),
-        TestPaymentAdapter,
-        PaykitSdkConfig::new(receiver_path),
+    let observer = PubkySessionBootstrap::with_pubky(
+        account.access.outbox_client.clone(),
+        "app.paykit.test-observer",
     )
-    .unwrap();
-    sdk.initialize().await.unwrap();
-    sdk.publish_paykit_receiver_marker(PaykitReceiverCapabilities {
-        private_payments: true,
-        payment_requests: true,
-        receipts: true,
-        outgoing_payments: true,
-    })
+    .unwrap()
+    .sign_in(
+        &PubkyLocalSecretKey::new(keypair.secret_key()),
+        paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
+    )
     .await
     .unwrap();
+    let sdk = sdk_fixtures::hosted_sdk(observer.access, "paykit-server", counter_seed).await;
+    store.mark_setup_complete(&creator).await.unwrap();
     CreatorFixture {
         creator,
         sdk,
@@ -280,34 +262,17 @@ async fn create_peer(
     bootstrap: &PubkySessionBootstrap,
     homeserver: &PubkyPublicKey,
 ) -> (ReaderPubky, PubkyPublicKey, PeerSdk) {
-    let path = PaykitReceiverPath::new("bitkit/server").unwrap();
     let account = bootstrap
         .sign_up(
             &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
-            ReceiverNoiseSecretKey::random(),
             homeserver,
             None,
-            &PaykitSdkConfig::new(path.clone()).required_session_capabilities(),
+            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
     let key = account.public_key.clone();
-    let sdk = PaykitSdk::new(
-        InMemoryStorage::default(),
-        TestSessionProvider::new(account.access),
-        TestPaymentAdapter,
-        PaykitSdkConfig::new(path),
-    )
-    .unwrap();
-    sdk.initialize().await.unwrap();
-    sdk.publish_paykit_receiver_marker(PaykitReceiverCapabilities {
-        private_payments: true,
-        payment_requests: true,
-        receipts: true,
-        outgoing_payments: true,
-    })
-    .await
-    .unwrap();
+    let sdk = sdk_fixtures::hosted_sdk(account.access, "bitkit", 0).await;
     (parse_reader(&format!("pubky{key}")).unwrap(), key, sdk)
 }
 
@@ -317,13 +282,11 @@ async fn link(
     peer: &PeerSdk,
     peer_key: PubkyPublicKey,
 ) {
-    let creator_path = PaykitReceiverPath::new("paykit/server").unwrap();
-    let peer_path = PaykitReceiverPath::new("bitkit/server").unwrap();
     creator
-        .initiate_link_with_peer(peer_key.clone(), peer_path.clone())
+        .initiate_link_with_peer(peer_key.clone())
         .await
         .unwrap();
-    peer.accept_link_with_peer(creator_key.clone(), creator_path.clone())
+    peer.accept_link_with_peer(creator_key.clone())
         .await
         .unwrap();
 
@@ -334,14 +297,14 @@ async fn link(
         assert!(tokio::time::Instant::now() < deadline, "link timed out");
         if creator_state != LinkedPeerState::Linked {
             creator_state = creator
-                .advance_link_handshake(peer_key.clone(), peer_path.clone())
+                .advance_link_handshake(peer_key.clone())
                 .await
                 .unwrap()
                 .state;
         }
         if peer_state != LinkedPeerState::Linked {
             peer_state = peer
-                .advance_link_handshake(creator_key.clone(), creator_path.clone())
+                .advance_link_handshake(creator_key.clone())
                 .await
                 .unwrap()
                 .state;
@@ -366,7 +329,7 @@ trusted_public_key = "{trusted_key}"
 allowed_origins = ["https://app.example"]
 [paykit]
 client_id = "app.paykit.server"
-receiver_path = "paykit/server"
+app_id = "paykit-server"
 network = "testnet"
 [bitcoin]
 network = "testnet"
@@ -569,17 +532,17 @@ async fn wait_for_completion(
                     "amount_matched": true
                 });
         }
-        if delivered == 4 && statuses_confirmed {
+        // Delivery can finish after this iteration's intake has already run.
+        let received = peer.payment_requests().await.unwrap().len();
+        if delivered == 2 && statuses_confirmed && received == fixtures.len() {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
-            let rows: Vec<OutboxDiagnostic> = sqlx::query_as(
-                "SELECT status, depends_on_id IS NOT NULL, attempt_count, error_class FROM outbox ORDER BY depends_on_id NULLS FIRST",
-            )
-            .fetch_all(pool)
-            .await
-            .unwrap();
-            let received = peer.payment_requests().await.unwrap().len();
+            let rows: Vec<OutboxDiagnostic> =
+                sqlx::query_as("SELECT status, attempt_count, error_class FROM outbox ORDER BY id")
+                    .fetch_all(pool)
+                    .await
+                    .unwrap();
             panic!(
                 "composed workflow did not finish: delivered={delivered}, statuses_confirmed={statuses_confirmed}, received={received}, rows={rows:?}"
             );
@@ -592,7 +555,6 @@ async fn raw_database_bytes(pool: &PgPool) -> Vec<Vec<u8>> {
     let mut values = sqlx::query_scalar::<_, Vec<u8>>(
         "SELECT value FROM (
              SELECT convert_to(to_jsonb(c)::text, 'UTF8') AS value FROM creators c
-             UNION ALL SELECT convert_to(to_jsonb(s)::text, 'UTF8') FROM sdk_states s
              UNION ALL SELECT convert_to(to_jsonb(r)::text, 'UTF8') FROM reader_assignments r
              UNION ALL SELECT convert_to(to_jsonb(i)::text, 'UTF8') FROM invoices i
              UNION ALL SELECT convert_to(to_jsonb(o)::text, 'UTF8') FROM outbox o
@@ -614,7 +576,6 @@ async fn raw_database_bytes(pool: &PgPool) -> Vec<Vec<u8>> {
     .bind(
         &[
             "creators",
-            "sdk_states",
             "reader_assignments",
             "invoices",
             "outbox",
@@ -662,20 +623,16 @@ async fn assert_persisted_workflow_inputs(
         Vec<u8>,
         uuid::Uuid,
         Vec<u8>,
-        uuid::Uuid,
-        Vec<u8>,
     );
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT c.creator_lookup_hash, c.next_child_index,
                 r.id, r.assignment_envelope,
                 i.id, i.invoice_envelope, i.payment_record_envelope,
-                endpoint.id, endpoint.intent_envelope,
                 payment.id, payment.intent_envelope
          FROM creators c
          JOIN reader_assignments r ON r.creator_id = c.id
          JOIN invoices i ON i.creator_id = c.id
-         JOIN outbox payment ON payment.invoice_id = i.id AND payment.depends_on_id IS NOT NULL
-         JOIN outbox endpoint ON endpoint.id = payment.depends_on_id",
+         JOIN outbox payment ON payment.invoice_id = i.id",
     )
     .fetch_all(pool)
     .await
@@ -692,8 +649,6 @@ async fn assert_persisted_workflow_inputs(
         invoice_id,
         invoice_envelope,
         payment_record_envelope,
-        endpoint_id,
-        endpoint_envelope,
         payment_id,
         payment_envelope,
     ) in rows
@@ -709,42 +664,16 @@ async fn assert_persisted_workflow_inputs(
             })
             .unwrap();
         assert_eq!(next_child_index, 1, "each Creator must allocate child 0");
-        ids.extend([assignment_id, invoice_id, endpoint_id, payment_id]);
+        ids.extend([assignment_id, invoice_id, payment_id]);
         envelopes.extend([
             assignment_envelope,
             invoice_envelope,
             payment_record_envelope,
-            endpoint_envelope.clone(),
             payment_envelope.clone(),
         ]);
 
         let creator_hash = crypto.lookup_hash(fixture.creator.to_string().as_bytes());
-        let endpoint_plaintext = crypto
-            .decrypt(
-                &EnvelopeContext::outbox_semantic_intent(creator_hash, endpoint_id),
-                &EncryptedEnvelope::from_bytes(endpoint_envelope),
-            )
-            .unwrap();
-        let endpoint = DeliveryIntentV1::decode(&endpoint_plaintext).unwrap();
-        assert_eq!(endpoint.version(), 2);
-        assert_eq!(endpoint.reader_pubky(), reader.to_string());
-        assert_eq!(
-            endpoint.selected_reader_path().unwrap().as_str(),
-            "bitkit/server"
-        );
-        assert_eq!(
-            endpoint.local_receiver_path().unwrap().as_str(),
-            "paykit/server"
-        );
-        assert_ne!(endpoint.marker_fingerprint(), [0; 32]);
         let expected_payload = serde_json::json!({ "value": fixture.address }).to_string();
-        assert!(matches!(
-            endpoint.operation(),
-            DeliveryOperationV1::EndpointPublication { receiving_details }
-                if receiving_details.len() == 1
-                    && receiving_details[0].identifier == "btc-testnet-p2wpkh"
-                    && receiving_details[0].payload == expected_payload
-        ));
 
         let payment_plaintext = crypto
             .decrypt(
@@ -753,42 +682,36 @@ async fn assert_persisted_workflow_inputs(
             )
             .unwrap();
         let payment = DeliveryIntentV1::decode(&payment_plaintext).unwrap();
-        assert_eq!(payment.version(), 2);
+        assert_eq!(payment.version(), 1);
         assert_eq!(payment.reader_pubky(), reader.to_string());
-        assert_eq!(
-            payment.selected_reader_path().unwrap().as_str(),
-            "bitkit/server"
-        );
-        assert_eq!(
-            payment.local_receiver_path().unwrap().as_str(),
-            "paykit/server"
-        );
-        assert_eq!(payment.marker_fingerprint(), endpoint.marker_fingerprint());
+        assert_eq!(payment.app_id(), "paykit-server");
         let amount = format!(
             "{}.{:08}",
             fixture.amount_sats / 100_000_000,
             fixture.amount_sats % 100_000_000
         );
-        assert!(matches!(
-            payment.operation(),
-            DeliveryOperationV1::PaymentRequestProposal { terms }
-                if terms.amount == amount
-                    && terms.asset == "btc"
-                    && uuid::Uuid::parse_str(&terms.payment_reference)
-                        .is_ok_and(|reference| reference.get_version_num() == 4
-                            && reference.get_variant() == uuid::Variant::RFC4122
-                            && terms.payment_reference == reference.hyphenated().to_string())
-                    && terms.proposal_expires_at.is_none()
-                    && terms.accepted_endpoint_identifiers == ["btc-testnet-p2wpkh"]
-                    && terms.metadata.get("bundle_id") == Some(&serde_json::json!(bundle))
-                    && terms.metadata.get("lock_resource")
-                        == Some(&serde_json::json!(fixture.lock_resource))
-        ));
+        let terms = payment.terms();
+        assert!(
+            terms.amount == amount
+                && terms.asset == "btc"
+                && uuid::Uuid::parse_str(&terms.payment_reference).is_ok_and(|reference| reference
+                    .get_version_num()
+                    == 4
+                    && reference.get_variant() == uuid::Variant::RFC4122
+                    && terms.payment_reference == reference.hyphenated().to_string())
+                && terms.proposal_expires_at.is_none()
+                && terms.accepted_endpoint_identifiers == ["btc-testnet-p2wpkh"]
+                && terms.payment_endpoints.len() == 1
+                && terms.payment_endpoints["btc-testnet-p2wpkh"] == expected_payload
+                && terms.metadata.get("bundle_id") == Some(&serde_json::json!(bundle))
+                && terms.metadata.get("lock_resource")
+                    == Some(&serde_json::json!(fixture.lock_resource))
+        );
     }
-    assert_eq!(ids.len(), 8, "workflow row identifiers must be distinct");
+    assert_eq!(ids.len(), 6, "workflow row identifiers must be distinct");
     assert_eq!(
         envelopes.len(),
-        10,
+        8,
         "Creator-bound envelopes must be distinct"
     );
 }
@@ -814,8 +737,6 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         &bootstrap,
         &homeserver,
         &creators,
-        &first_pool,
-        crypto.clone(),
         CreatorSpec {
             seed: 41,
             account_index: 0,
@@ -828,8 +749,6 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         &bootstrap,
         &homeserver,
         &creators,
-        &first_pool,
-        crypto.clone(),
         CreatorSpec {
             seed: 42,
             account_index: 1,
@@ -910,7 +829,7 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
             .fetch_all(&first_pool)
             .await
             .unwrap();
-    assert_eq!(queued_before.len(), 4);
+    assert_eq!(queued_before.len(), 2);
     assert!(
         queued_before
             .iter()
@@ -961,27 +880,55 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         &peer_sdk,
     )
     .await;
-    assert_eq!(peer_sdk.payment_requests().await.unwrap().len(), 2);
+    let requests = peer_sdk.payment_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        let resolution = peer_sdk
+            .resolve_private_payment_request(
+                request.counterparty.clone(),
+                &paykit_lib::PaymentRequestId::new(request.payment_request_id.clone()).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolution.status,
+            paykit_sdk::PrivatePaymentResolutionStatus::Payable
+        );
+        assert_eq!(resolution.private_payment_list_version, None);
+        assert_eq!(resolution.payable_endpoints.len(), 1);
+        let expected = request
+            .terms
+            .as_ref()
+            .unwrap()
+            .payment_endpoints
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            resolution.payable_endpoints[0].target.payload,
+            expected["btc-testnet-p2wpkh"]
+        );
+    }
 
-    let outbox_rows: Vec<(String, bool)> = sqlx::query_as(
-        "SELECT status, depends_on_id IS NOT NULL FROM outbox ORDER BY invoice_id, depends_on_id NULLS FIRST",
-    )
-    .fetch_all(&second_pool)
-    .await
-    .unwrap();
+    let outbox_rows: Vec<String> =
+        sqlx::query_scalar("SELECT status FROM outbox ORDER BY invoice_id")
+            .fetch_all(&second_pool)
+            .await
+            .unwrap();
     assert_eq!(
         outbox_rows,
-        vec![
-            ("delivered".into(), false),
-            ("delivered".into(), true),
-            ("delivered".into(), false),
-            ("delivered".into(), true),
-        ]
+        vec!["delivered".to_owned(), "delivered".to_owned(),]
     );
 
-    let state_store = SdkStateStore::new(&second_pool, crypto.clone());
-    let state_a = state_store.load(&creator_a.creator).await.unwrap();
-    let state_b = state_store.load(&creator_b.creator).await.unwrap();
+    let state_a = creator_a.sdk.export_backup_state().await.unwrap();
+    let state_b = creator_b.sdk.export_backup_state().await.unwrap();
+    for state in [&state_a, &state_b] {
+        assert_eq!(state.outbound_private_messages.len(), 1);
+        assert!(
+            state.outbound_private_messages[0].raw_json.len()
+                <= paykit_lib::pubky_noise::snow_crypto::PUBKY_NOISE_MSG_LEN
+        );
+    }
     assert!(state_a.next_outbound_private_message_id > creator_a.counter_seed);
     assert!(state_b.next_outbound_private_message_id > creator_b.counter_seed);
 
@@ -1045,7 +992,6 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         "SELECT EXISTS (
              SELECT 1 FROM (
                  SELECT to_jsonb(c) AS value FROM creators c
-                 UNION ALL SELECT to_jsonb(s) FROM sdk_states s
                  UNION ALL SELECT to_jsonb(r) FROM reader_assignments r
                  UNION ALL SELECT to_jsonb(i) FROM invoices i
                  UNION ALL SELECT to_jsonb(o) FROM outbox o

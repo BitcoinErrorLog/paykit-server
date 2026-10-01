@@ -161,10 +161,8 @@ impl Crypto {
 /// The supported kinds of encrypted persisted state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnvelopeType {
-    /// The creator's encrypted session, receiver-secret, and account credentials.
+    /// The creator's encrypted session, delegated Paykit key, and account credentials.
     CreatorCredentials,
-    /// A creator's encrypted Paykit SDK state snapshot.
-    SdkState,
     /// A reader's permanent encrypted assignment.
     ReaderAssignment,
     /// An encrypted invoice payload.
@@ -181,7 +179,6 @@ impl EnvelopeType {
     fn as_bytes(self) -> &'static [u8] {
         match self {
             Self::CreatorCredentials => b"creator-credentials",
-            Self::SdkState => b"sdk-state",
             Self::ReaderAssignment => b"reader-assignment",
             Self::Invoice => b"invoice",
             Self::InvoicePaymentRecord => b"invoice-payment-record",
@@ -220,10 +217,6 @@ impl EnvelopeContext {
         )
     }
 
-    /// Creates the binding context for a creator SDK-state envelope.
-    pub fn sdk_state(creator_lookup_hash: LookupHash, row_id: Uuid) -> Self {
-        Self::new(EnvelopeType::SdkState, creator_lookup_hash, row_id)
-    }
     /// Creates the binding context for a reader assignment.
     pub fn reader_assignment(creator_lookup_hash: LookupHash, row_id: Uuid) -> Self {
         Self::new(EnvelopeType::ReaderAssignment, creator_lookup_hash, row_id)

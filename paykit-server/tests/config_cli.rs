@@ -17,7 +17,7 @@ trusted_public_key = "{KEY}"
 [setup]
 allowed_origins = ["http://127.0.0.1:8080"]
 [paykit]
-{}receiver_path = "bitkit/server"
+{}app_id = "paykit-server"
 network = "mainnet"
 [bitcoin]
 network = "regtest"

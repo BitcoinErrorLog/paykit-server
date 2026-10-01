@@ -4,12 +4,10 @@
 //! methods. They deliberately do not contain SDK-generated event, request, wire,
 //! or outbound-message identifiers.
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use paykit_lib::{
-    PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier,
-    PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
-    serialize_paykit_receiver_marker,
+    PaykitAppId, PaymentAmount, PaymentEndpointIdentifier, PaymentReference, PaymentRequestTerms,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -19,27 +17,8 @@ use thiserror::Error;
 pub struct DeliveryIntentV1 {
     version: u8,
     reader_pubky: String,
-    selected_reader_path: String,
-    marker_fingerprint: [u8; 32],
-    local_receiver_path: String,
-    operation: DeliveryOperationV1,
-}
-
-/// Exactly one supported public-SDK operation and all of its caller inputs.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub enum DeliveryOperationV1 {
-    EndpointPublication {
-        receiving_details: Vec<ReceivingDetailV1>,
-    },
-    PaymentRequestProposal {
-        terms: PaymentTermsV1,
-    },
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReceivingDetailV1 {
-    pub identifier: String,
-    pub payload: String,
+    app_id: String,
+    terms: PaymentTermsV1,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -49,6 +28,7 @@ pub struct PaymentTermsV1 {
     pub payment_reference: String,
     pub proposal_expires_at: Option<String>,
     pub accepted_endpoint_identifiers: Vec<String>,
+    pub payment_endpoints: BTreeMap<String, String>,
     #[serde(with = "json_map_as_string")]
     pub metadata: serde_json::Map<String, serde_json::Value>,
 }
@@ -77,80 +57,46 @@ mod json_map_as_string {
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum DeliveryIntentError {
-    #[error("could not canonicalize receiver marker")]
-    Marker,
     #[error("stored delivery intent contains an invalid canonical value")]
     Invalid,
 }
 
 impl DeliveryIntentV1 {
-    pub fn fingerprint(marker: &PaykitReceiverMarker) -> Result<[u8; 32], DeliveryIntentError> {
-        let canonical =
-            serialize_paykit_receiver_marker(marker).map_err(|_| DeliveryIntentError::Marker)?;
-        Ok(*blake3::hash(canonical.as_bytes()).as_bytes())
-    }
-
-    pub fn endpoint(
+    pub fn payment_request(
         reader_pubky: String,
-        marker: &PaykitReceiverMarker,
-        local_receiver_path: PaykitReceiverPath,
-        receiving_details: Vec<(PaymentEndpointIdentifier, PaymentEndpointPayload)>,
+        app_id: PaykitAppId,
+        terms: &PaymentRequestTerms,
     ) -> Result<Self, DeliveryIntentError> {
-        if receiving_details.is_empty()
-            || receiving_details
-                .iter()
-                .any(|(_, payload)| payload.as_str().is_empty())
+        if terms.recurrence().is_some()
+            || terms.conversion().is_some()
+            || terms.payment_deadline().is_some()
+            || terms.required_app_id() != Some(&app_id)
         {
             return Err(DeliveryIntentError::Invalid);
         }
         let intent = Self {
-            version: 2,
+            version: 1,
             reader_pubky,
-            selected_reader_path: marker.receiver_path.as_str().into(),
-            marker_fingerprint: Self::fingerprint(marker)?,
-            local_receiver_path: local_receiver_path.as_str().into(),
-            operation: DeliveryOperationV1::EndpointPublication {
-                receiving_details: receiving_details
-                    .into_iter()
-                    .map(|(identifier, payload)| ReceivingDetailV1 {
-                        identifier: identifier.to_string(),
-                        payload: payload.into_inner(),
+            app_id: app_id.as_str().into(),
+            terms: PaymentTermsV1 {
+                amount: terms.amount().value().to_owned(),
+                asset: terms.amount().asset().to_owned(),
+                payment_reference: terms.payment_reference().to_string(),
+                proposal_expires_at: terms.proposal_expires_at().clone(),
+                accepted_endpoint_identifiers: terms
+                    .accepted_payment_endpoint_identifiers()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                payment_endpoints: terms
+                    .payment_endpoints()
+                    .ok_or(DeliveryIntentError::Invalid)?
+                    .iter()
+                    .map(|(identifier, payload)| {
+                        (identifier.to_string(), payload.as_str().to_owned())
                     })
                     .collect(),
-            },
-        };
-        intent.validate()?;
-        Ok(intent)
-    }
-
-    pub fn payment_request(
-        reader_pubky: String,
-        marker: &PaykitReceiverMarker,
-        local_receiver_path: PaykitReceiverPath,
-        terms: &PaymentRequestTerms,
-    ) -> Result<Self, DeliveryIntentError> {
-        if terms.recurrence.is_some() {
-            return Err(DeliveryIntentError::Invalid);
-        }
-        let intent = Self {
-            version: 2,
-            reader_pubky,
-            selected_reader_path: marker.receiver_path.as_str().into(),
-            marker_fingerprint: Self::fingerprint(marker)?,
-            local_receiver_path: local_receiver_path.as_str().into(),
-            operation: DeliveryOperationV1::PaymentRequestProposal {
-                terms: PaymentTermsV1 {
-                    amount: terms.amount.value.clone(),
-                    asset: terms.amount.asset.clone(),
-                    payment_reference: terms.payment_reference.to_string(),
-                    proposal_expires_at: terms.proposal_expires_at.clone(),
-                    accepted_endpoint_identifiers: terms
-                        .accepted_payment_endpoint_identifiers
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect(),
-                    metadata: terms.metadata.clone(),
-                },
+                metadata: terms.metadata().clone(),
             },
         };
         intent.validate()?;
@@ -170,47 +116,37 @@ impl DeliveryIntentV1 {
 
     /// Revalidates every canonical value after authenticated deserialization.
     pub fn validate(&self) -> Result<(), DeliveryIntentError> {
-        if self.version != 2
+        if self.version != 1
             || crate::domain::locks::parse_reader(&self.reader_pubky).is_err()
-            || PaykitReceiverPath::new(self.selected_reader_path.clone()).is_err()
-            || PaykitReceiverPath::new(self.local_receiver_path.clone()).is_err()
+            || self.app_id != crate::config::PAYKIT_APP_ID
         {
             return Err(DeliveryIntentError::Invalid);
         }
-        match &self.operation {
-            DeliveryOperationV1::EndpointPublication { receiving_details } => {
-                if receiving_details.is_empty()
-                    || receiving_details.iter().any(|detail| {
-                        detail.payload.is_empty()
-                            || PaymentEndpointIdentifier::new(detail.identifier.clone()).is_err()
-                    })
-                {
-                    return Err(DeliveryIntentError::Invalid);
-                }
-            }
-            DeliveryOperationV1::PaymentRequestProposal { terms } => {
-                if PaymentReference::new(terms.payment_reference.clone()).is_err()
-                    || PaymentAmount::new(terms.amount.clone(), terms.asset.clone()).is_err()
-                    || terms.accepted_endpoint_identifiers.is_empty()
-                    || terms
-                        .accepted_endpoint_identifiers
-                        .iter()
-                        .any(|identifier| {
-                            PaymentEndpointIdentifier::new(identifier.clone()).is_err()
-                        })
-                {
-                    return Err(DeliveryIntentError::Invalid);
-                }
-                let reference = uuid::Uuid::parse_str(&terms.payment_reference)
-                    .map_err(|_| DeliveryIntentError::Invalid)?;
-                if reference.get_version_num() != 4
-                    || reference.get_variant() != uuid::Variant::RFC4122
-                    || terms.payment_reference != reference.hyphenated().to_string()
-                    || terms.proposal_expires_at.is_some()
-                {
-                    return Err(DeliveryIntentError::Invalid);
-                }
-            }
+        let terms = &self.terms;
+        if PaymentReference::new(terms.payment_reference.clone()).is_err()
+            || PaymentAmount::new(terms.amount.clone(), terms.asset.clone()).is_err()
+            || terms.accepted_endpoint_identifiers.is_empty()
+            || terms.payment_endpoints.is_empty()
+            || terms.payment_endpoints.iter().any(|(identifier, payload)| {
+                payload.is_empty()
+                    || !terms.accepted_endpoint_identifiers.contains(identifier)
+                    || PaymentEndpointIdentifier::new(identifier.clone()).is_err()
+            })
+            || terms
+                .accepted_endpoint_identifiers
+                .iter()
+                .any(|identifier| PaymentEndpointIdentifier::new(identifier.clone()).is_err())
+        {
+            return Err(DeliveryIntentError::Invalid);
+        }
+        let reference = uuid::Uuid::parse_str(&terms.payment_reference)
+            .map_err(|_| DeliveryIntentError::Invalid)?;
+        if reference.get_version_num() != 4
+            || reference.get_variant() != uuid::Variant::RFC4122
+            || terms.payment_reference != reference.hyphenated().to_string()
+            || terms.proposal_expires_at.is_some()
+        {
+            return Err(DeliveryIntentError::Invalid);
         }
         Ok(())
     }
@@ -219,22 +155,12 @@ impl DeliveryIntentV1 {
         &self.reader_pubky
     }
 
-    pub fn selected_reader_path(&self) -> Result<PaykitReceiverPath, DeliveryIntentError> {
-        PaykitReceiverPath::new(self.selected_reader_path.clone())
-            .map_err(|_| DeliveryIntentError::Invalid)
+    pub fn app_id(&self) -> &str {
+        &self.app_id
     }
 
-    pub fn marker_fingerprint(&self) -> [u8; 32] {
-        self.marker_fingerprint
-    }
-
-    pub fn local_receiver_path(&self) -> Result<PaykitReceiverPath, DeliveryIntentError> {
-        PaykitReceiverPath::new(self.local_receiver_path.clone())
-            .map_err(|_| DeliveryIntentError::Invalid)
-    }
-
-    pub fn operation(&self) -> &DeliveryOperationV1 {
-        &self.operation
+    pub fn terms(&self) -> &PaymentTermsV1 {
+        &self.terms
     }
 }
 
@@ -243,23 +169,8 @@ impl fmt::Debug for DeliveryIntentV1 {
         formatter
             .debug_struct("DeliveryIntentV1")
             .field("version", &self.version)
-            .field("operation", &self.operation)
+            .field("terms", &self.terms)
             .finish_non_exhaustive()
-    }
-}
-
-impl fmt::Debug for DeliveryOperationV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::EndpointPublication { .. } => "EndpointPublication { .. }",
-            Self::PaymentRequestProposal { .. } => "PaymentRequestProposal { .. }",
-        })
-    }
-}
-
-impl fmt::Debug for ReceivingDetailV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ReceivingDetailV1 { .. }")
     }
 }
 
@@ -272,102 +183,43 @@ impl fmt::Debug for PaymentTermsV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paykit_lib::PaymentEndpointPayload;
+    use std::collections::HashMap;
+    const READER: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 
     #[test]
-    fn authenticated_but_invalid_stored_paths_fail_without_panicking() {
-        let intent = DeliveryIntentV1 {
-            version: 2,
-            reader_pubky: "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy".into(),
-            selected_reader_path: "../invalid".into(),
-            marker_fingerprint: [0; 32],
-            local_receiver_path: "paykit/server".into(),
-            operation: DeliveryOperationV1::EndpointPublication {
-                receiving_details: vec![ReceivingDetailV1 {
-                    identifier: "btc-bitcoin-p2wpkh".into(),
-                    payload: "address-secret".into(),
-                }],
-            },
-        };
-
-        assert_eq!(intent.validate(), Err(DeliveryIntentError::Invalid));
-        assert_eq!(
-            intent.selected_reader_path(),
-            Err(DeliveryIntentError::Invalid)
-        );
-    }
-
-    #[test]
-    fn debug_formatting_redacts_encrypted_business_values() {
-        let intent = DeliveryIntentV1 {
-            version: 2,
-            reader_pubky: "reader-secret".into(),
-            selected_reader_path: "bitkit/wallet".into(),
-            marker_fingerprint: [0; 32],
-            local_receiver_path: "paykit/server".into(),
-            operation: DeliveryOperationV1::EndpointPublication {
-                receiving_details: vec![ReceivingDetailV1 {
-                    identifier: "btc-bitcoin-p2wpkh".into(),
-                    payload: "address-secret".into(),
-                }],
-            },
-        };
-        let rendered = format!("{intent:?}");
-
-        assert!(!rendered.contains("reader-secret"));
-        assert!(!rendered.contains("address-secret"));
-        assert!(!rendered.contains("bitkit/wallet"));
-    }
-
-    #[test]
-    fn payment_request_metadata_round_trips_through_postcard() {
-        let metadata = serde_json::Map::from_iter([
+    fn bound_payment_request_round_trips_without_exposing_private_terms() {
+        let app_id = PaykitAppId::new(crate::config::PAYKIT_APP_ID).unwrap();
+        let terms = PaymentRequestTerms::builder(
+            PaymentAmount::new("0.00000100", "btc").unwrap(),
+            PaymentReference::new("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
+        )
+        .required_app_id(Some(app_id.clone()))
+        .payment_endpoints(Some(HashMap::from([(
+            PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+            PaymentEndpointPayload::new("private-address"),
+        )])))
+        .metadata(serde_json::Map::from_iter([
             ("bundle_id".into(), serde_json::json!("bundle-secret")),
             (
                 "nested".into(),
                 serde_json::json!({"reader": "reader-secret"}),
             ),
-        ]);
-        let intent = DeliveryIntentV1 {
-            version: 2,
-            reader_pubky: "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy".into(),
-            selected_reader_path: "bitkit/wallet".into(),
-            marker_fingerprint: [9; 32],
-            local_receiver_path: "paykit/server".into(),
-            operation: DeliveryOperationV1::PaymentRequestProposal {
-                terms: PaymentTermsV1 {
-                    amount: "0.00000100".into(),
-                    asset: "btc".into(),
-                    payment_reference: "550e8400-e29b-41d4-a716-446655440000".into(),
-                    proposal_expires_at: None,
-                    accepted_endpoint_identifiers: vec!["btc-bitcoin-p2wpkh".into()],
-                    metadata: metadata.clone(),
-                },
-            },
-        };
-
-        let decoded = DeliveryIntentV1::decode(&postcard::to_allocvec(&intent).unwrap()).unwrap();
-        assert_eq!(decoded, intent);
-    }
-
-    #[test]
-    fn unsupported_persisted_intent_version_is_rejected() {
-        let intent = DeliveryIntentV1 {
-            version: 1,
-            reader_pubky: "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy".into(),
-            selected_reader_path: "bitkit/wallet".into(),
-            marker_fingerprint: [3; 32],
-            local_receiver_path: "paykit/server".into(),
-            operation: DeliveryOperationV1::EndpointPublication {
-                receiving_details: vec![ReceivingDetailV1 {
-                    identifier: "btc-bitcoin-p2wpkh".into(),
-                    payload: "address-secret".into(),
-                }],
-            },
-        };
-
+        ]))
+        .build()
+        .unwrap();
+        let intent = DeliveryIntentV1::payment_request(READER.into(), app_id, &terms).unwrap();
         assert_eq!(
-            DeliveryIntentV1::decode(&postcard::to_allocvec(&intent).unwrap()),
-            Err(DeliveryIntentError::Invalid)
+            DeliveryIntentV1::decode(&postcard::to_allocvec(&intent).unwrap()).unwrap(),
+            intent
         );
+        assert!(!format!("{intent:?}").contains("private-address"));
+        let mut wrong_app = intent.clone();
+        wrong_app.app_id = "bitkit".into();
+        assert_eq!(wrong_app.validate(), Err(DeliveryIntentError::Invalid));
+        let mut wrong_version = intent;
+        wrong_version.version = 2;
+        assert_eq!(wrong_version.validate(), Err(DeliveryIntentError::Invalid));
     }
 }

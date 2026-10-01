@@ -1,7 +1,7 @@
 //! Bounded external-I/O seams for the Bitkit companion receiver.
 //!
 //! The verifier is server-owned (`bitkit_claim`); these seams isolate only the
-//! Pubky relay and durable/marker side effects so no unverified relay body can
+//! Pubky relay and durable app-publication side effects so no unverified relay body can
 //! reach persistence.
 
 use std::time::Duration;
@@ -11,7 +11,8 @@ use ed25519_dalek::VerifyingKey;
 use pubky::{HttpRelayInboxChannel, PubkyHttpClient};
 
 use crate::bitkit_claim::{
-    AuthRequest, ClaimError, WatchOnlyAccountClaim, decrypt_and_verify, derive_channel_id,
+    AuthRequest, ClaimError, PAYKIT_ACCESS_CLAIM, VerifiedCompanionClaim, decrypt_and_verify,
+    decrypt_and_verify_reconnect, derive_channel_id,
 };
 use crate::setup_diagnostics::{
     SetupFailureClass, SetupOutcome, SetupStage, claim_failure_class, emit_setup_stage,
@@ -46,7 +47,7 @@ pub trait CompanionRelay: Send + Sync {
         request: &AuthRequest,
         deadline: Duration,
     ) -> Result<Option<Vec<u8>>, CompanionRelayError>;
-    /// Called only after marker publication/read-back and durable state commit.
+    /// Called only after credential persistence and app publication/read-back.
     async fn acknowledge(&self, request: &AuthRequest) -> Result<(), CompanionRelayError>;
 }
 
@@ -63,7 +64,7 @@ impl PubkyCompanionRelay {
         Self { client }
     }
     fn channel(&self, request: &AuthRequest) -> Result<HttpRelayInboxChannel, CompanionRelayError> {
-        HttpRelayInboxChannel::new(request.relay().clone(), derive_channel_id(request.secret()))
+        HttpRelayInboxChannel::new(request.relay().clone(), derive_channel_id(request))
             .map_err(|_| CompanionRelayError::InvalidRequest)
     }
 }
@@ -91,12 +92,12 @@ impl CompanionRelay for PubkyCompanionRelay {
 
 #[async_trait]
 pub trait VerifiedSetupCommit: Send + Sync {
-    /// Must publish and read back the receiver marker, then commit encrypted
-    /// creator credentials and SDK `StorageState`. It is deliberately invoked
+    /// Must persist validated credentials, publish and read back the server app,
+    /// and mark setup complete. It is deliberately invoked
     /// only after normal AUTH identity and claim signature agree.
     async fn publish_readback_and_commit(
         &self,
-        claim: WatchOnlyAccountClaim,
+        claim: VerifiedCompanionClaim,
     ) -> Result<(), ClaimError>;
 }
 
@@ -148,7 +149,12 @@ where
         SetupOutcome::Started,
         SetupFailureClass::None,
     );
-    let claim = match decrypt_and_verify(&body, request.secret(), creator) {
+    let verified = if request.claim_type() == PAYKIT_ACCESS_CLAIM {
+        decrypt_and_verify_reconnect(&body, request, creator).map(VerifiedCompanionClaim::Reconnect)
+    } else {
+        decrypt_and_verify(&body, request, creator).map(VerifiedCompanionClaim::Setup)
+    };
+    let claim = match verified {
         Ok(claim) => {
             emit_setup_stage(
                 SetupStage::ClaimVerify,
@@ -285,7 +291,7 @@ mod tests {
     impl VerifiedSetupCommit for Commit {
         async fn publish_readback_and_commit(
             &self,
-            _: WatchOnlyAccountClaim,
+            _: VerifiedCompanionClaim,
         ) -> Result<(), ClaimError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.result.clone()
@@ -294,20 +300,23 @@ mod tests {
     fn request() -> AuthRequest {
         let client_public_key = pubky::Keypair::from_secret(&[7; 32]).public_key();
         crate::bitkit_claim::parse_auth_request(&format!(
-            "pubkyauth://signin_grant?caps={}&relay=https://relay.example/inbox&secret=AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM&cid=app.paykit.server&cpk={}&x-bitkit-claim=watch-only-account-v1",
+            "pubkyauth://signin_grant?caps={}&relay=https://relay.example/inbox&secret=AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM&cid=app.paykit.server&cpk={}&x-bitkit-claim=paykit-access-v1.watch-only-account-v1",
             crate::bitkit_claim::LOCAL_DEMO_CAPABILITIES,
             client_public_key.as_inner(),
         ), crate::bitkit_claim::LOCAL_DEMO_CAPABILITIES)
         .unwrap()
     }
     fn body(secret: &[u8; 32], key: &SigningKey) -> Vec<u8> {
-        let mut payload = [0; 84];
+        let mut payload = zeroize::Zeroizing::new([0; crate::bitkit_claim::UNSIGNED_PAYLOAD_LEN]);
+        payload[84..92].copy_from_slice(&1u64.to_be_bytes());
         payload[0] = 1;
         payload[5] = 0;
-        let mut input = b"x-bitkit-claim|watch-only-account-v1|".to_vec();
+        let mut input = zeroize::Zeroizing::new(
+            b"x-bitkit-claim|paykit-access-v1.watch-only-account-v1|".to_vec(),
+        );
         input.extend_from_slice(&Sha256::digest(secret));
-        input.extend_from_slice(&payload);
-        let mut signed = payload.to_vec();
+        input.extend_from_slice(payload.as_slice());
+        let mut signed = zeroize::Zeroizing::new(payload.to_vec());
         signed.extend_from_slice(&key.sign(&input).to_bytes());
         let nonce = [4; 24];
         let ciphertext = XSalsa20Poly1305::new(secret.into())
@@ -316,7 +325,7 @@ mod tests {
         [nonce.to_vec(), ciphertext].concat()
     }
     #[tokio::test]
-    async fn no_durable_commit_or_ack_precedes_verified_claim_and_marker_readback() {
+    async fn no_durable_commit_or_ack_precedes_verified_claim_and_app_publication() {
         let request = request();
         let key = SigningKey::from_bytes(&[8; 32]);
         let relay = Relay {

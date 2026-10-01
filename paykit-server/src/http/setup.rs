@@ -10,11 +10,13 @@ use qrcode::{QrCode, render::svg};
 use serde_json::json;
 use std::net::SocketAddr;
 
+use crate::domain::locks::{CreatorPubky, parse_creator};
 use crate::setup::{BeginError, PollResult, SetupService, StartedFlow};
 
 pub fn setup_router(service: SetupService) -> Router {
     Router::new()
         .route("/setup", get(begin))
+        .route("/setup/reconnect", get(reconnect))
         .route("/setup/{flow_id}/complete", post(complete))
         .with_state(service)
 }
@@ -24,10 +26,29 @@ async fn begin(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
-    let Some((return_to, state)) = parse_setup_query(query.as_deref()) else {
+    let Some((return_to, state, None)) = parse_setup_query(query.as_deref(), false) else {
         return invalid_request();
     };
-    match service.begin(peer.ip(), &return_to, &state).await {
+    response_for_begin(service.begin(peer.ip(), &return_to, &state).await)
+}
+
+async fn reconnect(
+    State(service): State<SetupService>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    RawQuery(query): RawQuery,
+) -> Response<Body> {
+    let Some((return_to, state, Some(creator))) = parse_setup_query(query.as_deref(), true) else {
+        return invalid_request();
+    };
+    response_for_begin(
+        service
+            .begin_reconnect(peer.ip(), &return_to, &state, &creator)
+            .await,
+    )
+}
+
+fn response_for_begin(result: Result<StartedFlow, BeginError>) -> Response<Body> {
+    match result {
         Ok(flow) => iframe_response(flow),
         Err(BeginError::InvalidRequest) => invalid_request(),
         Err(BeginError::RateLimited) => safe_response_with_retry(
@@ -50,17 +71,24 @@ async fn complete(
     response_for_poll(service.complete_and_poll(&flow_id).await)
 }
 
-fn parse_setup_query(query: Option<&str>) -> Option<(String, String)> {
+fn parse_setup_query(
+    query: Option<&str>,
+    reconnect: bool,
+) -> Option<(String, String, Option<CreatorPubky>)> {
     let mut return_to = None;
     let mut state = None;
+    let mut creator = None;
     for (key, value) in url::form_urlencoded::parse(query?.as_bytes()) {
         match key.as_ref() {
             "return_to" if return_to.is_none() => return_to = Some(value.into_owned()),
             "state" if state.is_none() => state = Some(value.into_owned()),
+            "creator" if reconnect && creator.is_none() => {
+                creator = Some(parse_creator(&value).ok()?)
+            }
             _ => return None,
         }
     }
-    Some((return_to?, state?))
+    Some((return_to?, state?, creator))
 }
 
 fn iframe_response(flow: StartedFlow) -> Response<Body> {
