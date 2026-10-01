@@ -358,6 +358,16 @@ Rules:
 - Crash between SDK enqueue and the fenced server update is an ambiguous at-least-once window: the public proposal API has no caller-supplied IDs or exact server-intent lookup, so retry may create a new SDK outbound message, Event ID, and Payment Request ID. The stable server outbox intent ID and caller-supplied Payment Reference remain the server correlation values.
 - Serialized outbox payload is encrypted with deployment master key; IDs, status, lease, attempts, and timestamps remain plaintext for indexing/scheduling.
 - Background worker establishes/advances link and sends through `paykit-sdk`.
+- Before link establishment or enqueue, the worker asks `paykit-sdk` to observe
+  the Reader's recovery marker for the persisted Reader/path binding. Confirmed
+  marker absence is normal. A fresh marker makes the SDK clear obsolete link
+  state, advance its recovery generation, and begin a fresh handshake; lookup
+  or prerequisite errors fail closed and leave server work retryable without
+  SDK handoff identifiers.
+- This recovery rule covers work whose handoff begins after the fresh marker
+  exists. It does not rescue an SDK outbound record already durably `Sent`
+  before marker publication, and Paykit Server does not publish a recovery
+  marker on the Reader's behalf.
 - Relay or post-validation delivery outage leaves work retryable and reports degraded health.
 - Transient outbox failures retry indefinitely with exponential backoff from 1 second to 5 minutes and ±20% jitter.
 - Attempt count and `next_attempt_at` are persisted.

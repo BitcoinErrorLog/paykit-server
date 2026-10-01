@@ -395,11 +395,22 @@ cargo test --workspace
   event/request/message, so consumers must tolerate duplicate proposals.
 - Latest-State Private Payment List re-enqueue is safe after ambiguous handoff.
 - Publication confirmation gates dependent Payment Request handoff.
+- Recovery-marker observation precedes link establishment and enqueue. A
+  confirmed absent marker continues normally; a typed lookup/prerequisite
+  failure prevents link ensure and enqueue and records a retryable closed stage.
+- A protocol-real fresh-marker flow abandons the old generation, keeps the exact
+  affected Payment Request row without SDK IDs while the Reader is absent,
+  completes a fresh handshake, delivers one logical request, and only then
+  marks that exact row delivered.
 - Leased transient work retries with approved backoff; permanent error remains retained/degraded.
 - Every outbox row resolves its owning Creator and mutates only that Creator's SDK state; work for different Creators may execute concurrently without cross-Creator state leakage.
 
 **Implementation:**
 - SDK owns Encrypted-Link send/retry after handoff.
+- Compose the public SDK recovery-marker observation and link-ensure APIs under
+  the existing Creator mutation lock. Do not publish a server marker or mutate
+  SDK snapshots locally. The rule applies before handoff only; later markers do
+  not retroactively rescue records already durably `Sent`.
 - Reconcile the exact stored SDK outbound message ID to durable SDK `Sent`
   before marking the server intent `delivered`; this does not claim recipient
   application acknowledgement.

@@ -126,6 +126,7 @@ pub trait Adapter: Send + Sync {
         reader: &str,
         path: &str,
     ) -> Result<Option<PaykitReceiverMarker>, HandoffError>;
+    async fn observe_recovery_marker(&self, reader: &str, path: &str) -> Result<(), HandoffError>;
     async fn ensure_link_with_peer(&self, reader: &str, path: &str) -> Result<(), HandoffError>;
     async fn enqueue_private_payment_list_with_receiving_details(
         &self,
@@ -179,6 +180,10 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
             RetryableHandoffStage::MarkerChanged,
         ));
     }
+    adapter
+        .observe_recovery_marker(intent.reader_pubky(), selected_path.as_str())
+        .await
+        .map_err(|error| at_stage(error, RetryableHandoffStage::RecoveryMarkerObservation))?;
     adapter
         .ensure_link_with_peer(intent.reader_pubky(), selected_path.as_str())
         .await

@@ -29,8 +29,10 @@ fn marker(path: &str) -> PaykitReceiverMarker {
 
 struct FakeAdapter {
     marker: PaykitReceiverMarker,
+    recovery_marker_error: Option<HandoffError>,
     link_error: Option<HandoffError>,
     payment_request_calls: Mutex<usize>,
+    calls: Mutex<Vec<&'static str>>,
 }
 
 #[async_trait]
@@ -40,10 +42,21 @@ impl Adapter for FakeAdapter {
         _reader: &str,
         _path: &str,
     ) -> Result<Option<PaykitReceiverMarker>, HandoffError> {
+        self.calls.lock().unwrap().push("fetch_marker");
         Ok(Some(self.marker.clone()))
     }
 
+    async fn observe_recovery_marker(
+        &self,
+        _reader: &str,
+        _path: &str,
+    ) -> Result<(), HandoffError> {
+        self.calls.lock().unwrap().push("observe_recovery_marker");
+        self.recovery_marker_error.map_or(Ok(()), Err)
+    }
+
     async fn ensure_link_with_peer(&self, _reader: &str, _path: &str) -> Result<(), HandoffError> {
+        self.calls.lock().unwrap().push("ensure_link_with_peer");
         self.link_error.map_or(Ok(()), Err)
     }
 
@@ -64,6 +77,7 @@ impl Adapter for FakeAdapter {
         _path: &str,
         _terms: &PaymentTermsV1,
     ) -> Result<HandoffResult, HandoffError> {
+        self.calls.lock().unwrap().push("propose_payment_request");
         *self.payment_request_calls.lock().unwrap() += 1;
         Ok(HandoffResult::PaymentRequestProposal {
             outbound_message_id: 42,
@@ -105,8 +119,10 @@ async fn changed_selected_marker_is_retryable_without_a_reselection() {
     let changed = marker("other/wallet");
     let adapter = FakeAdapter {
         marker: changed,
+        recovery_marker_error: None,
         link_error: None,
         payment_request_calls: Mutex::new(0),
+        calls: Mutex::new(Vec::new()),
     };
 
     assert_eq!(
@@ -123,8 +139,10 @@ async fn link_failure_has_one_durable_diagnostic_stage() {
     let selected = marker("bitkit/wallet");
     let adapter = FakeAdapter {
         marker: selected.clone(),
+        recovery_marker_error: None,
         link_error: Some(HandoffError::Retryable(RetryableHandoffCause::Transport)),
         payment_request_calls: Mutex::new(0),
+        calls: Mutex::new(Vec::new()),
     };
 
     assert_eq!(
@@ -140,8 +158,10 @@ async fn retry_after_an_ambiguous_handoff_can_propose_twice() {
     let selected = marker("bitkit/wallet");
     let adapter = Arc::new(FakeAdapter {
         marker: selected.clone(),
+        recovery_marker_error: None,
         link_error: None,
         payment_request_calls: Mutex::new(0),
+        calls: Mutex::new(Vec::new()),
     });
     let intent = payment_intent(&selected);
 
@@ -158,4 +178,76 @@ async fn retry_after_an_ambiguous_handoff_can_propose_twice() {
         ) if event_id == "event-42" && payment_request_id == "request-42" && second_event == event_id && second_request == payment_request_id
     ));
     assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 2);
+}
+
+#[tokio::test]
+async fn recovery_marker_observation_precedes_link_ensure_and_enqueue() {
+    let selected = marker("bitkit/wallet");
+    let adapter = FakeAdapter {
+        marker: selected.clone(),
+        recovery_marker_error: None,
+        link_error: None,
+        payment_request_calls: Mutex::new(0),
+        calls: Mutex::new(Vec::new()),
+    };
+
+    handoff(&adapter, &payment_intent(&selected)).await.unwrap();
+
+    assert_eq!(
+        *adapter.calls.lock().unwrap(),
+        [
+            "fetch_marker",
+            "observe_recovery_marker",
+            "ensure_link_with_peer",
+            "propose_payment_request",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn recovery_marker_lookup_failure_never_ensures_or_enqueues() {
+    let selected = marker("bitkit/wallet");
+    let adapter = FakeAdapter {
+        marker: selected.clone(),
+        recovery_marker_error: Some(HandoffError::Retryable(RetryableHandoffCause::Transport)),
+        link_error: None,
+        payment_request_calls: Mutex::new(0),
+        calls: Mutex::new(Vec::new()),
+    };
+
+    assert_eq!(
+        handoff(&adapter, &payment_intent(&selected)).await,
+        Err(HandoffFailure::Retryable(
+            RetryableHandoffStage::RecoveryMarkerObservation
+        ))
+    );
+    assert_eq!(
+        *adapter.calls.lock().unwrap(),
+        ["fetch_marker", "observe_recovery_marker"]
+    );
+    assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn confirmed_absent_recovery_marker_continues_to_link_ensure() {
+    let selected = marker("bitkit/wallet");
+    let adapter = FakeAdapter {
+        marker: selected.clone(),
+        recovery_marker_error: None,
+        link_error: None,
+        payment_request_calls: Mutex::new(0),
+        calls: Mutex::new(Vec::new()),
+    };
+
+    handoff(&adapter, &payment_intent(&selected)).await.unwrap();
+
+    assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 1);
+    assert!(
+        adapter
+            .calls
+            .lock()
+            .unwrap()
+            .windows(2)
+            .any(|calls| calls == ["observe_recovery_marker", "ensure_link_with_peer"])
+    );
 }
