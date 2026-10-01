@@ -155,7 +155,7 @@ Immutable deployment values are:
 
 Changing any of them after database initialization requires resetting the database.
 
-Persisted application and schema compatibility across releases is intentionally unsupported during this pre-production phase. When an upgrade changes the baseline migration or a persisted payload representation:
+Persisted application and schema compatibility across releases is unsupported. When an upgrade changes the schema or a persisted payload representation:
 
 1. stop the old process;
 2. discard and recreate the Paykit Server database;

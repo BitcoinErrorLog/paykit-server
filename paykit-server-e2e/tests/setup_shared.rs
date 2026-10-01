@@ -119,7 +119,7 @@ impl AppPublisher for FailAfterPublication {
             access.paykit_identity_secret_key.as_ref()
         );
         assert!(!self.creators.setup_complete(&self.creator).await.unwrap());
-        // Reproduce a worker loading the newly persisted grant before publication.
+        // Workers can load persisted credentials before app publication completes.
         let provider = self.sessions.provider(&self.creator);
         let worker = provider.load_session_access().await.unwrap().unwrap();
         let refreshed = worker

@@ -20,6 +20,6 @@ A successful proposal stores the returned SDK outbound, Event, and Payment Reque
 
 Payment Requests are retained Event Messages. The server neither publishes nor waits on invoice-specific Private Payment Lists, so their latest-state compaction cannot block request delivery or change an invoice's destination.
 
-The baseline schema requires new `handed_off` and `delivered` rows to carry a canonical numeric SDK outbound ID. Earlier prototype rows are not migrated; operators must reset the database when adopting this baseline.
+The schema requires `handed_off` and `delivered` rows to carry a canonical numeric SDK outbound ID. See the [upgrade policy](../README.md#persistence-startup-and-upgrades) before replacing a database or binary.
 
 No part of this design claims exactly-once remote delivery.

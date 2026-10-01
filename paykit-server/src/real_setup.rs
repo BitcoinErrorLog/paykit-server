@@ -46,7 +46,7 @@ fn stage_result<T, E>(
     }
 }
 
-/// Capabilities owned by the receiver-only server app.
+/// Server capabilities for receiving payments and issuing Payment Requests.
 pub fn server_app() -> PaykitApp {
     PaykitApp::new(
         "Paykit Server",

@@ -50,7 +50,7 @@ Payment Requests, and outgoing payments; it does not select a receiver path.
 
 SDK handoff is at least once. Reconciliation identifies the exact outbound ID and
 app; only SDK `Sent` means delivered, not payer acknowledgement. See
-[outbox recovery](task12-outbox-recovery.md) for leases and retry behavior.
+[outbox recovery](outbox-recovery.md) for leases and retry behavior.
 
 Only direct observation of the invoice address attributes payment. Shared private
 events, payer identity, Payment Proofs, and connection state cannot settle an
@@ -58,6 +58,5 @@ invoice. One amount-matched output is required; split outputs are not aggregated
 An amount-matched output freezes at one confirmation and becomes final at six.
 No spending, refunds, receipt issuance, or horizontal replicas are supported.
 
-Persisted-format compatibility is unsupported before production. No reader for
-earlier draft formats is retained. Upgrade policy and operational limits are in
-the [README](../README.md); validation commands are in [CONTRIBUTING](../CONTRIBUTING.md).
+Upgrade policy and operational limits are in the [README](../README.md);
+validation commands are in [CONTRIBUTING](../CONTRIBUTING.md).
