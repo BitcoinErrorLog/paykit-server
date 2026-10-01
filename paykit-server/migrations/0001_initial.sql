@@ -5,7 +5,7 @@ CREATE TABLE deployment_metadata (
     id SMALLINT PRIMARY KEY DEFAULT 1,
     bitcoin_network TEXT NOT NULL,
     paykit_client_id TEXT NOT NULL,
-    receiver_path TEXT NOT NULL,
+    app_id TEXT NOT NULL,
     locks_key_fingerprint BYTEA NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -15,14 +15,8 @@ CREATE TABLE creators (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     creator_lookup_hash BYTEA UNIQUE NOT NULL,
     credential_envelope BYTEA NOT NULL,
+    setup_complete BOOLEAN NOT NULL DEFAULT FALSE,
     next_child_index BIGINT NOT NULL DEFAULT 0,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE sdk_states (
-    creator_id UUID PRIMARY KEY REFERENCES creators (id) ON DELETE RESTRICT,
-    state_envelope BYTEA NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -61,11 +55,9 @@ CREATE TABLE invoices (
 CREATE TABLE outbox (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     creator_id UUID NOT NULL REFERENCES creators (id) ON DELETE RESTRICT,
-    invoice_id UUID REFERENCES invoices (id) ON DELETE RESTRICT,
-    reader_assignment_id UUID REFERENCES reader_assignments (id) ON DELETE RESTRICT,
+    invoice_id UUID UNIQUE REFERENCES invoices (id) ON DELETE RESTRICT,
     intent_envelope BYTEA NOT NULL,
     status TEXT NOT NULL,
-    depends_on_id UUID REFERENCES outbox (id) ON DELETE RESTRICT,
     lease_owner UUID,
     claim_token UUID,
     lease_expires_at TIMESTAMPTZ,
@@ -90,7 +82,6 @@ CREATE TABLE outbox (
 );
 
 CREATE INDEX outbox_claim_index ON outbox (status, next_attempt_at);
-CREATE INDEX outbox_dependency_claim_index ON outbox (depends_on_id, status);
 CREATE INDEX outbox_handed_off_reconciliation_index
     ON outbox (status, next_attempt_at)
     WHERE status = 'handed_off';

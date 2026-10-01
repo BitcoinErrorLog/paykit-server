@@ -20,7 +20,7 @@ pub mod metrics;
 pub mod paykit;
 /// PostgreSQL persistence primitives and migrations.
 pub mod persistence;
-/// Concrete normal-AUTH, companion-claim, marker, and encrypted-store setup flow.
+/// Concrete normal-AUTH, companion-claim, app publication, and credential setup flow.
 pub mod real_setup;
 /// Server lifecycle, dependency checks, admission control, and shutdown.
 pub mod runtime;

@@ -54,7 +54,7 @@ allowed_origins = ["https://app.example"]
 log_authorization_url = {log_authorization_url}
 [paykit]
 client_id = "app.paykit.server"
-receiver_path = "paykit/server"
+app_id = "paykit-server"
 network = "testnet"
 [bitcoin]
 network = "testnet"

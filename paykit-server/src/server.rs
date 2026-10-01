@@ -6,8 +6,8 @@ use crate::{
     application::{
         connection_status::ConnectionStatusService,
         create_invoice::{
-            CreateInvoiceError, CreateInvoiceService, LockFetchError, LockFetcher, MarkerDiscovery,
-            PaykitIntentBuilder, SessionValidationError, SessionValidator,
+            AppRegistryDiscovery, CreateInvoiceError, CreateInvoiceService, LockFetchError,
+            LockFetcher, PaykitIntentBuilder, SessionValidationError, SessionValidator,
         },
         payment_status::PaymentStatusService,
         setup_status::SetupStatusService,
@@ -17,11 +17,8 @@ use crate::{
     crypto::Crypto,
     domain::locks::{CreatorPubky, PubkyLockResource, ReaderPubky},
     http::{self, auth::SignedLocksAuth},
-    paykit::{CreatorSessionProvider, PaykitAdapter},
-    persistence::{
-        CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PersistenceError,
-        PostgresStorageAdapter, SdkStateStore,
-    },
+    paykit::{CreatorSessions, PaykitAdapter},
+    persistence::{CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PersistenceError},
     real_setup::RealSetupCompleter,
     runtime::{PostgresDependency, Runtime, operational_router},
     setup::{SetupLimits, SetupService, SystemClock},
@@ -37,13 +34,28 @@ use crate::{
 use async_trait::async_trait;
 use axum::{Extension, Router};
 use locks_core::lock_policy::ContentLock;
-use paykit_lib::{PaykitReceiverMarker, get_paykit_receiver_marker, list_paykit_receiver_paths};
+use paykit_lib::{PaykitAppRegistry, get_paykit_app_registry};
 use paykit_sdk::{PaykitSdkError, PubkyPublicKey, PubkySessionBootstrap, PubkySessionProvider};
 use pubky::{Pubky, errors::RequestError};
 use sqlx::PgPool;
 use thiserror::Error;
 use tokio::{task::JoinSet, time::MissedTickBehavior};
 use uuid::Uuid;
+
+fn setup_bootstrap(
+    pubky: Pubky,
+    client_id: &str,
+    network: PaykitNetwork,
+) -> Result<PubkySessionBootstrap, ServerBuildError> {
+    let bootstrap =
+        PubkySessionBootstrap::with_pubky(pubky, client_id).map_err(|_| ServerBuildError::Pubky)?;
+    match network {
+        PaykitNetwork::Mainnet => Ok(bootstrap),
+        PaykitNetwork::Testnet => bootstrap
+            .with_auth_relay("http://127.0.0.1:15412/inbox")
+            .map_err(|_| ServerBuildError::Pubky),
+    }
+}
 
 /// Fail-fast, secret-free construction errors.
 #[derive(Debug, Error)]
@@ -65,13 +77,11 @@ pub struct Server {
 }
 
 struct WorkerComponents {
-    pool: PgPool,
-    crypto: Arc<Crypto>,
     creators: CreatorStore,
+    sessions: CreatorSessions,
     outbox: OutboxStore,
     invoices: InvoiceStore,
     electrum: Arc<dyn ElectrumPort>,
-    pubky: Pubky,
     paykit: PaykitConfig,
     bitcoin_network: crate::config::BitcoinNetwork,
     outbox_poll_interval: Duration,
@@ -141,16 +151,19 @@ impl Server {
         let invoices = InvoiceStore::new(&pool, crypto.clone());
         let outbox = OutboxStore::new(&pool, crypto.clone());
 
-        let bootstrap =
-            PubkySessionBootstrap::with_pubky(pubky.clone(), config.paykit.client_id.as_str())
-                .map_err(|_| ServerBuildError::Pubky)?;
+        let bootstrap = setup_bootstrap(
+            pubky.clone(),
+            config.paykit.client_id.as_str(),
+            config.paykit.network,
+        )?;
         let relay = Arc::new(PubkyCompanionRelay::new(pubky.client().clone()));
+        let sessions = CreatorSessions::new(creators.clone(), pubky.clone(), config.paykit.clone());
         let setup_completer = Arc::new(RealSetupCompleter::new(
-            BitkitAuthStarter::new(bootstrap, &config.paykit.receiver_path),
+            BitkitAuthStarter::new(bootstrap),
             relay,
             creators.clone(),
+            sessions.clone(),
             config.deployment_invariants().bitcoin_network.clone(),
-            config.paykit.receiver_path.clone(),
         ));
         let setup = SetupService::new_with_authorization_url_logging(
             config.setup.allowed_origins.clone(),
@@ -174,8 +187,7 @@ impl Server {
 
         let session_validator = Arc::new(CreatorSessionValidator {
             creators: creators.clone(),
-            pubky: pubky.clone(),
-            paykit: config.paykit.clone(),
+            sessions: sessions.clone(),
         });
         let invoice_service = Arc::new(CreateInvoiceService::new(
             session_validator.clone(),
@@ -184,11 +196,10 @@ impl Server {
                 max_bytes: config.limits.lock_resource_bytes,
                 timeout: config.limits.lock_fetch_timeout,
             }),
-            Arc::new(PubkyMarkerDiscovery {
+            Arc::new(PubkyAppRegistryDiscovery {
                 storage: pubky.public_storage(),
             }),
-            config.paykit.receiver_path_priority.clone(),
-            config.paykit.receiver_path.clone(),
+            config.paykit.app_id.clone(),
             Arc::new(creators.clone()),
             config.deployment_invariants().bitcoin_network.clone(),
             Arc::new(invoices.clone()),
@@ -198,7 +209,7 @@ impl Server {
         ));
         let connection_status_service = Arc::new(ConnectionStatusService::new(
             Arc::new(invoices.clone()),
-            Arc::new(SdkStateStore::new(&pool, crypto.clone())),
+            Arc::new(sessions.clone()),
         ));
         let status_service = Arc::new(PaymentStatusService::new(Arc::new(invoices.clone())));
         let setup_status_service = Arc::new(SetupStatusService::new(session_validator));
@@ -221,13 +232,11 @@ impl Server {
         ));
         let router = operational_router(business_routes, runtime.clone());
         let workers = WorkerComponents {
-            pool,
-            crypto,
             creators,
+            sessions,
             outbox,
             invoices,
             electrum,
-            pubky,
             paykit: config.paykit.clone(),
             bitcoin_network: config.deployment_invariants().bitcoin_network.clone(),
             outbox_poll_interval: config.outbox.poll_interval,
@@ -335,8 +344,53 @@ fn spawn_owned_workers(workers: WorkerComponents, runtime: Arc<Runtime>) -> Join
     let workers = Arc::new(workers);
     tasks.spawn(outbox_enqueue_loop(workers.clone(), runtime.clone()));
     tasks.spawn(outbox_reconciliation_loop(workers.clone(), runtime.clone()));
+    tasks.spawn(shared_transport_loop(workers.clone(), runtime.clone()));
     tasks.spawn(observer_loop(workers, runtime));
     tasks
+}
+
+async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
+    let mut interval = tokio::time::interval(workers.outbox_poll_interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = runtime.cancelled() => break,
+            _ = interval.tick() => {}
+        }
+        let Ok(creators) = workers.creators.ready_ids().await else {
+            runtime.set_paykit_transport_available(false);
+            continue;
+        };
+        let mut available = true;
+        let mut deferred = false;
+        for creator in creators {
+            if !runtime.may_start_worker_claim() {
+                return;
+            }
+            let maintained = match creator_adapter(&workers, creator).await {
+                Ok(adapter) => match adapter.maintain_transport().await {
+                    Ok(()) => true,
+                    Err(error) if error.is_concurrent_update() => {
+                        deferred = true;
+                        true
+                    }
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+            if !maintained {
+                available = false;
+                tracing::warn!(
+                    stage = "shared_transport",
+                    "Paykit transport maintenance failed"
+                );
+            }
+        }
+        // Contention is retried by the next poll, not evidence of recovery or failure.
+        if !available || !deferred {
+            runtime.set_paykit_transport_available(available);
+        }
+    }
 }
 
 fn outbox_batch_size(config: &OutboxConfig) -> i64 {
@@ -363,21 +417,9 @@ async fn creator_adapter(
                 _ => AdapterBuildError::Unavailable,
             })?;
     let creator = credentials.creator().clone();
-    SdkStateStore::new(&workers.pool, workers.crypto.clone())
-        .load(&creator)
-        .await
-        .map_err(|error| match error {
-            PersistenceError::CorruptOrMissing => AdapterBuildError::Permanent,
-            _ => AdapterBuildError::Unavailable,
-        })?;
-    let storage = PostgresStorageAdapter::new(&workers.pool, workers.crypto.clone(), creator_id);
-    let sessions = CreatorSessionProvider::with_pubky(
-        workers.creators.clone(),
-        creator,
-        workers.pubky.clone(),
-        &workers.paykit,
-    );
-    PaykitAdapter::new(storage, sessions, &workers.paykit).map_err(|_| AdapterBuildError::Permanent)
+    let sessions = workers.sessions.provider(&creator);
+    PaykitAdapter::new(creator_id, sessions, &workers.paykit)
+        .map_err(|_| AdapterBuildError::Permanent)
 }
 
 fn retry_delay(initial: Duration, maximum: Duration, attempt_count: i32) -> Duration {
@@ -643,23 +685,59 @@ fn map_electrum_error(_: ObserverError) -> ServerBuildError {
 #[derive(Clone)]
 struct CreatorSessionValidator {
     creators: CreatorStore,
-    pubky: Pubky,
-    paykit: PaykitConfig,
+    sessions: CreatorSessions,
 }
 
 #[async_trait]
 impl SessionValidator for CreatorSessionValidator {
     async fn validate(&self, creator: &CreatorPubky) -> Result<(), SessionValidationError> {
-        CreatorSessionProvider::with_pubky(
-            self.creators.clone(),
-            creator.clone(),
-            self.pubky.clone(),
-            &self.paykit,
-        )
-        .load_session_access()
-        .await
-        .map(|_| ())
-        .map_err(map_session_validation_error)
+        if !self
+            .creators
+            .setup_complete(creator)
+            .await
+            .map_err(|_| SessionValidationError::Unavailable)?
+        {
+            return Err(SessionValidationError::Invalid);
+        }
+        let provider = self.sessions.provider(creator);
+        let access = provider
+            .load_session_access()
+            .await
+            .map_err(map_session_validation_error)?
+            .ok_or(SessionValidationError::Invalid)?;
+        access
+            .session
+            .revalidate()
+            .await
+            .map_err(|error| classify_pubky_session_error(&error))?
+            .ok_or(SessionValidationError::Invalid)?;
+        let owner = access
+            .public_key()
+            .and_then(|key| key.to_public_key())
+            .map_err(map_session_validation_error)?;
+        let registry =
+            paykit_lib::get_paykit_app_registry(&access.outbox_client.public_storage(), &owner)
+                .await
+                .map_err(|_| SessionValidationError::Unavailable)?
+                .ok_or(SessionValidationError::Invalid)?;
+        let key = access
+            .paykit_identity_secret_key
+            .as_ref()
+            .ok_or(SessionValidationError::Invalid)?;
+        crate::real_setup::verify_registry_key(&registry, key)
+            .map_err(|_| SessionValidationError::Invalid)?;
+        let app_id =
+            paykit_lib::PaykitAppId::new(crate::config::PAYKIT_APP_ID).expect("static app id");
+        if registry.apps().get(&app_id) != Some(&crate::real_setup::server_app()) {
+            return Err(SessionValidationError::Invalid);
+        }
+        use paykit_sdk::StorageAdapter;
+        paykit_sdk::PubkySharedStateStorage::new(provider)
+            .transaction(|tx| Ok(tx.load_identity_state()))
+            .await
+            .map_err(map_session_validation_error)?
+            .ok_or(SessionValidationError::Invalid)?;
+        Ok(())
     }
 }
 
@@ -683,14 +761,7 @@ fn classify_pubky_session_error(error: &pubky::Error) -> SessionValidationError 
     match error {
         pubky::Error::Authentication(_) | pubky::Error::Parse(_) => SessionValidationError::Invalid,
         pubky::Error::Request(RequestError::Validation { .. }) => SessionValidationError::Invalid,
-        // Pubky 0.11 reports revoked grants as an untyped 401. Treat that status as terminal so
-        // setup can recover. A recoverable PoP audience or timestamp rejection may also be 401;
-        // this narrow ambiguity remains until upstream preserves a typed rejection cause.
-        pubky::Error::Request(RequestError::Server { status, .. })
-            if *status == pubky::StatusCode::UNAUTHORIZED =>
-        {
-            SessionValidationError::Invalid
-        }
+        // Untyped HTTP errors cannot distinguish revoked grants from recoverable PoP failures.
         pubky::Error::Request(_) | pubky::Error::Pkarr(_) | pubky::Error::Build(_) => {
             SessionValidationError::Unavailable
         }
@@ -758,38 +829,45 @@ impl PubkyLockFetcher {
 }
 
 #[derive(Clone)]
-struct PubkyMarkerDiscovery {
+struct PubkyAppRegistryDiscovery {
     storage: pubky::PublicStorage,
 }
 
 #[async_trait]
-impl MarkerDiscovery for PubkyMarkerDiscovery {
+impl AppRegistryDiscovery for PubkyAppRegistryDiscovery {
     async fn discover(
         &self,
         reader: &ReaderPubky,
-    ) -> Result<Vec<PaykitReceiverMarker>, CreateInvoiceError> {
+    ) -> Result<Option<PaykitAppRegistry>, CreateInvoiceError> {
         let reader = PubkyPublicKey::from_raw_or_app_key(reader.to_string())
             .and_then(|key| key.to_public_key())
             .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-        let paths = list_paykit_receiver_paths(&self.storage, &reader)
+        get_paykit_app_registry(&self.storage, &reader)
             .await
-            .map_err(|_| CreateInvoiceError::Unavailable)?;
-        let mut markers = Vec::with_capacity(paths.len());
-        for path in paths {
-            if let Some(marker) = get_paykit_receiver_marker(&self.storage, &reader, &path)
-                .await
-                .map_err(|_| CreateInvoiceError::Unavailable)?
-            {
-                markers.push(marker);
-            }
-        }
-        Ok(markers)
+            .map_err(|_| CreateInvoiceError::Unavailable)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn setup_auth_relay_matches_the_configured_pubky_network() {
+        for (network, expected_relay) in [
+            (PaykitNetwork::Testnet, "http://127.0.0.1:15412/inbox"),
+            (PaykitNetwork::Mainnet, "https://httprelay.pubky.app/inbox"),
+        ] {
+            let bootstrap =
+                setup_bootstrap(Pubky::testnet().unwrap(), "app.paykit.server", network).unwrap();
+            let request = bootstrap
+                .start_sign_in_auth(crate::bitkit_claim::LOCAL_DEMO_CAPABILITIES)
+                .await
+                .unwrap();
+            let details = paykit_sdk::parse_pubky_auth_url(request.authorization_url()).unwrap();
+            assert_eq!(details.relay_url, expected_relay);
+        }
+    }
     use crate::config::ConfigEnvironment;
 
     const CONFIG_KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
@@ -807,23 +885,44 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pubky_unauthorized_restore_is_invalid_to_recover_revoked_grants() {
-        let error = PaykitSdkError::Identity {
-            context: "restore Pubky grant session".into(),
-            source: Some(
-                pubky::Error::Request(pubky::errors::RequestError::Server {
-                    status: pubky::StatusCode::UNAUTHORIZED,
-                    message: "grant rejected".into(),
-                })
-                .into(),
-            ),
-        };
+    #[tokio::test]
+    async fn untyped_pubky_unauthorized_restore_does_not_require_setup() {
+        struct UnauthorizedSession(&'static str);
 
-        assert_eq!(
-            map_session_validation_error(error),
-            SessionValidationError::Invalid
-        );
+        #[async_trait]
+        impl SessionValidator for UnauthorizedSession {
+            async fn validate(&self, _: &CreatorPubky) -> Result<(), SessionValidationError> {
+                Err(map_session_validation_error(PaykitSdkError::Identity {
+                    context: "restore Pubky grant session".into(),
+                    source: Some(
+                        pubky::Error::Request(RequestError::Server {
+                            status: pubky::StatusCode::UNAUTHORIZED,
+                            message: self.0.into(),
+                        })
+                        .into(),
+                    ),
+                }))
+            }
+        }
+
+        let creator = crate::domain::locks::parse_creator(CONFIG_KEY).unwrap();
+        for message in [
+            "invalid PoP proof: PoP audience mismatch",
+            "invalid PoP proof: PoP timestamp out of range",
+            "PoP nonce already used",
+            "Grant has been revoked",
+            "Unauthorized",
+        ] {
+            let sessions = Arc::new(UnauthorizedSession(message));
+            assert_eq!(
+                sessions.validate(&creator).await,
+                Err(SessionValidationError::Unavailable)
+            );
+            assert_eq!(
+                SetupStatusService::new(sessions).status(&creator).await,
+                crate::application::setup_status::SetupStatus::Unavailable
+            );
+        }
     }
 
     #[test]
@@ -905,7 +1004,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_spawn_path_owns_all_three_workers() {
+    async fn production_spawn_path_owns_all_four_workers() {
         let config = Config::from_toml_and_environment(
             &format!(
                 r#"
@@ -917,7 +1016,7 @@ trusted_public_key = "{CONFIG_KEY}"
 allowed_origins = ["https://app.example"]
 [paykit]
 client_id = "app.paykit.server"
-receiver_path = "paykit/server"
+app_id = "paykit-server"
 network = "testnet"
 [bitcoin]
 network = "testnet"
@@ -940,7 +1039,7 @@ poll_interval = "1s"
             .unwrap();
         let server = Server::build(config, pool).await.unwrap();
         let mut tasks = spawn_owned_workers(server.workers, server.runtime);
-        assert_eq!(tasks.len(), 3);
+        assert_eq!(tasks.len(), 4);
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }

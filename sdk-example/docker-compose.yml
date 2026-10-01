@@ -1,0 +1,42 @@
+services:
+  postgres:
+    image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+    environment:
+      POSTGRES_PASSWORD: example
+    ports:
+      - "127.0.0.1::5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+
+  bitcoin:
+    image: btcpayserver/bitcoin:26.0@sha256:a9ac26fba4d38c6c202151e132c650900a3d61678a970718c043da064bd63100
+    command:
+      - bitcoind
+      - -regtest
+      - -server
+      - -rpcbind=0.0.0.0
+      - -rpcallowip=0.0.0.0/0
+      - -rpcuser=example
+      - -rpcpassword=example
+      - -fallbackfee=0.00001
+    ports:
+      - "127.0.0.1::18443"
+    healthcheck:
+      test: ["CMD", "bitcoin-cli", "-regtest", "-rpcuser=example", "-rpcpassword=example", "getblockchaininfo"]
+      interval: 1s
+      timeout: 5s
+      retries: 60
+
+  electrs:
+    image: getumbrel/electrs:v0.10.2@sha256:bcd3066e795b0f242540481736705b5e86fa159b539fdd562f08007bd112faf9
+    command: ["--conf", "/etc/electrs.toml"]
+    volumes:
+      - ./electrs.toml:/etc/electrs.toml:ro
+    ports:
+      - "127.0.0.1::50001"
+    depends_on:
+      bitcoin:
+        condition: service_healthy

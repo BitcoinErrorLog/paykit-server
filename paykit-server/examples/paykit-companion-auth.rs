@@ -12,8 +12,7 @@ use paykit_sdk::{
 };
 use paykit_server::{
     bitkit_claim::{
-        CLAIM_TYPE, LOCAL_DEMO_CAPABILITIES, QUERY_PARAMETER, encode_unsigned_payload,
-        parse_auth_request,
+        LOCAL_DEMO_CAPABILITIES, QUERY_PARAMETER, encode_unsigned_payload, parse_auth_request,
     },
     config::{BitcoinNetwork, PAYKIT_CLIENT_ID},
     real_setup::validate_xpub,
@@ -36,6 +35,7 @@ struct Input {
     creator_secret: Zeroizing<String>,
     account_xpub: String,
     account_index: u32,
+    key_generation: u64,
 }
 
 struct ApprovalRequest {
@@ -161,7 +161,7 @@ fn validate(input: Input) -> Result<ApprovalRequest, Failure> {
     if auth.client_id != PAYKIT_CLIENT_ID || auth.capabilities != LOCAL_DEMO_CAPABILITIES {
         return Err(Failure::InvalidInput);
     }
-    parse_auth_request(input.auth_url.as_str(), LOCAL_DEMO_CAPABILITIES)
+    let companion_request = parse_auth_request(input.auth_url.as_str(), LOCAL_DEMO_CAPABILITIES)
         .map_err(|_| Failure::InvalidInput)?;
 
     let mut creator_secret_bytes = Zeroizing::new(
@@ -174,6 +174,7 @@ fn validate(input: Input) -> Result<ApprovalRequest, Failure> {
     if creator_secret_bytes.len() != 32
         || canonical_creator_secret.as_str() != input.creator_secret.as_str()
         || input.account_index >= (1 << 31)
+        || input.key_generation == 0
     {
         return Err(Failure::InvalidInput);
     }
@@ -193,9 +194,16 @@ fn validate(input: Input) -> Result<ApprovalRequest, Failure> {
         &BitcoinNetwork::Regtest,
     )
     .map_err(|_| Failure::InvalidInput)?;
-    let payload = encode_unsigned_payload(input.account_index, &xpub.encode());
-    let claim = PubkyAuthCompanionClaim::new(QUERY_PARAMETER, CLAIM_TYPE, payload.to_vec())
-        .map_err(|_| Failure::Authentication)?;
+    let key = creator_secret
+        .derive_paykit_identity_secret_key(input.key_generation)
+        .map_err(|_| Failure::InvalidInput)?;
+    let payload = encode_unsigned_payload(input.account_index, &xpub.encode(), &key);
+    let claim = PubkyAuthCompanionClaim::new(
+        QUERY_PARAMETER,
+        companion_request.claim_type(),
+        payload.to_vec(),
+    )
+    .map_err(|_| Failure::Authentication)?;
     Ok(ApprovalRequest {
         auth_url: input.auth_url,
         creator_secret,
@@ -223,8 +231,8 @@ mod tests {
         secp256k1::Secp256k1,
     };
     use paykit_server::bitkit_claim::{
-        CLAIM_TYPE, LOCAL_DEMO_CAPABILITIES, QUERY_PARAMETER, decrypt_and_verify,
-        derive_channel_id, parse_unsigned_payload,
+        ClaimError, LOCAL_DEMO_CAPABILITIES, QUERY_PARAMETER, decrypt_and_verify,
+        derive_channel_id, parse_auth_request, parse_unsigned_payload, setup_claim_selection,
     };
     use pubky::{
         Capabilities, EncryptedHttpRelayInboxChannel, GrantClaims, HttpRelayInboxChannel, Keypair,
@@ -254,8 +262,9 @@ mod tests {
 
     fn auth_url(relay: &str, auth_secret: &[u8; 32]) -> String {
         let client_public_key = pubky::Keypair::from_secret(&[8; 32]).public_key();
+        let selection = setup_claim_selection();
         format!(
-            "pubkyauth://signin_grant?caps={LOCAL_DEMO_CAPABILITIES}&relay={relay}&secret={}&cid=app.paykit.server&cpk={}&{QUERY_PARAMETER}={CLAIM_TYPE}",
+            "pubkyauth://signin_grant?caps={LOCAL_DEMO_CAPABILITIES}&relay={relay}&secret={}&cid=app.paykit.server&cpk={}&{QUERY_PARAMETER}={selection}",
             URL_SAFE_NO_PAD.encode(auth_secret),
             client_public_key.as_inner(),
         )
@@ -268,6 +277,7 @@ mod tests {
             "creator_secret": URL_SAFE_NO_PAD.encode([7; 32]),
             "account_xpub": account_xpub(Network::Testnet, 0).to_string(),
             "account_index": 0,
+            "key_generation": 2,
         })
     }
 
@@ -332,6 +342,7 @@ mod tests {
             "creator_secret",
             "account_xpub",
             "account_index",
+            "key_generation",
         ] {
             let mut missing = valid_input();
             missing.as_object_mut().unwrap().remove(field);
@@ -344,6 +355,9 @@ mod tests {
 
     #[tokio::test]
     async fn version_must_be_exactly_one() {
+        let mut zero_generation = valid_input();
+        zero_generation["key_generation"] = json!(0);
+        assert_invalid(&zero_generation).await;
         for version in [0, 2] {
             let mut input = valid_input();
             input["version"] = json!(version);
@@ -439,11 +453,20 @@ mod tests {
     async fn auth_url_requires_canonical_bounded_exact_contract() {
         let valid = valid_input();
         let url = valid["auth_url"].as_str().unwrap();
+        let selection = setup_claim_selection();
         let cases = [
             url.replacen("pubkyauth", "https", 1),
             url.replace("cid=app.paykit.server", "cid=other.paykit.server"),
             url.replace(LOCAL_DEMO_CAPABILITIES, "/pub/paykit/v0/bitkit/server/:rw"),
-            url.replace(CLAIM_TYPE, "other-claim-v1"),
+            url.replace(&selection, "other-claim-v1"),
+            url.replace(&selection, "watch-only-account-v1"),
+            url.replace(&selection, "paykit-access-v1"),
+            url.replace(&selection, "paykit-access-v1..watch-only-account-v1"),
+            url.replace(
+                &selection,
+                "paykit-access-v1.watch-only-account-v1.paykit-access-v1",
+            ),
+            format!("{url}&{QUERY_PARAMETER}={selection}"),
             format!("{url}#fragment"),
             format!("{url}&padding={}", "a".repeat(16 * 1024)),
         ];
@@ -495,8 +518,15 @@ mod tests {
         let requests = approval.requests.lock().unwrap();
         let request = &requests[0];
         assert_eq!(request.auth_url.as_str(), input["auth_url"]);
+        assert!(
+            request
+                .auth_url
+                .contains("x-bitkit-claim=paykit-access-v1.watch-only-account-v1")
+        );
+        assert_eq!(request.claim.unsigned_payload().len(), 124);
         let parsed = parse_unsigned_payload(request.claim.unsigned_payload()).unwrap();
         assert_eq!(parsed.account_index, 0);
+        assert_eq!(parsed.paykit_identity_secret_key.key_generation(), 2);
         assert_eq!(
             parsed.serialized_xpub,
             account_xpub(Network::Testnet, 0).encode()
@@ -542,7 +572,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn canonical_sdk_delivers_companion_claim_and_grant_on_success() {
+    async fn canonical_sdk_delivers_both_permission_list_orders_with_exact_binding() {
+        for selection in [
+            setup_claim_selection(),
+            "watch-only-account-v1.paykit-access-v1".into(),
+        ] {
+            assert_sdk_delivers_selection(&selection).await;
+        }
+    }
+
+    async fn assert_sdk_delivers_selection(selection: &str) {
         let relay = http_relay::HttpRelay::builder()
             .http_port(0)
             .run()
@@ -551,7 +590,13 @@ mod tests {
         let inbox = relay.local_url().join("inbox").unwrap();
         let auth_secret = [9; 32];
         let mut input = valid_input();
-        input["auth_url"] = json!(auth_url(inbox.as_str(), &auth_secret));
+        input["auth_url"] = json!(
+            auth_url(inbox.as_str(), &auth_secret).replace(&setup_claim_selection(), selection)
+        );
+        let request =
+            parse_auth_request(input["auth_url"].as_str().unwrap(), LOCAL_DEMO_CAPABILITIES)
+                .unwrap();
+        assert_eq!(request.claim_type(), selection);
 
         let (success, stdout, stderr) = run(&input, vec!["helper".into()], &SdkApproval).await;
 
@@ -561,7 +606,7 @@ mod tests {
 
         let client = PubkyHttpClient::new().unwrap();
         let claim_channel =
-            HttpRelayInboxChannel::new(inbox.clone(), derive_channel_id(&auth_secret)).unwrap();
+            HttpRelayInboxChannel::new(inbox.clone(), derive_channel_id(&request)).unwrap();
         let encrypted_claim = claim_channel
             .poll(&client, Some(Duration::from_secs(1)))
             .await
@@ -570,11 +615,31 @@ mod tests {
         let creator = Keypair::from_secret(&[7; 32]);
         let verifying_key =
             ed25519_dalek::VerifyingKey::from_bytes(creator.public_key().as_bytes()).unwrap();
-        let claim = decrypt_and_verify(&encrypted_claim, &auth_secret, &verifying_key).unwrap();
+        let claim = decrypt_and_verify(&encrypted_claim, &request, &verifying_key).unwrap();
         assert_eq!(claim.account_index, 0);
         assert_eq!(
             claim.serialized_xpub,
             account_xpub(Network::Testnet, 0).encode()
+        );
+        assert_eq!(
+            claim.paykit_identity_secret_key,
+            paykit_sdk::PubkyLocalSecretKey::new([7; 32])
+                .derive_paykit_identity_secret_key(2)
+                .unwrap()
+        );
+        let reordered = selection.split('.').rev().collect::<Vec<_>>().join(".");
+        let changed_url = input["auth_url"]
+            .as_str()
+            .unwrap()
+            .replace(selection, &reordered);
+        let changed_request = parse_auth_request(&changed_url, LOCAL_DEMO_CAPABILITIES).unwrap();
+        assert_ne!(
+            derive_channel_id(&request),
+            derive_channel_id(&changed_request)
+        );
+        assert_eq!(
+            decrypt_and_verify(&encrypted_claim, &changed_request, &verifying_key),
+            Err(ClaimError::AuthenticationFailed)
         );
 
         let auth_channel = EncryptedHttpRelayInboxChannel::new(inbox, auth_secret).unwrap();
@@ -598,7 +663,9 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let relay = format!("http://{}/inbox", listener.local_addr().unwrap());
-        let expected_channel = derive_channel_id(&[9; 32]);
+        let request =
+            parse_auth_request(&auth_url(&relay, &[9; 32]), LOCAL_DEMO_CAPABILITIES).unwrap();
+        let expected_channel = derive_channel_id(&request);
         let fixture = std::thread::spawn(move || {
             let started = Instant::now();
             let (mut stream, _) = loop {

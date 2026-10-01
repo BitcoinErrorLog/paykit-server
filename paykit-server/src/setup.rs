@@ -15,6 +15,8 @@ use rand::{TryRng, rngs::SysRng};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
+use crate::domain::locks::CreatorPubky;
+
 const FLOW_LIFETIME: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const SETUP_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -54,6 +56,10 @@ pub trait SetupCompleter: Send + Sync {
     /// Starts one normal Pubky AUTH request. The returned attempt is retained
     /// within one in-memory flow, not in a process-global completer.
     async fn start(&self) -> Result<StartedSetup, Completion>;
+    /// Starts Paykit-only reauthentication bound to an already configured creator.
+    async fn start_reconnect(&self, _creator: &CreatorPubky) -> Result<StartedSetup, Completion> {
+        Err(Completion::DefinitiveFailure)
+    }
     /// Consumes the exact per-flow attempt after the iframe asks to complete.
     async fn complete(&self, attempt: Box<dyn SetupAttempt>) -> Completion;
 }
@@ -350,6 +356,29 @@ impl SetupService {
         return_to: &str,
         state: &str,
     ) -> Result<StartedFlow, BeginError> {
+        self.begin_for_creator(peer_ip, return_to, state, None)
+            .await
+    }
+
+    /// Starts an explicit reconnect without requesting another watch-only account.
+    pub async fn begin_reconnect(
+        &self,
+        peer_ip: IpAddr,
+        return_to: &str,
+        state: &str,
+        creator: &CreatorPubky,
+    ) -> Result<StartedFlow, BeginError> {
+        self.begin_for_creator(peer_ip, return_to, state, Some(creator))
+            .await
+    }
+
+    async fn begin_for_creator(
+        &self,
+        peer_ip: IpAddr,
+        return_to: &str,
+        state: &str,
+        creator: Option<&CreatorPubky>,
+    ) -> Result<StartedFlow, BeginError> {
         let origin = validated_origin(return_to, &self.inner.allowed_origins)
             .ok_or(BeginError::InvalidRequest)?;
         if !valid_state(state) {
@@ -369,12 +398,14 @@ impl SetupService {
             .clone()
             .try_acquire_owned()
             .map_err(|_| BeginError::Unavailable)?;
-        let started_setup = self
-            .inner
-            .completer
-            .start()
-            .await
-            .map_err(|_| BeginError::Unavailable)?;
+        let started_setup = match creator {
+            Some(creator) => self.inner.completer.start_reconnect(creator).await,
+            None => self.inner.completer.start().await,
+        }
+        .map_err(|error| match error {
+            Completion::DefinitiveFailure => BeginError::InvalidRequest,
+            _ => BeginError::Unavailable,
+        })?;
         let flow_id = random_token().map_err(|_| BeginError::Unavailable)?;
         let started = StartedFlow {
             flow_id: flow_id.clone(),

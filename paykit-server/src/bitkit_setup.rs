@@ -3,9 +3,9 @@
 use url::Url;
 
 use crate::bitkit_claim::{
-    AuthRequest, CLAIM_TYPE, ClaimError, QUERY_PARAMETER, parse_auth_request, required_capabilities,
+    AuthRequest, ClaimError, PAYKIT_ACCESS_CLAIM, QUERY_PARAMETER, parse_auth_request,
+    parse_reconnect_auth_request, required_capabilities, setup_claim_selection,
 };
-use paykit_lib::PaykitReceiverPath;
 
 /// A secret-bearing request is retained only in the in-memory flow. Callers may
 /// render `authorization_url` inside the server-origin iframe but must never put
@@ -41,25 +41,46 @@ pub struct BitkitAuthStarter {
 }
 
 impl BitkitAuthStarter {
-    pub fn new(
-        bootstrap: paykit_sdk::PubkySessionBootstrap,
-        receiver_path: &PaykitReceiverPath,
-    ) -> Self {
+    pub fn new(bootstrap: paykit_sdk::PubkySessionBootstrap) -> Self {
         Self {
             bootstrap,
-            capabilities: required_capabilities(receiver_path),
+            capabilities: required_capabilities(),
         }
     }
 
     pub async fn start(&self) -> Result<StartedBitkitAuth, ClaimError> {
+        self.start_request(false).await
+    }
+
+    /// Requests only delegated Paykit authority; the server retains its account binding.
+    pub async fn start_reconnect(&self) -> Result<StartedBitkitAuth, ClaimError> {
+        self.start_request(true).await
+    }
+
+    async fn start_request(&self, reconnect: bool) -> Result<StartedBitkitAuth, ClaimError> {
         let request = self
             .bootstrap
             .start_sign_in_auth(&self.capabilities)
             .await
             .map_err(|_| ClaimError::InvalidAuthRequest)?;
-        let authorization_url =
-            append_bitkit_claim(request.authorization_url(), &self.capabilities)?;
-        let companion = parse_auth_request(&authorization_url, &self.capabilities)?;
+        let mut url =
+            Url::parse(request.authorization_url()).map_err(|_| ClaimError::InvalidAuthRequest)?;
+        if url.query_pairs().any(|(key, _)| key == QUERY_PARAMETER) {
+            return Err(ClaimError::InvalidAuthRequest);
+        }
+        let selection = if reconnect {
+            PAYKIT_ACCESS_CLAIM.to_owned()
+        } else {
+            setup_claim_selection()
+        };
+        url.query_pairs_mut()
+            .append_pair(QUERY_PARAMETER, &selection);
+        let authorization_url = url.to_string();
+        let companion = if reconnect {
+            parse_reconnect_auth_request(&authorization_url, &self.capabilities)?
+        } else {
+            parse_auth_request(&authorization_url, &self.capabilities)?
+        };
         Ok(StartedBitkitAuth {
             authorization_url,
             request: companion,
@@ -78,7 +99,7 @@ pub fn append_bitkit_claim(
         return Err(ClaimError::InvalidAuthRequest);
     }
     url.query_pairs_mut()
-        .append_pair(QUERY_PARAMETER, CLAIM_TYPE);
+        .append_pair(QUERY_PARAMETER, &setup_claim_selection());
     let value = url.to_string();
     parse_auth_request(&value, expected_capabilities)?;
     Ok(value)
@@ -92,7 +113,7 @@ mod tests {
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 
     #[tokio::test]
-    async fn appends_one_exact_companion_query_pair_to_rc48_grant_url() {
+    async fn appends_one_exact_companion_query_pair_to_grant_url() {
         let request = paykit_sdk::PubkySessionBootstrap::new(PAYKIT_CLIENT_ID)
             .unwrap()
             .start_sign_in_auth(LOCAL_DEMO_CAPABILITIES)
@@ -116,7 +137,7 @@ mod tests {
             .try_into()
             .unwrap();
         let augmented = append_bitkit_claim(url, LOCAL_DEMO_CAPABILITIES).unwrap();
-        assert!(augmented.contains("x-bitkit-claim=watch-only-account-v1"));
+        assert!(augmented.contains("x-bitkit-claim=paykit-access-v1.watch-only-account-v1"));
         assert_eq!(
             parse_auth_request(&augmented, LOCAL_DEMO_CAPABILITIES)
                 .unwrap()

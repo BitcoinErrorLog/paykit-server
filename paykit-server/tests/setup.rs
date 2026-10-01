@@ -130,6 +130,70 @@ impl SetupAttempt for MockAttempt {
 
 struct InstructionCompleter;
 
+struct ReconnectCompleter(paykit_server::domain::locks::CreatorPubky);
+
+#[async_trait]
+impl SetupCompleter for ReconnectCompleter {
+    async fn start(&self) -> Result<StartedSetup, Completion> {
+        panic!("reconnect must not fall back to initial setup")
+    }
+
+    async fn start_reconnect(
+        &self,
+        creator: &paykit_server::domain::locks::CreatorPubky,
+    ) -> Result<StartedSetup, Completion> {
+        assert_eq!(creator, &self.0);
+        Ok(StartedSetup::new(
+            "pubkyauth://signin_grant?x-bitkit-claim=paykit-access-v1".into(),
+            Box::new(MockAttempt),
+        ))
+    }
+
+    async fn complete(&self, _: Box<dyn SetupAttempt>) -> Completion {
+        Completion::DurableSuccess
+    }
+}
+
+#[tokio::test]
+async fn reconnect_route_requires_one_explicit_canonical_creator() {
+    let creator = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
+    let router = setup_router(service(
+        Arc::new(ReconnectCompleter(
+            paykit_server::domain::locks::parse_creator(creator).unwrap(),
+        )),
+        Arc::new(ManualClock::default()),
+    ));
+    let query = "return_to=https%3A%2F%2Fapp.example&state=reconnect";
+    for uri in [
+        format!("/setup/reconnect?{query}"),
+        format!("/setup/reconnect?{query}&creator=invalid"),
+        format!("/setup/reconnect?{query}&creator={creator}&creator={creator}"),
+        format!("/setup/reconnect?{query}&creator={creator}&cid=app.paykit.server"),
+        format!("/setup?{query}&creator={creator}"),
+    ] {
+        assert_eq!(
+            request(router.clone(), Method::GET, &uri).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let response = request(
+        router,
+        Method::GET,
+        &format!("/setup/reconnect?{query}&creator={creator}"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("x-bitkit-claim=paykit-access-v1"));
+    assert!(!body.contains("watch-only-account-v1"));
+}
+
 #[async_trait]
 impl SetupCompleter for InstructionCompleter {
     async fn start(&self) -> Result<StartedSetup, Completion> {
@@ -1127,7 +1191,7 @@ async fn cancelling_start_and_completion_releases_reservation() {
 
 #[tokio::test]
 async fn setup_shell_renders_a_scannable_qr_for_a_full_length_auth_url() {
-    // Real Bitkit setup URLs carry two capability paths and the companion claim, so they are far
+    // Real Bitkit setup URLs carry the shared capability and permission list, so they are far
     // longer than the mock ones elsewhere in this file. High error correction shrinks QR capacity,
     // so assert a realistic URL still fits instead of panicking at request time.
     let auth_request = paykit_sdk::PubkySessionBootstrap::new(PAYKIT_CLIENT_ID)
@@ -1151,7 +1215,7 @@ async fn setup_shell_renders_a_scannable_qr_for_a_full_length_auth_url() {
     let shell = String::from_utf8(bytes.to_vec()).expect("utf8 shell");
     assert!(shell.contains(r#"<svg aria-label="Bitkit authorization QR code""#));
     // The same URL stays in the DOM as a deep link for touch devices, HTML-escaped.
-    assert!(shell.contains("x-bitkit-claim=watch-only-account-v1"));
+    assert!(shell.contains("x-bitkit-claim=paykit-access-v1.watch-only-account-v1"));
     assert!(shell.contains(r#"class="bitkit-btn""#));
 }
 

@@ -12,12 +12,11 @@ use uuid::Uuid;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OutboxRetryClass {
     AdapterUnavailable,
-    MarkerFetch,
-    MarkerMissing,
-    MarkerChanged,
+    RegistryFetch,
+    RegistryMissing,
+    RegistryIncapable,
     RecoveryMarkerObservation,
     LinkEstablishment,
-    EndpointPublication,
     PaymentRequestProposal,
     ReconciliationPending,
     Reconciliation,
@@ -27,12 +26,11 @@ impl OutboxRetryClass {
     const fn as_str(self) -> &'static str {
         match self {
             Self::AdapterUnavailable => "adapter_unavailable",
-            Self::MarkerFetch => "marker_fetch",
-            Self::MarkerMissing => "marker_missing",
-            Self::MarkerChanged => "marker_changed",
+            Self::RegistryFetch => "registry_fetch",
+            Self::RegistryMissing => "registry_missing",
+            Self::RegistryIncapable => "registry_incapable",
             Self::RecoveryMarkerObservation => "recovery_marker_observation",
             Self::LinkEstablishment => "link_establishment",
-            Self::EndpointPublication => "endpoint_publication",
             Self::PaymentRequestProposal => "payment_request_proposal",
             Self::ReconciliationPending => "reconciliation_pending",
             Self::Reconciliation => "reconciliation",
@@ -42,41 +40,21 @@ impl OutboxRetryClass {
 
 /// Exact public-SDK identifiers returned after one durable local enqueue.
 #[derive(Clone, PartialEq, Eq)]
-pub enum HandoffResult {
-    EndpointPublication {
-        outbound_message_id: u64,
-    },
-    PaymentRequestProposal {
-        outbound_message_id: u64,
-        event_id: String,
-        payment_request_id: String,
-    },
+pub struct HandoffResult {
+    pub outbound_message_id: u64,
+    pub event_id: String,
+    pub payment_request_id: String,
 }
 
 impl std::fmt::Debug for HandoffResult {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::EndpointPublication { .. } => {
-                formatter.write_str("HandoffResult::EndpointPublication(<redacted>)")
-            }
-            Self::PaymentRequestProposal { .. } => {
-                formatter.write_str("HandoffResult::PaymentRequestProposal(<redacted>)")
-            }
-        }
+        formatter.write_str("HandoffResult { <redacted> }")
     }
 }
 
 impl HandoffResult {
     pub fn outbound_message_id(&self) -> u64 {
-        match self {
-            Self::EndpointPublication {
-                outbound_message_id,
-            }
-            | Self::PaymentRequestProposal {
-                outbound_message_id,
-                ..
-            } => *outbound_message_id,
-        }
+        self.outbound_message_id
     }
 }
 
@@ -186,7 +164,7 @@ impl OutboxStore {
         .map_err(|_| PersistenceError::Unavailable)
     }
 
-    /// Claims eligible rows while preserving endpoint-publication dependencies.
+    /// Claims eligible Payment Request intents under a fresh lease fence.
     pub async fn claim(
         &self,
         owner: Uuid,
@@ -198,13 +176,11 @@ impl OutboxStore {
             "WITH candidates AS ( \
                  SELECT o.id \
                  FROM outbox o \
-                 LEFT JOIN outbox dependency ON dependency.id = o.depends_on_id \
                  WHERE ( \
                      (o.status = 'queued' AND o.next_attempt_at <= NOW()) \
                      OR (o.status = 'leased' AND o.lease_expires_at <= NOW()) \
                      OR (o.status = 'retryable' AND o.next_attempt_at <= NOW()) \
                  ) \
-                 AND (o.depends_on_id IS NULL OR dependency.status = 'delivered') \
                  ORDER BY o.next_attempt_at, o.id \
                  FOR UPDATE OF o SKIP LOCKED \
                  LIMIT $1 \
@@ -281,21 +257,13 @@ impl OutboxStore {
         DeliveryIntentV1::decode(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)
     }
 
-    /// Atomically associates the exact public-SDK result while the enqueue fence is live.
+    /// Records the exact SDK enqueue result while the enqueue fence is live.
     pub async fn mark_handed_off(
         &self,
         claim: &ClaimedOutbox,
         result: &HandoffResult,
     ) -> Result<bool, PersistenceError> {
         let outbound = result.outbound_message_id().to_string();
-        let (event_id, payment_request_id) = match result {
-            HandoffResult::EndpointPublication { .. } => (None, None),
-            HandoffResult::PaymentRequestProposal {
-                event_id,
-                payment_request_id,
-                ..
-            } => (Some(event_id.as_str()), Some(payment_request_id.as_str())),
-        };
         let changed = sqlx::query(
             "UPDATE outbox SET status = 'handed_off', sdk_outbound_message_id = $1, \
                  sdk_event_id = $2, sdk_payment_request_id = $3, error_class = NULL, \
@@ -303,8 +271,8 @@ impl OutboxStore {
              WHERE id = $4 AND status = 'leased' AND claim_token = $5 AND lease_expires_at > NOW()",
         )
         .bind(outbound)
-        .bind(event_id)
-        .bind(payment_request_id)
+        .bind(&result.event_id)
+        .bind(&result.payment_request_id)
         .bind(claim.id)
         .bind(claim.claim_token)
         .execute(&self.pool)
@@ -444,12 +412,11 @@ mod tests {
         assert_eq!(
             [
                 OutboxRetryClass::AdapterUnavailable,
-                OutboxRetryClass::MarkerFetch,
-                OutboxRetryClass::MarkerMissing,
-                OutboxRetryClass::MarkerChanged,
+                OutboxRetryClass::RegistryFetch,
+                OutboxRetryClass::RegistryMissing,
+                OutboxRetryClass::RegistryIncapable,
                 OutboxRetryClass::RecoveryMarkerObservation,
                 OutboxRetryClass::LinkEstablishment,
-                OutboxRetryClass::EndpointPublication,
                 OutboxRetryClass::PaymentRequestProposal,
                 OutboxRetryClass::ReconciliationPending,
                 OutboxRetryClass::Reconciliation,
@@ -457,12 +424,11 @@ mod tests {
             .map(OutboxRetryClass::as_str),
             [
                 "adapter_unavailable",
-                "marker_fetch",
-                "marker_missing",
-                "marker_changed",
+                "registry_fetch",
+                "registry_missing",
+                "registry_incapable",
                 "recovery_marker_observation",
                 "link_establishment",
-                "endpoint_publication",
                 "payment_request_proposal",
                 "reconciliation_pending",
                 "reconciliation",
@@ -475,7 +441,7 @@ mod tests {
         let event_id = "event-correlation-marker";
         let request_id = "request-correlation-marker";
         let outbound_id = "18446744073709551615";
-        let result = HandoffResult::PaymentRequestProposal {
+        let result = HandoffResult {
             outbound_message_id: u64::MAX,
             event_id: event_id.into(),
             payment_request_id: request_id.into(),

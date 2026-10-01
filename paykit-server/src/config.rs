@@ -2,7 +2,7 @@ use std::{fmt, net::SocketAddr, str::FromStr, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::VerifyingKey;
-use paykit_lib::PaykitReceiverPath;
+use paykit_lib::PaykitAppId;
 use pubky::{ClientId, PublicKey};
 use rustls_pki_types::ServerName;
 use serde::Deserialize;
@@ -13,6 +13,9 @@ use url::Url;
 
 /// Stable Pubky grant client ID owned by this Paykit Server application.
 pub const PAYKIT_CLIENT_ID: &str = "app.paykit.server";
+
+/// Paykit App owning server endpoints and Payment Requests.
+pub const PAYKIT_APP_ID: &str = "paykit-server";
 
 #[derive(Debug)]
 pub struct Config {
@@ -40,8 +43,10 @@ impl Config {
         let master_key = MasterKey::parse(environment.master_key)?;
         let trusted_public_key = TrustedLocksPublicKey::parse(raw.locks.trusted_public_key)?;
         let trusted_locks_key_fingerprint = trusted_public_key.fingerprint();
-        let receiver_path = PaykitReceiverPath::new(raw.paykit.receiver_path)
-            .map_err(|_| ConfigError::InvalidReceiverPath)?;
+        let app_id = PaykitAppId::new(raw.paykit.app_id).map_err(|_| ConfigError::InvalidAppId)?;
+        if app_id.as_str() != PAYKIT_APP_ID {
+            return Err(ConfigError::InvalidAppId);
+        }
         let raw_client_id = raw
             .paykit
             .client_id
@@ -50,22 +55,6 @@ impl Config {
             ClientId::new(&raw_client_id).map_err(|_| ConfigError::InvalidPaykitClientId)?;
         if client_id.as_str() != PAYKIT_CLIENT_ID {
             return Err(ConfigError::UnsupportedPaykitClientId);
-        }
-        let receiver_path_priority = raw
-            .paykit
-            .receiver_path_priority
-            .into_iter()
-            .map(ReceiverPathPriority::parse)
-            .collect::<Result<Vec<_>, _>>()?;
-        if receiver_path_priority.is_empty() {
-            return Err(ConfigError::EmptyReceiverPathPriority);
-        }
-        let mut seen_priority = std::collections::HashSet::new();
-        if receiver_path_priority
-            .iter()
-            .any(|segment| !seen_priority.insert(segment.as_str()))
-        {
-            return Err(ConfigError::DuplicateReceiverPathPriority);
         }
         let bitcoin_network = BitcoinNetwork::parse(&raw.bitcoin.network)?;
 
@@ -86,8 +75,7 @@ impl Config {
             },
             paykit: PaykitConfig {
                 client_id: client_id.clone(),
-                receiver_path: receiver_path.clone(),
-                receiver_path_priority,
+                app_id: app_id.clone(),
                 network: PaykitNetwork::parse(&raw.paykit.network)?,
             },
             electrum: ElectrumConfig {
@@ -105,7 +93,7 @@ impl Config {
             deployment_invariants: DeploymentInvariants {
                 bitcoin_network,
                 paykit_client_id: client_id,
-                receiver_path,
+                app_id,
                 trusted_locks_key_fingerprint,
             },
         };
@@ -218,7 +206,7 @@ impl fmt::Debug for ConfigEnvironment {
 pub struct DeploymentInvariants {
     pub bitcoin_network: BitcoinNetwork,
     pub paykit_client_id: ClientId,
-    pub receiver_path: PaykitReceiverPath,
+    pub app_id: PaykitAppId,
     pub trusted_locks_key_fingerprint: TrustedLocksKeyFingerprint,
 }
 
@@ -348,9 +336,7 @@ pub struct SetupConfig {
 #[derive(Clone, Debug)]
 pub struct PaykitConfig {
     pub client_id: ClientId,
-    pub receiver_path: PaykitReceiverPath,
-    /// Ordered first-segment preference for discovered reader receiver paths.
-    pub receiver_path_priority: Vec<ReceiverPathPriority>,
+    pub app_id: PaykitAppId,
     pub network: PaykitNetwork,
 }
 
@@ -367,26 +353,6 @@ impl PaykitNetwork {
             "testnet" => Ok(Self::Testnet),
             _ => Err(ConfigError::InvalidPaykitNetwork),
         }
-    }
-}
-
-/// A canonical Paykit receiver app segment used to rank discovered paths.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ReceiverPathPriority(String);
-
-impl ReceiverPathPriority {
-    pub fn parse(value: String) -> Result<Self, ConfigError> {
-        // Delegate grammar to the dependency-owned receiver-path parser and
-        // prove that this supplied segment is its exact canonical first path segment.
-        let probe = PaykitReceiverPath::new(format!("{value}/wallet"))
-            .map_err(|_| ConfigError::InvalidReceiverPathPriority)?;
-        (probe.as_str().split('/').next() == Some(value.as_str()))
-            .then_some(Self(value))
-            .ok_or(ConfigError::InvalidReceiverPathPriority)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
     }
 }
 
@@ -549,8 +515,8 @@ pub enum ConfigError {
         "setup.allowed_origins must contain exact HTTP(S) origins or the sole wildcard value *"
     )]
     InvalidOrigin,
-    #[error("paykit.receiver_path must be a valid Paykit receiver path")]
-    InvalidReceiverPath,
+    #[error("paykit.app_id must be paykit-server")]
+    InvalidAppId,
     #[error("paykit.client_id must be a valid non-empty Pubky client ID")]
     InvalidPaykitClientId,
     #[error("paykit.client_id is required")]
@@ -559,12 +525,6 @@ pub enum ConfigError {
     UnsupportedPaykitClientId,
     #[error("paykit.network must be mainnet or testnet")]
     InvalidPaykitNetwork,
-    #[error("paykit.receiver_path_priority entries must be canonical Paykit receiver app segments")]
-    InvalidReceiverPathPriority,
-    #[error("paykit.receiver_path_priority must not be empty")]
-    EmptyReceiverPathPriority,
-    #[error("paykit.receiver_path_priority must not contain duplicates")]
-    DuplicateReceiverPathPriority,
     #[error("{0} must be greater than zero")]
     ZeroDuration(&'static str),
     #[error("{0} must be greater than zero")]
@@ -687,14 +647,8 @@ struct RawSetupConfig {
 #[serde(deny_unknown_fields)]
 struct RawPaykitConfig {
     client_id: Option<String>,
-    receiver_path: String,
-    #[serde(default = "default_receiver_path_priority")]
-    receiver_path_priority: Vec<String>,
+    app_id: String,
     network: String,
-}
-
-fn default_receiver_path_priority() -> Vec<String> {
-    vec!["bitkit".into()]
 }
 
 #[derive(Deserialize)]

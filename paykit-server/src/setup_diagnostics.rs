@@ -10,10 +10,9 @@ pub(crate) enum SetupStage {
     XpubValidate,
     LockAcquire,
     CreatorLoad,
-    MarkerPublish,
-    MarkerReadback,
+    AppPublish,
+    AppReadback,
     Persistence,
-    Compensation,
     LockRelease,
     RelayAck,
 }
@@ -29,10 +28,9 @@ impl SetupStage {
             Self::XpubValidate => "xpub_validate",
             Self::LockAcquire => "lock_acquire",
             Self::CreatorLoad => "creator_load",
-            Self::MarkerPublish => "marker_publish",
-            Self::MarkerReadback => "marker_readback",
+            Self::AppPublish => "app_publish",
+            Self::AppReadback => "app_readback",
             Self::Persistence => "persistence",
-            Self::Compensation => "compensation",
             Self::LockRelease => "lock_release",
             Self::RelayAck => "relay_ack",
         }
@@ -118,7 +116,7 @@ pub(crate) fn claim_failure_class(error: &ClaimError) -> SetupFailureClass {
     }
 }
 
-pub(crate) fn marker_failure_class(error: &paykit_lib::PaykitError) -> SetupFailureClass {
+pub(crate) fn registry_failure_class(error: &paykit_lib::PaykitError) -> SetupFailureClass {
     match error {
         paykit_lib::PaykitError::Transport { .. } => SetupFailureClass::Transport,
         paykit_lib::PaykitError::NotFound(_) => SetupFailureClass::NotFound,
@@ -245,8 +243,8 @@ mod tests {
         assert_eq!(SetupStage::AuthComplete.as_str(), "auth_complete");
         assert_eq!(SetupStage::ClaimVerify.as_str(), "claim_verify");
         assert_eq!(SetupStage::XpubValidate.as_str(), "xpub_validate");
-        assert_eq!(SetupStage::MarkerPublish.as_str(), "marker_publish");
-        assert_eq!(SetupStage::MarkerReadback.as_str(), "marker_readback");
+        assert_eq!(SetupStage::AppPublish.as_str(), "app_publish");
+        assert_eq!(SetupStage::AppReadback.as_str(), "app_readback");
         assert_eq!(SetupStage::Persistence.as_str(), "persistence");
         assert_eq!(SetupStage::LockRelease.as_str(), "lock_release");
         assert_eq!(SetupStage::RelayAck.as_str(), "relay_ack");
@@ -278,7 +276,7 @@ mod tests {
                 SetupFailureClass::InvalidData,
             ),
         ] {
-            assert_eq!(marker_failure_class(&error), expected);
+            assert_eq!(registry_failure_class(&error), expected);
         }
 
         for (error, expected) in [
@@ -372,9 +370,9 @@ mod tests {
         let subscriber = tracing_subscriber::registry().with(capture.clone());
         tracing::subscriber::with_default(subscriber, || {
             emit_setup_stage(
-                SetupStage::MarkerReadback,
+                SetupStage::AppReadback,
                 SetupOutcome::Failed,
-                marker_failure_class(&error),
+                registry_failure_class(&error),
             );
         });
 

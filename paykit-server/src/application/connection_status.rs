@@ -3,39 +3,30 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use paykit_lib::PaykitReceiverPath;
 use serde::Serialize;
 
 use crate::{
     domain::locks::{BundleId, CreatorPubky, ReaderPubky},
-    persistence::{InvoiceStore, PersistenceError, SdkStateStore},
+    persistence::{InvoiceStore, PersistenceError},
 };
 
-/// Exact reader/path binding accepted when the invoice was created.
+/// Exact reader identity binding accepted when the invoice was created.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConnectionBinding {
     reader: ReaderPubky,
-    reader_path: PaykitReceiverPath,
 }
 
 impl ConnectionBinding {
-    pub fn new(reader: ReaderPubky, reader_path: PaykitReceiverPath) -> Self {
-        Self {
-            reader,
-            reader_path,
-        }
+    pub fn new(reader: ReaderPubky) -> Self {
+        Self { reader }
     }
 
     pub fn reader(&self) -> &ReaderPubky {
         &self.reader
     }
-
-    pub fn reader_path(&self) -> &PaykitReceiverPath {
-        &self.reader_path
-    }
 }
 
-/// Closed projection of Paykit Server's local persisted peer state.
+/// Closed projection of the Creator's shared peer state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PaykitConnectionState {
@@ -72,17 +63,6 @@ impl ConnectionBindingRepository for InvoiceStore {
         bundle_id: &BundleId,
     ) -> Result<Option<ConnectionBinding>, PersistenceError> {
         self.connection_binding(creator, bundle_id).await
-    }
-}
-
-#[async_trait]
-impl PeerConnectionStateRepository for SdkStateStore {
-    async fn connection_state(
-        &self,
-        creator: &CreatorPubky,
-        binding: &ConnectionBinding,
-    ) -> Result<PaykitConnectionState, PersistenceError> {
-        SdkStateStore::connection_state(self, creator, binding).await
     }
 }
 

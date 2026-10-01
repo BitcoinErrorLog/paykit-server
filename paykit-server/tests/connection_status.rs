@@ -8,7 +8,6 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
-use paykit_lib::PaykitReceiverPath;
 use paykit_server::{
     application::connection_status::{
         ConnectionBinding, ConnectionBindingRepository, ConnectionStatusError,
@@ -42,7 +41,7 @@ impl ConnectionBindingRepository for FakeBindings {
 
 struct FakePeers {
     result: Result<PaykitConnectionState, PersistenceError>,
-    calls: Mutex<Vec<(String, String, String)>>,
+    calls: Mutex<Vec<(String, String)>>,
 }
 
 #[async_trait]
@@ -52,20 +51,16 @@ impl PeerConnectionStateRepository for FakePeers {
         creator: &CreatorPubky,
         binding: &ConnectionBinding,
     ) -> Result<PaykitConnectionState, PersistenceError> {
-        self.calls.lock().unwrap().push((
-            creator.to_string(),
-            binding.reader().to_string(),
-            binding.reader_path().to_string(),
-        ));
+        self.calls
+            .lock()
+            .unwrap()
+            .push((creator.to_string(), binding.reader().to_string()));
         self.result
     }
 }
 
 fn binding() -> ConnectionBinding {
-    ConnectionBinding::new(
-        parse_reader(READER).unwrap(),
-        PaykitReceiverPath::new("bitkit/wallet").unwrap(),
-    )
+    ConnectionBinding::new(parse_reader(READER).unwrap())
 }
 
 fn service(
@@ -102,7 +97,7 @@ async fn service_derives_exact_persisted_binding_before_reading_peer_state() {
     assert_eq!(response, PaykitConnectionState::Connected);
     assert_eq!(
         peers.calls.lock().unwrap().as_slice(),
-        [(CREATOR.into(), READER.into(), "bitkit/wallet".into())]
+        [(CREATOR.into(), READER.into())]
     );
 }
 
@@ -138,7 +133,7 @@ trusted_public_key = "{key}"
 allowed_origins = ["https://app.example"]
 [paykit]
 client_id = "app.paykit.server"
-receiver_path = "paykit/server"
+app_id = "paykit-server"
 network = "testnet"
 [bitcoin]
 network = "testnet"

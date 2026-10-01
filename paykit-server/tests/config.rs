@@ -26,7 +26,7 @@ allowed_origins = ["https://app.example"]
 
 [paykit]
 client_id = "app.paykit.server"
-receiver_path = "paykit/server"
+app_id = "paykit-server"
 network = "testnet"
 
 [bitcoin]
@@ -55,8 +55,7 @@ allowed_origins = ["http://localhost:8080"]
 
 [paykit]
 client_id = "app.paykit.server"
-receiver_path = "bitkit/server"
-receiver_path_priority = ["bitkit"]
+app_id = "paykit-server"
 network = "testnet"
 
 [bitcoin]
@@ -113,9 +112,7 @@ fn parses_exact_local_compose_config_contract() {
         config.deployment_invariants().paykit_client_id.as_str(),
         "app.paykit.server"
     );
-    assert_eq!(config.paykit.receiver_path.as_str(), "bitkit/server");
-    assert_eq!(config.paykit.receiver_path_priority.len(), 1);
-    assert_eq!(config.paykit.receiver_path_priority[0].as_str(), "bitkit");
+    assert_eq!(config.paykit.app_id.as_str(), "paykit-server");
     assert_eq!(
         config.deployment_invariants().bitcoin_network.as_str(),
         "regtest"
@@ -309,14 +306,14 @@ fn rejects_invalid_network_origin_key_zero_values_and_inconsistent_retries() {
     );
     assert!(Config::from_toml_and_environment(&inconsistent_retries, environment()).is_err());
 
-    for invalid_receiver_path in ["/paykit/receiver", "paykit/receiver", "paykit/server/extra"] {
+    for invalid_app_id in ["", "../paykit-server", "bitkit"] {
         let input = valid_toml().replace(
-            "receiver_path = \"paykit/server\"",
-            &format!("receiver_path = \"{invalid_receiver_path}\""),
+            "app_id = \"paykit-server\"",
+            &format!("app_id = \"{invalid_app_id}\""),
         );
         assert!(
             Config::from_toml_and_environment(&input, environment()).is_err(),
-            "{invalid_receiver_path} should be rejected"
+            "{invalid_app_id} should be rejected"
         );
     }
 }
@@ -425,8 +422,8 @@ fn effective_config_is_redacted_and_exposes_typed_deployment_invariants() {
         "testnet"
     );
     assert_eq!(
-        config.deployment_invariants().receiver_path.as_str(),
-        "paykit/server"
+        config.deployment_invariants().app_id.as_str(),
+        "paykit-server"
     );
     assert_ne!(
         config
