@@ -43,7 +43,7 @@ mod sdk_fixtures;
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 const READER: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 const BUNDLE: &str = "000G40R40M30E209185GR38E1W";
-const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
+const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
 
 fn lock_resource() -> PubkyLockResource {
     parse_addressed_lock_resource(LOCK_RESOURCE).unwrap()
@@ -750,7 +750,7 @@ async fn shared_foreign_app_records_do_not_poison_existing_invoice_refresh_or_ne
     );
 
     let dynamic_lock = parse_addressed_lock_resource(&format!(
-        "{creator}/pub/locks.app/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
+        "{creator}/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json"
     ))
     .unwrap();
     let (invoice_id, _) = insert_invoice(

@@ -205,7 +205,7 @@ async fn create_creator(
     let lock_writer = bootstrap
         .sign_in(
             &PubkyLocalSecretKey::new(keypair.secret_key()),
-            "/pub/locks.app/:rw",
+            "/pub/app.locks/:rw",
         )
         .await
         .unwrap();

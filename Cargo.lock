@@ -2697,8 +2697,8 @@ dependencies = [
 
 [[package]]
 name = "locks-core"
-version = "0.1.0-rc1"
-source = "git+https://github.com/pubky/locks.git?tag=v0.1.0-rc1#8502ef79c443c640976a2a901b80c5e717319149"
+version = "0.1.0-rc8"
+source = "git+https://github.com/pubky/locks.git?tag=v0.1.0-rc8#b3dc87c961f6b907d76cde9c4a28f00670d5231e"
 dependencies = [
  "base32",
  "blake3",
@@ -3703,11 +3703,10 @@ checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
 [[package]]
 name = "pubky"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15a7b191157d57d5095f1577c8064aeda85f96606957fcf4c0a6f4b675adb96d"
+source = "git+https://github.com/pubky/pubky-homeserver.git?rev=99a2fb12f0ba4d3f7d9ff4b7b7b0740dabb18d03#99a2fb12f0ba4d3f7d9ff4b7b7b0740dabb18d03"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "cookie",
  "eventsource-stream",
  "flume 0.11.1",
@@ -3715,6 +3714,7 @@ dependencies = [
  "futures-util",
  "httpdate",
  "log",
+ "lru 0.18.3",
  "percent-encoding",
  "pkarr",
  "pubky-common 0.11.0",
@@ -3766,11 +3766,10 @@ dependencies = [
 [[package]]
 name = "pubky-common"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ee26f4cf7d9d11a300180b351f1ea0efebf17ec66f0e615a8867f8aba47dc5f"
+source = "git+https://github.com/pubky/pubky-homeserver.git?rev=99a2fb12f0ba4d3f7d9ff4b7b7b0740dabb18d03#99a2fb12f0ba4d3f7d9ff4b7b7b0740dabb18d03"
 dependencies = [
  "argon2 0.5.3",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "crypto_secretbox",
  "ed25519-dalek 3.0.0",
@@ -5294,7 +5293,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -6014,7 +6013,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

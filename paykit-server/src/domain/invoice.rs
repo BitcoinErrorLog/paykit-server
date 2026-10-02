@@ -26,7 +26,7 @@ pub const DEFAULT_PAYMENT_WINDOW_HOURS: u64 = 24;
 ///
 /// let bundle = BundleId::from_str("000g40r40m30e209185gr38e1w").unwrap();
 /// let resource = PubkyLockResource::from_str(
-///     "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/locks.app/000g40r40m30e209185gr38e1w8124gk2gahc5rr34d1p70x3rfg.json",
+///     "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000g40r40m30e209185gr38e1w8124gk2gahc5rr34d1p70x3rfg.json",
 /// )
 /// .unwrap();
 ///

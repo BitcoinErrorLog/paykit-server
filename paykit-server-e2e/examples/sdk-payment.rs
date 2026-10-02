@@ -512,7 +512,7 @@ drain_timeout = "2s"
     };
     let lock_path = lock.content_lock_path()?.to_string();
     let lock_writer = bootstrap
-        .sign_in(&creator_root, "/pub/locks.app/:rw")
+        .sign_in(&creator_root, "/pub/app.locks/:rw")
         .await?;
     lock_writer
         .access

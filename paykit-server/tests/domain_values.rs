@@ -16,7 +16,7 @@ const BUNDLE: &str = "000G40R40M30E209185GR38E1W";
 const LOCK_ID: &str = "000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG";
 
 fn lock_resource() -> PubkyLockResource {
-    parse_addressed_lock_resource(&format!("{CREATOR}/pub/locks.app/{LOCK_ID}.json"))
+    parse_addressed_lock_resource(&format!("{CREATOR}/pub/app.locks/{LOCK_ID}.json"))
         .expect("valid canonical lock resource")
 }
 
@@ -44,7 +44,7 @@ fn domain_canonical_locks_identifiers_parse_at_the_boundary_and_creator_derives_
     assert_eq!(resource.creator(), &creator);
     assert_eq!(
         resource.to_string(),
-        format!("{CREATOR}/pub/locks.app/{LOCK_ID}.json")
+        format!("{CREATOR}/pub/app.locks/{LOCK_ID}.json")
     );
     assert_eq!(reader.to_string(), READER);
     assert_eq!(bundle.to_string(), BUNDLE);
@@ -53,7 +53,7 @@ fn domain_canonical_locks_identifiers_parse_at_the_boundary_and_creator_derives_
     assert!(parse_reader("pubky/invalid").is_err());
     assert!(parse_bundle_id("not-a-bundle").is_err());
     assert!(
-        parse_addressed_lock_resource(&format!("pubky://{CREATOR}/pub/locks.app/{LOCK_ID}.json"))
+        parse_addressed_lock_resource(&format!("pubky://{CREATOR}/pub/app.locks/{LOCK_ID}.json"))
             .is_err()
     );
 }
@@ -71,7 +71,7 @@ fn domain_identifier_boundaries_reject_locks_core_normalizations() {
     );
 
     let noncanonical_resource = format!(
-        "{CREATOR}/pub/locks.app/{}.json",
+        "{CREATOR}/pub/app.locks/{}.json",
         LOCK_ID.to_ascii_lowercase()
     );
     let normalized_resource = RawPubkyLockResource::from_str(&noncanonical_resource)
@@ -79,7 +79,7 @@ fn domain_identifier_boundaries_reject_locks_core_normalizations() {
         .to_string();
     assert_eq!(
         normalized_resource,
-        format!("{CREATOR}/pub/locks.app/{LOCK_ID}.json")
+        format!("{CREATOR}/pub/app.locks/{LOCK_ID}.json")
     );
     assert_eq!(
         parse_addressed_lock_resource(&noncanonical_resource),
@@ -92,10 +92,10 @@ fn domain_identifier_boundaries_reject_locks_core_normalizations() {
     assert_eq!(parse_reader(READER).unwrap().to_string(), READER);
     assert_eq!(parse_bundle_id(BUNDLE).unwrap().to_string(), BUNDLE);
     assert_eq!(
-        parse_addressed_lock_resource(&format!("{CREATOR}/pub/locks.app/{LOCK_ID}.json"))
+        parse_addressed_lock_resource(&format!("{CREATOR}/pub/app.locks/{LOCK_ID}.json"))
             .unwrap()
             .to_string(),
-        format!("{CREATOR}/pub/locks.app/{LOCK_ID}.json")
+        format!("{CREATOR}/pub/app.locks/{LOCK_ID}.json")
     );
 }
 
@@ -105,7 +105,7 @@ fn domain_invoice_identity_is_creator_scoped_and_creator_is_not_a_constructor_in
     let identity = InvoiceIdentity::new(lock_resource(), bundle.clone());
     let same = InvoiceIdentity::new(lock_resource(), bundle.clone());
     let other_creator_resource = parse_addressed_lock_resource(&format!(
-        "{}/pub/locks.app/{LOCK_ID}.json",
+        "{}/pub/app.locks/{LOCK_ID}.json",
         another_creator()
     ))
     .expect("a second valid canonical creator");
