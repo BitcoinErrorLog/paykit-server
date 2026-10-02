@@ -122,11 +122,20 @@ async fn test_endpoint(
 }
 
 fn signed_request(key: &SigningKey, body: impl Into<Vec<u8>>) -> Request<Body> {
+    signed_request_for_path(key, "/test", body)
+}
+
+fn signed_request_for_path(
+    key: &SigningKey,
+    path: &str,
+    body: impl Into<Vec<u8>>,
+) -> Request<Body> {
     let body = body.into();
-    let signature = URL_SAFE_NO_PAD.encode(key.sign(&body).to_bytes());
+    let preimage = paykit_server::http::auth::signature_preimage("POST", path, &body);
+    let signature = URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes());
     Request::builder()
         .method(Method::POST)
-        .uri("/test")
+        .uri(path)
         .header("X-Paykit-Signature", signature)
         .body(Body::from(body))
         .unwrap()
@@ -147,6 +156,7 @@ async fn missing_malformed_and_invalid_signatures_have_the_same_safe_401_envelop
     let key = SigningKey::from_bytes(&[7; 32]);
     let router = router(&key, 100, 200);
     let body = br#"{"value":1}"#;
+    let preimage = paykit_server::http::auth::signature_preimage("POST", "/test", body);
     let missing = Request::builder()
         .method(Method::POST)
         .uri("/test")
@@ -163,21 +173,19 @@ async fn missing_malformed_and_invalid_signatures_have_the_same_safe_401_envelop
         .uri("/test")
         .header(
             "X-Paykit-Signature",
-            format!("{}=", URL_SAFE_NO_PAD.encode(key.sign(body).to_bytes())),
+            format!(
+                "{}=",
+                URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes())
+            ),
         )
         .body(Body::from(body.as_slice()))
         .unwrap();
+    let duplicate_signature = URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes());
     let duplicate = Request::builder()
         .method(Method::POST)
         .uri("/test")
-        .header(
-            "X-Paykit-Signature",
-            URL_SAFE_NO_PAD.encode(key.sign(body).to_bytes()),
-        )
-        .header(
-            "X-Paykit-Signature",
-            URL_SAFE_NO_PAD.encode(key.sign(body).to_bytes()),
-        )
+        .header("X-Paykit-Signature", &duplicate_signature)
+        .header("X-Paykit-Signature", &duplicate_signature)
         .body(Body::from(body.as_slice()))
         .unwrap();
     let invalid = signed_request(&SigningKey::from_bytes(&[8; 32]), body.as_slice());
@@ -190,6 +198,118 @@ async fn missing_malformed_and_invalid_signatures_have_the_same_safe_401_envelop
             r#"{"error":{"code":"invalid_signature","message":"request authentication failed"}}"#
         );
     }
+}
+
+#[tokio::test]
+async fn exact_path_prefix_is_part_of_the_signed_preimage() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let auth = Arc::new(SignedLocksAuth::from_config(&config_for(
+        &key,
+        100,
+        200,
+        16 * 1024,
+    )));
+    let router = Router::new()
+        .route("/api/paykit/test", post(test_endpoint))
+        .layer(Extension(auth));
+    let body = br#"{"value":1}"#;
+
+    let accepted = router
+        .clone()
+        .oneshot(signed_request_for_path(
+            &key,
+            "/api/paykit/test",
+            body.as_slice(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::OK);
+
+    let wrong_preimage = paykit_server::http::auth::signature_preimage("POST", "/test", body);
+    let wrong_prefix = Request::builder()
+        .method(Method::POST)
+        .uri("/api/paykit/test")
+        .header(
+            "X-Paykit-Signature",
+            URL_SAFE_NO_PAD.encode(key.sign(&wrong_preimage).to_bytes()),
+        )
+        .body(Body::from(body.as_slice()))
+        .unwrap();
+    assert_eq!(
+        router.oneshot(wrong_prefix).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn body_only_and_wrong_method_or_path_signatures_are_rejected() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let body = br#"{"value":1}"#;
+    let body_only = Request::builder()
+        .method(Method::POST)
+        .uri("/test")
+        .header(
+            "X-Paykit-Signature",
+            URL_SAFE_NO_PAD.encode(key.sign(body).to_bytes()),
+        )
+        .body(Body::from(body.as_slice()))
+        .unwrap();
+    let wrong_method_preimage = paykit_server::http::auth::signature_preimage("GET", "/test", body);
+    let wrong_method = Request::builder()
+        .method(Method::POST)
+        .uri("/test")
+        .header(
+            "X-Paykit-Signature",
+            URL_SAFE_NO_PAD.encode(key.sign(&wrong_method_preimage).to_bytes()),
+        )
+        .body(Body::from(body.as_slice()))
+        .unwrap();
+    let wrong_path_preimage = paykit_server::http::auth::signature_preimage("POST", "/other", body);
+    let wrong_path = Request::builder()
+        .method(Method::POST)
+        .uri("/test")
+        .header(
+            "X-Paykit-Signature",
+            URL_SAFE_NO_PAD.encode(key.sign(&wrong_path_preimage).to_bytes()),
+        )
+        .body(Body::from(body.as_slice()))
+        .unwrap();
+
+    for request in [body_only, wrong_method, wrong_path] {
+        assert_eq!(
+            router(&key, 100, 200)
+                .oneshot(request)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+}
+
+#[tokio::test]
+async fn signed_query_string_is_rejected_even_when_path_and_body_match() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let body = br#"{"value":1}"#;
+    let preimage = paykit_server::http::auth::signature_preimage("POST", "/test", body);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/test?unsigned=true")
+        .header(
+            "X-Paykit-Signature",
+            URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes()),
+        )
+        .body(Body::from(body.as_slice()))
+        .unwrap();
+
+    assert_eq!(
+        router(&key, 100, 200)
+            .oneshot(request)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
 }
 
 #[tokio::test]

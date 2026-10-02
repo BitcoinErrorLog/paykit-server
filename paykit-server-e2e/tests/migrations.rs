@@ -54,7 +54,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, vec![1]);
+    assert_eq!(applied_versions, (1..=8).collect::<Vec<_>>());
 
     let plaintext_creator_pubky_columns: Vec<String> = sqlx::query_scalar(
         "SELECT table_name \
@@ -396,8 +396,8 @@ async fn outbox_sdk_identifier_constraints_reject_unattributable_terminal_rows()
 
     assert_check_violation(
         sqlx::query(
-            "INSERT INTO outbox (creator_id, intent_envelope, status)
-             VALUES ($1, $2, 'handed_off')",
+            "INSERT INTO outbox (creator_id, intent_envelope, intent_kind, status)
+             VALUES ($1, $2, 'endpoint_publication', 'handed_off')",
         )
         .bind(creator_id)
         .bind(b"encrypted-intent".as_slice())
@@ -407,8 +407,8 @@ async fn outbox_sdk_identifier_constraints_reject_unattributable_terminal_rows()
     assert_check_violation(
         sqlx::query(
             "INSERT INTO outbox
-             (creator_id, intent_envelope, status, sdk_outbound_message_id)
-             VALUES ($1, $2, 'delivered', '01')",
+             (creator_id, intent_envelope, intent_kind, status, sdk_outbound_message_id)
+             VALUES ($1, $2, 'endpoint_publication', 'delivered', '01')",
         )
         .bind(creator_id)
         .bind(b"encrypted-intent".as_slice())
@@ -418,8 +418,8 @@ async fn outbox_sdk_identifier_constraints_reject_unattributable_terminal_rows()
     assert_check_violation(
         sqlx::query(
             "INSERT INTO outbox
-             (creator_id, intent_envelope, status, sdk_event_id)
-             VALUES ($1, $2, 'queued', 'event-id')",
+             (creator_id, intent_envelope, intent_kind, status, sdk_event_id)
+             VALUES ($1, $2, 'endpoint_publication', 'queued', 'event-id')",
         )
         .bind(creator_id)
         .bind(b"encrypted-intent".as_slice())
@@ -492,12 +492,16 @@ async fn insert_invoice_result_with_reader(
 ) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
     let address_hash = Uuid::new_v4();
     let derivation_index_hash = Uuid::new_v4();
+    let lock_resource_hash = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO invoices \
          (creator_id, reader_lookup_hash, bundle_lookup_hash, payment_request_lookup_hash, \
           invoice_envelope, payment_record_envelope, bitcoin_address_lookup_hash,
-          derivation_index_lookup_hash, payment_status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+          derivation_index_lookup_hash, payment_status, lock_resource_lookup_hash,
+          invoice_created_at, proposal_expires_at, payment_deadline,
+          proposal_acceptance_seconds, payment_window_seconds) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                 NOW(), NOW() + INTERVAL '1 hour', NOW() + INTERVAL '24 hours', 3600, 86400)",
     )
     .bind(creator_id)
     .bind(reader_hash)
@@ -508,6 +512,7 @@ async fn insert_invoice_result_with_reader(
     .bind(address_hash.as_bytes().as_slice())
     .bind(derivation_index_hash.as_bytes().as_slice())
     .bind("undetected")
+    .bind(lock_resource_hash.as_bytes().as_slice())
     .execute(pool)
     .await
 }

@@ -72,11 +72,19 @@ impl Adapter for FakeAdapter {
     ) -> Result<HandoffResult, HandoffError> {
         self.calls.lock().unwrap().push("propose_payment_request");
         *self.payment_request_calls.lock().unwrap() += 1;
-        Ok(HandoffResult {
+        Ok(HandoffResult::PaymentRequestProposal {
             outbound_message_id: 42,
             event_id: "event-42".into(),
             payment_request_id: "request-42".into(),
         })
+    }
+
+    async fn cancel_payment_request(
+        &self,
+        _reader: &str,
+        _payment_request_id: &str,
+    ) -> Result<HandoffResult, HandoffError> {
+        Err(HandoffError::Permanent)
     }
 
     async fn outbound_status(
@@ -166,8 +174,8 @@ async fn retry_after_an_ambiguous_handoff_can_propose_twice() {
     assert!(matches!(
         (&first, &second),
         (
-            HandoffResult { outbound_message_id: 42, event_id, payment_request_id },
-            HandoffResult { outbound_message_id: 42, event_id: second_event, payment_request_id: second_request }
+            HandoffResult::PaymentRequestProposal { outbound_message_id: 42, event_id, payment_request_id },
+            HandoffResult::PaymentRequestProposal { outbound_message_id: 42, event_id: second_event, payment_request_id: second_request }
         ) if event_id == "event-42" && payment_request_id == "request-42" && second_event == event_id && second_request == payment_request_id
     ));
     assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 2);

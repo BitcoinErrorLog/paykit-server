@@ -26,7 +26,7 @@ use serde_json::{Map, Value};
 use crate::{
     application::{reader_registry::reader_is_capable, semantic_intent::DeliveryIntentV1},
     domain::{
-        invoice::{CriterionAmount, CriterionAsset},
+        invoice::{CriterionAmount, CriterionAsset, CriterionPaymentWindowHours},
         locks::{BundleId, CreatorPubky, PubkyLockResource, ReaderPubky},
     },
     persistence::{
@@ -42,6 +42,7 @@ pub struct CreateInvoiceRequest {
     pub bundle_id: BundleId,
     pub lock_resource: PubkyLockResource,
     pub reader: ReaderPubky,
+    pub payment_in: CriterionPaymentWindowHours,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -306,6 +307,8 @@ pub struct CreateInvoiceService {
     store: Arc<dyn InvoicePersistence>,
     intents: Arc<dyn IntentBuilder>,
     clock: Arc<dyn DeadlineClock>,
+    proposal_acceptance_window: Duration,
+    payment_window: Duration,
 }
 impl CreateInvoiceService {
     #[allow(clippy::too_many_arguments)]
@@ -344,6 +347,63 @@ impl CreateInvoiceService {
         intents: Arc<dyn IntentBuilder>,
         clock: Arc<dyn DeadlineClock>,
     ) -> Self {
+        Self::with_clock_and_windows(
+            sessions,
+            locks,
+            registries,
+            app_id,
+            credentials,
+            bitcoin_network,
+            store,
+            intents,
+            clock,
+            Duration::from_secs(60 * 60),
+            Duration::from_secs(24 * 60 * 60),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_invoice_windows(
+        sessions: Arc<dyn SessionValidator>,
+        locks: Arc<dyn LockFetcher>,
+        registries: Arc<dyn AppRegistryDiscovery>,
+        app_id: PaykitAppId,
+        credentials: Arc<dyn CreatorXpubProvider>,
+        bitcoin_network: crate::config::BitcoinNetwork,
+        store: Arc<dyn InvoicePersistence>,
+        intents: Arc<dyn IntentBuilder>,
+        proposal_acceptance_window: Duration,
+        payment_window: Duration,
+    ) -> Self {
+        Self::with_clock_and_windows(
+            sessions,
+            locks,
+            registries,
+            app_id,
+            credentials,
+            bitcoin_network,
+            store,
+            intents,
+            Arc::new(SystemDeadlineClock),
+            proposal_acceptance_window,
+            payment_window,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_clock_and_windows(
+        sessions: Arc<dyn SessionValidator>,
+        locks: Arc<dyn LockFetcher>,
+        registries: Arc<dyn AppRegistryDiscovery>,
+        app_id: PaykitAppId,
+        credentials: Arc<dyn CreatorXpubProvider>,
+        bitcoin_network: crate::config::BitcoinNetwork,
+        store: Arc<dyn InvoicePersistence>,
+        intents: Arc<dyn IntentBuilder>,
+        clock: Arc<dyn DeadlineClock>,
+        proposal_acceptance_window: Duration,
+        payment_window: Duration,
+    ) -> Self {
         Self {
             sessions,
             locks,
@@ -354,6 +414,8 @@ impl CreateInvoiceService {
             store,
             intents,
             clock,
+            proposal_acceptance_window,
+            payment_window,
         }
     }
 
@@ -364,6 +426,7 @@ impl CreateInvoiceService {
         let started = self.clock.now();
         let creator = request.lock_resource.creator().clone();
         let bundle_binding = request.bundle_id.to_string().into_bytes();
+        let lock_resource_binding = request.lock_resource.to_string().into_bytes();
         let payment_request_binding = request_binding(&request)?;
         let preflight_remaining = remaining(started, self.clock.now())?;
         match tokio::time::timeout(
@@ -447,9 +510,12 @@ impl CreateInvoiceService {
                 creator: &creator,
                 reader: &request.reader,
                 bundle_binding: &bundle_binding,
+                lock_resource_binding: &lock_resource_binding,
                 payment_request_binding: &payment_request_binding,
                 invoice_payloads: &invoice_payloads,
                 required_sats: extract_terms(&lock)?.as_sats(),
+                proposal_acceptance_seconds: self.proposal_acceptance_window.as_secs(),
+                payment_window_seconds: self.payment_window.as_secs(),
             })
             .await
             .map_err(map_store)
@@ -457,7 +523,7 @@ impl CreateInvoiceService {
 }
 
 fn request_binding(request: &CreateInvoiceRequest) -> Result<Vec<u8>, CreateInvoiceError> {
-    serde_json_canonicalizer::to_vec(&serde_json::json!({"bundle_id":request.bundle_id.to_string(),"lock_resource":request.lock_resource.to_string(),"reader":request.reader.to_string()})).map_err(|_| CreateInvoiceError::InvalidRequest)
+    serde_json_canonicalizer::to_vec(&serde_json::json!({"bundle_id":request.bundle_id.to_string(),"lock_resource":request.lock_resource.to_string(),"reader":request.reader.to_string(),"payment_in":request.payment_in.get()})).map_err(|_| CreateInvoiceError::InvalidRequest)
 }
 fn remaining(start: Instant, now: Instant) -> Result<Duration, CreateInvoiceError> {
     let remaining = REQUEST_DEADLINE

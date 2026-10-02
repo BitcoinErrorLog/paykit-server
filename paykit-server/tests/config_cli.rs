@@ -68,6 +68,20 @@ fn check_config_validates_without_connecting_to_postgres() {
 }
 
 #[test]
+fn checked_in_example_config_is_valid() {
+    let source = include_str!("../../config/paykit-server.example.toml").replace(
+        "# trusted_public_key = \"pubky<pubky-key>\"",
+        &format!("trusted_public_key = \"{KEY}\""),
+    );
+    let output = run_check(&source, &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn check_config_reports_missing_client_id_without_secrets() {
     let output = run_check(&config(false), &[]);
     assert!(!output.status.success());

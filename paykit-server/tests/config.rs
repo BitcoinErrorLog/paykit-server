@@ -79,6 +79,49 @@ fn setup_authorization_url_logging_defaults_to_disabled() {
 }
 
 #[test]
+fn invoice_windows_default_to_one_hour_and_twenty_four_hours() {
+    let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
+
+    assert_eq!(
+        config.paykit.proposal_acceptance_window,
+        Duration::from_secs(60 * 60)
+    );
+    assert_eq!(
+        config.paykit.payment_window,
+        Duration::from_secs(24 * 60 * 60)
+    );
+}
+
+#[test]
+fn invoice_windows_require_positive_acceptance_strictly_before_payment() {
+    for windows in [
+        "proposal_acceptance_window = \"0s\"\npayment_window = \"24h\"",
+        "proposal_acceptance_window = \"24h\"\npayment_window = \"24h\"",
+        "proposal_acceptance_window = \"25h\"\npayment_window = \"24h\"",
+    ] {
+        let input = valid_toml().replace(
+            "network = \"testnet\"",
+            &format!("network = \"testnet\"\n{windows}"),
+        );
+        assert!(Config::from_toml_and_environment(&input, environment()).is_err());
+    }
+}
+
+#[test]
+fn invoice_windows_reject_subsecond_precision_that_storage_cannot_preserve() {
+    let input = valid_toml().replacen(
+        "network = \"testnet\"",
+        "network = \"testnet\"\nproposal_acceptance_window = \"1500ms\"\npayment_window = \"2500ms\"",
+        1,
+    );
+
+    assert!(matches!(
+        Config::from_toml_and_environment(&input, environment()),
+        Err(ConfigError::InvalidInvoiceWindows)
+    ));
+}
+
+#[test]
 fn setup_authorization_url_logging_accepts_explicit_true() {
     let input = valid_toml().replace(
         "allowed_origins = [\"https://app.example\"]",

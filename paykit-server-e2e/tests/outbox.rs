@@ -104,6 +104,14 @@ impl Adapter for ReconciliationAdapter {
         Err(HandoffError::Permanent)
     }
 
+    async fn cancel_payment_request(
+        &self,
+        _reader: &str,
+        _payment_request_id: &str,
+    ) -> Result<HandoffResult, HandoffError> {
+        Err(HandoffError::Permanent)
+    }
+
     async fn outbound_status(
         &self,
         _outbound_message_id: u64,
@@ -122,8 +130,9 @@ async fn assert_reconciliation_status(
 ) {
     let row_id: Uuid = sqlx::query_scalar(
         "INSERT INTO outbox \
-         (creator_id, intent_envelope, status, sdk_outbound_message_id) \
-         SELECT id, decode('00', 'hex'), 'handed_off', $1 FROM creators LIMIT 1 \
+         (creator_id, intent_envelope, intent_kind, status, sdk_outbound_message_id) \
+         SELECT id, decode('00', 'hex'), 'endpoint_publication', 'handed_off', $1 \
+         FROM creators LIMIT 1 \
          RETURNING id",
     )
     .bind(outbound_id.to_string())
@@ -190,9 +199,12 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
             creator: &creator,
             reader: &reader,
             bundle_binding: b"outbox-bundle",
+            lock_resource_binding: b"outbox-lock",
             payment_request_binding: b"outbox-payment-request",
             invoice_payloads: &payloads,
             required_sats: 100,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap();
@@ -209,6 +221,7 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
             .delivery_intent(&request_claims[0])
             .unwrap()
             .terms()
+            .unwrap()
             .payment_endpoints
             .len(),
         1
@@ -261,7 +274,7 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
         !outbox
             .mark_handed_off(
                 &request_claims[0],
-                &HandoffResult {
+                &HandoffResult::PaymentRequestProposal {
                     outbound_message_id: 16,
                     event_id: "event-16".into(),
                     payment_request_id: "request-16".into(),
@@ -275,7 +288,7 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
         outbox
             .mark_handed_off(
                 &reclaimed_request[0],
-                &HandoffResult {
+                &HandoffResult::PaymentRequestProposal {
                     outbound_message_id: 17,
                     event_id: "event-17".into(),
                     payment_request_id: "request-17".into(),
@@ -327,6 +340,7 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
             .delivery_intent(&payment_claims[0])
             .unwrap()
             .terms()
+            .unwrap()
             .payment_endpoints
             .len(),
         1
@@ -449,8 +463,9 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
     .await;
 
     let corrupt_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO outbox (creator_id, intent_envelope, status) \
-         SELECT id, decode('00', 'hex'), 'queued' FROM creators LIMIT 1 RETURNING id",
+        "INSERT INTO outbox (creator_id, intent_envelope, intent_kind, status) \
+         SELECT id, decode('00', 'hex'), 'endpoint_publication', 'queued' \
+         FROM creators LIMIT 1 RETURNING id",
     )
     .fetch_one(database.pool())
     .await
@@ -483,7 +498,8 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
     );
 
     let missing_intent_insert = sqlx::query(
-        "INSERT INTO outbox (creator_id, status) SELECT id, 'queued' FROM creators LIMIT 1",
+        "INSERT INTO outbox (creator_id, intent_kind, status) \
+         SELECT id, 'endpoint_publication', 'queued' FROM creators LIMIT 1",
     )
     .execute(database.pool())
     .await;
@@ -492,8 +508,9 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
         "schema accepted a claimable row without an intent"
     );
     let unattributed_handoff = sqlx::query(
-        "INSERT INTO outbox (creator_id, intent_envelope, status) \
-         SELECT id, decode('00', 'hex'), 'handed_off' FROM creators LIMIT 1",
+        "INSERT INTO outbox (creator_id, intent_envelope, intent_kind, status) \
+         SELECT id, decode('00', 'hex'), 'endpoint_publication', 'handed_off' \
+         FROM creators LIMIT 1",
     )
     .execute(database.pool())
     .await;
@@ -502,8 +519,10 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
         "schema accepted handed_off without an SDK outbound ID"
     );
     let unpaired_payment_ids = sqlx::query(
-        "INSERT INTO outbox (creator_id, intent_envelope, status, sdk_event_id) \
-         SELECT id, decode('00', 'hex'), 'queued', 'event-only' FROM creators LIMIT 1",
+        "INSERT INTO outbox \
+         (creator_id, intent_envelope, intent_kind, status, sdk_event_id) \
+         SELECT id, decode('00', 'hex'), 'endpoint_publication', 'queued', 'event-only' \
+         FROM creators LIMIT 1",
     )
     .execute(database.pool())
     .await;
@@ -604,11 +623,14 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             creator: &creator,
             reader: &reader,
             bundle_binding: b"public-sdk-crash-window-bundle",
+            lock_resource_binding: b"public-sdk-crash-window-lock",
             payment_request_binding: b"public-sdk-crash-window-request",
             invoice_payloads: &Payloads {
                 reader: reader.clone(),
             },
             required_sats: 100,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap();
@@ -621,7 +643,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         .unwrap();
     assert_eq!(first_claim.id(), invoice.payment_request_outbox_id());
     let intent = outbox.delivery_intent(&first_claim).unwrap();
-    let terms = intent.terms();
+    let terms = intent.terms().unwrap();
     let terms = PaymentRequestTerms::builder(
         PaymentAmount::new(terms.amount.clone(), terms.asset.clone()).unwrap(),
         PaymentReference::new(terms.payment_reference.clone()).unwrap(),
@@ -655,7 +677,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         .propose_payment_request(peer_bootstrap.public_key.clone(), terms.clone())
         .await
         .unwrap();
-    let first_result = HandoffResult {
+    let first_result = HandoffResult::PaymentRequestProposal {
         outbound_message_id: first.proposal_outbound_message_id.unwrap(),
         event_id: first.proposal_event_id.unwrap(),
         payment_request_id: first.payment_request_id,
@@ -676,22 +698,28 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         .propose_payment_request(peer_bootstrap.public_key.clone(), terms)
         .await
         .unwrap();
-    let second_result = HandoffResult {
+    let second_result = HandoffResult::PaymentRequestProposal {
         outbound_message_id: second.proposal_outbound_message_id.unwrap(),
         event_id: second.proposal_event_id.unwrap(),
         payment_request_id: second.payment_request_id,
     };
 
-    let (first_outbound, first_event, first_request) = (
-        first_result.outbound_message_id,
-        &first_result.event_id,
-        &first_result.payment_request_id,
-    );
-    let (second_outbound, second_event, second_request) = (
-        second_result.outbound_message_id,
-        &second_result.event_id,
-        &second_result.payment_request_id,
-    );
+    let HandoffResult::PaymentRequestProposal {
+        outbound_message_id: first_outbound,
+        event_id: first_event,
+        payment_request_id: first_request,
+    } = &first_result
+    else {
+        unreachable!()
+    };
+    let HandoffResult::PaymentRequestProposal {
+        outbound_message_id: second_outbound,
+        event_id: second_event,
+        payment_request_id: second_request,
+    } = &second_result
+    else {
+        unreachable!()
+    };
     assert_ne!(first_outbound, second_outbound);
     assert_ne!(first_event, second_event);
     assert_ne!(first_request, second_request);
@@ -704,7 +732,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         let outbound = durable_state
             .outbound_private_messages
             .iter()
-            .find(|record| record.outbound_message_id == outbound_id)
+            .find(|record| record.outbound_message_id == *outbound_id)
             .expect("SDK-generated outbound ID was not durable");
         assert!(outbound.raw_json.contains(event_id));
         assert!(outbound.raw_json.contains(request_id));
@@ -751,6 +779,8 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
         app_id: common::app_id(),
         network: PaykitNetwork::Testnet,
+        proposal_acceptance_window: Duration::from_secs(60 * 60),
+        payment_window: Duration::from_secs(24 * 60 * 60),
     };
     let sessions = CreatorSessions::new(creators.clone(), testnet.sdk().unwrap(), config.clone());
     let provider = sessions.provider(&creator);
@@ -787,7 +817,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
                 assert_eq!(
                     outbound
                         .iter()
-                        .find(|record| record.outbound_message_id == outbound_id)
+                        .find(|record| record.outbound_message_id == *outbound_id)
                         .unwrap()
                         .status,
                     OutboundPrivateMessageStatus::Pending
@@ -830,7 +860,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             compacted
                 .outbound_private_messages
                 .iter()
-                .any(|record| record.outbound_message_id == outbound_id
+                .any(|record| record.outbound_message_id == *outbound_id
                     && record.status == OutboundPrivateMessageStatus::Sent)
         );
     }
@@ -863,7 +893,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         assert_eq!(resolution.private_payment_list_version, None);
         assert_eq!(
             resolution.payable_endpoints[0].target.payload,
-            intent.terms().payment_endpoints["btc-bitcoin-p2wpkh"]
+            intent.terms().unwrap().payment_endpoints["btc-bitcoin-p2wpkh"]
         );
     }
 

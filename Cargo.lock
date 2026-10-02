@@ -3252,7 +3252,7 @@ dependencies = [
 
 [[package]]
 name = "paykit-server"
-version = "0.1.0-rc4"
+version = "0.1.0-rc6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3297,7 +3297,7 @@ dependencies = [
 
 [[package]]
 name = "paykit-server-e2e"
-version = "0.1.0-rc4"
+version = "0.1.0-rc6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5035,6 +5035,7 @@ dependencies = [
  "sha2 0.10.9",
  "smallvec",
  "thiserror 2.0.20",
+ "time",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -5120,6 +5121,7 @@ dependencies = [
  "sqlx-core",
  "stringprep",
  "thiserror 2.0.20",
+ "time",
  "tracing",
  "uuid",
  "whoami",
@@ -5159,6 +5161,7 @@ dependencies = [
  "sqlx-core",
  "stringprep",
  "thiserror 2.0.20",
+ "time",
  "tracing",
  "uuid",
  "whoami",
@@ -5185,6 +5188,7 @@ dependencies = [
  "serde_urlencoded",
  "sqlx-core",
  "thiserror 2.0.20",
+ "time",
  "tracing",
  "url",
  "uuid",

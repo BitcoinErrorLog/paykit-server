@@ -170,6 +170,9 @@ where
             .cloned()
             .ok_or(ApiError::InvalidSignature)?;
         let (parts, body) = request.into_parts();
+        if parts.uri.query().is_some() {
+            return Err(ApiError::InvalidRequest);
+        }
         let limit = auth.request_body_bytes;
         let raw_body = to_bytes(body, limit.saturating_add(1))
             .await
@@ -178,7 +181,8 @@ where
             return Err(ApiError::PayloadTooLarge);
         }
         auth.observer.signature_verification_started();
-        verify_signature(&auth.trusted_key, &parts.headers, &raw_body)?;
+        let preimage = signature_preimage(parts.method.as_str(), parts.uri.path(), &raw_body);
+        verify_signature(&auth.trusted_key, &parts.headers, &preimage)?;
 
         let value: serde_json::Value =
             serde_json::from_slice(&raw_body).map_err(|_| ApiError::InvalidRequest)?;
@@ -207,7 +211,7 @@ where
 fn verify_signature(
     trusted_key: &VerifyingKey,
     headers: &axum::http::HeaderMap,
-    raw_body: &[u8],
+    preimage: &[u8],
 ) -> Result<(), ApiError> {
     let signatures = headers.get_all(&SIGNATURE_HEADER);
     if signatures.iter().count() != 1 {
@@ -228,8 +232,23 @@ fn verify_signature(
         return Err(ApiError::InvalidSignature);
     }
     trusted_key
-        .verify(raw_body, &Signature::from_bytes(&signature))
+        .verify(preimage, &Signature::from_bytes(&signature))
         .map_err(|_| ApiError::InvalidSignature)
+}
+
+/// Builds the versioned signed HTTP request preimage.
+pub fn signature_preimage(method: &str, path: &str, raw_body: &[u8]) -> Vec<u8> {
+    const DOMAIN: &[u8] = b"paykit-http-signature-v1\0";
+    let method = method.to_ascii_uppercase();
+    let mut preimage =
+        Vec::with_capacity(DOMAIN.len() + method.len() + 1 + path.len() + 1 + raw_body.len());
+    preimage.extend_from_slice(DOMAIN);
+    preimage.extend_from_slice(method.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(path.as_bytes());
+    preimage.push(0);
+    preimage.extend_from_slice(raw_body);
+    preimage
 }
 
 #[cfg(test)]

@@ -2,9 +2,10 @@
 
 `POST /invoices` atomically allocates an invoice address and persists its reader assignment, complete Payment Request terms, and one encrypted outbox intent. The terms bind the address in `payment_endpoints` under the required `paykit-server` app. Exact replay preserves those durable identities, terms, and address. Distinct invoices, including concurrent invoices for the same Reader, receive distinct addresses.
 
-After persistence or exact replay, `POST /invoices` returns `204 No Content`; it
-does not observe Noise state. `POST /connections/status` separately loads the
-persisted Reader identity binding and returns `none`, `handshake`, `connected`,
+After persistence or exact replay, `POST /invoices` returns `200 OK` with only
+the immutable `invoice_created_at` and `payment_deadline` timestamps; it does not
+observe Noise state. `POST /connections/status` separately loads the persisted
+Reader identity binding and returns `none`, `handshake`, `connected`,
 `recovery_required`, or `blocked`. This lookup does not advance handshake,
 rewrite SDK state, acquire the worker mutation lock, mutate outbox state, or wait
 for delivery. Missing invoices and storage, authentication, malformed-state, or

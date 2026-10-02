@@ -37,6 +37,7 @@ use paykit_server::{
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
+    http::auth::signature_preimage,
     persistence::{CreatorCredentials, CreatorStore},
     startup::initialize_database,
     workers::observer::{ElectrumPort, ObserverError},
@@ -378,12 +379,14 @@ fn signed_request(
     uri: &str,
     body: String,
 ) -> Request<Body> {
+    let path = uri.split('?').next().expect("request URI has a path");
+    let preimage = signature_preimage(method.as_str(), path, body.as_bytes());
     Request::builder()
         .method(method)
         .uri(uri)
         .header(
             "X-Paykit-Signature",
-            URL_SAFE_NO_PAD.encode(signing_key.sign(body.as_bytes()).to_bytes()),
+            URL_SAFE_NO_PAD.encode(signing_key.sign(&preimage).to_bytes()),
         )
         .body(Body::from(body))
         .unwrap()
@@ -698,7 +701,7 @@ async fn assert_persisted_workflow_inputs(
             )
             .unwrap();
         let payment = DeliveryIntentV1::decode(&payment_plaintext).unwrap();
-        assert_eq!(payment.version(), 1);
+        assert_eq!(payment.version(), 2);
         assert_eq!(payment.reader_pubky(), reader.to_string());
         assert_eq!(payment.app_id(), "paykit-server");
         let amount = format!(
@@ -706,7 +709,7 @@ async fn assert_persisted_workflow_inputs(
             fixture.amount_sats / 100_000_000,
             fixture.amount_sats % 100_000_000
         );
-        let terms = payment.terms();
+        let terms = payment.terms().unwrap();
         assert!(
             terms.amount == amount
                 && terms.asset == "btc"
@@ -715,7 +718,8 @@ async fn assert_persisted_workflow_inputs(
                     == 4
                     && reference.get_variant() == uuid::Variant::RFC4122
                     && terms.payment_reference == reference.hyphenated().to_string())
-                && terms.proposal_expires_at.is_none()
+                && terms.proposal_expires_at.is_some()
+                && terms.payment_deadline.is_some()
                 && terms.accepted_endpoint_identifiers == ["btc-testnet-p2wpkh"]
                 && terms.payment_endpoints.len() == 1
                 && terms.payment_endpoints["btc-testnet-p2wpkh"] == expected_payload
@@ -826,11 +830,23 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     for (label, response) in [("Creator A", &invoice_a), ("Creator B", &invoice_b)] {
         assert_eq!(
             response.status,
-            StatusCode::NO_CONTENT,
+            StatusCode::OK,
             "{label} invoice body: {}",
             String::from_utf8_lossy(&response.body)
         );
-        assert!(response.body.is_empty());
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        let object = body.as_object().unwrap();
+        assert_eq!(object.len(), 2);
+        for field in ["invoice_created_at", "payment_deadline"] {
+            time::OffsetDateTime::parse(
+                object
+                    .get(field)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap(),
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap();
+        }
     }
     assert_persisted_workflow_inputs(
         &first_pool,
@@ -1084,8 +1100,9 @@ async fn open_invoice(
     .await;
     assert_eq!(
         response.status,
-        StatusCode::NO_CONTENT,
-        "invoice creation failed"
+        StatusCode::OK,
+        "invoice creation failed: {}",
+        String::from_utf8_lossy(&response.body)
     );
     let created: Vec<_> = outbox_ids(pool)
         .await

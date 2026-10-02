@@ -23,7 +23,6 @@ pub enum PersistedPaymentStatus {
     },
 }
 
-/// Narrow read-only durable status boundary.
 #[async_trait]
 pub trait StatusRepository: Send + Sync {
     async fn status(
@@ -61,7 +60,7 @@ impl PaymentStatusResponse {
         }
     }
 
-    fn observed(status: &'static str, confirmations: u32, amount_matched: bool) -> Self {
+    fn factual(status: &'static str, confirmations: u32, amount_matched: bool) -> Self {
         Self {
             status,
             confirmations,
@@ -115,11 +114,11 @@ impl PaymentStatusService {
             PersistedPaymentStatus::Detected {
                 confirmations,
                 amount_matched,
-            } => PaymentStatusResponse::observed("detected", confirmations, amount_matched),
+            } => PaymentStatusResponse::factual("detected", confirmations, amount_matched),
             PersistedPaymentStatus::Confirmed {
                 confirmations,
                 amount_matched,
-            } => PaymentStatusResponse::observed("confirmed", confirmations, amount_matched),
+            } => PaymentStatusResponse::factual("confirmed", confirmations, amount_matched),
         })
     }
 }

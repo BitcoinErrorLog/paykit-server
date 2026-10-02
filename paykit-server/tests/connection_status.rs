@@ -157,12 +157,14 @@ signed_burst = 200
 }
 
 fn signed_request(key: &SigningKey, body: Vec<u8>) -> Request<Body> {
+    let preimage =
+        paykit_server::http::auth::signature_preimage("POST", "/connections/status", &body);
     Request::builder()
         .method(Method::POST)
         .uri("/connections/status")
         .header(
             "X-Paykit-Signature",
-            URL_SAFE_NO_PAD.encode(key.sign(&body).to_bytes()),
+            URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes()),
         )
         .body(Body::from(body))
         .unwrap()

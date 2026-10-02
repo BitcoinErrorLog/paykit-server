@@ -123,6 +123,14 @@ impl Crypto {
         self.domain_separated_lookup_hash(b"paykit-server:bitcoin-address:v1", address)
     }
 
+    /// Produces a keyed semantic identity for one Payment Request proposal.
+    pub fn payment_request_proposal_lookup_hash(&self, payment_reference: &[u8]) -> LookupHash {
+        self.domain_separated_lookup_hash(
+            b"paykit-server:payment-request-proposal:v1",
+            payment_reference,
+        )
+    }
+
     /// Produces a Creator-scoped keyed hash for a Bitcoin derivation index.
     pub fn bitcoin_derivation_index_lookup_hash(
         &self,
@@ -138,6 +146,14 @@ impl Crypto {
     /// Produces a keyed lookup hash scoped exclusively to Bitcoin outpoints.
     pub fn bitcoin_outpoint_lookup_hash(&self, outpoint: &[u8]) -> LookupHash {
         self.domain_separated_lookup_hash(b"paykit-server:bitcoin-outpoint:v1", outpoint)
+    }
+
+    /// Produces an opaque capability bound to one immutable payment drain.
+    pub fn payment_drain_cleanup_token(&self, drain_id: uuid::Uuid) -> LookupHash {
+        self.domain_separated_lookup_hash(
+            b"paykit-server:payment-drain-cleanup:v1",
+            drain_id.as_bytes(),
+        )
     }
 
     fn domain_separated_lookup_hash(&self, domain: &[u8], logical_bytes: &[u8]) -> LookupHash {
@@ -173,6 +189,8 @@ pub enum EnvelopeType {
     BitcoinObservation,
     /// Versioned server-owned semantic inputs for an outbound SDK handoff.
     OutboxSemanticIntent,
+    /// Canonical addressed lock resource bound to one operational drain.
+    PaymentDrain,
 }
 
 impl EnvelopeType {
@@ -184,6 +202,7 @@ impl EnvelopeType {
             Self::InvoicePaymentRecord => b"invoice-payment-record",
             Self::BitcoinObservation => b"bitcoin-observation",
             Self::OutboxSemanticIntent => b"outbox-semantic-intent",
+            Self::PaymentDrain => b"payment-drain",
         }
     }
 }
@@ -258,6 +277,10 @@ impl EnvelopeContext {
             creator_lookup_hash,
             row_id,
         )
+    }
+    /// Creates the binding context for one operational payment drain.
+    pub fn payment_drain(creator_lookup_hash: LookupHash, row_id: Uuid) -> Self {
+        Self::new(EnvelopeType::PaymentDrain, creator_lookup_hash, row_id)
     }
 
     fn new(envelope_type: EnvelopeType, creator_lookup_hash: LookupHash, row_id: Uuid) -> Self {

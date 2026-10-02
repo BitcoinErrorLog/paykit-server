@@ -38,9 +38,9 @@ serde_json_canonicalizer = "=0.3.2"
 rand = "0.10"
 rustls-pki-types = "1"
 sha2 = "0.11"
-sqlx = { version = "0.8", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-ring", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio", "time", "tls-rustls-ring", "uuid"] }
 thiserror = "2"
-time = "0.3"
+time = { version = "0.3", features = ["formatting", "parsing"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "signal"] }
 toml = "1.1"
 tracing = "0.1"

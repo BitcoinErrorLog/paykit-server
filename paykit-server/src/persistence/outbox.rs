@@ -5,8 +5,9 @@ use crate::{
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
     persistence::PersistenceError,
 };
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use std::time::Duration;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,6 +19,7 @@ pub enum OutboxRetryClass {
     RecoveryMarkerObservation,
     LinkEstablishment,
     PaymentRequestProposal,
+    PaymentRequestCancellation,
     ReconciliationPending,
     Reconciliation,
 }
@@ -32,6 +34,7 @@ impl OutboxRetryClass {
             Self::RecoveryMarkerObservation => "recovery_marker_observation",
             Self::LinkEstablishment => "link_establishment",
             Self::PaymentRequestProposal => "payment_request_proposal",
+            Self::PaymentRequestCancellation => "payment_request_cancellation",
             Self::ReconciliationPending => "reconciliation_pending",
             Self::Reconciliation => "reconciliation",
         }
@@ -40,21 +43,53 @@ impl OutboxRetryClass {
 
 /// Exact public-SDK identifiers returned after one durable local enqueue.
 #[derive(Clone, PartialEq, Eq)]
-pub struct HandoffResult {
-    pub outbound_message_id: u64,
-    pub event_id: String,
-    pub payment_request_id: String,
+pub enum HandoffResult {
+    EndpointPublication {
+        outbound_message_id: u64,
+    },
+    PaymentRequestProposal {
+        outbound_message_id: u64,
+        event_id: String,
+        payment_request_id: String,
+    },
+    PaymentRequestCancellation {
+        outbound_message_id: u64,
+        event_id: String,
+        payment_request_id: String,
+    },
 }
 
 impl std::fmt::Debug for HandoffResult {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("HandoffResult { <redacted> }")
+        match self {
+            Self::EndpointPublication { .. } => {
+                formatter.write_str("HandoffResult::EndpointPublication(<redacted>)")
+            }
+            Self::PaymentRequestProposal { .. } => {
+                formatter.write_str("HandoffResult::PaymentRequestProposal(<redacted>)")
+            }
+            Self::PaymentRequestCancellation { .. } => {
+                formatter.write_str("HandoffResult::PaymentRequestCancellation(<redacted>)")
+            }
+        }
     }
 }
 
 impl HandoffResult {
     pub fn outbound_message_id(&self) -> u64 {
-        self.outbound_message_id
+        match self {
+            Self::EndpointPublication {
+                outbound_message_id,
+            }
+            | Self::PaymentRequestProposal {
+                outbound_message_id,
+                ..
+            }
+            | Self::PaymentRequestCancellation {
+                outbound_message_id,
+                ..
+            } => *outbound_message_id,
+        }
     }
 }
 
@@ -177,10 +212,21 @@ impl OutboxStore {
                  SELECT o.id \
                  FROM outbox o \
                  WHERE ( \
-                     (o.status = 'queued' AND o.next_attempt_at <= NOW()) \
-                     OR (o.status = 'leased' AND o.lease_expires_at <= NOW()) \
-                     OR (o.status = 'retryable' AND o.next_attempt_at <= NOW()) \
+                     (o.status = 'queued' AND o.next_attempt_at <= clock_timestamp()) \
+                     OR (o.status = 'leased' AND o.lease_expires_at <= clock_timestamp()) \
+                     OR (o.status = 'retryable' AND o.next_attempt_at <= clock_timestamp()) \
                  ) \
+                 AND (o.intent_kind <> 'payment_request_proposal' OR ( \
+                     o.proposal_lookup_hash IS NOT NULL AND EXISTS ( \
+                     SELECT 1 \
+                     FROM invoices invoice \
+                     JOIN lock_payment_generations generation \
+                       ON generation.creator_id = invoice.creator_id \
+                      AND generation.lock_resource_lookup_hash = invoice.lock_resource_lookup_hash \
+                     WHERE invoice.id = o.invoice_id \
+                       AND generation.current_generation = invoice.lock_resource_generation \
+                       AND generation.active_drain_id IS NULL \
+                 ))) \
                  ORDER BY o.next_attempt_at, o.id \
                  FOR UPDATE OF o SKIP LOCKED \
                  LIMIT $1 \
@@ -189,9 +235,9 @@ impl OutboxStore {
              SET status = 'leased', \
                  lease_owner = $2, \
                  claim_token = gen_random_uuid(), \
-                 lease_expires_at = NOW() + ($3 * INTERVAL '1 second'), \
+                 lease_expires_at = clock_timestamp() + ($3 * INTERVAL '1 second'), \
                  attempt_count = o.attempt_count + 1, \
-                 updated_at = NOW() \
+                 updated_at = clock_timestamp() \
              FROM candidates \
              WHERE o.id = candidates.id \
              RETURNING o.id, o.creator_id, o.invoice_id, o.attempt_count, o.claim_token, \
@@ -202,6 +248,36 @@ impl OutboxStore {
         .bind(owner)
         .bind(seconds)
         .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)
+    }
+
+    /// Revalidates one live claim against the durable lock-generation drain fence.
+    pub async fn claim_handoff_eligible(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<bool, PersistenceError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM outbox o \
+                 WHERE o.id = $1 AND o.status = 'leased' \
+                   AND o.claim_token = $2 AND o.lease_expires_at > transaction_timestamp() \
+                   AND (o.intent_kind <> 'payment_request_proposal' OR ( \
+                       o.proposal_lookup_hash IS NOT NULL AND EXISTS ( \
+                       SELECT 1 \
+                       FROM invoices invoice \
+                       JOIN lock_payment_generations generation \
+                         ON generation.creator_id = invoice.creator_id \
+                        AND generation.lock_resource_lookup_hash = invoice.lock_resource_lookup_hash \
+                       WHERE invoice.id = o.invoice_id \
+                         AND generation.current_generation = invoice.lock_resource_generation \
+                         AND generation.active_drain_id IS NULL \
+                   ))) \
+             )",
+        )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .fetch_one(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)
     }
@@ -219,16 +295,16 @@ impl OutboxStore {
                  SELECT id FROM outbox \
                  WHERE status = 'handed_off' \
                    AND sdk_outbound_message_id IS NOT NULL \
-                   AND next_attempt_at <= NOW() \
-                   AND (claim_token IS NULL OR lease_expires_at <= NOW()) \
+                   AND next_attempt_at <= clock_timestamp() \
+                   AND (claim_token IS NULL OR lease_expires_at <= clock_timestamp()) \
                  ORDER BY next_attempt_at, id \
                  FOR UPDATE SKIP LOCKED \
                  LIMIT $1 \
              ) \
              UPDATE outbox o \
              SET lease_owner = $2, claim_token = gen_random_uuid(), \
-                 lease_expires_at = NOW() + ($3 * INTERVAL '1 second'), \
-                 attempt_count = o.attempt_count + 1, updated_at = NOW() \
+                 lease_expires_at = clock_timestamp() + ($3 * INTERVAL '1 second'), \
+                 attempt_count = o.attempt_count + 1, updated_at = clock_timestamp() \
              FROM candidates WHERE o.id = candidates.id \
              RETURNING o.id, o.creator_id, o.attempt_count, o.claim_token, \
                  o.sdk_outbound_message_id",
@@ -264,20 +340,41 @@ impl OutboxStore {
         result: &HandoffResult,
     ) -> Result<bool, PersistenceError> {
         let outbound = result.outbound_message_id().to_string();
+        let (event_id, payment_request_id) = match result {
+            HandoffResult::EndpointPublication { .. } => (None, None),
+            HandoffResult::PaymentRequestProposal {
+                event_id,
+                payment_request_id,
+                ..
+            }
+            | HandoffResult::PaymentRequestCancellation {
+                event_id,
+                payment_request_id,
+                ..
+            } => (Some(event_id.as_str()), Some(payment_request_id.as_str())),
+        };
+        let Some((mut transaction, now)) = self.transition_fence(claim.id).await? else {
+            return Ok(false);
+        };
         let changed = sqlx::query(
             "UPDATE outbox SET status = 'handed_off', sdk_outbound_message_id = $1, \
                  sdk_event_id = $2, sdk_payment_request_id = $3, error_class = NULL, \
-                 lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = NOW() \
-             WHERE id = $4 AND status = 'leased' AND claim_token = $5 AND lease_expires_at > NOW()",
+                 lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = $6 \
+             WHERE id = $4 AND status = 'leased' AND claim_token = $5 AND lease_expires_at > $6",
         )
         .bind(outbound)
-        .bind(&result.event_id)
-        .bind(&result.payment_request_id)
+        .bind(event_id)
+        .bind(payment_request_id)
         .bind(claim.id)
         .bind(claim.claim_token)
-        .execute(&self.pool)
+        .bind(now)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         Ok(changed.rows_affected() == 1)
     }
 
@@ -347,21 +444,29 @@ impl OutboxStore {
         error_class: Option<&str>,
         delay: Option<i64>,
     ) -> Result<bool, PersistenceError> {
+        let Some((mut transaction, now)) = self.transition_fence(claim.id).await? else {
+            return Ok(false);
+        };
         let changed = sqlx::query(
             "UPDATE outbox \
              SET status = $1, error_class = $2, \
-                 next_attempt_at = CASE WHEN $3::BIGINT IS NULL THEN next_attempt_at ELSE NOW() + ($3 * INTERVAL '1 second') END, \
-                 lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = NOW() \
-             WHERE id = $4 AND status = 'leased' AND claim_token = $5 AND lease_expires_at > NOW()",
+                 next_attempt_at = CASE WHEN $3::BIGINT IS NULL THEN next_attempt_at ELSE $6 + ($3 * INTERVAL '1 second') END, \
+                 lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = $6 \
+             WHERE id = $4 AND status = 'leased' AND claim_token = $5 AND lease_expires_at > $6",
         )
         .bind(status)
         .bind(error_class)
         .bind(delay)
         .bind(claim.id)
         .bind(claim.claim_token)
-        .execute(&self.pool)
+        .bind(now)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         Ok(changed.rows_affected() == 1)
     }
 
@@ -372,12 +477,15 @@ impl OutboxStore {
         error_class: Option<&str>,
         delay: Option<i64>,
     ) -> Result<bool, PersistenceError> {
+        let Some((mut transaction, now)) = self.transition_fence(claim.id).await? else {
+            return Ok(false);
+        };
         let changed = sqlx::query(
             "UPDATE outbox SET status = $1, error_class = $2, \
-                 next_attempt_at = CASE WHEN $3::BIGINT IS NULL THEN next_attempt_at ELSE NOW() + ($3 * INTERVAL '1 second') END, \
-                 lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = NOW() \
+                 next_attempt_at = CASE WHEN $3::BIGINT IS NULL THEN next_attempt_at ELSE $7 + ($3 * INTERVAL '1 second') END, \
+                 lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = $7 \
              WHERE id = $4 AND status = 'handed_off' \
-               AND sdk_outbound_message_id = $5 AND claim_token = $6 AND lease_expires_at > NOW()",
+               AND sdk_outbound_message_id = $5 AND claim_token = $6 AND lease_expires_at > $7",
         )
         .bind(status)
         .bind(error_class)
@@ -385,10 +493,40 @@ impl OutboxStore {
         .bind(claim.id)
         .bind(&claim.sdk_outbound_message_id)
         .bind(claim.claim_token)
-        .execute(&self.pool)
+        .bind(now)
+        .execute(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
         Ok(changed.rows_affected() == 1)
+    }
+
+    async fn transition_fence(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<(Transaction<'_, Postgres>, OffsetDateTime)>, PersistenceError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let exists: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM outbox WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+        if exists.is_none() {
+            return Ok(None);
+        }
+        let now = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(Some((transaction, now)))
     }
 }
 
@@ -418,6 +556,7 @@ mod tests {
                 OutboxRetryClass::RecoveryMarkerObservation,
                 OutboxRetryClass::LinkEstablishment,
                 OutboxRetryClass::PaymentRequestProposal,
+                OutboxRetryClass::PaymentRequestCancellation,
                 OutboxRetryClass::ReconciliationPending,
                 OutboxRetryClass::Reconciliation,
             ]
@@ -430,6 +569,7 @@ mod tests {
                 "recovery_marker_observation",
                 "link_establishment",
                 "payment_request_proposal",
+                "payment_request_cancellation",
                 "reconciliation_pending",
                 "reconciliation",
             ]
@@ -441,7 +581,7 @@ mod tests {
         let event_id = "event-correlation-marker";
         let request_id = "request-correlation-marker";
         let outbound_id = "18446744073709551615";
-        let result = HandoffResult {
+        let result = HandoffResult::PaymentRequestProposal {
             outbound_message_id: u64::MAX,
             event_id: event_id.into(),
             payment_request_id: request_id.into(),

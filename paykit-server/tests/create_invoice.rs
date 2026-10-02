@@ -33,7 +33,10 @@ use paykit_server::{
     application::semantic_intent::DeliveryIntentV1,
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     domain::locks::{CreatorPubky, parse_addressed_lock_resource, parse_bundle_id, parse_reader},
-    http::{auth::SignedLocksAuth, invoices::invoices_router},
+    http::{
+        auth::{SignedLocksAuth, signature_preimage},
+        invoices::invoices_router,
+    },
     persistence::{AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, PersistenceError},
 };
 use tower::ServiceExt;
@@ -58,6 +61,7 @@ fn request() -> CreateInvoiceRequest {
         bundle_id: parse_bundle_id(BUNDLE).unwrap(),
         lock_resource: parse_addressed_lock_resource(LOCK_RESOURCE).unwrap(),
         reader: parse_reader(&reader()).unwrap(),
+        payment_in: paykit_server::domain::invoice::CriterionPaymentWindowHours::new(24).unwrap(),
     }
 }
 
@@ -230,6 +234,8 @@ impl InvoicePersistence for FakeStore {
             uuid::Uuid::nil(),
             uuid::Uuid::nil(),
             0,
+            time::OffsetDateTime::UNIX_EPOCH,
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(24),
             true,
         ))
     }
@@ -244,6 +250,8 @@ impl InvoicePersistence for FakeStore {
             uuid::Uuid::nil(),
             uuid::Uuid::nil(),
             0,
+            time::OffsetDateTime::UNIX_EPOCH,
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(24),
             true,
         ))
     }
@@ -687,12 +695,13 @@ signed_burst = 100
 }
 
 fn signed_invoice_request(key: &SigningKey, body: Vec<u8>) -> Request<Body> {
+    let preimage = signature_preimage("POST", "/invoices", &body);
     Request::builder()
         .method(Method::POST)
         .uri("/invoices")
         .header(
             "X-Paykit-Signature",
-            URL_SAFE_NO_PAD.encode(key.sign(&body).to_bytes()),
+            URL_SAFE_NO_PAD.encode(key.sign(&preimage).to_bytes()),
         )
         .body(Body::from(body))
         .unwrap()
@@ -724,11 +733,17 @@ async fn signed_router_parses_canonical_invoice_and_derives_creator_from_lock_re
         .oneshot(signed_invoice_request(&key, body))
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.status(), StatusCode::OK);
     let body = axum::body::to_bytes(response.into_body(), 4096)
         .await
         .unwrap();
-    assert!(body.is_empty());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({
+            "invoice_created_at": "1970-01-01T00:00:00Z",
+            "payment_deadline": "1970-01-02T00:00:00Z"
+        })
+    );
     assert_eq!(session.creators.lock().unwrap().as_slice(), [CREATOR]);
 }
 
@@ -854,6 +869,8 @@ impl InvoicePersistence for CapturingIntentStore {
             uuid::Uuid::nil(),
             uuid::Uuid::nil(),
             0,
+            time::OffsetDateTime::UNIX_EPOCH,
+            time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(24),
             false,
         ))
     }
@@ -895,8 +912,8 @@ async fn new_invoice_checks_registry_and_binds_invoice_address_to_request() {
     for intent in captured.iter() {
         assert_eq!(intent.app_id(), "paykit-server");
     }
-    assert!(uuid::Uuid::parse_str(&captured[0].terms().payment_reference).is_ok());
-    assert_eq!(captured[0].terms().payment_endpoints.len(), 1);
+    assert!(uuid::Uuid::parse_str(&captured[0].terms().unwrap().payment_reference).is_ok());
+    assert_eq!(captured[0].terms().unwrap().payment_endpoints.len(), 1);
 }
 
 #[test]
@@ -912,7 +929,7 @@ fn delivery_intent_is_closed_and_contains_complete_sdk_inputs_not_final_wire_ids
     .unwrap();
 
     assert_eq!(intent.app_id(), "paykit-server");
-    assert_eq!(intent.terms().payment_endpoints.len(), 1);
+    assert_eq!(intent.terms().unwrap().payment_endpoints.len(), 1);
     let serialized = postcard::to_allocvec(&intent).unwrap();
     assert!(
         !serialized

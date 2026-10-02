@@ -55,10 +55,15 @@ Business routes:
 - signed `POST /connections/status`
 - signed `POST /transactions/status`
 - signed `POST /setup/status`
+- signed `POST /payment-requests/status`
+- signed `POST /payment-request-drains`
+- signed `POST /payment-request-drain-lookups`
+- signed `POST /payment-request-drain-cleanups`
 
 Business-route signatures use the configured trusted Locks Ed25519 key. Setup uses the Bitkit Pubky Auth companion-claim flow and an exact configured browser origin.
 
-Successful invoice creation returns `204 No Content`; it does not expose Noise
+Successful invoice creation and exact replay return `200 OK` with only RFC 3339
+`invoice_created_at` and `payment_deadline` timestamps; they do not expose Noise
 state. `POST /connections/status` is the separate read-only lookup. Its closed
 body is `{"bundle_id":"...","creator":"pubky..."}`. Paykit Server derives
 the exact Reader identity from persisted invoice state, then returns
@@ -67,7 +72,7 @@ invoices return `404`; authentication, storage, malformed-state, and dependency
 failures remain typed errors. `connected` is the identity's shared Noise state,
 not payment or verification completion.
 
-`POST /setup/status` is the Locks-only readiness check for an authenticated Creator. Its closed canonical body is `{"creator":"pubky..."}`; the signature covers the exact compact canonical JSON bytes. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
+`POST /setup/status` is the Locks-only readiness check for an authenticated Creator. Its closed canonical body is `{"creator":"pubky..."}`. Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
 
 ### Setup iframe
 
@@ -136,7 +141,7 @@ remain opt-in; see [`docs/live-adapter-smoke.md`](docs/live-adapter-smoke.md).
 
 ## Deployment model and Creator cardinality
 
-Run exactly **one Paykit Server process** for a deployment. Horizontal replicas and active-active operation are unsupported because setup flows are memory-only and Creator SDK runtimes are process-cached. PostgreSQL locks, constraints, and leases provide concurrency control and crash recovery inside this one-process model, not multi-replica coordination.
+Run exactly **one Paykit Server process** for a deployment. Horizontal replicas and active-active operation are unsupported because setup flows are memory-only, Creator SDK runtimes are process-cached, and receive/project/status/drain SDK operations share only an in-process per-Creator mutation fence. PostgreSQL locks, constraints, and leases provide concurrency control and crash recovery inside this one-process model, not multi-replica coordination.
 
 Setup publication and workers share the cached Creator session handle. Restoring
 the same Pubky grant independently mints a new bearer and invalidates the prior
@@ -167,11 +172,7 @@ Immutable deployment values are:
 
 Changing any of them after database initialization requires resetting the database.
 
-Persisted application and schema compatibility across releases is unsupported. When an upgrade changes the schema or a persisted payload representation:
-
-1. stop the old process;
-2. discard and recreate the Paykit Server database;
-3. start the new binary so it applies the current baseline.
+Persisted application and schema compatibility across releases is intentionally unsupported during this pre-production phase. The `0.1.0-rc6` Paykit Server and `0.1.0-rc6` Locks rollout is coordinated: stop both services, deploy both versions, then start each service and let its one-time SQLx reset migration clear only its dedicated disposable prototype database while preserving `_sqlx_migrations`. Verify both migrations and services before allowing new invoice or verification work, then reacquire any required prototype state. Do not manually drop/recreate either database. Never run these reset migrations against production, staging, an unidentified database, or a database shared with unrelated applications.
 
 The cryptographic envelope version, domain-separated KDF/AAD labels, and private payload format discriminators remain enforced. They detect unsupported or corrupt bytes; they are not compatibility readers.
 
@@ -312,9 +313,22 @@ Each invoice receives a unique BIP84 external-chain address. Observation uses th
 
 The server has no Bitcoin spending keys and cannot spend, refund, or create change.
 
+`POST /transactions/status` remains the legacy Bitcoin-only compatibility
+endpoint. Its closed `status` vocabulary is `undetected`, `detected`, and
+`confirmed`; Payment Request lifecycle never changes those labels.
+
+`POST /payment-requests/status` is the canonical Locks lifecycle contract. It
+exposes request lifecycle, payment state, invoice timestamps, confirmations, and
+amount matching as separate facts. Before returning them, it performs linked-peer
+receive, exact required-target freshness checks, Creator-local SDK mutation
+serialization, and transactional target revalidation. Missing, partial,
+unrelated, or failed required-peer intake returns unavailable. Exact terminal
+response fixtures for Locks are published under
+`docs/fixtures/payment-request-status/`.
+
 ## Payer, proof, and receipt exclusions
 
-The SDK receives payer-originated events into shared protocol state. The server exposes no payer inbox or proof-submission API and does not use those events as settlement evidence. Direct invoice-address observation is the only payment-attribution input.
+The server receives and durably projects Paykit Payment Request acceptance, rejection, proof, and cancellation records from its local SDK state. It exposes no payer inbox or proof-submission API. Direct invoice-address observation remains the only Bitcoin payment-attribution input; Paykit Server never decides Locks access.
 
 Paykit Receipt issuance, Receipt Access delivery, and receipt storage are unsupported.
 

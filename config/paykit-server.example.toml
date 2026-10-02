@@ -25,6 +25,10 @@ log_authorization_url = false
 # Cargo example. Required exactly as shown; missing or other values are rejected.
 client_id = "app.paykit.server"
 app_id = "paykit-server"
+# New proposals must be accepted before this window closes. Payment must then
+# complete before payment_window, measured from same invoice creation instant.
+proposal_acceptance_window = "1h"
+payment_window = "24h"
 # "testnet" targets the pinned Pubky client's fixed localhost testnet ports.
 # Run the Pubky static testnet; this is not a hosted public network.
 network = "testnet"

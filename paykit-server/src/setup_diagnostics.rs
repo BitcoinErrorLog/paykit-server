@@ -147,6 +147,7 @@ pub(crate) fn persistence_failure_class(error: &PersistenceError) -> SetupFailur
         PersistenceError::ReauthenticationMismatch => SetupFailureClass::AccountMismatch,
         PersistenceError::Unavailable => SetupFailureClass::Storage,
         PersistenceError::Conflict => SetupFailureClass::Conflict,
+        PersistenceError::InvalidInput => SetupFailureClass::InvalidRequest,
     }
 }
 
@@ -355,6 +356,10 @@ mod tests {
             ),
             (PersistenceError::Unavailable, SetupFailureClass::Storage),
             (PersistenceError::Conflict, SetupFailureClass::Conflict),
+            (
+                PersistenceError::InvalidInput,
+                SetupFailureClass::InvalidRequest,
+            ),
         ] {
             assert_eq!(persistence_failure_class(&error), expected);
         }

@@ -35,6 +35,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
+use std::time::Duration;
 
 mod common;
 #[path = "fixtures/sdk.rs"]
@@ -69,9 +70,12 @@ async fn allocate_invoice(
             creator,
             reader,
             bundle_binding: binding,
+            lock_resource_binding: binding,
             payment_request_binding: binding,
             invoice_payloads: &AccountPayloads(reader),
             required_sats: 100,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap()
@@ -324,6 +328,8 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
             client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
             app_id: paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
             network: paykit_server::config::PaykitNetwork::Testnet,
+            proposal_acceptance_window: Duration::from_secs(60 * 60),
+            payment_window: Duration::from_secs(24 * 60 * 60),
         },
     );
     let publisher = Arc::new(FailAfterPublication {

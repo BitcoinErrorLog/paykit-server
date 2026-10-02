@@ -234,12 +234,15 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             creator: &creator_a,
             reader: &reader,
             bundle_binding: b"composition-bundle-a",
+            lock_resource_binding: b"composition-lock-a",
             payment_request_binding: b"composition-request-a",
             invoice_payloads: &Payloads {
                 reader: reader.clone(),
                 address_prefix: "creator-a-address",
             },
             required_sats: 100,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap();
@@ -248,12 +251,15 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             creator: &creator_b,
             reader: &reader,
             bundle_binding: b"composition-bundle-b",
+            lock_resource_binding: b"composition-lock-b",
             payment_request_binding: b"composition-request-b",
             invoice_payloads: &Payloads {
                 reader: reader.clone(),
                 address_prefix: "creator-b-address",
             },
             required_sats: 200,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap();
@@ -264,12 +270,15 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             creator: &creator_c,
             reader: &unreachable_reader,
             bundle_binding: b"composition-bundle-c",
+            lock_resource_binding: b"composition-lock-c",
             payment_request_binding: b"composition-request-c",
             invoice_payloads: &Payloads {
                 reader: unreachable_reader.clone(),
                 address_prefix: "creator-c-address",
             },
             required_sats: 300,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap();
@@ -335,8 +344,14 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
 
-    assert_eq!(outbound_a, before_a);
-    assert_eq!(outbound_b, before_b);
+    assert!(
+        (before_a..before_b).contains(&outbound_a),
+        "Creator A must allocate from its own seeded outbound counter range"
+    );
+    assert!(
+        (before_b..before_c).contains(&outbound_b),
+        "Creator B must allocate from its own seeded outbound counter range"
+    );
     assert_ne!(outbound_a, outbound_b);
     let health = tokio::time::timeout(Duration::from_secs(15), async {
         loop {

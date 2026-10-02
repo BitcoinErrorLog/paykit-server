@@ -118,9 +118,12 @@ fn input<'a>(
         creator,
         reader,
         bundle_binding: bundle,
+        lock_resource_binding: request,
         payment_request_binding: request,
         invoice_payloads: &TEST_PAYLOADS,
         required_sats: 100,
+        proposal_acceptance_seconds: 60 * 60,
+        payment_window_seconds: 24 * 60 * 60,
     }
 }
 
@@ -254,7 +257,7 @@ async fn invoice_allocation_encrypts_bound_terms_and_replays() {
         )
         .unwrap();
     let original_intent = DeliveryIntentV1::decode(&original_plaintext).unwrap();
-    let original_reference = original_intent.terms().payment_reference.clone();
+    let original_reference = original_intent.terms().unwrap().payment_reference.clone();
     let original_app_id = original_intent.app_id();
 
     let replay = store
@@ -288,7 +291,7 @@ async fn invoice_allocation_encrypts_bound_terms_and_replays() {
     let replayed_intent = DeliveryIntentV1::decode(&replayed_plaintext).unwrap();
     assert_eq!(replayed_intent.app_id(), original_app_id);
     assert_eq!(
-        replayed_intent.terms().payment_reference,
+        replayed_intent.terms().unwrap().payment_reference,
         original_reference
     );
     assert_eq!(replayed_intent, original_intent);
@@ -369,8 +372,8 @@ async fn invoice_allocation_encrypts_bound_terms_and_replays() {
         )
         .unwrap();
     let second_intent = DeliveryIntentV1::decode(&plaintext).unwrap();
-    let first_terms = original_intent.terms();
-    let second_terms = second_intent.terms();
+    let first_terms = original_intent.terms().unwrap();
+    let second_terms = second_intent.terms().unwrap();
     assert_eq!(
         first_terms.payment_endpoints["btc-bitcoin-p2wpkh"],
         serde_json::json!({"value":"test-address-0"}).to_string()
@@ -464,6 +467,7 @@ async fn concurrent_invoices_for_same_reader_bind_distinct_addresses() {
                 .delivery_intent(claim)
                 .unwrap()
                 .terms()
+                .unwrap()
                 .payment_endpoints["btc-bitcoin-p2wpkh"]
                 .clone()
         })
@@ -621,17 +625,23 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             creator: &first_creator,
             reader: &reader,
             bundle_binding: b"creator-one-bundle",
+            lock_resource_binding: b"creator-one-lock",
             payment_request_binding: b"creator-one-request",
             invoice_payloads: &first_payloads,
             required_sats: 100,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         }),
         second_store.create_atomic(AtomicInvoiceInput {
             creator: &second_creator,
             reader: &reader,
             bundle_binding: b"creator-two-bundle",
+            lock_resource_binding: b"creator-two-lock",
             payment_request_binding: b"creator-two-request",
             invoice_payloads: &second_payloads,
             required_sats: 100,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
     );
     let first = first.unwrap();
@@ -707,7 +717,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
         .unwrap();
     let intent: DeliveryIntentV1 = postcard::from_bytes(&plaintext).unwrap();
     assert_eq!(
-        intent.terms().payment_endpoints["btc-bitcoin-p2wpkh"],
+        intent.terms().unwrap().payment_endpoints["btc-bitcoin-p2wpkh"],
         serde_json::json!({"value": "creator-one-address-0"}).to_string()
     );
 

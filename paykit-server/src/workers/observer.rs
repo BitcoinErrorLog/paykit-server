@@ -14,6 +14,8 @@ use bdk_electrum::{
     electrum_client::{Client, ConfigBuilder, Error as ElectrumError},
 };
 use bitcoin::{Address, Network, constants::genesis_block};
+#[cfg(any(test, feature = "test-utils"))]
+use time::OffsetDateTime;
 
 use crate::{
     bitcoin::{ObservationTarget, ObservedOutput},
@@ -241,6 +243,33 @@ pub async fn observe_once(
     let observations = validate_batch(observations, network, targets)?;
     invoices
         .apply_bitcoin_observation_batch(&observations)
+        .await
+        .map_err(map_persistence)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn observe_once_at(
+    port: &dyn ElectrumPort,
+    invoices: &InvoiceStore,
+    network: &BitcoinNetwork,
+    targets: &[ObservationTarget],
+    observed_at: OffsetDateTime,
+) -> Result<usize, ObserverError> {
+    observe_once_with_clock(port, invoices, network, targets, || observed_at).await
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+async fn observe_once_with_clock(
+    port: &dyn ElectrumPort,
+    invoices: &InvoiceStore,
+    network: &BitcoinNetwork,
+    targets: &[ObservationTarget],
+    clock: impl FnOnce() -> OffsetDateTime,
+) -> Result<usize, ObserverError> {
+    let observations = port.observations(targets).await?;
+    let observations = validate_batch(observations, network, targets)?;
+    invoices
+        .apply_bitcoin_observation_batch_at(&observations, clock())
         .await
         .map_err(map_persistence)
 }

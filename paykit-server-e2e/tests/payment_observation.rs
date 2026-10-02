@@ -13,10 +13,11 @@ use paykit_server::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
         InvoicePayloads, InvoiceStore, PersistenceError, run_migrations,
     },
-    workers::observer::{ElectrumPort, ObserverError, observe_once},
+    workers::observer::{ElectrumPort, ObserverError, observe_once, observe_once_at},
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::Row;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 mod common;
 
@@ -95,9 +96,12 @@ async fn invoice_for(
             creator: &creator(),
             reader: &reader(),
             bundle_binding: bundle,
+            lock_resource_binding: b"payment-observation-lock",
             payment_request_binding: request,
             invoice_payloads: &PAYLOADS,
             required_sats: 100,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap();
@@ -138,9 +142,12 @@ async fn other_creator_invoice(
             creator: &other_creator(),
             reader: &reader(),
             bundle_binding: bundle,
+            lock_resource_binding: b"payment-observation-lock",
             payment_request_binding: request,
             invoice_payloads: &FixedPayloads(address),
             required_sats: 100,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap()
@@ -194,9 +201,12 @@ async fn batch_invoice(database: &TestDatabase) -> (InvoiceStore, uuid::Uuid) {
             creator: &creator(),
             reader: &reader(),
             bundle_binding: b"batch-bundle",
+            lock_resource_binding: b"batch-lock",
             payment_request_binding: b"batch-request",
             invoice_payloads: &FixedPayloads(REGTEST_ADDRESS),
             required_sats: 100,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
         })
         .await
         .unwrap()
@@ -224,6 +234,553 @@ async fn assert_invoice_has_no_observation_writes(database: &TestDatabase, invoi
             .unwrap(),
         0
     );
+}
+
+fn timestamp(value: &str) -> OffsetDateTime {
+    OffsetDateTime::parse(value, &Rfc3339).unwrap()
+}
+
+async fn set_invoice_deadline(
+    database: &TestDatabase,
+    invoice_id: uuid::Uuid,
+    deadline: OffsetDateTime,
+) {
+    sqlx::query(
+        "UPDATE invoices
+         SET invoice_created_at = $1 - INTERVAL '24 hours',
+             proposal_expires_at = $1 - INTERVAL '23 hours',
+             payment_deadline = $1
+         WHERE id = $2",
+    )
+    .bind(deadline)
+    .bind(invoice_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+}
+
+async fn install_decision_clock_audit(database: &TestDatabase) {
+    sqlx::query(
+        "CREATE TABLE decision_clock_audit (
+             decision_at TIMESTAMPTZ NOT NULL,
+             database_at TIMESTAMPTZ NOT NULL
+         )",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE FUNCTION audit_invoice_decision_clock() RETURNS trigger AS $$
+         BEGIN
+             IF NEW.payment_expired_at IS DISTINCT FROM OLD.payment_expired_at THEN
+                 INSERT INTO decision_clock_audit VALUES
+                     (NEW.payment_expired_at, clock_timestamp());
+             ELSIF NEW.first_amount_matched_observed_at IS DISTINCT FROM
+                   OLD.first_amount_matched_observed_at THEN
+                 INSERT INTO decision_clock_audit VALUES
+                     (NEW.first_amount_matched_observed_at, clock_timestamp());
+             END IF;
+             RETURN NEW;
+         END;
+         $$ LANGUAGE plpgsql",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER audit_invoice_decision_clock
+         AFTER UPDATE ON invoices
+         FOR EACH ROW EXECUTE FUNCTION audit_invoice_decision_clock()",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn amount_match_at_deadline_persists_first_observation_and_continues_confirmations() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+    let deadline = timestamp("2030-01-02T00:00:00Z");
+    set_invoice_deadline(&database, invoice_id, deadline).await;
+    let initial_provider_outpoint = provider_outpoint(90);
+    let outpoint = BitcoinOutpoint::from_bitcoin(initial_provider_outpoint);
+
+    assert_eq!(
+        observe_once_at(
+            &FixedBatch(vec![ObservedOutput {
+                network: BitcoinNetwork::Regtest,
+                address: REGTEST_ADDRESS.into(),
+                outpoint: initial_provider_outpoint,
+                sats: 100,
+                confirmations: 0,
+                present: true,
+            }]),
+            &store,
+            &BitcoinNetwork::Regtest,
+            &[invoice_target()],
+            deadline,
+        )
+        .await,
+        Ok(1)
+    );
+    let lifecycle: (Option<OffsetDateTime>, Option<OffsetDateTime>) = sqlx::query_as(
+        "SELECT first_amount_matched_observed_at, payment_expired_at FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(lifecycle, (Some(deadline), None));
+    assert_eq!(
+        store
+            .observation_targets_at(deadline + time::Duration::hours(1))
+            .await
+            .unwrap(),
+        vec![tracked_invoice_target(initial_provider_outpoint, 100)]
+    );
+
+    assert!(
+        store
+            .apply_bitcoin_observation_at(
+                REGTEST_ADDRESS,
+                &outpoint,
+                100,
+                1,
+                true,
+                deadline + time::Duration::hours(1),
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("confirmed".into(), 1, true)
+    );
+
+    assert!(
+        store
+            .apply_bitcoin_observation_at(
+                REGTEST_ADDRESS,
+                &outpoint,
+                100,
+                0,
+                false,
+                deadline + time::Duration::hours(2),
+            )
+            .await
+            .unwrap()
+    );
+    let replacement = BitcoinOutpoint::from_bitcoin(provider_outpoint(94));
+    assert!(
+        store
+            .apply_bitcoin_observation_at(
+                REGTEST_ADDRESS,
+                &replacement,
+                100,
+                0,
+                true,
+                deadline + time::Duration::hours(3),
+            )
+            .await
+            .unwrap()
+    );
+    let lifecycle: (Option<OffsetDateTime>, Option<OffsetDateTime>) = sqlx::query_as(
+        "SELECT first_amount_matched_observed_at, payment_expired_at FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(lifecycle.0, Some(deadline));
+    assert!(lifecycle.1.is_some());
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn overdue_undetected_invoice_is_durably_expired_and_remains_observable_after_restart() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+    let deadline = timestamp("2030-01-02T00:00:00Z");
+    let after_deadline = deadline + time::Duration::microseconds(1);
+    set_invoice_deadline(&database, invoice_id, deadline).await;
+
+    assert_eq!(
+        store.observation_targets_at(after_deadline).await.unwrap(),
+        vec![invoice_target()]
+    );
+    let expired_at: Option<OffsetDateTime> =
+        sqlx::query_scalar("SELECT payment_expired_at FROM invoices WHERE id = $1")
+            .bind(invoice_id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(expired_at, Some(after_deadline));
+
+    let restarted = InvoiceStore::new(database.pool(), crypto());
+    assert_eq!(
+        restarted
+            .observation_targets_at(after_deadline)
+            .await
+            .unwrap(),
+        vec![invoice_target()]
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn first_late_match_is_persisted_as_factual_evidence_but_remains_expired() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+    let deadline = timestamp("2030-01-02T00:00:00Z");
+    let observed_at = deadline + time::Duration::microseconds(1);
+    set_invoice_deadline(&database, invoice_id, deadline).await;
+    let provider_outpoint = provider_outpoint(89);
+    let outpoint = BitcoinOutpoint::from_bitcoin(provider_outpoint);
+
+    assert!(
+        store
+            .apply_bitcoin_observation_at(REGTEST_ADDRESS, &outpoint, 100, 0, true, observed_at,)
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("detected".into(), 0, true)
+    );
+    let lifecycle: (Option<OffsetDateTime>, Option<OffsetDateTime>, i64) = sqlx::query_as(
+        "SELECT first_amount_matched_observed_at, payment_expired_at,
+                (SELECT COUNT(*) FROM bitcoin_observations WHERE invoice_id = $1)
+         FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(lifecycle, (Some(observed_at), Some(observed_at), 1));
+    assert_eq!(
+        store
+            .observation_targets_at(observed_at + time::Duration::hours(1))
+            .await
+            .unwrap(),
+        vec![tracked_invoice_target(provider_outpoint, 100)]
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn production_target_expiry_uses_post_fence_postgres_time() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+    sqlx::query(
+        "UPDATE invoices
+         SET invoice_created_at = transaction_timestamp() - INTERVAL '25 hours',
+             proposal_expires_at = transaction_timestamp() - INTERVAL '24 hours',
+             payment_deadline = transaction_timestamp() - INTERVAL '1 hour'
+         WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    install_decision_clock_audit(&database).await;
+
+    assert_eq!(
+        store.observation_targets().await.unwrap(),
+        vec![invoice_target()]
+    );
+    let audit: (OffsetDateTime, OffsetDateTime) =
+        sqlx::query_as("SELECT decision_at, database_at FROM decision_clock_audit")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert!(audit.0 <= audit.1);
+    assert!(audit.1 - audit.0 < time::Duration::seconds(1));
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn production_bitcoin_observation_uses_post_fence_postgres_time() {
+    let database = TestDatabase::create().await;
+    let (store, _) = batch_invoice(&database).await;
+    install_decision_clock_audit(&database).await;
+
+    let outpoint = BitcoinOutpoint::from_bitcoin(provider_outpoint(97));
+    assert!(
+        store
+            .apply_bitcoin_observation(REGTEST_ADDRESS, &outpoint, 100, 0, true)
+            .await
+            .unwrap()
+    );
+    let audit: (OffsetDateTime, OffsetDateTime) =
+        sqlx::query_as("SELECT decision_at, database_at FROM decision_clock_audit")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert!(audit.0 <= audit.1);
+    assert!(audit.1 - audit.0 < time::Duration::seconds(1));
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn production_observation_samples_database_time_after_invoice_lock_wait() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+    let mut blocker = database.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE")
+        .bind(invoice_id)
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let deadline: OffsetDateTime = sqlx::query_scalar(
+        "UPDATE invoices
+         SET invoice_created_at = sampled.now + INTERVAL '300 milliseconds' - INTERVAL '24 hours',
+             proposal_expires_at = sampled.now + INTERVAL '300 milliseconds' - INTERVAL '23 hours',
+             payment_deadline = sampled.now + INTERVAL '300 milliseconds'
+         FROM (SELECT clock_timestamp() AS now) AS sampled
+         WHERE id = $1 RETURNING payment_deadline",
+    )
+    .bind(invoice_id)
+    .fetch_one(&mut *blocker)
+    .await
+    .unwrap();
+
+    let task = tokio::spawn(async move {
+        let outpoint = BitcoinOutpoint::from_bitcoin(provider_outpoint(98));
+        store
+            .apply_bitcoin_observation(REGTEST_ADDRESS, &outpoint, 100, 0, true)
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    blocker.commit().await.unwrap();
+    assert!(task.await.unwrap().unwrap());
+
+    let lifecycle: (Option<OffsetDateTime>, Option<OffsetDateTime>) = sqlx::query_as(
+        "SELECT first_amount_matched_observed_at, payment_expired_at
+         FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        lifecycle
+            .0
+            .is_some_and(|first_observed_at| first_observed_at > deadline)
+    );
+    assert!(lifecycle.1.is_some_and(|expired_at| expired_at > deadline));
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn late_qualifying_replacement_is_factual_without_upgrading_timeliness() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+    let deadline = timestamp("2030-01-02T00:00:00Z");
+    set_invoice_deadline(&database, invoice_id, deadline).await;
+    let underpayment = BitcoinOutpoint::from_bitcoin(provider_outpoint(91));
+    let late_match = BitcoinOutpoint::from_bitcoin(provider_outpoint(92));
+
+    assert!(
+        store
+            .apply_bitcoin_observation_at(
+                REGTEST_ADDRESS,
+                &underpayment,
+                99,
+                0,
+                true,
+                deadline - time::Duration::hours(1),
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .apply_bitcoin_observation_at(
+                REGTEST_ADDRESS,
+                &late_match,
+                100,
+                0,
+                true,
+                deadline + time::Duration::microseconds(1),
+            )
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("detected".into(), 0, true)
+    );
+    let lifecycle: (Option<OffsetDateTime>, Option<OffsetDateTime>, i64) = sqlx::query_as(
+        "SELECT first_amount_matched_observed_at, payment_expired_at,
+                (SELECT COUNT(*) FROM bitcoin_observations)
+         FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        lifecycle,
+        (
+            Some(deadline + time::Duration::microseconds(1)),
+            Some(deadline + time::Duration::microseconds(1)),
+            2,
+        )
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn expired_replacement_survives_stale_absence_applied_after_it() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+    let deadline = timestamp("2030-01-02T00:00:00Z");
+    set_invoice_deadline(&database, invoice_id, deadline).await;
+    let original_provider_outpoint = provider_outpoint(81);
+    let original = BitcoinOutpoint::from_bitcoin(original_provider_outpoint);
+    let replacement_provider_outpoint = provider_outpoint(82);
+    let replacement = BitcoinOutpoint::from_bitcoin(replacement_provider_outpoint);
+
+    assert!(
+        store
+            .apply_bitcoin_observation_at(REGTEST_ADDRESS, &original, 99, 0, true, deadline,)
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .apply_bitcoin_observation_at(
+                REGTEST_ADDRESS,
+                &replacement,
+                100,
+                0,
+                true,
+                deadline + time::Duration::microseconds(1),
+            )
+            .await
+            .unwrap()
+    );
+
+    assert!(
+        store
+            .apply_bitcoin_observation_at(
+                REGTEST_ADDRESS,
+                &original,
+                99,
+                0,
+                false,
+                deadline + time::Duration::microseconds(1),
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .observation_targets_at(deadline + time::Duration::hours(1))
+            .await
+            .unwrap(),
+        vec![tracked_invoice_target(replacement_provider_outpoint, 100)]
+    );
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("detected".into(), 0, true)
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn underpayment_at_deadline_is_persisted_and_terminally_expired() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+    let deadline = timestamp("2030-01-02T00:00:00Z");
+    set_invoice_deadline(&database, invoice_id, deadline).await;
+    let underpayment = BitcoinOutpoint::from_bitcoin(provider_outpoint(93));
+
+    assert!(
+        store
+            .apply_bitcoin_observation_at(REGTEST_ADDRESS, &underpayment, 99, 0, true, deadline,)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("detected".into(), 0, false)
+    );
+    let lifecycle: (Option<OffsetDateTime>, Option<OffsetDateTime>) = sqlx::query_as(
+        "SELECT first_amount_matched_observed_at, payment_expired_at FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(lifecycle, (None, Some(deadline)));
+    assert_eq!(
+        store.observation_targets_at(deadline).await.unwrap(),
+        vec![tracked_invoice_target(provider_outpoint(93), 99)]
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn matching_output_later_in_exact_deadline_batch_wins_before_expiry() {
+    let database = TestDatabase::create().await;
+    let (store, invoice_id) = batch_invoice(&database).await;
+    let deadline = timestamp("2030-01-02T00:00:00Z");
+    set_invoice_deadline(&database, invoice_id, deadline).await;
+
+    assert_eq!(
+        observe_once_at(
+            &FixedBatch(vec![
+                ObservedOutput {
+                    network: BitcoinNetwork::Regtest,
+                    address: REGTEST_ADDRESS.into(),
+                    outpoint: provider_outpoint(95),
+                    sats: 99,
+                    confirmations: 0,
+                    present: true,
+                },
+                ObservedOutput {
+                    network: BitcoinNetwork::Regtest,
+                    address: REGTEST_ADDRESS.into(),
+                    outpoint: provider_outpoint(96),
+                    sats: 100,
+                    confirmations: 0,
+                    present: true,
+                },
+            ]),
+            &store,
+            &BitcoinNetwork::Regtest,
+            &[invoice_target()],
+            deadline,
+        )
+        .await,
+        Ok(2)
+    );
+    let lifecycle: (Option<OffsetDateTime>, Option<OffsetDateTime>) = sqlx::query_as(
+        "SELECT first_amount_matched_observed_at, payment_expired_at FROM invoices WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(lifecycle, (Some(deadline), None));
+    assert_eq!(
+        facts(&database, invoice_id).await,
+        ("detected".into(), 0, true)
+    );
+
+    database.cleanup().await;
 }
 
 #[tokio::test]

@@ -77,6 +77,8 @@ impl Config {
                 client_id: client_id.clone(),
                 app_id: app_id.clone(),
                 network: PaykitNetwork::parse(&raw.paykit.network)?,
+                proposal_acceptance_window: raw.paykit.proposal_acceptance_window,
+                payment_window: raw.paykit.payment_window,
             },
             electrum: ElectrumConfig {
                 endpoint: electrum_endpoint,
@@ -176,6 +178,13 @@ impl Config {
         }
         if self.outbox.retry_initial > self.outbox.retry_max {
             return Err(ConfigError::InconsistentRetries("outbox"));
+        }
+        if self.paykit.proposal_acceptance_window.is_zero()
+            || self.paykit.proposal_acceptance_window.subsec_nanos() != 0
+            || self.paykit.payment_window.subsec_nanos() != 0
+            || self.paykit.proposal_acceptance_window >= self.paykit.payment_window
+        {
+            return Err(ConfigError::InvalidInvoiceWindows);
         }
         if self.rate_limits.max_pending_setup_flows > tokio::sync::Semaphore::MAX_PERMITS as u64 {
             return Err(ConfigError::ValueTooLarge(
@@ -338,6 +347,8 @@ pub struct PaykitConfig {
     pub client_id: ClientId,
     pub app_id: PaykitAppId,
     pub network: PaykitNetwork,
+    pub proposal_acceptance_window: Duration,
+    pub payment_window: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -525,6 +536,14 @@ pub enum ConfigError {
     UnsupportedPaykitClientId,
     #[error("paykit.network must be mainnet or testnet")]
     InvalidPaykitNetwork,
+    #[error("paykit.receiver_path_priority entries must be canonical Paykit receiver app segments")]
+    InvalidReceiverPathPriority,
+    #[error("paykit.receiver_path_priority must not be empty")]
+    EmptyReceiverPathPriority,
+    #[error("paykit.receiver_path_priority must not contain duplicates")]
+    DuplicateReceiverPathPriority,
+    #[error("paykit proposal acceptance window must be positive and shorter than payment window")]
+    InvalidInvoiceWindows,
     #[error("{0} must be greater than zero")]
     ZeroDuration(&'static str),
     #[error("{0} must be greater than zero")]
@@ -649,6 +668,21 @@ struct RawPaykitConfig {
     client_id: Option<String>,
     app_id: String,
     network: String,
+    #[serde(
+        default = "default_proposal_acceptance_window",
+        with = "humantime_serde"
+    )]
+    proposal_acceptance_window: Duration,
+    #[serde(default = "default_payment_window", with = "humantime_serde")]
+    payment_window: Duration,
+}
+
+const fn default_proposal_acceptance_window() -> Duration {
+    Duration::from_secs(60 * 60)
+}
+
+const fn default_payment_window() -> Duration {
+    Duration::from_secs(24 * 60 * 60)
 }
 
 #[derive(Deserialize)]
