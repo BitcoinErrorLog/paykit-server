@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 /// Application services and explicit side-effect ports.
 pub mod application;
 /// Bitcoin output observation values and injected transport boundary.
@@ -20,12 +22,13 @@ pub mod metrics;
 pub mod paykit;
 /// PostgreSQL persistence primitives and migrations.
 pub mod persistence;
-/// Concrete normal-AUTH, companion-claim, marker, and encrypted-store setup flow.
+/// Concrete normal-AUTH, companion-claim, app publication, and credential setup flow.
 pub mod real_setup;
 /// Server lifecycle, dependency checks, admission control, and shutdown.
 pub mod runtime;
 pub mod server;
 pub mod setup;
+mod setup_diagnostics;
 /// Relay receive/ack boundary and durable-before-ack setup orchestration.
 pub mod setup_orchestration;
 /// Fail-closed database and Creator-state initialization before HTTP bind.

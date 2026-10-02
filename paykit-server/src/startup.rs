@@ -26,7 +26,7 @@ pub enum StartupError {
     /// Deployment cryptographic state could not be constructed.
     #[error("cryptographic initialization failed")]
     Crypto,
-    /// At least one persisted Creator or SDK state could not be authenticated.
+    /// At least one persisted Creator or payment record could not be authenticated.
     #[error("creator integrity check failed")]
     CreatorIntegrity,
     /// At least one encrypted Bitcoin payment record failed authentication.
@@ -35,10 +35,10 @@ pub enum StartupError {
 }
 
 /// Connects, migrates, validates deployment invariants, and authenticates every
-/// persisted Creator credential and SDK state before returning a ready database.
+/// persisted Creator credential and payment record before returning a ready database.
 pub async fn initialize_database(config: &Config) -> Result<PgPool, StartupError> {
     let pool = PgPoolOptions::new()
-        .connect(config.database_url())
+        .connect_with(config.database_options().clone())
         .await
         .map_err(|_| StartupError::Connection)?;
     run_migrations(&pool)

@@ -19,14 +19,30 @@ use paykit_server::runtime::{
 };
 use paykit_server::{
     Server,
-    config::{Config, ConfigEnvironment},
+    config::{Config, ConfigEnvironment, ConfigError},
 };
 use tower::ServiceExt;
+use tracing::{Event, Subscriber, instrument::WithSubscriber};
+use tracing_subscriber::{Layer, layer::Context, prelude::*};
 
 const CONFIG_KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 const CONFIG_MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 
 fn production_config(electrum_endpoint: &str) -> Config {
+    production_config_with_setup_logging(electrum_endpoint, false)
+}
+
+fn production_config_with_setup_logging(
+    electrum_endpoint: &str,
+    log_authorization_url: bool,
+) -> Config {
+    try_production_config_with_setup_logging(electrum_endpoint, log_authorization_url).unwrap()
+}
+
+fn try_production_config_with_setup_logging(
+    electrum_endpoint: &str,
+    log_authorization_url: bool,
+) -> Result<Config, ConfigError> {
     let source = format!(
         r#"
 [http]
@@ -35,8 +51,10 @@ listen_addr = "127.0.0.1:0"
 trusted_public_key = "{CONFIG_KEY}"
 [setup]
 allowed_origins = ["https://app.example"]
+log_authorization_url = {log_authorization_url}
 [paykit]
-receiver_path = "paykit/server"
+client_id = "app.paykit.server"
+app_id = "paykit-server"
 network = "testnet"
 [bitcoin]
 network = "testnet"
@@ -55,7 +73,6 @@ poll_interval = "1s"
             master_key: Some(CONFIG_MASTER_KEY.into()),
         },
     )
-    .unwrap()
 }
 
 fn lazy_pool() -> sqlx::PgPool {
@@ -63,6 +80,45 @@ fn lazy_pool() -> sqlx::PgPool {
         .acquire_timeout(Duration::from_millis(5))
         .connect_lazy("postgres://127.0.0.1:1/paykit")
         .unwrap()
+}
+
+type CapturedSetupEventFields = Vec<Vec<(String, String)>>;
+
+#[derive(Clone, Default)]
+struct SetupEventCapture(Arc<std::sync::Mutex<CapturedSetupEventFields>>);
+
+impl<S> Layer<S> for SetupEventCapture
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        let mut fields = Vec::new();
+        event.record(&mut RuntimeFieldVisitor(&mut fields));
+        self.0.lock().unwrap().push(fields);
+    }
+}
+
+impl SetupEventCapture {
+    fn authorization_url_event_count(&self) -> usize {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|fields| {
+                fields.iter().any(|(name, value)| {
+                    name == "event" && value.contains("paykit_setup_authorization_url")
+                })
+            })
+            .count()
+    }
+}
+
+struct RuntimeFieldVisitor<'a>(&'a mut Vec<(String, String)>);
+
+impl tracing::field::Visit for RuntimeFieldVisitor<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn core::fmt::Debug) {
+        self.0.push((field.name().to_owned(), format!("{value:?}")));
+    }
 }
 
 struct Check(AtomicBool);
@@ -277,6 +333,38 @@ async fn metrics_have_no_user_controlled_labels_or_identifiers() {
 }
 
 #[tokio::test]
+async fn production_constructor_propagates_setup_authorization_url_logging_config() {
+    for (enabled, expected_count) in [(false, 0), (true, 1)] {
+        let server = Server::build(
+            production_config_with_setup_logging("tcp://127.0.0.1:1", enabled),
+            lazy_pool(),
+        )
+        .await
+        .unwrap();
+        let capture = SetupEventCapture::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let mut request = Request::get(
+            "/setup?return_to=https://app.example/callback&state=production-propagation",
+        )
+        .body(Body::empty())
+        .unwrap();
+        request.extensions_mut().insert(axum::extract::ConnectInfo(
+            "127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap(),
+        ));
+
+        let response = server
+            .router()
+            .oneshot(request)
+            .with_subscriber(subscriber)
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(capture.authorization_url_event_count(), expected_count);
+    }
+}
+
+#[tokio::test]
 async fn production_constructor_mounts_all_routes() {
     let server = Server::build(production_config("tcp://127.0.0.1:1"), lazy_pool())
         .await
@@ -292,9 +380,19 @@ async fn production_constructor_mounts_all_routes() {
             StatusCode::UNAUTHORIZED,
         ),
         (
+            Request::post("/connections/status")
+                .body(Body::empty())
+                .unwrap(),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
             Request::post("/transactions/status")
                 .body(Body::empty())
                 .unwrap(),
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            Request::post("/setup/status").body(Body::empty()).unwrap(),
             StatusCode::UNAUTHORIZED,
         ),
         (
@@ -331,14 +429,13 @@ async fn production_constructor_allows_electrum_to_be_temporarily_unavailable() 
     );
 }
 
-#[tokio::test]
-async fn production_constructor_rejects_malformed_electrum_adapter_configuration() {
-    assert!(
-        Server::build(
-            production_config("https://electrum.example:50002/path?token=secret"),
-            lazy_pool(),
-        )
-        .await
-        .is_err()
-    );
+#[test]
+fn config_rejects_malformed_electrum_adapter_configuration_before_server_construction() {
+    assert!(matches!(
+        try_production_config_with_setup_logging(
+            "https://electrum.example:50002/path?token=secret",
+            false,
+        ),
+        Err(ConfigError::InvalidElectrumEndpoint)
+    ));
 }

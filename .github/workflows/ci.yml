@@ -1,22 +1,84 @@
 name: CI
 
 on:
-  push:
   pull_request:
+  push:
+    branches: [master]
 
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
-  workspace:
-    name: Workspace checks
+  formatting:
+    name: Formatting
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        continue-on-error: true
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  server-tests:
+    name: Server tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Show toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        continue-on-error: true
+
+      - name: Run server tests
+        run: cargo test --locked -p paykit-server -- --test-threads=1
+
+      - name: Run companion helper example tests
+        run: cargo test --locked -p paykit-server --example paykit-companion-auth -- --test-threads=1
+
+  postgres-e2e:
+    name: PostgreSQL E2E
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-
     services:
       postgres:
         image: postgres:16-bookworm
@@ -31,11 +93,8 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 12
-
     env:
-      CARGO_TERM_COLOR: always
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-
     steps:
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -45,14 +104,13 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Check formatting
-        run: cargo fmt --all --check
-
-      - name: Run Clippy
-        run: cargo clippy --locked --workspace --all-targets -- -D warnings
-
-      - name: Run server tests
-        run: cargo test --locked -p paykit-server -- --test-threads=1
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        continue-on-error: true
 
       - name: Run PostgreSQL E2E tests
         run: cargo test --locked -p paykit-server-e2e -- --test-threads=1
+
+      - name: Print PostgreSQL logs after failure
+        if: failure()
+        run: docker logs "${{ job.services.postgres.id }}"

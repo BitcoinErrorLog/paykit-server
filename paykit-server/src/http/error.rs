@@ -13,11 +13,13 @@ pub enum ApiError {
     RateLimited,
     CreatorSessionInvalid,
     CreatorSessionUnavailable,
+    DependencyUnavailable,
     DependencyTimeout,
     InvoiceConflict,
     InvoiceNotFound,
     InternalError,
     LockNotFound,
+    LockResourceUnavailable,
 }
 
 #[derive(Serialize)]
@@ -64,6 +66,11 @@ impl ApiError {
                 "creator_session_unavailable",
                 "creator session is unavailable",
             ),
+            Self::DependencyUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "dependency_unavailable",
+                "dependency is unavailable",
+            ),
             Self::DependencyTimeout => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "dependency_timeout",
@@ -88,6 +95,11 @@ impl ApiError {
                 StatusCode::NOT_FOUND,
                 "lock_not_found",
                 "lock resource was not found",
+            ),
+            Self::LockResourceUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "lock_resource_unavailable",
+                "lock resource is unavailable",
             ),
         }
     }

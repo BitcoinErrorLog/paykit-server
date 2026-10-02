@@ -17,7 +17,7 @@ use bitcoin::{Address, Network, constants::genesis_block};
 
 use crate::{
     bitcoin::{ObservationTarget, ObservedOutput},
-    config::BitcoinNetwork,
+    config::{BitcoinNetwork, validate_electrum_endpoint},
     domain::payment::BitcoinOutpoint,
     persistence::{BitcoinObservationInput, InvoiceStore, PersistenceError},
 };
@@ -57,18 +57,7 @@ impl ElectrumAdapter {
         retries: u8,
     ) -> Result<Self, ObserverError> {
         let endpoint = endpoint.into();
-        let parsed = url::Url::parse(&endpoint).map_err(|_| ObserverError::Unavailable)?;
-        if !matches!(parsed.scheme(), "tcp" | "ssl")
-            || parsed.host_str().is_none()
-            || parsed.port().is_none()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || !matches!(parsed.path(), "" | "/")
-            || parsed.query().is_some()
-            || parsed.fragment().is_some()
-        {
-            return Err(ObserverError::Unavailable);
-        }
+        validate_electrum_endpoint(&endpoint).map_err(|_| ObserverError::Unavailable)?;
         Ok(Self {
             endpoint: endpoint.into(),
             network,

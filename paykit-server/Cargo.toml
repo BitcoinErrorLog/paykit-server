@@ -1,6 +1,6 @@
 [package]
 name = "paykit-server"
-version = "0.1.0"
+version = "0.1.0-rc4"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -31,12 +31,14 @@ paykit-lib.workspace = true
 paykit-sdk.workspace = true
 pubky.workspace = true
 prometheus-client.workspace = true
+qrcode.workspace = true
 postcard.workspace = true
 serde.workspace = true
 serde_ignored.workspace = true
 serde_json.workspace = true
 serde_json_canonicalizer.workspace = true
 rand.workspace = true
+rustls-pki-types.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true

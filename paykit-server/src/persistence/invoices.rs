@@ -12,22 +12,21 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    application::payment_status::PersistedPaymentStatus,
-    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    application::{
+        connection_status::ConnectionBinding, payment_status::PersistedPaymentStatus,
+        semantic_intent::DeliveryIntentV1,
+    },
     bitcoin::{DirectBinding, ObservationAction, ObservationTarget, TrackedOutput},
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
-    domain::locks::{CreatorPubky, ReaderPubky},
+    domain::locks::{BundleId, CreatorPubky, ReaderPubky, parse_reader},
     domain::payment::BitcoinOutpoint,
     persistence::PersistenceError,
 };
 
 /// Opaque inputs for one transactional invoice-allocation operation.
 ///
-/// `endpoint_publication_payload` is persisted only when the reader has no
-/// assignment yet. In that case the payment-request intent depends on its
-/// outbox row. For an existing reader, no new endpoint publication is invented:
-/// the application must have established that the existing reader endpoint is
-/// ready before it asks this store to enqueue a payment request.
+/// The allocation callback binds the invoice address into the complete Payment
+/// Request before either the invoice or its outbox intent is persisted.
 pub struct AtomicInvoiceInput<'a> {
     pub creator: &'a CreatorPubky,
     pub reader: &'a ReaderPubky,
@@ -35,18 +34,16 @@ pub struct AtomicInvoiceInput<'a> {
     pub bundle_binding: &'a [u8],
     /// Exact payment-request binding for idempotent replay detection.
     pub payment_request_binding: &'a [u8],
-    /// Derives the encrypted assignment and endpoint payloads only after this
+    /// Derives the address and complete request only after this
     /// transaction has selected the permanent child index.
-    pub new_reader_payloads: &'a dyn NewReaderPayloadFactory,
-    /// Complete Payment Request proposal intent. Exact replay does not rebuild it.
-    pub payment_request_intent: DeliveryIntentV1,
+    pub invoice_payloads: &'a dyn InvoicePayloadFactory,
     /// Settlement-authoritative integer satoshi amount captured from the lock.
     pub required_sats: u64,
 }
 
-/// Private payloads for a newly allocated `(creator, reader)` assignment.
-pub struct NewReaderPayloads {
-    pub endpoint_intent: DeliveryIntentV1,
+/// Private payloads for a newly allocated invoice.
+pub struct InvoicePayloads {
+    pub payment_request_intent: DeliveryIntentV1,
     /// Invoice-specific BIP84 P2WPKH address derived at the allocated index.
     pub bitcoin_address: String,
 }
@@ -75,8 +72,8 @@ pub(crate) struct BitcoinObservationInput {
 }
 
 /// Produces payloads after the creator-row lock determines the child index.
-pub trait NewReaderPayloadFactory: Send + Sync {
-    fn for_child_index(&self, child_index: i64) -> Result<NewReaderPayloads, PersistenceError>;
+pub trait InvoicePayloadFactory: Send + Sync {
+    fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError>;
 }
 
 /// Secret-free identifiers returned by an atomic allocation attempt.
@@ -84,7 +81,6 @@ pub trait NewReaderPayloadFactory: Send + Sync {
 pub struct AtomicInvoiceResult {
     invoice_id: Uuid,
     payment_request_outbox_id: Uuid,
-    endpoint_publication_outbox_id: Option<Uuid>,
     reader_assignment_id: Uuid,
     reader_child_index: i64,
     replayed: bool,
@@ -99,7 +95,7 @@ pub enum InvoicePreflight {
 }
 
 impl AtomicInvoiceResult {
-    /// Builds the secret-free result returned by an invoice persistence adapter.
+    /// Builds the result returned by an invoice persistence adapter.
     ///
     /// This is public because [`crate::application::create_invoice::InvoicePersistence`]
     /// is an injected port; alternate adapters must be able to report a completed
@@ -107,7 +103,6 @@ impl AtomicInvoiceResult {
     pub fn new(
         invoice_id: Uuid,
         payment_request_outbox_id: Uuid,
-        endpoint_publication_outbox_id: Option<Uuid>,
         reader_assignment_id: Uuid,
         reader_child_index: i64,
         replayed: bool,
@@ -115,7 +110,6 @@ impl AtomicInvoiceResult {
         Self {
             invoice_id,
             payment_request_outbox_id,
-            endpoint_publication_outbox_id,
             reader_assignment_id,
             reader_child_index,
             replayed,
@@ -128,12 +122,6 @@ impl AtomicInvoiceResult {
 
     pub fn payment_request_outbox_id(&self) -> Uuid {
         self.payment_request_outbox_id
-    }
-
-    /// Returns the endpoint-publication intent that gates this payment request,
-    /// when this invoice required one.
-    pub fn endpoint_publication_outbox_id(&self) -> Option<Uuid> {
-        self.endpoint_publication_outbox_id
     }
 
     pub fn reader_assignment_id(&self) -> Uuid {
@@ -340,7 +328,7 @@ impl InvoiceStore {
         let bundle_hash = self.crypto.lookup_hash(bundle_binding);
         let payment_hash = self.crypto.lookup_hash(payment_request_binding);
         let existing = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT invoices.id, invoices.payment_request_lookup_hash FROM invoices \
+            "SELECT invoices.payment_request_lookup_hash FROM invoices \
              JOIN creators ON creators.id = invoices.creator_id \
              WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
         )
@@ -356,6 +344,48 @@ impl InvoiceStore {
             }
             Some(_) => InvoicePreflight::Conflict,
         })
+    }
+
+    /// Loads the accepted Reader identity for one persisted invoice.
+    ///
+    /// This is a read-only lookup. It does not lock rows, replay invoice creation,
+    /// or invoke any Paykit SDK operation.
+    pub async fn connection_binding(
+        &self,
+        creator: &CreatorPubky,
+        bundle_id: &BundleId,
+    ) -> Result<Option<ConnectionBinding>, PersistenceError> {
+        let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        let bundle_hash = self.crypto.lookup_hash(bundle_id.to_string().as_bytes());
+        let row = sqlx::query_as::<_, ConnectionBindingRow>(
+            "SELECT invoices.id, creators.creator_lookup_hash, invoices.invoice_envelope \
+             FROM invoices JOIN creators ON creators.id = invoices.creator_id \
+             WHERE creators.creator_lookup_hash = $1 AND invoices.bundle_lookup_hash = $2",
+        )
+        .bind(creator_hash.as_bytes().as_slice())
+        .bind(bundle_hash.as_bytes().as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+
+        row.map(|row| {
+            if lookup_hash(&row.creator_lookup_hash)? != creator_hash {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+            let plaintext = self
+                .crypto
+                .decrypt(
+                    &EnvelopeContext::invoice(creator_hash, row.id),
+                    &EncryptedEnvelope::from_bytes(row.invoice_envelope),
+                )
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            let intent = DeliveryIntentV1::decode(&plaintext)
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            let reader = parse_reader(intent.reader_pubky())
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            Ok(ConnectionBinding::new(reader))
+        })
+        .transpose()
     }
 
     /// Loads an exact replay without rebuilding delivery intent or repeating
@@ -388,8 +418,8 @@ impl InvoiceStore {
         if lookup_hash(&creator.creator_lookup_hash)? != creator_hash {
             return Err(PersistenceError::CorruptOrMissing);
         }
-        let existing = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT id, payment_request_lookup_hash FROM invoices \
+        let existing = sqlx::query_as::<_, ReplayInvoice>(
+            "SELECT id, payment_request_lookup_hash, invoice_envelope FROM invoices \
              WHERE creator_id = $1 AND bundle_lookup_hash = $2 FOR UPDATE",
         )
         .bind(creator.id)
@@ -401,13 +431,13 @@ impl InvoiceStore {
         if existing.payment_request_lookup_hash != payment_hash.as_bytes() {
             return Err(PersistenceError::Conflict);
         }
+        self.validate_replay_intent(creator_hash, existing.id, existing.invoice_envelope, reader)?;
         let assignment = self
             .load_assignment(&mut tx, creator.id, reader_hash, bundle_hash, creator_hash)
             .await?
             .ok_or(PersistenceError::CorruptOrMissing)?;
         let payment_outbox = sqlx::query_as::<_, ExistingPaymentOutbox>(
-            "SELECT id, depends_on_id FROM outbox WHERE invoice_id = $1 \
-             AND depends_on_id IS NOT NULL ORDER BY created_at, id LIMIT 1",
+            "SELECT id FROM outbox WHERE invoice_id = $1",
         )
         .bind(existing.id)
         .fetch_optional(&mut *tx)
@@ -420,7 +450,6 @@ impl InvoiceStore {
         Ok(AtomicInvoiceResult {
             invoice_id: existing.id,
             payment_request_outbox_id: payment_outbox.id,
-            endpoint_publication_outbox_id: payment_outbox.depends_on_id,
             reader_assignment_id: assignment.id,
             reader_child_index: assignment.child_index,
             replayed: true,
@@ -712,8 +741,8 @@ impl InvoiceStore {
         Ok(true)
     }
 
-    /// Atomically resolves the creator, checks replay, allocates/reuses a
-    /// reader, persists an invoice, and inserts ordered encrypted outbox work.
+    /// Atomically checks replay, allocates an invoice address, and persists its
+    /// complete bound Payment Request in the invoice and encrypted outbox.
     pub async fn create_atomic(
         &self,
         input: AtomicInvoiceInput<'_>,
@@ -743,8 +772,8 @@ impl InvoiceStore {
             return Err(PersistenceError::CorruptOrMissing);
         }
 
-        if let Some(existing) = sqlx::query_as::<_, ExistingInvoice>(
-            "SELECT id, payment_request_lookup_hash FROM invoices \
+        if let Some(existing) = sqlx::query_as::<_, ReplayInvoice>(
+            "SELECT id, payment_request_lookup_hash, invoice_envelope FROM invoices \
              WHERE creator_id = $1 AND bundle_lookup_hash = $2 FOR UPDATE",
         )
         .bind(creator.id)
@@ -756,14 +785,18 @@ impl InvoiceStore {
             if existing.payment_request_lookup_hash != payment_request_hash.as_bytes() {
                 return Err(PersistenceError::Conflict);
             }
+            self.validate_replay_intent(
+                creator_hash,
+                existing.id,
+                existing.invoice_envelope,
+                input.reader,
+            )?;
             let assignment = self
                 .load_assignment(&mut tx, creator.id, reader_hash, bundle_hash, creator_hash)
                 .await?
                 .ok_or(PersistenceError::CorruptOrMissing)?;
             let payment_request_outbox = sqlx::query_as::<_, ExistingPaymentOutbox>(
-                "SELECT id, depends_on_id FROM outbox \
-                 WHERE invoice_id = $1 AND depends_on_id IS NOT NULL \
-                 ORDER BY created_at, id LIMIT 1",
+                "SELECT id FROM outbox WHERE invoice_id = $1",
             )
             .bind(existing.id)
             .fetch_optional(&mut *tx)
@@ -776,35 +809,39 @@ impl InvoiceStore {
             return Ok(AtomicInvoiceResult {
                 invoice_id: existing.id,
                 payment_request_outbox_id: payment_request_outbox.id,
-                endpoint_publication_outbox_id: payment_request_outbox.depends_on_id,
                 reader_assignment_id: assignment.id,
                 reader_child_index: assignment.child_index,
                 replayed: true,
             });
         }
 
-        validate_intent(&input.payment_request_intent, input.reader, false)?;
-        let (assignment, endpoint_publication_outbox_id, bitcoin_address) = match self
+        let (assignment, payloads) = match self
             .load_assignment(&mut tx, creator.id, reader_hash, bundle_hash, creator_hash)
             .await?
         {
             // A row for this triple must have been returned by the replay lookup
-            // above. Anything else is legacy/corrupt state, never a reusable address.
+            // above. Anything else is inconsistent state, never a reusable address.
             Some(_) => return Err(PersistenceError::CorruptOrMissing),
             None => {
                 let payloads = input
-                    .new_reader_payloads
+                    .invoice_payloads
                     .for_child_index(creator.next_child_index)?;
-                validate_intent(&payloads.endpoint_intent, input.reader, true)?;
+                validate_intent(&payloads.payment_request_intent, input.reader)?;
+                let terms = payloads.payment_request_intent.terms();
+                if terms.payment_endpoints.len() != 1
+                    || terms.payment_endpoints.values().any(|payload| {
+                        serde_json::from_str::<serde_json::Value>(payload).ok()
+                            != Some(serde_json::json!({ "value": payloads.bitcoin_address }))
+                    })
+                {
+                    return Err(PersistenceError::CorruptOrMissing);
+                }
                 let assignment_id = Uuid::new_v4();
-                let endpoint_plaintext = postcard::to_allocvec(&payloads.endpoint_intent)
-                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
                 let envelope = encrypt_assignment(
                     &self.crypto,
                     creator_hash,
                     assignment_id,
                     creator.next_child_index,
-                    &endpoint_plaintext,
                 )?;
                 sqlx::query(
                     "INSERT INTO reader_assignments \
@@ -828,45 +865,23 @@ impl InvoiceStore {
                 .await
                 .map_err(|_| PersistenceError::Unavailable)?;
 
-                let endpoint_id = Uuid::new_v4();
-                let endpoint_envelope = self
-                    .crypto
-                    .encrypt(
-                        &EnvelopeContext::outbox_semantic_intent(creator_hash, endpoint_id),
-                        &endpoint_plaintext,
-                    )
-                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
-
-                insert_outbox(
-                    &mut tx,
-                    OutboxInsert {
-                        id: endpoint_id,
-                        creator_id: creator.id,
-                        invoice_id: None,
-                        intent_envelope: endpoint_envelope.as_bytes(),
-                        depends_on_id: None,
-                        reader_assignment_id: Some(assignment_id),
-                    },
-                )
-                .await?;
                 (
                     Assignment {
                         id: assignment_id,
                         child_index: creator.next_child_index,
                     },
-                    Some(endpoint_id),
-                    payloads.bitcoin_address,
+                    payloads,
                 )
             }
         };
 
-        let payment_request_plaintext = postcard::to_allocvec(&input.payment_request_intent)
+        let payment_request_plaintext = postcard::to_allocvec(&payloads.payment_request_intent)
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         let invoice_id = Uuid::new_v4();
         let payment_record_plaintext = postcard::to_allocvec(&InvoicePaymentRecordV1 {
             version: 1,
             derivation_index: assignment.child_index,
-            bitcoin_address: bitcoin_address.clone(),
+            bitcoin_address: payloads.bitcoin_address.clone(),
             required_sats: input.required_sats,
         })
         .map_err(|_| PersistenceError::CorruptOrMissing)?;
@@ -879,7 +894,7 @@ impl InvoiceStore {
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         let bitcoin_address_lookup_hash = self
             .crypto
-            .bitcoin_address_lookup_hash(bitcoin_address.as_bytes());
+            .bitcoin_address_lookup_hash(payloads.bitcoin_address.as_bytes());
         let derivation_index_lookup_hash = self
             .crypto
             .bitcoin_derivation_index_lookup_hash(creator_hash, assignment.child_index);
@@ -907,14 +922,6 @@ impl InvoiceStore {
         .execute(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Conflict)?;
-        // Endpoint publication is invoice-scoped, not a reusable reader assignment.
-        sqlx::query("UPDATE outbox SET invoice_id = $1 WHERE id = $2")
-            .bind(invoice_id)
-            .bind(endpoint_publication_outbox_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|_| PersistenceError::Unavailable)?;
-
         let payment_request_outbox_id = Uuid::new_v4();
         let payment_request_envelope = self
             .crypto
@@ -929,10 +936,8 @@ impl InvoiceStore {
             OutboxInsert {
                 id: payment_request_outbox_id,
                 creator_id: creator.id,
-                invoice_id: Some(invoice_id),
+                invoice_id,
                 intent_envelope: payment_request_envelope.as_bytes(),
-                depends_on_id: endpoint_publication_outbox_id,
-                reader_assignment_id: None,
             },
         )
         .await?;
@@ -943,11 +948,30 @@ impl InvoiceStore {
         Ok(AtomicInvoiceResult {
             invoice_id,
             payment_request_outbox_id,
-            endpoint_publication_outbox_id,
             reader_assignment_id: assignment.id,
             reader_child_index: assignment.child_index,
             replayed: false,
         })
+    }
+
+    fn validate_replay_intent(
+        &self,
+        creator_hash: LookupHash,
+        invoice_id: Uuid,
+        invoice_envelope: Vec<u8>,
+        reader: &ReaderPubky,
+    ) -> Result<(), PersistenceError> {
+        let plaintext = self
+            .crypto
+            .decrypt(
+                &EnvelopeContext::invoice(creator_hash, invoice_id),
+                &EncryptedEnvelope::from_bytes(invoice_envelope),
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let intent =
+            DeliveryIntentV1::decode(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)?;
+        validate_intent(&intent, reader)?;
+        Ok(())
     }
 
     fn decrypt_observation(
@@ -1014,10 +1038,8 @@ impl InvoiceStore {
 struct OutboxInsert<'a> {
     id: Uuid,
     creator_id: Uuid,
-    invoice_id: Option<Uuid>,
+    invoice_id: Uuid,
     intent_envelope: &'a [u8],
-    depends_on_id: Option<Uuid>,
-    reader_assignment_id: Option<Uuid>,
 }
 
 async fn insert_outbox(
@@ -1026,15 +1048,13 @@ async fn insert_outbox(
 ) -> Result<(), PersistenceError> {
     sqlx::query(
         "INSERT INTO outbox \
-         (id, creator_id, invoice_id, intent_envelope, status, depends_on_id, reader_assignment_id) \
-         VALUES ($1, $2, $3, $4, 'queued', $5, $6)",
+         (id, creator_id, invoice_id, intent_envelope, status) \
+         VALUES ($1, $2, $3, $4, 'queued')",
     )
     .bind(row.id)
     .bind(row.creator_id)
     .bind(row.invoice_id)
     .bind(row.intent_envelope)
-    .bind(row.depends_on_id)
-    .bind(row.reader_assignment_id)
     .execute(&mut **tx)
     .await
     .map_err(|_| PersistenceError::Unavailable)?;
@@ -1044,7 +1064,6 @@ async fn insert_outbox(
 fn validate_intent(
     intent: &DeliveryIntentV1,
     reader: &ReaderPubky,
-    endpoint: bool,
 ) -> Result<(), PersistenceError> {
     intent
         .validate()
@@ -1052,11 +1071,7 @@ fn validate_intent(
     if intent.reader_pubky() != reader.to_string() {
         return Err(PersistenceError::CorruptOrMissing);
     }
-    match (endpoint, intent.operation()) {
-        (true, DeliveryOperationV1::EndpointPublication { .. })
-        | (false, DeliveryOperationV1::PaymentRequestProposal { .. }) => Ok(()),
-        _ => Err(PersistenceError::CorruptOrMissing),
-    }
+    Ok(())
 }
 
 fn lookup_hash_from_storage(bytes: &[u8]) -> Result<LookupHash, PersistenceError> {
@@ -1123,14 +1138,19 @@ struct ObservationTargetRow {
 
 #[derive(sqlx::FromRow)]
 struct ExistingInvoice {
+    payment_request_lookup_hash: Vec<u8>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ReplayInvoice {
     id: Uuid,
     payment_request_lookup_hash: Vec<u8>,
+    invoice_envelope: Vec<u8>,
 }
 
 #[derive(sqlx::FromRow)]
 struct ExistingPaymentOutbox {
     id: Uuid,
-    depends_on_id: Option<Uuid>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1138,6 +1158,13 @@ struct PaymentStatusRow {
     payment_status: String,
     confirmation_count: i32,
     amount_matched: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct ConnectionBindingRow {
+    id: Uuid,
+    creator_lookup_hash: Vec<u8>,
+    invoice_envelope: Vec<u8>,
 }
 
 impl TryFrom<PaymentStatusRow> for PersistedPaymentStatus {
@@ -1172,18 +1199,10 @@ struct Assignment {
     child_index: i64,
 }
 
-#[derive(Serialize)]
-struct ReaderAssignmentV1Ref<'a> {
-    version: u8,
-    child_index: i64,
-    opaque_payload: &'a [u8],
-}
-
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct ReaderAssignmentV1 {
     version: u8,
     child_index: i64,
-    opaque_payload: Vec<u8>,
 }
 
 fn encrypt_assignment(
@@ -1191,13 +1210,11 @@ fn encrypt_assignment(
     creator_hash: LookupHash,
     id: Uuid,
     child_index: i64,
-    opaque_payload: &[u8],
 ) -> Result<EncryptedEnvelope, PersistenceError> {
     let bytes = Zeroizing::new(
-        postcard::to_allocvec(&ReaderAssignmentV1Ref {
+        postcard::to_allocvec(&ReaderAssignmentV1 {
             version: 1,
             child_index,
-            opaque_payload,
         })
         .map_err(|_| PersistenceError::CorruptOrMissing)?,
     );
@@ -1228,8 +1245,6 @@ fn decrypt_assignment(
     if assignment.version != 1 || assignment.child_index < 0 {
         return Err(PersistenceError::CorruptOrMissing);
     }
-    // The opaque payload is intentionally never inspected or returned here.
-    let _ = assignment.opaque_payload;
     Ok(assignment.child_index)
 }
 

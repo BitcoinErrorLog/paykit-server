@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use paykit_server::config::{Config, ConfigEnvironment, PaykitNetwork};
+use paykit_server::config::{Config, ConfigEnvironment, ConfigError, PaykitNetwork};
 
 const KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
@@ -25,7 +25,8 @@ trusted_public_key = "{KEY}"
 allowed_origins = ["https://app.example"]
 
 [paykit]
-receiver_path = "paykit/server"
+client_id = "app.paykit.server"
+app_id = "paykit-server"
 network = "testnet"
 
 [bitcoin]
@@ -53,8 +54,8 @@ trusted_public_key = "{KEY}"
 allowed_origins = ["http://localhost:8080"]
 
 [paykit]
-receiver_path = "bitkit/server"
-receiver_path_priority = ["bitkit"]
+client_id = "app.paykit.server"
+app_id = "paykit-server"
 network = "testnet"
 
 [bitcoin]
@@ -71,16 +72,47 @@ poll_interval = "500ms"
 }
 
 #[test]
+fn setup_authorization_url_logging_defaults_to_disabled() {
+    let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
+
+    assert!(!config.setup.log_authorization_url);
+}
+
+#[test]
+fn setup_authorization_url_logging_accepts_explicit_true() {
+    let input = valid_toml().replace(
+        "allowed_origins = [\"https://app.example\"]",
+        "allowed_origins = [\"https://app.example\"]\nlog_authorization_url = true",
+    );
+    let config = Config::from_toml_and_environment(&input, environment()).unwrap();
+
+    assert!(config.setup.log_authorization_url);
+}
+
+#[test]
+fn setup_still_rejects_unknown_keys() {
+    let input = valid_toml().replace(
+        "allowed_origins = [\"https://app.example\"]",
+        "allowed_origins = [\"https://app.example\"]\nlog_authorisation_url = true",
+    );
+
+    assert!(Config::from_toml_and_environment(&input, environment()).is_err());
+}
+
+#[test]
 fn parses_exact_local_compose_config_contract() {
     let config = Config::from_toml_and_environment(&local_compose_toml(), environment())
         .expect("local Compose configuration");
 
-    assert_eq!(config.http.listen_addr, "0.0.0.0:3001");
+    assert_eq!(config.http.listen_addr().to_string(), "0.0.0.0:3001");
     assert_eq!(config.setup.allowed_origins, vec!["http://localhost:8080"]);
     assert_eq!(config.paykit.network, PaykitNetwork::Testnet);
-    assert_eq!(config.paykit.receiver_path.as_str(), "bitkit/server");
-    assert_eq!(config.paykit.receiver_path_priority.len(), 1);
-    assert_eq!(config.paykit.receiver_path_priority[0].as_str(), "bitkit");
+    assert_eq!(config.paykit.client_id.as_str(), "app.paykit.server");
+    assert_eq!(
+        config.deployment_invariants().paykit_client_id.as_str(),
+        "app.paykit.server"
+    );
+    assert_eq!(config.paykit.app_id.as_str(), "paykit-server");
     assert_eq!(
         config.deployment_invariants().bitcoin_network.as_str(),
         "regtest"
@@ -95,7 +127,7 @@ fn parses_exact_local_compose_config_contract() {
             120, 70, 178, 165, 123, 137, 126, 113, 9, 25, 183, 103, 9,
         ]
     );
-    assert_eq!(config.electrum.endpoint, "tcp://fulcrum:50001");
+    assert_eq!(config.electrum.endpoint(), "tcp://fulcrum:50001");
     assert_eq!(config.electrum.poll_interval, Duration::from_secs(1));
     assert_eq!(config.outbox.poll_interval, Duration::from_millis(500));
 }
@@ -129,6 +161,23 @@ fn rejects_unknown_toml_fields() {
     );
 
     assert!(Config::from_toml_and_environment(&config, environment()).is_err());
+}
+
+#[test]
+fn requires_a_nonempty_paykit_client_id() {
+    let missing = valid_toml().replace("client_id = \"app.paykit.server\"\n", "");
+    let empty = valid_toml().replace("client_id = \"app.paykit.server\"", "client_id = \"\"");
+    let other = valid_toml().replace(
+        "client_id = \"app.paykit.server\"",
+        "client_id = \"other.paykit.server\"",
+    );
+
+    assert!(matches!(
+        Config::from_toml_and_environment(&missing, environment()),
+        Err(ConfigError::MissingPaykitClientId)
+    ));
+    assert!(Config::from_toml_and_environment(&empty, environment()).is_err());
+    assert!(Config::from_toml_and_environment(&other, environment()).is_err());
 }
 
 #[test]
@@ -177,6 +226,19 @@ fn rejects_non_postgresql_database_url() {
     };
 
     assert!(Config::from_toml_and_environment(&valid_toml(), non_postgresql).is_err());
+}
+
+#[test]
+fn config_environment_debug_redacts_both_secrets() {
+    let environment = ConfigEnvironment {
+        database_url: Some("postgres://debug-user:debug-password@example.test/paykit".into()),
+        master_key: Some("debug-master-key".into()),
+    };
+
+    let rendered = format!("{environment:?}");
+    assert!(!rendered.contains("debug-password"));
+    assert!(!rendered.contains("debug-master-key"));
+    assert!(rendered.contains("<redacted>"));
 }
 
 #[test]
@@ -244,14 +306,14 @@ fn rejects_invalid_network_origin_key_zero_values_and_inconsistent_retries() {
     );
     assert!(Config::from_toml_and_environment(&inconsistent_retries, environment()).is_err());
 
-    for invalid_receiver_path in ["/paykit/receiver", "paykit/receiver", "paykit/server/extra"] {
+    for invalid_app_id in ["", "../paykit-server", "bitkit"] {
         let input = valid_toml().replace(
-            "receiver_path = \"paykit/server\"",
-            &format!("receiver_path = \"{invalid_receiver_path}\""),
+            "app_id = \"paykit-server\"",
+            &format!("app_id = \"{invalid_app_id}\""),
         );
         assert!(
             Config::from_toml_and_environment(&input, environment()).is_err(),
-            "{invalid_receiver_path} should be rejected"
+            "{invalid_app_id} should be rejected"
         );
     }
 }
@@ -306,7 +368,7 @@ fn parses_accepted_durations_and_uses_ledger_defaults() {
     assert_eq!(config.rate_limits.signed_requests_per_second, 100);
     assert_eq!(config.rate_limits.signed_burst, 200);
     assert_eq!(config.rate_limits.setup_per_ip_per_minute, 10);
-    assert_eq!(config.rate_limits.max_pending_setup_flows, 100);
+    assert_eq!(config.rate_limits.max_pending_setup_flows(), 100);
     assert_eq!(config.rate_limits.max_completion_polls_per_flow, 2);
     assert_eq!(config.rate_limits.max_completion_polls, 200);
     assert_eq!(config.shutdown.drain_timeout, Duration::from_secs(30));
@@ -360,8 +422,8 @@ fn effective_config_is_redacted_and_exposes_typed_deployment_invariants() {
         "testnet"
     );
     assert_eq!(
-        config.deployment_invariants().receiver_path.as_str(),
-        "paykit/server"
+        config.deployment_invariants().app_id.as_str(),
+        "paykit-server"
     );
     assert_ne!(
         config

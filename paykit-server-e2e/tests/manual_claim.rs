@@ -12,18 +12,18 @@ use bitcoin::{
     bip32::{ChildNumber, Xpriv, Xpub},
     secp256k1::Secp256k1,
 };
-use paykit_lib::PaykitReceiverPath;
-use paykit_sdk::{PaykitSdkConfig, PubkyPublicKey};
+use paykit_sdk::PubkyPublicKey;
 use paykit_server::{
     application::create_invoice::derive_bip84_p2wpkh_address,
-    config::BitcoinNetwork,
+    config::{BitcoinNetwork, PaykitConfig, PaykitNetwork},
     crypto::Crypto,
     domain::locks::parse_creator,
     manual_claim::{
         ManualClaimError, ManualClaimRequest, ManualClaimService, RelayLoopbackSessionMinter,
     },
+    paykit::CreatorSessions,
     persistence::{CreatorStore, run_migrations},
-    real_setup::DirectMarkerPublisher,
+    real_setup::SharedAppPublisher,
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use pubky_testnet::{
@@ -76,16 +76,24 @@ async fn manual_claim_persists_account_publishes_marker_and_refuses_replacement(
 
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(database.pool(), crypto);
-    let receiver_path = PaykitReceiverPath::new("paykit/server").unwrap();
-    let required_capabilities =
-        PaykitSdkConfig::new(receiver_path.clone()).required_session_capabilities();
+    let required_capabilities = paykit_server::bitkit_claim::required_capabilities();
+    let sessions = CreatorSessions::new(
+        creators.clone(),
+        pubky.clone(),
+        PaykitConfig {
+            client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
+            app_id: paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+            network: PaykitNetwork::Testnet,
+            auth_relay: relay_inbox.clone(),
+        },
+    );
     let service = ManualClaimService::new(
         pubky.clone(),
         Arc::new(RelayLoopbackSessionMinter::new(pubky.clone(), relay_inbox)),
         creators.clone(),
-        Arc::new(DirectMarkerPublisher),
+        Arc::new(SharedAppPublisher),
+        sessions,
         BitcoinNetwork::Testnet,
-        receiver_path.clone(),
     );
     assert_eq!(service.required_capabilities(), required_capabilities);
 
@@ -124,19 +132,23 @@ async fn manual_claim_persists_account_publishes_marker_and_refuses_replacement(
         derive_bip84_p2wpkh_address(&xpub, 0, &BitcoinNetwork::Testnet, 0).unwrap()
     );
 
-    // The receiver marker was published to the creator's homeserver and is
-    // publicly readable, exactly like a companion-flow setup.
+    // The shared Paykit app registry was published to the creator's
+    // homeserver and is publicly readable, exactly like a companion-flow
+    // setup.
     let owner = PubkyPublicKey::from_public_key(&keypair.public_key())
         .to_public_key()
         .unwrap();
-    let marker =
-        paykit_lib::get_paykit_receiver_marker(&pubky.public_storage(), &owner, &receiver_path)
-            .await
-            .unwrap()
-            .expect("receiver marker is published");
-    assert!(marker.capabilities.private_payments);
-    assert!(marker.capabilities.payment_requests);
-    assert!(!marker.capabilities.receipts);
+    let registry = paykit_lib::get_paykit_app_registry(&pubky.public_storage(), &owner)
+        .await
+        .unwrap()
+        .expect("app registry is published");
+    let app = registry
+        .apps()
+        .get(&paykit_lib::PaykitAppId::new("paykit-server").unwrap())
+        .expect("server app entry is published");
+    assert!(app.capabilities().private_payments);
+    assert!(app.capabilities().payment_requests);
+    assert!(!app.capabilities().receipts);
 
     assert!(service.account_exists(&creator).await.unwrap());
 

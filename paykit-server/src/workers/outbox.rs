@@ -6,11 +6,11 @@
 //! queue and encrypted-link retry state; this worker never claims exactly-once.
 
 use async_trait::async_trait;
-use paykit_lib::PaykitReceiverMarker;
+use paykit_lib::PaykitAppRegistry;
 use paykit_sdk::OutboundPrivateMessageStatus;
 
 use crate::{
-    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    application::semantic_intent::DeliveryIntentV1,
     persistence::{ClaimedHandoff, ClaimedOutbox, OutboxStore, PersistenceError},
 };
 use std::time::Duration;
@@ -23,6 +23,15 @@ pub enum HandoffError {
     Permanent,
 }
 
+impl HandoffError {
+    pub const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::Retryable(cause) => cause.diagnostic_label(),
+            Self::Permanent => "permanent",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetryableHandoffCause {
     Storage,
@@ -31,7 +40,25 @@ pub enum RetryableHandoffCause {
     NotFound,
     PaymentAdapter,
     RecoveryRequired,
+    Policy,
+    LinkPending,
     Other,
+}
+
+impl RetryableHandoffCause {
+    pub const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::Storage => "storage",
+            Self::Identity => "identity",
+            Self::Transport => "transport",
+            Self::NotFound => "not_found",
+            Self::PaymentAdapter => "payment_adapter",
+            Self::RecoveryRequired => "recovery_required",
+            Self::Policy => "policy",
+            Self::LinkPending => "link_pending",
+            Self::Other => "other",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,12 +77,39 @@ fn at_stage(error: HandoffError, stage: RetryableHandoffStage) -> HandoffFailure
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessingHealth {
     Available,
-    Retryable,
+    Retryable(Duration),
     PermanentFailure,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetrySchedule {
+    default: Duration,
+    link_establishment: Duration,
+}
+
+impl RetrySchedule {
+    pub fn new(default: Duration, link_establishment: Duration) -> Self {
+        Self {
+            default,
+            link_establishment,
+        }
+    }
+
+    pub fn default_delay(self) -> Duration {
+        self.default
+    }
+
+    pub(crate) fn delay_for(self, stage: RetryableHandoffStage) -> Duration {
+        if stage == RetryableHandoffStage::LinkEstablishment {
+            self.link_establishment
+        } else {
+            self.default
+        }
+    }
+}
+
 /// Public-SDK-only adapter. Production implementations must persist SDK state
-/// through the creator SDK-state service; an in-memory runtime is test-only.
+/// through identity-wide Pubky shared storage; an in-memory runtime is test-only.
 #[async_trait]
 pub trait Adapter: Send + Sync {
     /// Executes one complete semantic handoff. Concrete adapters may override
@@ -67,22 +121,12 @@ pub trait Adapter: Send + Sync {
         handoff_steps(self, intent).await
     }
 
-    async fn fetch_marker(
-        &self,
-        reader: &str,
-        path: &str,
-    ) -> Result<Option<PaykitReceiverMarker>, HandoffError>;
-    async fn ensure_link_with_peer(&self, reader: &str, path: &str) -> Result<(), HandoffError>;
-    async fn enqueue_private_payment_list_with_receiving_details(
-        &self,
-        reader: &str,
-        path: &str,
-        details: &[crate::application::semantic_intent::ReceivingDetailV1],
-    ) -> Result<HandoffResult, HandoffError>;
+    async fn fetch_registry(&self, reader: &str)
+    -> Result<Option<PaykitAppRegistry>, HandoffError>;
+    async fn ensure_link_with_peer(&self, reader: &str) -> Result<(), HandoffError>;
     async fn propose_payment_request(
         &self,
         reader: &str,
-        path: &str,
         terms: &crate::application::semantic_intent::PaymentTermsV1,
     ) -> Result<HandoffResult, HandoffError>;
     async fn outbound_status(
@@ -91,8 +135,7 @@ pub trait Adapter: Send + Sync {
     ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError>;
 }
 
-/// Preflight the persisted exact path before any SDK call. Missing, changed, or
-/// no-longer-capable markers are retryable and never cause path reselection.
+/// Recheck reader capabilities before handing off the persisted intent.
 pub async fn handoff(
     adapter: &dyn Adapter,
     intent: &DeliveryIntentV1,
@@ -105,48 +148,30 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
     intent: &DeliveryIntentV1,
 ) -> Result<HandoffResult, HandoffFailure> {
     intent.validate().map_err(|_| HandoffFailure::Permanent)?;
-    let selected_path = intent
-        .selected_reader_path()
-        .map_err(|_| HandoffFailure::Permanent)?;
-    let marker = adapter
-        .fetch_marker(intent.reader_pubky(), selected_path.as_str())
+    let registry = adapter
+        .fetch_registry(intent.reader_pubky())
         .await
-        .map_err(|error| at_stage(error, RetryableHandoffStage::MarkerFetch))?
+        .map_err(|error| at_stage(error, RetryableHandoffStage::RegistryFetch))?
         .ok_or(HandoffFailure::Retryable(
-            RetryableHandoffStage::MarkerMissing,
+            RetryableHandoffStage::RegistryMissing,
         ))?;
-    if !marker.capabilities.private_payments
-        || !marker.capabilities.payment_requests
-        || DeliveryIntentV1::fingerprint(&marker)
-            .map_err(|_| HandoffFailure::Retryable(RetryableHandoffStage::MarkerChanged))?
-            != intent.marker_fingerprint()
-    {
+    if !crate::application::reader_registry::reader_is_capable(&registry) {
         return Err(HandoffFailure::Retryable(
-            RetryableHandoffStage::MarkerChanged,
+            RetryableHandoffStage::RegistryIncapable,
         ));
     }
     adapter
-        .ensure_link_with_peer(intent.reader_pubky(), selected_path.as_str())
+        .ensure_link_with_peer(intent.reader_pubky())
         .await
         .map_err(|error| at_stage(error, RetryableHandoffStage::LinkEstablishment))?;
-    match intent.operation() {
-        DeliveryOperationV1::EndpointPublication { receiving_details } => adapter
-            .enqueue_private_payment_list_with_receiving_details(
-                intent.reader_pubky(),
-                selected_path.as_str(),
-                receiving_details,
-            )
-            .await
-            .map_err(|error| at_stage(error, RetryableHandoffStage::EndpointPublication)),
-        DeliveryOperationV1::PaymentRequestProposal { terms } => adapter
-            .propose_payment_request(intent.reader_pubky(), selected_path.as_str(), terms)
-            .await
-            .map_err(|error| at_stage(error, RetryableHandoffStage::PaymentRequestProposal)),
-    }
+    adapter
+        .propose_payment_request(intent.reader_pubky(), intent.terms())
+        .await
+        .map_err(|error| at_stage(error, RetryableHandoffStage::PaymentRequestProposal))
 }
 
-/// Executes one already-fenced claim. A successful public SDK enqueue is only
-/// `handed_off`: the SDK API returns local queue state, not remote delivery.
+/// Executes one already-fenced claim. Enqueue is only `handed_off`; the SDK
+/// outbound record is reconciled separately before publication is acknowledged.
 /// A crash after enqueue but before this fenced transition is intentionally
 /// retried, so Payment Request proposals are at-least-once and may duplicate.
 pub async fn process_claim(
@@ -155,16 +180,21 @@ pub async fn process_claim(
     claim: &ClaimedOutbox,
     retry_delay: Duration,
 ) -> Result<bool, PersistenceError> {
-    process_claim_with_health(store, adapter, claim, retry_delay)
-        .await
-        .map(|(transitioned, _)| transitioned)
+    process_claim_with_health(
+        store,
+        adapter,
+        claim,
+        RetrySchedule::new(retry_delay, retry_delay),
+    )
+    .await
+    .map(|(transitioned, _)| transitioned)
 }
 
 pub async fn process_claim_with_health(
     store: &OutboxStore,
     adapter: &dyn Adapter,
     claim: &ClaimedOutbox,
-    retry_delay: Duration,
+    retry_schedule: RetrySchedule,
 ) -> Result<(bool, ProcessingHealth), PersistenceError> {
     let intent = match store.delivery_intent(claim) {
         Ok(intent) => intent,
@@ -180,10 +210,13 @@ pub async fn process_claim_with_health(
             .mark_handed_off(claim, &result)
             .await
             .map(|transitioned| (transitioned, ProcessingHealth::Available)),
-        Err(HandoffFailure::Retryable(stage)) => store
-            .mark_retryable(claim, retry_delay, stage)
-            .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+        Err(HandoffFailure::Retryable(stage)) => {
+            let delay = retry_schedule.delay_for(stage);
+            store
+                .mark_retryable(claim, delay, stage)
+                .await
+                .map(|transitioned| (transitioned, ProcessingHealth::Retryable(delay)))
+        }
         Err(HandoffFailure::Permanent) => store
             .mark_permanently_failed(claim)
             .await
@@ -191,8 +224,8 @@ pub async fn process_claim_with_health(
     }
 }
 
-/// Reconciles one exact persisted SDK outbound record. Only durable `Sent`
-/// unlocks dependencies. Recoverable states remain `handed_off`; exact
+/// Reconciles one exact persisted SDK outbound event. Only durable `Sent`
+/// acknowledges publication. Recoverable states remain `handed_off`; exact
 /// `Invalid`, `RecoveryRequired`, or `Superseded` records become retained
 /// permanent failures because the SDK will not claim those records again.
 pub async fn process_reconciliation(
@@ -230,7 +263,8 @@ pub async fn process_reconciliation_with_health(
             OutboundPrivateMessageStatus::Invalid
             | OutboundPrivateMessageStatus::RecoveryRequired
             | OutboundPrivateMessageStatus::Superseded,
-        )) => store
+        ))
+        | Ok(None) => store
             .mark_reconciliation_permanently_failed(claim)
             .await
             .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
@@ -241,11 +275,11 @@ pub async fn process_reconciliation_with_health(
                 RetryableHandoffStage::ReconciliationPending,
             )
             .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+            .map(|transitioned| (transitioned, ProcessingHealth::Retryable(retry_delay))),
         Err(HandoffError::Retryable(_)) => store
             .retry_reconciliation(claim, retry_delay, RetryableHandoffStage::Reconciliation)
             .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Retryable)),
+            .map(|transitioned| (transitioned, ProcessingHealth::Retryable(retry_delay))),
         Err(HandoffError::Permanent) => store
             .mark_reconciliation_permanently_failed(claim)
             .await

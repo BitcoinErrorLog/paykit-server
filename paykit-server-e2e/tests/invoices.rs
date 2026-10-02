@@ -1,40 +1,36 @@
 use std::sync::Arc;
 
-use paykit_lib::{
-    PaykitReceiverCapabilities, PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount,
-    PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
-    PublicKey,
-};
-use paykit_sdk::{ReceiverNoiseSecretKey, storage::StorageState};
+use paykit_sdk::PaykitIdentitySecretKey;
 use paykit_server::{
-    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    application::semantic_intent::DeliveryIntentV1,
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
-    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
     persistence::{
-        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
-        NewReaderPayloadFactory, NewReaderPayloads, PersistenceError, run_migrations,
+        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
+        InvoicePayloads, InvoiceStore, PersistenceError, run_migrations,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::Row;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+mod common;
 
 struct TestPayloads;
-impl NewReaderPayloadFactory for TestPayloads {
-    fn for_child_index(&self, _child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
-        Ok(NewReaderPayloads {
-            endpoint_intent: endpoint_intent(format!("test-address-{_child_index}")),
-            bitcoin_address: format!("test-address-{_child_index}"),
+impl InvoicePayloadFactory for TestPayloads {
+    fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
+        Ok(InvoicePayloads {
+            payment_request_intent: payment_intent(format!("test-address-{child_index}")),
+            bitcoin_address: format!("test-address-{child_index}"),
         })
     }
 }
 
-struct PaymentAsEndpointPayloads;
-impl NewReaderPayloadFactory for PaymentAsEndpointPayloads {
-    fn for_child_index(&self, child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
-        Ok(NewReaderPayloads {
-            endpoint_intent: payment_intent(),
+struct MismatchedAddressPayloads;
+impl InvoicePayloadFactory for MismatchedAddressPayloads {
+    fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
+        Ok(InvoicePayloads {
+            payment_request_intent: payment_intent("wrong-address".into()),
             bitcoin_address: format!("bad-address-{child_index}"),
         })
     }
@@ -44,59 +40,18 @@ struct CreatorPayloads {
     address_prefix: &'static str,
 }
 
-impl NewReaderPayloadFactory for CreatorPayloads {
-    fn for_child_index(&self, child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
+impl InvoicePayloadFactory for CreatorPayloads {
+    fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         let address = format!("{}-{child_index}", self.address_prefix);
-        Ok(NewReaderPayloads {
-            endpoint_intent: endpoint_intent(address.clone()),
+        Ok(InvoicePayloads {
+            payment_request_intent: payment_intent(address.clone()),
             bitcoin_address: address,
         })
     }
 }
 
-fn marker() -> PaykitReceiverMarker {
-    PaykitReceiverMarker::new(
-        PaykitReceiverPath::new("bitkit/wallet").unwrap(),
-        PaykitReceiverCapabilities {
-            private_payments: true,
-            payment_requests: true,
-            receipts: false,
-            outgoing_payments: false,
-        },
-        PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy").unwrap(),
-    )
-}
-
-fn endpoint_intent(address: String) -> DeliveryIntentV1 {
-    DeliveryIntentV1::endpoint(
-        reader().to_string(),
-        &marker(),
-        PaykitReceiverPath::new("paykit/server").unwrap(),
-        vec![(
-            PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
-            PaymentEndpointPayload::new(address),
-        )],
-    )
-    .unwrap()
-}
-
-fn payment_intent() -> DeliveryIntentV1 {
-    DeliveryIntentV1::payment_request(
-        reader().to_string(),
-        &marker(),
-        PaykitReceiverPath::new("paykit/server").unwrap(),
-        &PaymentRequestTerms {
-            amount: PaymentAmount::new("0.00000100", "BTC").unwrap(),
-            payment_reference: PaymentReference::new(uuid::Uuid::new_v4().to_string()).unwrap(),
-            proposal_expires_at: None,
-            recurrence: None,
-            accepted_payment_endpoint_identifiers: vec![
-                PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
-            ],
-            metadata: Default::default(),
-        },
-    )
-    .unwrap()
+fn payment_intent(address: String) -> DeliveryIntentV1 {
+    common::payment_intent(&reader(), address)
 }
 
 static TEST_PAYLOADS: TestPayloads = TestPayloads;
@@ -141,16 +96,13 @@ async fn invoice_store(database: &TestDatabase) -> InvoiceStore {
     run_migrations(database.pool()).await.unwrap();
     let crypto = crypto();
     CreatorStore::new(database.pool(), crypto.clone())
-        .create(
-            &CreatorCredentials::new(
-                creator(),
-                "session-secret".into(),
-                ReceiverNoiseSecretKey::new([9; 32]),
-                "xpub-secret".into(),
-                0,
-            ),
-            &StorageState::default(),
-        )
+        .create(&CreatorCredentials::new(
+            creator(),
+            "session-secret".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            "xpub-secret".into(),
+            0,
+        ))
         .await
         .unwrap();
     InvoiceStore::new(database.pool(), crypto)
@@ -167,14 +119,56 @@ fn input<'a>(
         reader,
         bundle_binding: bundle,
         payment_request_binding: request,
-        new_reader_payloads: &TEST_PAYLOADS,
-        payment_request_intent: payment_intent(),
+        invoice_payloads: &TEST_PAYLOADS,
         required_sats: 100,
     }
 }
 
 #[tokio::test]
-async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
+async fn connection_binding_uses_persisted_reader_identity_without_mutating_business_rows() {
+    let database = TestDatabase::create().await;
+    let invoices = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let bundle = "000G40R40M30E209185GR38E1W";
+    invoices
+        .create_atomic(input(
+            &creator,
+            &reader,
+            bundle.as_bytes(),
+            b"connection-request",
+        ))
+        .await
+        .unwrap();
+    let before: Vec<String> =
+        sqlx::query_scalar("SELECT row_to_json(o)::text FROM outbox o ORDER BY id")
+            .fetch_all(database.pool())
+            .await
+            .unwrap();
+    let binding = invoices
+        .connection_binding(&creator, &parse_bundle_id(bundle).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.reader(), &reader);
+    assert!(
+        invoices
+            .connection_binding(&second_creator(), &parse_bundle_id(bundle).unwrap())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let after: Vec<String> =
+        sqlx::query_scalar("SELECT row_to_json(o)::text FROM outbox o ORDER BY id")
+            .fetch_all(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(before, after);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn invoice_allocation_encrypts_bound_terms_and_replays() {
     let database = TestDatabase::create().await;
     let store = invoice_store(&database).await;
     let creator = creator();
@@ -186,9 +180,6 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
         .unwrap();
     assert!(!first.replayed());
     assert_eq!(first.reader_child_index(), 0);
-    let endpoint_id = first
-        .endpoint_publication_outbox_id()
-        .expect("new reader must enqueue endpoint publication");
 
     let protected_payment_row = sqlx::query(
         "SELECT payment_record_envelope, bitcoin_address_lookup_hash FROM invoices WHERE id = $1",
@@ -214,34 +205,17 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
             .any(|window| window == b"test-address-0")
     );
 
-    let payment_row =
-        sqlx::query("SELECT invoice_id, depends_on_id, intent_envelope FROM outbox WHERE id = $1")
-            .bind(first.payment_request_outbox_id())
-            .fetch_one(database.pool())
-            .await
-            .unwrap();
-    assert_eq!(
-        payment_row.get::<Option<_>, _>("invoice_id"),
-        Some(first.invoice_id())
-    );
-    assert_eq!(
-        payment_row.get::<Option<_>, _>("depends_on_id"),
-        Some(endpoint_id)
-    );
-
-    let endpoint_row = sqlx::query("SELECT invoice_id, intent_envelope FROM outbox WHERE id = $1")
-        .bind(endpoint_id)
+    let payment_row = sqlx::query("SELECT invoice_id, intent_envelope FROM outbox WHERE id = $1")
+        .bind(first.payment_request_outbox_id())
         .fetch_one(database.pool())
         .await
         .unwrap();
     assert_eq!(
-        endpoint_row.get::<Option<uuid::Uuid>, _>("invoice_id"),
+        payment_row.get::<Option<_>, _>("invoice_id"),
         Some(first.invoice_id())
     );
-
     for raw in [
         payment_row.get::<Vec<u8>, _>("intent_envelope"),
-        endpoint_row.get::<Vec<u8>, _>("intent_envelope"),
         sqlx::query_scalar::<_, Vec<u8>>("SELECT invoice_envelope FROM invoices WHERE id = $1")
             .bind(first.invoice_id())
             .fetch_one(database.pool())
@@ -255,12 +229,7 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
         .await
         .unwrap(),
     ] {
-        for plaintext in [
-            b"reader-assignment-private-sentinel".as_slice(),
-            b"invoice-private-sentinel".as_slice(),
-            b"endpoint-publication-private-sentinel".as_slice(),
-            b"payment-request-private-sentinel".as_slice(),
-        ] {
+        for plaintext in [b"test-address-0".as_slice(), reader.to_string().as_bytes()] {
             assert!(
                 !raw.windows(plaintext.len())
                     .any(|window| window == plaintext)
@@ -285,14 +254,8 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
         )
         .unwrap();
     let original_intent = DeliveryIntentV1::decode(&original_plaintext).unwrap();
-    let original_reference = match original_intent.operation() {
-        DeliveryOperationV1::PaymentRequestProposal { terms } => terms.payment_reference.clone(),
-        DeliveryOperationV1::EndpointPublication { .. } => {
-            panic!("payment row had endpoint intent")
-        }
-    };
-    let original_path = original_intent.selected_reader_path().unwrap();
-    let original_fingerprint = original_intent.marker_fingerprint();
+    let original_reference = original_intent.terms().payment_reference.clone();
+    let original_app_id = original_intent.app_id();
 
     let replay = store
         .create_atomic(input(&creator, &reader, b"bundle-one", b"request-one"))
@@ -306,7 +269,6 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
     );
     assert_eq!(replay.reader_assignment_id(), first.reader_assignment_id());
     assert_eq!(replay.reader_child_index(), 0);
-    assert_eq!(replay.endpoint_publication_outbox_id(), Some(endpoint_id));
     let replayed_payment_envelope: Vec<u8> =
         sqlx::query_scalar("SELECT intent_envelope FROM outbox WHERE id = $1")
             .bind(replay.payment_request_outbox_id())
@@ -324,16 +286,12 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
         )
         .unwrap();
     let replayed_intent = DeliveryIntentV1::decode(&replayed_plaintext).unwrap();
+    assert_eq!(replayed_intent.app_id(), original_app_id);
     assert_eq!(
-        replayed_intent.selected_reader_path().unwrap(),
-        original_path
+        replayed_intent.terms().payment_reference,
+        original_reference
     );
-    assert_eq!(replayed_intent.marker_fingerprint(), original_fingerprint);
-    assert!(matches!(
-        replayed_intent.operation(),
-        DeliveryOperationV1::PaymentRequestProposal { terms }
-            if terms.payment_reference == original_reference
-    ));
+    assert_eq!(replayed_intent, original_intent);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM reader_assignments")
             .fetch_one(database.pool())
@@ -353,7 +311,7 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
             .fetch_one(database.pool())
             .await
             .unwrap(),
-        2
+        1
     );
     assert_eq!(
         store
@@ -381,10 +339,6 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
     assert_ne!(second.reader_assignment_id(), first.reader_assignment_id());
     assert_eq!(second.reader_child_index(), 1);
     assert_ne!(
-        second.endpoint_publication_outbox_id(),
-        first.endpoint_publication_outbox_id()
-    );
-    assert_ne!(
         sqlx::query_scalar::<_, Vec<u8>>(
             "SELECT bitcoin_address_lookup_hash FROM invoices WHERE id = $1",
         )
@@ -400,15 +354,30 @@ async fn invoice_allocation_encrypts_payloads_orders_outbox_and_replays() {
         .await
         .unwrap(),
     );
-    assert_eq!(
-        sqlx::query_scalar::<_, Option<uuid::Uuid>>(
-            "SELECT depends_on_id FROM outbox WHERE id = $1",
-        )
+    let envelope: Vec<u8> = sqlx::query_scalar("SELECT intent_envelope FROM outbox WHERE id = $1")
         .bind(second.payment_request_outbox_id())
         .fetch_one(database.pool())
         .await
-        .unwrap(),
-        second.endpoint_publication_outbox_id()
+        .unwrap();
+    let plaintext = crypto()
+        .decrypt(
+            &EnvelopeContext::outbox_semantic_intent(
+                creator_hash,
+                second.payment_request_outbox_id(),
+            ),
+            &EncryptedEnvelope::from_bytes(envelope),
+        )
+        .unwrap();
+    let second_intent = DeliveryIntentV1::decode(&plaintext).unwrap();
+    let first_terms = original_intent.terms();
+    let second_terms = second_intent.terms();
+    assert_eq!(
+        first_terms.payment_endpoints["btc-bitcoin-p2wpkh"],
+        serde_json::json!({"value":"test-address-0"}).to_string()
+    );
+    assert_eq!(
+        second_terms.payment_endpoints["btc-bitcoin-p2wpkh"],
+        serde_json::json!({"value":"test-address-1"}).to_string()
     );
 
     database.cleanup().await;
@@ -443,17 +412,13 @@ async fn concurrent_exact_invoice_allocation_serializes_to_one_durable_result() 
     assert_eq!(first.invoice_id(), second.invoice_id());
     assert_eq!(first.reader_assignment_id(), second.reader_assignment_id());
     assert_eq!(
-        first.endpoint_publication_outbox_id(),
-        second.endpoint_publication_outbox_id()
-    );
-    assert_eq!(
         first.payment_request_outbox_id(),
         second.payment_request_outbox_id()
     );
     for (table, expected) in [
         ("reader_assignments", 1_i64),
         ("invoices", 1_i64),
-        ("outbox", 2_i64),
+        ("outbox", 1_i64),
     ] {
         let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
             .fetch_one(database.pool())
@@ -473,29 +438,66 @@ async fn concurrent_exact_invoice_allocation_serializes_to_one_durable_result() 
 }
 
 #[tokio::test]
-async fn atomic_store_rejects_wrong_intent_role_and_reader_before_any_insert() {
-    static BAD_PAYLOADS: PaymentAsEndpointPayloads = PaymentAsEndpointPayloads;
+async fn concurrent_invoices_for_same_reader_bind_distinct_addresses() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let (first, second) = tokio::join!(
+        store.create_atomic(input(&creator, &reader, b"bundle-a", b"request-a")),
+        store.create_atomic(input(&creator, &reader, b"bundle-b", b"request-b")),
+    );
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_ne!(first.invoice_id(), second.invoice_id());
+    assert_ne!(first.reader_child_index(), second.reader_child_index());
+    let outbox = paykit_server::persistence::OutboxStore::new(database.pool(), crypto());
+    let claims = outbox
+        .claim(uuid::Uuid::new_v4(), 10, std::time::Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 2, "each invoice is immediately claimable");
+    let mut destinations = claims
+        .iter()
+        .map(|claim| {
+            outbox
+                .delivery_intent(claim)
+                .unwrap()
+                .terms()
+                .payment_endpoints["btc-bitcoin-p2wpkh"]
+                .clone()
+        })
+        .collect::<Vec<_>>();
+    destinations.sort();
+    assert_eq!(
+        destinations,
+        [
+            serde_json::json!({"value": "test-address-0"}).to_string(),
+            serde_json::json!({"value": "test-address-1"}).to_string(),
+        ]
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        2
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn atomic_store_rejects_mismatched_address_and_reader_before_any_insert() {
+    static BAD_PAYLOADS: MismatchedAddressPayloads = MismatchedAddressPayloads;
     let database = TestDatabase::create().await;
     let store = invoice_store(&database).await;
     let creator = creator();
     let reader = reader();
 
-    let mut wrong_payment_role = input(&creator, &reader, b"bad-role", b"bad-role-request");
-    wrong_payment_role.payment_request_intent = endpoint_intent("wrong-role-address".into());
+    let mut mismatched_address = input(&creator, &reader, b"bad-address", b"bad-address-request");
+    mismatched_address.invoice_payloads = &BAD_PAYLOADS;
     assert_eq!(
-        store.create_atomic(wrong_payment_role).await,
-        Err(PersistenceError::CorruptOrMissing)
-    );
-
-    let mut wrong_endpoint_role = input(
-        &creator,
-        &reader,
-        b"bad-endpoint-role",
-        b"bad-endpoint-request",
-    );
-    wrong_endpoint_role.new_reader_payloads = &BAD_PAYLOADS;
-    assert_eq!(
-        store.create_atomic(wrong_endpoint_role).await,
+        store.create_atomic(mismatched_address).await,
         Err(PersistenceError::CorruptOrMissing)
     );
 
@@ -526,7 +528,7 @@ async fn atomic_store_rejects_wrong_intent_role_and_reader_before_any_insert() {
 }
 
 #[tokio::test]
-async fn allocation_invoice_and_both_outbox_inserts_rollback_on_dependent_outbox_failure() {
+async fn allocation_and_invoice_rollback_on_request_outbox_failure() {
     let database = TestDatabase::create().await;
     let store = invoice_store(&database).await;
     let creator = creator();
@@ -585,29 +587,23 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
     let first_creator = creator();
     let second_creator = second_creator();
     creators
-        .create(
-            &CreatorCredentials::new(
-                first_creator.clone(),
-                "session-one".into(),
-                ReceiverNoiseSecretKey::new([9; 32]),
-                "xpub-one".into(),
-                0,
-            ),
-            &StorageState::default(),
-        )
+        .create(&CreatorCredentials::new(
+            first_creator.clone(),
+            "session-one".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            "xpub-one".into(),
+            0,
+        ))
         .await
         .unwrap();
     creators
-        .create(
-            &CreatorCredentials::new(
-                second_creator.clone(),
-                "session-two".into(),
-                ReceiverNoiseSecretKey::new([8; 32]),
-                "xpub-two".into(),
-                0,
-            ),
-            &StorageState::default(),
-        )
+        .create(&CreatorCredentials::new(
+            second_creator.clone(),
+            "session-two".into(),
+            PaykitIdentitySecretKey::new([8; 32], 1).unwrap(),
+            "xpub-two".into(),
+            0,
+        ))
         .await
         .unwrap();
 
@@ -626,8 +622,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             reader: &reader,
             bundle_binding: b"creator-one-bundle",
             payment_request_binding: b"creator-one-request",
-            new_reader_payloads: &first_payloads,
-            payment_request_intent: payment_intent(),
+            invoice_payloads: &first_payloads,
             required_sats: 100,
         }),
         second_store.create_atomic(AtomicInvoiceInput {
@@ -635,8 +630,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
             reader: &reader,
             bundle_binding: b"creator-two-bundle",
             payment_request_binding: b"creator-two-request",
-            new_reader_payloads: &second_payloads,
-            payment_request_intent: payment_intent(),
+            invoice_payloads: &second_payloads,
             required_sats: 100,
         })
     );
@@ -664,10 +658,10 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
     assert_ne!(first_hashes.0, second_hashes.0);
     assert_ne!(first_hashes.1, second_hashes.1);
 
-    let first_endpoint = first.endpoint_publication_outbox_id().unwrap();
+    let first_request = first.payment_request_outbox_id();
     let first_envelope: Vec<u8> =
         sqlx::query_scalar("SELECT intent_envelope FROM outbox WHERE id = $1")
-            .bind(first_endpoint)
+            .bind(first_request)
             .fetch_one(database.pool())
             .await
             .unwrap();
@@ -699,7 +693,7 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
     assert!(
         crypto
             .decrypt(
-                &EnvelopeContext::outbox_semantic_intent(second_hash, first_endpoint),
+                &EnvelopeContext::outbox_semantic_intent(second_hash, first_request),
                 &EncryptedEnvelope::from_bytes(first_envelope.clone()),
             )
             .is_err(),
@@ -707,16 +701,15 @@ async fn concurrent_creators_own_distinct_intents_at_the_same_child_index() {
     );
     let plaintext = crypto
         .decrypt(
-            &EnvelopeContext::outbox_semantic_intent(first_hash, first_endpoint),
+            &EnvelopeContext::outbox_semantic_intent(first_hash, first_request),
             &EncryptedEnvelope::from_bytes(first_envelope),
         )
         .unwrap();
     let intent: DeliveryIntentV1 = postcard::from_bytes(&plaintext).unwrap();
-    assert!(matches!(
-        intent.operation(),
-        DeliveryOperationV1::EndpointPublication { receiving_details }
-            if receiving_details[0].payload == "creator-one-address-0"
-    ));
+    assert_eq!(
+        intent.terms().payment_endpoints["btc-bitcoin-p2wpkh"],
+        serde_json::json!({"value": "creator-one-address-0"}).to_string()
+    );
 
     database.cleanup().await;
 }

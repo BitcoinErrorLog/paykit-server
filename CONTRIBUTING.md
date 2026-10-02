@@ -44,6 +44,19 @@ TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres \
 
 Two live-adapter tests are ignored by default. They require external Pubky or Electrum infrastructure and are documented in `docs/live-adapter-smoke.md`. Do not claim those paths passed unless they were run explicitly against the documented environment.
 
+## Continuous integration
+
+CI runs for every pull request and for pushes merged to `master`. Other branch pushes run through their pull request rather than triggering a duplicate workflow. Superseded pull-request runs are cancelled; every `master` run completes.
+
+The four required checks are independent and run these exact commands:
+
+- **Formatting:** `cargo fmt --all --check`
+- **Clippy:** `cargo clippy --locked --workspace --all-targets -- -D warnings`
+- **Server tests:** `cargo test --locked -p paykit-server -- --test-threads=1`
+- **PostgreSQL E2E:** `cargo test --locked -p paykit-server-e2e -- --test-threads=1`
+
+The E2E check executes against PostgreSQL; it is not a compile-only gate. Rust build caches accelerate Clippy and tests, but cache failures fall back to cold builds and do not weaken any required check. CI does not automatically retry failed tests or jobs: reproducible flakes must be fixed at their source.
+
 ## Pull requests
 
 - Keep each pull request coherent and reviewable.

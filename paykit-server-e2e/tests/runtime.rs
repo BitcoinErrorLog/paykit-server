@@ -36,7 +36,8 @@ trusted_public_key = "{TRUSTED_KEY}"
 allowed_origins = ["https://app.example"]
 
 [paykit]
-receiver_path = "paykit/server"
+client_id = "app.paykit.server"
+app_id = "paykit-server"
 network = "testnet"
 
 [bitcoin]
@@ -113,6 +114,45 @@ async fn production_workers_publish_startup_evidence_before_readiness() {
     })
     .await
     .expect("all owned workers must publish startup evidence");
+
+    let creator = paykit_server::domain::locks::parse_creator(TRUSTED_KEY).unwrap();
+    let creators = paykit_server::persistence::CreatorStore::new(
+        database.pool(),
+        std::sync::Arc::new(paykit_server::crypto::Crypto::from_master_key(&[1; 32]).unwrap()),
+    );
+    creators
+        .create(&paykit_server::persistence::CreatorCredentials::new(
+            creator.clone(),
+            "invalid-session".into(),
+            paykit_sdk::PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            "unused-xpub".into(),
+            0,
+        ))
+        .await
+        .unwrap();
+    creators.mark_setup_complete(&creator).await.unwrap();
+    // An empty outbox must not hide a configured Creator's transport failure.
+    for expected in [ComponentState::Degraded, ComponentState::Ready] {
+        if expected == ComponentState::Ready {
+            sqlx::query("UPDATE creators SET setup_complete = FALSE")
+                .execute(database.pool())
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let report = runtime.readiness().await;
+                if report.paykit_delivery == expected {
+                    assert_eq!(report.status, expected);
+                    assert_eq!(report.outbox, ComponentState::Ready);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("transport worker must report availability");
+    }
 
     shutdown_tx.send(()).unwrap();
     task.await.unwrap().unwrap();
