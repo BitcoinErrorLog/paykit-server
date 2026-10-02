@@ -3252,7 +3252,7 @@ dependencies = [
 
 [[package]]
 name = "paykit-server"
-version = "0.1.0-rc6"
+version = "0.1.0-rc7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3297,7 +3297,7 @@ dependencies = [
 
 [[package]]
 name = "paykit-server-e2e"
-version = "0.1.0-rc6"
+version = "0.1.0-rc7"
 dependencies = [
  "anyhow",
  "async-trait",
