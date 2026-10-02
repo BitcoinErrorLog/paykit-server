@@ -13,13 +13,13 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
 use paykit_server::{
     application::create_invoice::{
-        CreateInvoiceError, CreatorXpubProvider, InvoicePersistence, MarkerDiscovery,
+        AppRegistryDiscovery, CreateInvoiceError, CreatorXpubProvider, InvoicePersistence,
         PaykitIntentBuilder, SessionValidationError, SessionValidator, derive_bip84_p2wpkh_address,
     },
     application::create_payment_request::{
         MarketplacePaymentRequest, MarketplacePaymentRequestService,
     },
-    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    application::semantic_intent::DeliveryIntentV1,
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     domain::locks::{CreatorPubky, parse_bundle_id, parse_creator, parse_reader},
     http::{auth::SignedLocksAuth, payment_requests::payment_requests_router},
@@ -50,18 +50,27 @@ fn request(amount_sats: u64) -> MarketplacePaymentRequest {
     }
 }
 
-fn capable_marker() -> paykit_lib::PaykitReceiverMarker {
-    paykit_lib::PaykitReceiverMarker::new(
-        paykit_lib::PaykitReceiverPath::new("bitkit/wallet").unwrap(),
-        paykit_lib::PaykitReceiverCapabilities {
-            private_payments: true,
-            payment_requests: true,
-            receipts: false,
-            outgoing_payments: false,
-        },
+fn capable_registry() -> paykit_lib::PaykitAppRegistry {
+    let mut registry = paykit_lib::PaykitAppRegistry::new(Some(
         paykit_lib::PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
             .unwrap(),
-    )
+    ));
+    registry
+        .register_app(
+            paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+            paykit_lib::PaykitApp::new(
+                "Paykit Server",
+                paykit_lib::PaykitAppCapabilities {
+                    private_payments: true,
+                    payment_requests: true,
+                    receipts: true,
+                    outgoing_payments: true,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    registry
 }
 
 struct FakeSession {
@@ -77,19 +86,19 @@ impl SessionValidator for FakeSession {
     }
 }
 
-struct FakeMarkers {
-    markers: Vec<paykit_lib::PaykitReceiverMarker>,
+struct FakeRegistries {
+    registry: Option<paykit_lib::PaykitAppRegistry>,
     calls: AtomicUsize,
 }
 
 #[async_trait]
-impl MarkerDiscovery for FakeMarkers {
+impl AppRegistryDiscovery for FakeRegistries {
     async fn discover(
         &self,
         _reader: &paykit_server::domain::locks::ReaderPubky,
-    ) -> Result<Vec<paykit_lib::PaykitReceiverMarker>, CreateInvoiceError> {
+    ) -> Result<Option<paykit_lib::PaykitAppRegistry>, CreateInvoiceError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self.markers.clone())
+        Ok(self.registry.clone())
     }
 }
 
@@ -174,7 +183,6 @@ impl InvoicePersistence for CapturingStore {
         Ok(AtomicInvoiceResult::new(
             uuid::Uuid::nil(),
             uuid::Uuid::nil(),
-            None,
             uuid::Uuid::nil(),
             0,
             true,
@@ -186,18 +194,17 @@ impl InvoicePersistence for CapturingStore {
         input: AtomicInvoiceInput<'_>,
     ) -> Result<AtomicInvoiceResult, PersistenceError> {
         self.create_calls.fetch_add(1, Ordering::SeqCst);
-        let payloads = input.new_reader_payloads.for_child_index(0)?;
+        let payloads = input.invoice_payloads.for_child_index(0)?;
         self.captured.lock().unwrap().push(CapturedInput {
             bundle_binding: input.bundle_binding.to_vec(),
             payment_request_binding: input.payment_request_binding.to_vec(),
             required_sats: input.required_sats,
-            payment_request_intent: input.payment_request_intent.clone(),
+            payment_request_intent: payloads.payment_request_intent,
             new_reader_bitcoin_address: payloads.bitcoin_address,
         });
         Ok(AtomicInvoiceResult::new(
             uuid::Uuid::new_v4(),
             uuid::Uuid::new_v4(),
-            Some(uuid::Uuid::new_v4()),
             uuid::Uuid::new_v4(),
             0,
             false,
@@ -212,16 +219,14 @@ fn service(
 ) -> MarketplacePaymentRequestService {
     MarketplacePaymentRequestService::new(
         session,
-        Arc::new(FakeMarkers {
-            markers: vec![capable_marker()],
+        Arc::new(FakeRegistries {
+            registry: Some(capable_registry()),
             calls: AtomicUsize::default(),
         }),
-        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
-        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
         Arc::new(FakeCredentials),
         network.clone(),
         store,
-        Arc::new(PaykitIntentBuilder::for_network(&network)),
+        Arc::new(PaykitIntentBuilder::new(network)),
     )
 }
 
@@ -259,22 +264,23 @@ async fn persists_exact_terms_bindings_and_derived_address_without_a_lock() {
         input.new_reader_bitcoin_address,
         derive_bip84_p2wpkh_address(&account_xpub(), 0, &BitcoinNetwork::Mainnet, 0).unwrap()
     );
-    match input.payment_request_intent.operation() {
-        DeliveryOperationV1::PaymentRequestProposal { terms } => {
-            assert_eq!(terms.amount, "0.00050000");
-            assert_eq!(terms.asset, "btc");
-            let reference = uuid::Uuid::parse_str(&terms.payment_reference).unwrap();
-            assert_eq!(reference.get_version_num(), 4);
-            assert_eq!(terms.proposal_expires_at, None);
-            assert_eq!(terms.accepted_endpoint_identifiers, ["btc-bitcoin-p2wpkh"]);
-            assert_eq!(
-                serde_json::Value::Object(terms.metadata.clone()),
-                serde_json::json!({"order_reference": REFERENCE, "reader": reader()})
-            );
-        }
-        DeliveryOperationV1::EndpointPublication { .. } => {
-            panic!("payment request intent expected")
-        }
+    let terms = input.payment_request_intent.terms();
+    assert_eq!(input.payment_request_intent.app_id(), "paykit-server");
+    {
+        assert_eq!(terms.amount, "0.00050000");
+        assert_eq!(terms.asset, "btc");
+        let reference = uuid::Uuid::parse_str(&terms.payment_reference).unwrap();
+        assert_eq!(reference.get_version_num(), 4);
+        assert_eq!(terms.proposal_expires_at, None);
+        assert_eq!(terms.accepted_endpoint_identifiers, ["btc-bitcoin-p2wpkh"]);
+        assert_eq!(
+            terms.payment_endpoints.get("btc-bitcoin-p2wpkh").unwrap(),
+            &serde_json::json!({ "value": input.new_reader_bitcoin_address }).to_string()
+        );
+        assert_eq!(
+            serde_json::Value::Object(terms.metadata.clone()),
+            serde_json::json!({"order_reference": REFERENCE, "reader": reader()})
+        );
     }
 }
 
@@ -308,26 +314,20 @@ async fn regtest_deployments_advertise_the_regtest_endpoint_identifier() {
     let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
     let service = MarketplacePaymentRequestService::new(
         ok_session(),
-        Arc::new(FakeMarkers {
-            markers: vec![capable_marker()],
+        Arc::new(FakeRegistries {
+            registry: Some(capable_registry()),
             calls: AtomicUsize::default(),
         }),
-        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
-        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
         Arc::new(RegtestCredentials),
         BitcoinNetwork::Regtest,
         store.clone(),
-        Arc::new(PaykitIntentBuilder::for_network(&BitcoinNetwork::Regtest)),
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Regtest)),
     );
     service.create(request(21_000)).await.unwrap();
     let captured = store.captured.lock().unwrap();
-    match captured[0].payment_request_intent.operation() {
-        DeliveryOperationV1::PaymentRequestProposal { terms } => {
-            assert_eq!(terms.accepted_endpoint_identifiers, ["btc-regtest-p2wpkh"]);
-        }
-        DeliveryOperationV1::EndpointPublication { .. } => {
-            panic!("payment request intent expected")
-        }
+    {
+        let terms = captured[0].payment_request_intent.terms();
+        assert_eq!(terms.accepted_endpoint_identifiers, ["btc-regtest-p2wpkh"]);
     }
     assert!(captured[0].new_reader_bitcoin_address.starts_with("bcrt1"));
 }
@@ -403,20 +403,18 @@ async fn invalid_and_unavailable_sessions_return_without_store_mutation() {
 }
 
 #[tokio::test]
-async fn a_reader_without_a_capable_marker_is_unavailable() {
+async fn a_reader_without_a_capable_registry_is_unavailable() {
     let store = Arc::new(CapturingStore::with_preflight(InvoicePreflight::New));
     let service = MarketplacePaymentRequestService::new(
         ok_session(),
-        Arc::new(FakeMarkers {
-            markers: vec![],
+        Arc::new(FakeRegistries {
+            registry: None,
             calls: AtomicUsize::default(),
         }),
-        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
-        paykit_lib::PaykitReceiverPath::new("paykit/server").unwrap(),
         Arc::new(FakeCredentials),
         BitcoinNetwork::Mainnet,
         store.clone(),
-        Arc::new(PaykitIntentBuilder::default()),
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
     );
     assert_eq!(
         service.create(request(50_000)).await,
@@ -470,8 +468,10 @@ trusted_public_key = "{locks_key}"
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
-receiver_path = "paykit/server"
+client_id = "app.paykit.server"
+app_id = "paykit-server"
 network = "testnet"
+auth_relay = "https://relay.example/inbox"
 [bitcoin]
 network = "mainnet"
 [electrum]

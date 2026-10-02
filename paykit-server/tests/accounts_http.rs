@@ -5,15 +5,14 @@ use axum::{
     http::{Method, Request, StatusCode, header},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use paykit_lib::PaykitReceiverPath;
-use paykit_sdk::PaykitSdkConfig;
 use paykit_server::{
-    config::BitcoinNetwork,
+    config::{BitcoinNetwork, PaykitConfig, PaykitNetwork},
     crypto::Crypto,
     http::accounts::{AccountsState, accounts_router},
     manual_claim::{ManualClaimError, ManualClaimService, SessionMinter},
+    paykit::CreatorSessions,
     persistence::CreatorStore,
-    real_setup::DirectMarkerPublisher,
+    real_setup::SharedAppPublisher,
 };
 use pubky::{AuthToken, Capabilities, Keypair, PubkySession};
 use tower::ServiceExt;
@@ -34,12 +33,8 @@ impl SessionMinter for RefusingMinter {
     }
 }
 
-fn receiver_path() -> PaykitReceiverPath {
-    PaykitReceiverPath::new("paykit/server").unwrap()
-}
-
 fn required_capabilities() -> String {
-    PaykitSdkConfig::new(receiver_path()).required_session_capabilities()
+    paykit_server::bitkit_claim::required_capabilities()
 }
 
 fn service() -> Arc<ManualClaimService> {
@@ -47,13 +42,25 @@ fn service() -> Arc<ManualClaimService> {
         .connect_lazy("postgres://127.0.0.1:1/paykit")
         .unwrap();
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(&pool, crypto);
+    let pubky = pubky::Pubky::new().unwrap();
+    let sessions = CreatorSessions::new(
+        creators.clone(),
+        pubky.clone(),
+        PaykitConfig {
+            client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
+            app_id: paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+            network: PaykitNetwork::Testnet,
+            auth_relay: "http://127.0.0.1:1/inbox".parse().unwrap(),
+        },
+    );
     Arc::new(ManualClaimService::new(
-        pubky::Pubky::new().unwrap(),
+        pubky,
         Arc::new(RefusingMinter),
-        CreatorStore::new(&pool, crypto),
-        Arc::new(DirectMarkerPublisher),
+        creators,
+        Arc::new(SharedAppPublisher),
+        sessions,
         BitcoinNetwork::Regtest,
-        receiver_path(),
     ))
 }
 

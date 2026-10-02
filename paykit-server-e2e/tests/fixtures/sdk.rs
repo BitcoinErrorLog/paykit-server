@@ -2,7 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use paykit_sdk::{
-    PaymentAdapter, PaymentTarget, PubkySessionAccess, PubkySessionProvider,
+    PaymentAdapter, PaymentTarget, PrivatePaymentEndpointCandidate,
+    PrivatePaymentEndpointSelectionRequest, PubkySessionAccess, PubkySessionProvider,
     PublicPaymentEndpointCandidate, PublicPaymentEndpointSelectionRequest, PublicReceivingDetail,
 };
 
@@ -47,6 +48,22 @@ pub struct TestPaymentAdapter;
 
 #[async_trait]
 impl PaymentAdapter for TestPaymentAdapter {
+    async fn select_private_payment_endpoints(
+        &self,
+        request: &PrivatePaymentEndpointSelectionRequest,
+    ) -> paykit_sdk::Result<Vec<PrivatePaymentEndpointCandidate>> {
+        Ok(request.candidates.clone())
+    }
+
+    async fn build_private_payment_target(
+        &self,
+        endpoint: &PrivatePaymentEndpointCandidate,
+    ) -> paykit_sdk::Result<PaymentTarget> {
+        Ok(PaymentTarget {
+            payload: endpoint.payload.clone(),
+        })
+    }
+
     async fn current_public_receiving_details(
         &self,
     ) -> paykit_sdk::Result<Vec<PublicReceivingDetail>> {
@@ -68,4 +85,41 @@ impl PaymentAdapter for TestPaymentAdapter {
             payload: endpoint.payload.clone(),
         })
     }
+}
+
+pub type HostedSdk = paykit_sdk::PaykitSdk<
+    paykit_sdk::PubkySharedStateStorage,
+    TestSessionProvider,
+    TestPaymentAdapter,
+>;
+
+pub async fn hosted_sdk(access: PubkySessionAccess, app_id: &str, counter_seed: u64) -> HostedSdk {
+    let provider = TestSessionProvider::new(access);
+    let storage = paykit_sdk::PubkySharedStateStorage::new(provider.clone());
+    let sdk = paykit_sdk::PaykitSdk::new(
+        storage.clone(),
+        provider,
+        TestPaymentAdapter,
+        paykit_sdk::PaykitSdkConfig::new(app_id).unwrap(),
+    );
+    sdk.initialize().await.unwrap();
+    let mut backup = sdk.export_backup_state().await.unwrap();
+    backup.next_outbound_private_message_id = counter_seed;
+    sdk.restore_backup_state(backup).await.unwrap();
+    let app = if app_id == "paykit-server" {
+        paykit_server::real_setup::server_app()
+    } else {
+        paykit_lib::PaykitApp::new(
+            "Test App",
+            paykit_lib::PaykitAppCapabilities {
+                private_payments: true,
+                payment_requests: true,
+                receipts: true,
+                outgoing_payments: true,
+            },
+        )
+        .unwrap()
+    };
+    sdk.publish_paykit_app(app).await.unwrap();
+    sdk
 }

@@ -8,29 +8,38 @@
 //! validated. Everything downstream (per-reader address derivation, atomic
 //! persistence, outbox delivery to the reader's wallet, Electrum observation,
 //! and the status lookup keyed by `(creator, reference)`) reuses the invoice
-//! pipeline unchanged.
+//! pipeline unchanged. The reader's receiving capability is checked against
+//! their shared Paykit app registry — the identity-wide replacement for the
+//! receiver markers this service used to discover.
 
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use paykit_lib::{PaymentAmount, PaymentEndpointIdentifier, PaymentReference, PaymentRequestTerms};
+use paykit_lib::{
+    PaykitAppId, PaymentAmount, PaymentEndpointIdentifier, PaymentEndpointPayload,
+    PaymentReference, PaymentRequestTerms,
+};
 use serde_json::{Map, Value};
 
 use crate::{
     application::{
         create_invoice::{
-            CreateInvoiceError, CreatorXpubProvider, DeadlineClock, DerivedNewReaderPayloads,
-            InvoicePersistence, MarkerDiscovery, PaykitIntentBuilder, SessionValidationError,
-            SessionValidator, SystemDeadlineClock, map_store, remaining,
+            AppRegistryDiscovery, CreateInvoiceError, CreatorXpubProvider, DeadlineClock,
+            InvoicePersistence, PaykitIntentBuilder, SessionValidationError, SessionValidator,
+            SystemDeadlineClock, derive_bip84_p2wpkh_address, map_store, remaining,
         },
-        reader_marker::select_reader_marker,
+        reader_registry::reader_is_capable,
         semantic_intent::DeliveryIntentV1,
     },
-    config::ReceiverPathPriority,
+    config::BitcoinNetwork,
     domain::locks::{BundleId, CreatorPubky, ReaderPubky},
-    persistence::{AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight},
+    persistence::{
+        AtomicInvoiceInput, AtomicInvoiceResult, InvoicePayloadFactory, InvoicePayloads,
+        InvoicePreflight, PersistenceError,
+    },
 };
 
 /// One marketplace order's payment request. `reference` is the marketplace's
@@ -46,11 +55,9 @@ pub struct MarketplacePaymentRequest {
 
 pub struct MarketplacePaymentRequestService {
     sessions: Arc<dyn SessionValidator>,
-    markers: Arc<dyn MarkerDiscovery>,
-    marker_priority: Vec<ReceiverPathPriority>,
-    local_receiver_path: paykit_lib::PaykitReceiverPath,
+    registries: Arc<dyn AppRegistryDiscovery>,
     credentials: Arc<dyn CreatorXpubProvider>,
-    bitcoin_network: crate::config::BitcoinNetwork,
+    bitcoin_network: BitcoinNetwork,
     store: Arc<dyn InvoicePersistence>,
     intents: Arc<PaykitIntentBuilder>,
     clock: Arc<dyn DeadlineClock>,
@@ -60,19 +67,15 @@ impl MarketplacePaymentRequestService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         sessions: Arc<dyn SessionValidator>,
-        markers: Arc<dyn MarkerDiscovery>,
-        marker_priority: Vec<ReceiverPathPriority>,
-        local_receiver_path: paykit_lib::PaykitReceiverPath,
+        registries: Arc<dyn AppRegistryDiscovery>,
         credentials: Arc<dyn CreatorXpubProvider>,
-        bitcoin_network: crate::config::BitcoinNetwork,
+        bitcoin_network: BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<PaykitIntentBuilder>,
     ) -> Self {
         Self::with_clock(
             sessions,
-            markers,
-            marker_priority,
-            local_receiver_path,
+            registries,
             credentials,
             bitcoin_network,
             store,
@@ -84,20 +87,16 @@ impl MarketplacePaymentRequestService {
     #[allow(clippy::too_many_arguments)]
     pub fn with_clock(
         sessions: Arc<dyn SessionValidator>,
-        markers: Arc<dyn MarkerDiscovery>,
-        marker_priority: Vec<ReceiverPathPriority>,
-        local_receiver_path: paykit_lib::PaykitReceiverPath,
+        registries: Arc<dyn AppRegistryDiscovery>,
         credentials: Arc<dyn CreatorXpubProvider>,
-        bitcoin_network: crate::config::BitcoinNetwork,
+        bitcoin_network: BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<PaykitIntentBuilder>,
         clock: Arc<dyn DeadlineClock>,
     ) -> Self {
         Self {
             sessions,
-            markers,
-            marker_priority,
-            local_receiver_path,
+            registries,
             credentials,
             bitcoin_network,
             store,
@@ -154,13 +153,19 @@ impl MarketplacePaymentRequestService {
                     CreateInvoiceError::CreatorSessionUnavailable
                 }
             })?;
-        let marker_remaining = elapsed_remaining(started, self.clock.now())?;
-        let discovered =
-            tokio::time::timeout(marker_remaining, self.markers.discover(&request.reader))
-                .await
-                .map_err(|_| CreateInvoiceError::DeadlineExceeded)??;
-        let selected = select_reader_marker(discovered, &self.marker_priority)
-            .ok_or(CreateInvoiceError::Unavailable)?;
+        // As in the invoice path: a reader without a capable shared Paykit
+        // registry cannot receive the payment request, so the order must not
+        // allocate an invoice for them.
+        let registry_remaining = elapsed_remaining(started, self.clock.now())?;
+        let discovered = tokio::time::timeout(
+            registry_remaining,
+            self.registries.discover(&request.reader),
+        )
+        .await
+        .map_err(|_| CreateInvoiceError::DeadlineExceeded)??;
+        if !discovered.as_ref().is_some_and(reader_is_capable) {
+            return Err(CreateInvoiceError::Unavailable);
+        }
         let credentials_remaining = elapsed_remaining(started, self.clock.now())?;
         let (xpub, account_index) = tokio::time::timeout(
             credentials_remaining,
@@ -169,22 +174,12 @@ impl MarketplacePaymentRequestService {
         .await
         .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
         .map_err(map_store)?;
-        let terms = self.payment_request_terms(&request)?;
-        let payment_request_intent = DeliveryIntentV1::payment_request(
-            request.reader.to_string(),
-            &selected.marker,
-            self.local_receiver_path.clone(),
-            &terms,
-        )
-        .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-        let new_reader_payloads = DerivedNewReaderPayloads {
+        let payloads = MarketplaceInvoicePayloads {
             intents: self.intents.clone(),
             xpub,
             account_index,
             network: self.bitcoin_network.clone(),
-            reader: request.reader.to_string(),
-            marker: selected.marker,
-            local_receiver_path: self.local_receiver_path.clone(),
+            request: &request,
         };
         elapsed_remaining(started, self.clock.now())?;
         // As in the Locks invoice path: once PostgreSQL mutation starts it is
@@ -196,46 +191,94 @@ impl MarketplacePaymentRequestService {
                 reader: &request.reader,
                 bundle_binding: &bundle_binding,
                 payment_request_binding: &payment_request_binding,
-                new_reader_payloads: &new_reader_payloads,
-                payment_request_intent,
+                invoice_payloads: &payloads,
                 required_sats: request.amount_sats,
             })
             .await
             .map_err(map_store)
     }
+}
 
-    fn payment_request_terms(
-        &self,
-        request: &MarketplacePaymentRequest,
-    ) -> Result<PaymentRequestTerms, CreateInvoiceError> {
-        let sats = request.amount_sats;
-        let mut metadata = Map::new();
-        metadata.insert(
-            "order_reference".into(),
-            Value::String(request.reference.to_string()),
-        );
-        metadata.insert("reader".into(), Value::String(request.reader.to_string()));
-        Ok(PaymentRequestTerms {
-            amount: PaymentAmount::new(
-                format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000),
-                "btc",
-            )
-            .map_err(|_| CreateInvoiceError::InvalidRequest)?,
-            // The delivery-intent contract requires a UUIDv4 payment
-            // reference. A retry never mints a second one: preflight replays
-            // the stored intent before terms are rebuilt. Order correlation
-            // rides in `metadata.order_reference`.
-            payment_reference: PaymentReference::new(uuid::Uuid::new_v4().hyphenated().to_string())
-                .map_err(|_| CreateInvoiceError::InvalidRequest)?,
-            proposal_expires_at: None,
-            recurrence: None,
-            accepted_payment_endpoint_identifiers: vec![
-                PaymentEndpointIdentifier::new(self.intents.onchain_endpoint_identifier())
-                    .map_err(|_| CreateInvoiceError::InvalidRequest)?,
-            ],
-            metadata,
+/// Builds the marketplace payment request only after the transaction has
+/// selected the permanent child index, so the derived invoice address binds
+/// into the payment endpoints before either row is persisted.
+struct MarketplaceInvoicePayloads<'a> {
+    intents: Arc<PaykitIntentBuilder>,
+    xpub: String,
+    account_index: u32,
+    network: BitcoinNetwork,
+    request: &'a MarketplacePaymentRequest,
+}
+
+impl InvoicePayloadFactory for MarketplaceInvoicePayloads<'_> {
+    fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
+        let address =
+            derive_bip84_p2wpkh_address(&self.xpub, self.account_index, &self.network, child_index)
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let terms = payment_request_terms(
+            self.request,
+            self.intents.onchain_endpoint_identifier(),
+            &address,
+        )
+        .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let payment_request_intent = DeliveryIntentV1::payment_request(
+            self.request.reader.to_string(),
+            PaykitAppId::new(crate::config::PAYKIT_APP_ID).expect("static app id"),
+            &terms,
+        )
+        .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        Ok(InvoicePayloads {
+            payment_request_intent,
+            bitcoin_address: address,
         })
     }
+}
+
+fn payment_request_terms(
+    request: &MarketplacePaymentRequest,
+    onchain_endpoint_identifier: &str,
+    address: &str,
+) -> Result<PaymentRequestTerms, CreateInvoiceError> {
+    if address.is_empty() {
+        return Err(CreateInvoiceError::InvalidRequest);
+    }
+    let identifier = PaymentEndpointIdentifier::new(onchain_endpoint_identifier)
+        .map_err(|_| CreateInvoiceError::InvalidRequest)?;
+    // Payment-endpoint-identifier spec section 7: the interoperable payload
+    // convention is a JSON object with the receiving handle under "value".
+    let payload = serde_json::to_string(&serde_json::json!({ "value": address }))
+        .map_err(|_| CreateInvoiceError::InvalidRequest)?;
+    let sats = request.amount_sats;
+    let mut metadata = Map::new();
+    metadata.insert(
+        "order_reference".into(),
+        Value::String(request.reference.to_string()),
+    );
+    metadata.insert("reader".into(), Value::String(request.reader.to_string()));
+    PaymentRequestTerms::builder(
+        PaymentAmount::new(
+            format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000),
+            "btc",
+        )
+        .map_err(|_| CreateInvoiceError::InvalidRequest)?,
+        // The delivery-intent contract requires a UUIDv4 payment reference. A
+        // retry never mints a second one: preflight replays the stored intent
+        // before terms are rebuilt. Order correlation rides in
+        // `metadata.order_reference`.
+        PaymentReference::new(uuid::Uuid::new_v4().hyphenated().to_string())
+            .map_err(|_| CreateInvoiceError::InvalidRequest)?,
+        vec![identifier.clone()],
+    )
+    .required_app_id(Some(
+        PaykitAppId::new(crate::config::PAYKIT_APP_ID).expect("static app id"),
+    ))
+    .payment_endpoints(Some(HashMap::from([(
+        identifier,
+        PaymentEndpointPayload::new(payload),
+    )])))
+    .metadata(metadata)
+    .build()
+    .map_err(|_| CreateInvoiceError::InvalidRequest)
 }
 
 fn elapsed_remaining(start: Instant, now: Instant) -> Result<Duration, CreateInvoiceError> {

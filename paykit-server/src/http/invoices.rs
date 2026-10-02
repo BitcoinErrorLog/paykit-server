@@ -57,9 +57,11 @@ fn invoice_error(error: CreateInvoiceError) -> Response {
         CreateInvoiceError::CreatorSessionInvalid => {
             ApiError::CreatorSessionInvalid.into_response()
         }
-        CreateInvoiceError::CreatorSessionUnavailable
-        | CreateInvoiceError::LockUnavailable
-        | CreateInvoiceError::Unavailable => ApiError::CreatorSessionUnavailable.into_response(),
+        CreateInvoiceError::CreatorSessionUnavailable => {
+            ApiError::CreatorSessionUnavailable.into_response()
+        }
+        CreateInvoiceError::LockUnavailable => ApiError::LockResourceUnavailable.into_response(),
+        CreateInvoiceError::Unavailable => ApiError::DependencyUnavailable.into_response(),
         CreateInvoiceError::LockNotFound => ApiError::LockNotFound.into_response(),
         CreateInvoiceError::Conflict => ApiError::InvoiceConflict.into_response(),
         CreateInvoiceError::DeadlineExceeded => ApiError::DependencyTimeout.into_response(),

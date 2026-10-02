@@ -5,10 +5,9 @@ use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
 use uuid::Uuid;
 
-const REQUIRED_TABLES: [&str; 7] = [
+const REQUIRED_TABLES: [&str; 6] = [
     "deployment_metadata",
     "creators",
-    "sdk_states",
     "reader_assignments",
     "invoices",
     "outbox",
@@ -43,7 +42,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
     for table in REQUIRED_TABLES {
         assert!(tables.iter().any(|name| name == table), "missing {table}");
     }
-    for retired_table in ["inbox_events", "peer_work_leases"] {
+    for retired_table in ["inbox_events", "peer_work_leases", "sdk_states"] {
         assert!(
             !tables.iter().any(|name| name == retired_table),
             "retired table remains: {retired_table}"

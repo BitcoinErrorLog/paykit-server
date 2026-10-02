@@ -68,7 +68,8 @@ trusted_public_key = "{key}"
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
-receiver_path = "paykit/server"
+client_id = "app.paykit.server"
+app_id = "paykit-server"
 network = "testnet"
 [bitcoin]
 network = "testnet"

@@ -1,27 +1,26 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use async_trait::async_trait;
 use paykit_lib::{
-    PaykitReceiverMarker, PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier,
+    PaykitAppRegistry, PaymentAmount, PaymentEndpointIdentifier, PaymentEndpointPayload,
     PaymentReference, PaymentRequestTerms,
 };
 use paykit_sdk::{
-    InMemoryStorage, LinkedPeerState, OutboundPrivateMessageStatus, PaykitReceiverCapabilities,
-    PaykitSdk, PaykitSdkConfig, PaykitSdkError, PubkyLocalSecretKey, PubkyPublicKey,
-    PubkySessionBootstrap, ReceiverNoiseSecretKey, StorageAdapter, storage::StorageState,
+    LinkedPeerState, OutboundPrivateMessageStatus, PaykitIdentitySecretKey, PubkyLocalSecretKey,
+    PubkyPublicKey, PubkySessionBootstrap, StorageAdapter,
 };
 use paykit_server::{
-    application::semantic_intent::DeliveryOperationV1,
+    config::{PaykitConfig, PaykitNetwork},
     crypto::Crypto,
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    paykit::{CreatorSessions, PaykitAdapter},
     persistence::{
-        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoiceStore,
-        NewReaderPayloadFactory, NewReaderPayloads, OutboxStore, PersistenceError,
-        PostgresStorageAdapter, SdkStateStore, run_migrations,
+        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
+        InvoicePayloads, InvoiceStore, OutboxStore, PersistenceError, run_migrations,
     },
     workers::outbox::{
         Adapter, HandoffError, HandoffResult, process_claim, process_reconciliation,
@@ -34,8 +33,6 @@ use uuid::Uuid;
 mod common;
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
-
-use sdk_fixtures::{TestPaymentAdapter, TestSessionProvider};
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
 
@@ -68,11 +65,11 @@ struct Payloads {
     reader: ReaderPubky,
 }
 
-impl NewReaderPayloadFactory for Payloads {
-    fn for_child_index(&self, child_index: i64) -> Result<NewReaderPayloads, PersistenceError> {
+impl InvoicePayloadFactory for Payloads {
+    fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         let address = format!("outbox-test-address-{child_index}");
-        Ok(NewReaderPayloads {
-            endpoint_intent: common::endpoint_intent(&self.reader, address.clone()),
+        Ok(InvoicePayloads {
+            payment_request_intent: common::payment_intent(&self.reader, address.clone()),
             bitcoin_address: address,
         })
     }
@@ -84,31 +81,20 @@ struct ReconciliationAdapter {
 
 #[async_trait]
 impl Adapter for ReconciliationAdapter {
-    async fn fetch_marker(
+    async fn fetch_registry(
         &self,
         _reader: &str,
-        _path: &str,
-    ) -> Result<Option<PaykitReceiverMarker>, HandoffError> {
+    ) -> Result<Option<PaykitAppRegistry>, HandoffError> {
         Ok(None)
     }
 
-    async fn ensure_link_with_peer(&self, _reader: &str, _path: &str) -> Result<(), HandoffError> {
-        Err(HandoffError::Permanent)
-    }
-
-    async fn enqueue_private_payment_list_with_receiving_details(
-        &self,
-        _reader: &str,
-        _path: &str,
-        _details: &[paykit_server::application::semantic_intent::ReceivingDetailV1],
-    ) -> Result<HandoffResult, HandoffError> {
+    async fn ensure_link_with_peer(&self, _reader: &str) -> Result<(), HandoffError> {
         Err(HandoffError::Permanent)
     }
 
     async fn propose_payment_request(
         &self,
         _reader: &str,
-        _path: &str,
         _terms: &paykit_server::application::semantic_intent::PaymentTermsV1,
     ) -> Result<HandoffResult, HandoffError> {
         Err(HandoffError::Permanent)
@@ -126,7 +112,7 @@ async fn assert_reconciliation_status(
     database: &TestDatabase,
     outbox: &OutboxStore,
     outbound_id: u64,
-    sdk_status: OutboundPrivateMessageStatus,
+    sdk_status: Option<OutboundPrivateMessageStatus>,
     expected_status: &str,
     expected_error_class: &str,
 ) {
@@ -149,7 +135,7 @@ async fn assert_reconciliation_status(
         .find(|claim| claim.id() == row_id)
         .expect("inserted reconciliation row was claimable");
     let adapter = ReconciliationAdapter {
-        statuses: Mutex::new(VecDeque::from([sdk_status])),
+        statuses: Mutex::new(sdk_status.into_iter().collect()),
     };
     assert!(
         process_reconciliation(outbox, &adapter, claim, Duration::from_secs(5))
@@ -176,23 +162,20 @@ async fn assert_reconciliation_status(
 }
 
 #[tokio::test]
-async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_dependency_order() {
+async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
     let creator = creator();
     let reader = reader();
     CreatorStore::new(database.pool(), crypto.clone())
-        .create(
-            &CreatorCredentials::new(
-                creator.clone(),
-                "session-secret".into(),
-                ReceiverNoiseSecretKey::new([9; 32]),
-                "xpub-secret".into(),
-                0,
-            ),
-            &StorageState::default(),
-        )
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "session-secret".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            "xpub-secret".into(),
+            0,
+        ))
         .await
         .unwrap();
     let payloads = Payloads {
@@ -204,28 +187,28 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             reader: &reader,
             bundle_binding: b"outbox-bundle",
             payment_request_binding: b"outbox-payment-request",
-            new_reader_payloads: &payloads,
-            payment_request_intent: common::payment_intent(&reader),
+            invoice_payloads: &payloads,
             required_sats: 100,
         })
         .await
         .unwrap();
     let outbox = OutboxStore::new(database.pool(), crypto);
 
-    let endpoint_claims = outbox
+    let request_claims = outbox
         .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
         .await
         .unwrap();
-    assert_eq!(endpoint_claims.len(), 1);
+    assert_eq!(request_claims.len(), 1);
+    assert_eq!(request_claims[0].id(), invoice.payment_request_outbox_id());
     assert_eq!(
-        endpoint_claims[0].id(),
-        invoice.endpoint_publication_outbox_id().unwrap()
+        outbox
+            .delivery_intent(&request_claims[0])
+            .unwrap()
+            .terms()
+            .payment_endpoints
+            .len(),
+        1
     );
-    assert!(matches!(
-        outbox.delivery_intent(&endpoint_claims[0]).unwrap().operation(),
-        DeliveryOperationV1::EndpointPublication { receiving_details }
-            if receiving_details.len() == 1
-    ));
     let retry_adapter = ReconciliationAdapter {
         statuses: Mutex::new(VecDeque::new()),
     };
@@ -233,7 +216,7 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
         process_claim(
             &outbox,
             &retry_adapter,
-            &endpoint_claims[0],
+            &request_claims[0],
             Duration::from_secs(5),
         )
         .await
@@ -242,40 +225,42 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
     let retry_state: (String, bool, Option<String>) = sqlx::query_as(
         "SELECT status, next_attempt_at > NOW(), error_class FROM outbox WHERE id = $1",
     )
-    .bind(endpoint_claims[0].id())
+    .bind(request_claims[0].id())
     .fetch_one(database.pool())
     .await
     .unwrap();
     assert_eq!(
         retry_state,
-        ("retryable".into(), true, Some("marker_missing".into()))
+        ("retryable".into(), true, Some("registry_missing".into()))
     );
     sqlx::query("UPDATE outbox SET next_attempt_at = NOW() WHERE id = $1")
-        .bind(endpoint_claims[0].id())
+        .bind(request_claims[0].id())
         .execute(database.pool())
         .await
         .unwrap();
-    let endpoint_claims = outbox
+    let request_claims = outbox
         .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
         .await
         .unwrap();
-    assert_eq!(endpoint_claims.len(), 1);
+    assert_eq!(request_claims.len(), 1);
     sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
-        .bind(endpoint_claims[0].id())
+        .bind(request_claims[0].id())
         .execute(database.pool())
         .await
         .unwrap();
-    let reclaimed_endpoint = outbox
+    let reclaimed_request = outbox
         .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
         .await
         .unwrap();
-    assert_eq!(reclaimed_endpoint.len(), 1);
+    assert_eq!(reclaimed_request.len(), 1);
     assert!(
         !outbox
             .mark_handed_off(
-                &endpoint_claims[0],
-                &HandoffResult::EndpointPublication {
+                &request_claims[0],
+                &HandoffResult {
                     outbound_message_id: 16,
+                    event_id: "event-16".into(),
+                    payment_request_id: "request-16".into(),
                 },
             )
             .await
@@ -285,9 +270,11 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
     assert!(
         outbox
             .mark_handed_off(
-                &reclaimed_endpoint[0],
-                &HandoffResult::EndpointPublication {
+                &reclaimed_request[0],
+                &HandoffResult {
                     outbound_message_id: 17,
+                    event_id: "event-17".into(),
+                    payment_request_id: "request-17".into(),
                 },
             )
             .await
@@ -299,7 +286,7 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             .await
             .unwrap()
             .is_empty(),
-        "dependent work must remain blocked at handed_off"
+        "handed-off work must not be enqueued again"
     );
     let reconciliation = outbox
         .claim_reconciliation(Uuid::new_v4(), 10, Duration::from_secs(30))
@@ -308,10 +295,7 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
     assert_eq!(reconciliation.len(), 1);
     assert_eq!(reconciliation[0].sdk_outbound_message_id().unwrap(), 17);
     let reconciliation_adapter = ReconciliationAdapter {
-        statuses: Mutex::new(VecDeque::from([
-            OutboundPrivateMessageStatus::Pending,
-            OutboundPrivateMessageStatus::Sent,
-        ])),
+        statuses: Mutex::new(VecDeque::from([OutboundPrivateMessageStatus::Pending])),
     };
     assert!(
         process_reconciliation(
@@ -329,49 +313,19 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             .await
             .unwrap()
             .is_empty(),
-        "Pending SDK state unblocked dependent work"
+        "Pending SDK state caused another enqueue"
     );
-    let reconciliation = outbox
-        .claim_reconciliation(Uuid::new_v4(), 10, Duration::from_secs(30))
-        .await
-        .unwrap();
-    assert_eq!(reconciliation.len(), 1);
-    assert!(
-        process_reconciliation(
-            &outbox,
-            &reconciliation_adapter,
-            &reconciliation[0],
-            Duration::ZERO,
-        )
-        .await
-        .unwrap()
-    );
-
-    let payment_claims = outbox
-        .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
-        .await
-        .unwrap();
+    let payment_claims = reclaimed_request;
     assert_eq!(payment_claims.len(), 1);
     assert_eq!(payment_claims[0].id(), invoice.payment_request_outbox_id());
-    assert!(matches!(
+    assert_eq!(
         outbox
             .delivery_intent(&payment_claims[0])
             .unwrap()
-            .operation(),
-        DeliveryOperationV1::PaymentRequestProposal { .. }
-    ));
-    assert!(
-        outbox
-            .mark_handed_off(
-                &payment_claims[0],
-                &HandoffResult::PaymentRequestProposal {
-                    outbound_message_id: 18,
-                    event_id: "event-18".into(),
-                    payment_request_id: "request-18".into(),
-                },
-            )
-            .await
-            .unwrap()
+            .terms()
+            .payment_endpoints
+            .len(),
+        1
     );
     let ids: (String, Option<String>, Option<String>) = sqlx::query_as(
         "SELECT sdk_outbound_message_id, sdk_event_id, sdk_payment_request_id FROM outbox WHERE id = $1",
@@ -383,9 +337,9 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
     assert_eq!(
         ids,
         (
-            "18".into(),
-            Some("event-18".into()),
-            Some("request-18".into())
+            "17".into(),
+            Some("event-17".into()),
+            Some("request-17".into())
         )
     );
 
@@ -455,7 +409,7 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             &database,
             &outbox,
             100 + offset as u64,
-            status,
+            Some(status),
             "handed_off",
             "reconciliation_pending",
         )
@@ -473,12 +427,22 @@ async fn every_claimed_invoice_row_has_one_complete_decryptable_intent_and_depen
             &database,
             &outbox,
             200 + offset as u64,
-            status,
+            Some(status),
             "permanently_failed",
             "permanent_sdk_reconciliation",
         )
         .await;
     }
+
+    assert_reconciliation_status(
+        &database,
+        &outbox,
+        300,
+        None,
+        "permanently_failed",
+        "permanent_sdk_reconciliation",
+    )
+    .await;
 
     let corrupt_id: Uuid = sqlx::query_scalar(
         "INSERT INTO outbox (creator_id, intent_envelope, status) \
@@ -554,96 +518,58 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
     let testnet = build_pubky_testnet().await;
     let crypto = Arc::new(Crypto::from_master_key(&[11; 32]).unwrap());
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
-    let bootstrap = PubkySessionBootstrap::with_pubky(testnet.sdk().unwrap());
+    let bootstrap =
+        PubkySessionBootstrap::with_pubky(testnet.sdk().unwrap(), "app.paykit.server").unwrap();
 
-    let creator_receiver_path = PaykitReceiverPath::new("bitkit/server").unwrap();
     let creator_keypair = Keypair::random();
     let creator_bootstrap = bootstrap
         .sign_up(
             &PubkyLocalSecretKey::new(creator_keypair.secret_key()),
-            ReceiverNoiseSecretKey::random(),
             &homeserver,
             None,
-            &PaykitSdkConfig::new(creator_receiver_path.clone()).required_session_capabilities(),
+            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
+    let creator_session_secret = creator_bootstrap
+        .export_session_secret()
+        .await
+        .unwrap()
+        .into_inner();
     let creator = parse_creator(&format!("pubky{}", creator_bootstrap.public_key)).unwrap();
-    let creator_row = CreatorStore::new(database.pool(), crypto.clone())
-        .create(
-            &CreatorCredentials::new(
-                creator.clone(),
-                creator_bootstrap.access.session.export_secret(),
-                creator_bootstrap.access.receiver_noise_secret_key.clone(),
-                "unused-test-xpub".into(),
-                0,
-            ),
-            &StorageState::default(),
-        )
+    let creator_record = CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            creator_session_secret,
+            PubkyLocalSecretKey::new(creator_keypair.secret_key())
+                .derive_paykit_identity_secret_key(1)
+                .unwrap(),
+            "unused-test-xpub".into(),
+            0,
+        ))
         .await
         .unwrap();
-    let creator_storage =
-        PostgresStorageAdapter::new(database.pool(), crypto.clone(), creator_row.id());
-    let creator_sdk = PaykitSdk::new(
-        creator_storage.clone(),
-        TestSessionProvider::new(creator_bootstrap.access.clone()),
-        TestPaymentAdapter,
-        PaykitSdkConfig::new(creator_receiver_path.clone()),
-    )
-    .unwrap();
-    creator_sdk.initialize().await.unwrap();
-    creator_sdk
-        .publish_paykit_receiver_marker(PaykitReceiverCapabilities {
-            private_payments: true,
-            payment_requests: true,
-            receipts: true,
-            outgoing_payments: true,
-        })
-        .await
-        .unwrap();
+    let creator_sdk =
+        sdk_fixtures::hosted_sdk(creator_bootstrap.access.clone(), "paykit-server", 0).await;
 
-    let peer_receiver_path = PaykitReceiverPath::new("paykit/server").unwrap();
     let peer_keypair = Keypair::random();
     let peer_bootstrap = bootstrap
         .sign_up(
             &PubkyLocalSecretKey::new(peer_keypair.secret_key()),
-            ReceiverNoiseSecretKey::random(),
             &homeserver,
             None,
-            &PaykitSdkConfig::new(peer_receiver_path.clone()).required_session_capabilities(),
+            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
-    let peer_sdk = PaykitSdk::new(
-        InMemoryStorage::default(),
-        TestSessionProvider::new(peer_bootstrap.access.clone()),
-        TestPaymentAdapter,
-        PaykitSdkConfig::new(peer_receiver_path.clone()),
-    )
-    .unwrap();
-    peer_sdk.initialize().await.unwrap();
-    peer_sdk
-        .publish_paykit_receiver_marker(PaykitReceiverCapabilities {
-            private_payments: true,
-            payment_requests: true,
-            receipts: true,
-            outgoing_payments: true,
-        })
-        .await
-        .unwrap();
+    let peer_sdk = sdk_fixtures::hosted_sdk(peer_bootstrap.access.clone(), "bitkit", 0).await;
 
     creator_sdk
-        .initiate_link_with_peer(
-            peer_bootstrap.public_key.clone(),
-            peer_receiver_path.clone(),
-        )
+        .initiate_link_with_peer(peer_bootstrap.public_key.clone())
         .await
         .unwrap();
     peer_sdk
-        .accept_link_with_peer(
-            creator_bootstrap.public_key.clone(),
-            creator_receiver_path.clone(),
-        )
+        .accept_link_with_peer(creator_bootstrap.public_key.clone())
         .await
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -653,20 +579,14 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         assert!(tokio::time::Instant::now() < deadline, "link timed out");
         if creator_link != LinkedPeerState::Linked {
             creator_link = creator_sdk
-                .advance_link_handshake(
-                    peer_bootstrap.public_key.clone(),
-                    peer_receiver_path.clone(),
-                )
+                .advance_link_handshake(peer_bootstrap.public_key.clone())
                 .await
                 .unwrap()
                 .state;
         }
         if peer_link != LinkedPeerState::Linked {
             peer_link = peer_sdk
-                .advance_link_handshake(
-                    creator_bootstrap.public_key.clone(),
-                    creator_receiver_path.clone(),
-                )
+                .advance_link_handshake(creator_bootstrap.public_key.clone())
                 .await
                 .unwrap()
                 .state;
@@ -681,21 +601,13 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             reader: &reader,
             bundle_binding: b"public-sdk-crash-window-bundle",
             payment_request_binding: b"public-sdk-crash-window-request",
-            new_reader_payloads: &Payloads {
+            invoice_payloads: &Payloads {
                 reader: reader.clone(),
             },
-            payment_request_intent: common::payment_intent(&reader),
             required_sats: 100,
         })
         .await
         .unwrap();
-    sqlx::query(
-        "UPDATE outbox SET status = 'delivered', sdk_outbound_message_id = '0' WHERE id = $1",
-    )
-    .bind(invoice.endpoint_publication_outbox_id().unwrap())
-    .execute(database.pool())
-    .await
-    .unwrap();
     let outbox = OutboxStore::new(database.pool(), crypto.clone());
     let first_claim = outbox
         .claim(Uuid::new_v4(), 10, Duration::from_secs(30))
@@ -705,33 +617,41 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         .unwrap();
     assert_eq!(first_claim.id(), invoice.payment_request_outbox_id());
     let intent = outbox.delivery_intent(&first_claim).unwrap();
-    let terms = match intent.operation() {
-        DeliveryOperationV1::PaymentRequestProposal { terms } => PaymentRequestTerms {
-            amount: PaymentAmount::new(terms.amount.clone(), terms.asset.clone()).unwrap(),
-            payment_reference: PaymentReference::new(terms.payment_reference.clone()).unwrap(),
-            proposal_expires_at: terms.proposal_expires_at.clone(),
-            recurrence: None,
-            accepted_payment_endpoint_identifiers: terms
-                .accepted_endpoint_identifiers
-                .iter()
-                .cloned()
-                .map(PaymentEndpointIdentifier::new)
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap(),
-            metadata: terms.metadata.clone(),
-        },
-        DeliveryOperationV1::EndpointPublication { .. } => panic!("claimed endpoint row"),
-    };
+    let terms = intent.terms();
+    let terms = PaymentRequestTerms::builder(
+        PaymentAmount::new(terms.amount.clone(), terms.asset.clone()).unwrap(),
+        PaymentReference::new(terms.payment_reference.clone()).unwrap(),
+        terms
+            .accepted_endpoint_identifiers
+            .iter()
+            .cloned()
+            .map(PaymentEndpointIdentifier::new)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+    )
+    .required_app_id(Some(common::app_id()))
+    .payment_endpoints(Some(
+        terms
+            .payment_endpoints
+            .iter()
+            .map(|(identifier, payload)| {
+                (
+                    PaymentEndpointIdentifier::new(identifier.clone()).unwrap(),
+                    PaymentEndpointPayload::new(payload.clone()),
+                )
+            })
+            .collect(),
+    ))
+    .proposal_expires_at(terms.proposal_expires_at.clone())
+    .metadata(terms.metadata.clone())
+    .build()
+    .unwrap();
 
     let first = creator_sdk
-        .propose_payment_request(
-            peer_bootstrap.public_key.clone(),
-            peer_receiver_path.clone(),
-            terms.clone(),
-        )
+        .propose_payment_request(peer_bootstrap.public_key.clone(), terms.clone())
         .await
         .unwrap();
-    let first_result = HandoffResult::PaymentRequestProposal {
+    let first_result = HandoffResult {
         outbound_message_id: first.proposal_outbound_message_id.unwrap(),
         event_id: first.proposal_event_id.unwrap(),
         payment_request_id: first.payment_request_id,
@@ -749,39 +669,30 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         .pop()
         .unwrap();
     let second = creator_sdk
-        .propose_payment_request(peer_bootstrap.public_key, peer_receiver_path, terms)
+        .propose_payment_request(peer_bootstrap.public_key.clone(), terms)
         .await
         .unwrap();
-    let second_result = HandoffResult::PaymentRequestProposal {
+    let second_result = HandoffResult {
         outbound_message_id: second.proposal_outbound_message_id.unwrap(),
         event_id: second.proposal_event_id.unwrap(),
         payment_request_id: second.payment_request_id,
     };
 
-    let (first_outbound, first_event, first_request) = match &first_result {
-        HandoffResult::PaymentRequestProposal {
-            outbound_message_id,
-            event_id,
-            payment_request_id,
-        } => (*outbound_message_id, event_id, payment_request_id),
-        HandoffResult::EndpointPublication { .. } => unreachable!(),
-    };
-    let (second_outbound, second_event, second_request) = match &second_result {
-        HandoffResult::PaymentRequestProposal {
-            outbound_message_id,
-            event_id,
-            payment_request_id,
-        } => (*outbound_message_id, event_id, payment_request_id),
-        HandoffResult::EndpointPublication { .. } => unreachable!(),
-    };
+    let (first_outbound, first_event, first_request) = (
+        first_result.outbound_message_id,
+        &first_result.event_id,
+        &first_result.payment_request_id,
+    );
+    let (second_outbound, second_event, second_request) = (
+        second_result.outbound_message_id,
+        &second_result.event_id,
+        &second_result.payment_request_id,
+    );
     assert_ne!(first_outbound, second_outbound);
     assert_ne!(first_event, second_event);
     assert_ne!(first_request, second_request);
 
-    let durable_state = SdkStateStore::new(database.pool(), crypto)
-        .load(&creator)
-        .await
-        .unwrap();
+    let durable_state = creator_sdk.export_backup_state().await.unwrap();
     for (outbound_id, event_id, request_id) in [
         (first_outbound, first_event, first_request),
         (second_outbound, second_event, second_request),
@@ -793,6 +704,164 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             .expect("SDK-generated outbound ID was not durable");
         assert!(outbound.raw_json.contains(event_id));
         assert!(outbound.raw_json.contains(request_id));
+        assert!(
+            outbound.raw_json.len() <= paykit_lib::pubky_noise::snow_crypto::PUBKY_NOISE_MSG_LEN
+        );
+        let wire: serde_json::Value = serde_json::from_str(&outbound.raw_json).unwrap();
+        assert!(wire.to_string().contains("payment_endpoints"));
+    }
+
+    let old_list = creator_sdk
+        .enqueue_private_payment_list_with_receiving_details(
+            peer_bootstrap.public_key.clone(),
+            vec![paykit_sdk::PrivateReceivingDetail {
+                identifier: "btc-bitcoin-p2wpkh".into(),
+                payload: serde_json::json!({"value": "unrelated-old-address"}).to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+    creator_sdk
+        .enqueue_private_payment_list_with_receiving_details(
+            peer_bootstrap.public_key.clone(),
+            vec![paykit_sdk::PrivateReceivingDetail {
+                identifier: "btc-bitcoin-p2wpkh".into(),
+                payload: serde_json::json!({"value": "unrelated-new-address"}).to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+    // A stored linked peer may no longer publish an App Registry. Its intake
+    // failure must degrade maintenance without blocking the healthy peer's sends.
+    let missing_registry_peer = bootstrap
+        .sign_up(
+            &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
+            &homeserver,
+            None,
+            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
+        )
+        .await
+        .unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto.clone());
+    let config = PaykitConfig {
+        client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
+        app_id: common::app_id(),
+        network: PaykitNetwork::Testnet,
+        auth_relay: "http://127.0.0.1:1/inbox".parse().unwrap(),
+    };
+    let sessions = CreatorSessions::new(creators.clone(), testnet.sdk().unwrap(), config.clone());
+    let provider = sessions.provider(&creator);
+    let storage = paykit_sdk::PubkySharedStateStorage::new(provider.clone());
+    let adapter = PaykitAdapter::new(creator_record.id(), provider.clone(), &config).unwrap();
+    let lease = storage
+        .transaction(|tx| {
+            let now = sqlx::types::chrono::Utc::now();
+            Ok(tx
+                .claim_peer_link_operation(
+                    &peer_bootstrap.public_key,
+                    now,
+                    now + Duration::from_secs(60),
+                )?
+                .unwrap())
+        })
+        .await
+        .unwrap();
+    assert!(
+        adapter
+            .maintain_transport()
+            .await
+            .unwrap_err()
+            .is_concurrent_update()
+    );
+    storage
+        .transaction(|tx| {
+            assert_eq!(
+                tx.peer_link_operation_lease(&peer_bootstrap.public_key),
+                Some(lease.clone())
+            );
+            let outbound = tx.outbound_private_messages(&peer_bootstrap.public_key);
+            for outbound_id in [first_outbound, second_outbound] {
+                assert_eq!(
+                    outbound
+                        .iter()
+                        .find(|record| record.outbound_message_id == outbound_id)
+                        .unwrap()
+                        .status,
+                    OutboundPrivateMessageStatus::Pending
+                );
+            }
+            tx.release_peer_link_operation(&peer_bootstrap.public_key, lease.lease_id);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    storage
+        .transaction(|tx| {
+            let mut linked_peer = tx.linked_peer(&peer_bootstrap.public_key).unwrap();
+            linked_peer.counterparty = missing_registry_peer.public_key.clone();
+            tx.save_linked_peer(linked_peer);
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        adapter.maintain_transport().await,
+        Err(paykit_sdk::PaykitSdkError::Transport { .. })
+    ));
+    // Use the process-shared provider after it restores the stored grant.
+    let creator_sdk = paykit_sdk::PaykitSdk::new(
+        storage,
+        provider,
+        sdk_fixtures::TestPaymentAdapter,
+        paykit_sdk::PaykitSdkConfig::new("paykit-server").unwrap(),
+    );
+    let compacted = creator_sdk.export_backup_state().await.unwrap();
+    assert!(
+        !compacted
+            .outbound_private_messages
+            .iter()
+            .any(|record| record.outbound_message_id == old_list.outbound_message_id)
+    );
+    for outbound_id in [first_outbound, second_outbound] {
+        assert!(
+            compacted
+                .outbound_private_messages
+                .iter()
+                .any(|record| record.outbound_message_id == outbound_id
+                    && record.status == OutboundPrivateMessageStatus::Sent)
+        );
+    }
+    peer_sdk
+        .receive_private_messages(creator_bootstrap.public_key.clone())
+        .await
+        .unwrap();
+    let received = peer_sdk
+        .actionable_received_payment_requests()
+        .await
+        .unwrap();
+    assert_eq!(received.len(), 2);
+    assert_eq!(
+        received[0].terms, received[1].terms,
+        "ambiguous replay preserves all terms"
+    );
+    for request in received {
+        let resolution = peer_sdk
+            .resolve_private_payment_request(
+                creator_bootstrap.public_key.clone(),
+                &paykit_lib::PaymentRequestId::new(request.payment_request_id).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resolution.status,
+            paykit_sdk::PrivatePaymentResolutionStatus::Payable
+        );
+        assert_eq!(resolution.private_payment_list_version, None);
+        assert_eq!(
+            resolution.payable_endpoints[0].target.payload,
+            intent.terms().payment_endpoints["btc-bitcoin-p2wpkh"]
+        );
     }
 
     assert!(
@@ -825,148 +894,5 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
     );
 
     drop(testnet);
-    database.cleanup().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn postgres_sdk_transactions_are_durable_and_creator_isolated() {
-    let database = TestDatabase::create().await;
-    run_migrations(database.pool()).await.unwrap();
-    let crypto = Arc::new(Crypto::from_master_key(&[8; 32]).unwrap());
-    let creators = CreatorStore::new(database.pool(), crypto.clone());
-    let first_creator = creator();
-    let mut second_creator = None;
-    for replacement in "ybndrfg8ejkmcpqxot1uwisza345h769".chars() {
-        let mut candidate = CREATOR.to_owned();
-        candidate.replace_range(5..6, &replacement.to_string());
-        if let Ok(value) = parse_creator(&candidate)
-            && value != first_creator
-        {
-            second_creator = Some(value);
-            break;
-        }
-    }
-    let second_creator = second_creator.expect("second valid creator fixture");
-    let first = creators
-        .create(
-            &CreatorCredentials::new(
-                first_creator,
-                "first-session".into(),
-                ReceiverNoiseSecretKey::new([1; 32]),
-                "first-xpub".into(),
-                0,
-            ),
-            &StorageState::default(),
-        )
-        .await
-        .unwrap();
-    let second = creators
-        .create(
-            &CreatorCredentials::new(
-                second_creator,
-                "second-session".into(),
-                ReceiverNoiseSecretKey::new([2; 32]),
-                "second-xpub".into(),
-                0,
-            ),
-            &StorageState::default(),
-        )
-        .await
-        .unwrap();
-    let first_storage = PostgresStorageAdapter::new(database.pool(), crypto.clone(), first.id());
-    let second_storage = PostgresStorageAdapter::new(database.pool(), crypto, second.id());
-
-    let (first_id, second_id) = tokio::join!(
-        first_storage.transaction(|tx| Ok(tx.allocate_receive_batch_id())),
-        second_storage.transaction(|tx| Ok(tx.allocate_receive_batch_id())),
-    );
-    assert_eq!(first_id.unwrap(), 0);
-    assert_eq!(second_id.unwrap(), 0);
-    assert_eq!(
-        first_storage
-            .transaction(|tx| Ok(tx.allocate_receive_batch_id()))
-            .await
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        second_storage
-            .transaction(|tx| Ok(tx.allocate_receive_batch_id()))
-            .await
-            .unwrap(),
-        1
-    );
-
-    let (first_entered_tx, first_entered_rx) = tokio::sync::oneshot::channel();
-    let (release_first_tx, release_first_rx) = mpsc::channel();
-    let held_storage = first_storage.clone();
-    let held = tokio::spawn(async move {
-        held_storage
-            .transaction(move |_| {
-                first_entered_tx.send(()).unwrap();
-                release_first_rx.recv().unwrap();
-                Ok(())
-            })
-            .await
-    });
-    first_entered_rx.await.unwrap();
-
-    let (same_entered_tx, mut same_entered_rx) = tokio::sync::oneshot::channel();
-    let same_storage = first_storage.clone();
-    let same = tokio::spawn(async move {
-        same_storage
-            .transaction(move |_| {
-                same_entered_tx.send(()).unwrap();
-                Ok(())
-            })
-            .await
-    });
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), &mut same_entered_rx)
-            .await
-            .is_err(),
-        "a second callback entered the same Creator transaction concurrently"
-    );
-
-    let (other_entered_tx, other_entered_rx) = tokio::sync::oneshot::channel();
-    let other_storage = second_storage.clone();
-    let other = tokio::spawn(async move {
-        other_storage
-            .transaction(move |_| {
-                other_entered_tx.send(()).unwrap();
-                Ok(())
-            })
-            .await
-    });
-    tokio::time::timeout(Duration::from_secs(2), other_entered_rx)
-        .await
-        .expect("different Creator callback did not progress concurrently")
-        .unwrap();
-    other.await.unwrap().unwrap();
-
-    release_first_tx.send(()).unwrap();
-    held.await.unwrap().unwrap();
-    same_entered_rx.await.unwrap();
-    same.await.unwrap().unwrap();
-
-    let rolled_back: paykit_sdk::Result<()> = first_storage
-        .transaction(|transaction| {
-            transaction.allocate_receive_batch_id();
-            Err(PaykitSdkError::Policy {
-                context: "test rollback".into(),
-                source: None,
-            })
-        })
-        .await;
-    assert!(rolled_back.is_err());
-    assert_eq!(
-        first_storage
-            .transaction(|transaction| Ok(transaction.allocate_receive_batch_id()))
-            .await
-            .unwrap(),
-        2,
-        "callback error committed mutated SDK state"
-    );
-
     database.cleanup().await;
 }

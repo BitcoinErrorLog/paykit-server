@@ -4,11 +4,16 @@ ARG RUST_IMAGE=rust:1.91.1-slim-bookworm@sha256:8514999d4786ef12efe89239e86b3d0a
 ARG RUNTIME_IMAGE=debian:bookworm-20260112-slim@sha256:56ff6d36d4eb3db13a741b342ec466f121480b5edded42e4b7ee850ce7a418ee
 
 FROM ${RUST_IMAGE} AS builder
+ENV RUSTUP_TOOLCHAIN=1.91.1
 WORKDIR /build
 
-# These named contexts are supplied by the sibling Locks Compose project. The
-# Paykit contexts are crate directories, so the paykit-rs repository needs no
-# Docker-owned files and its workspace target directory is never transferred.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+# These named contexts are supplied by the calling build or Compose project.
+# The Paykit contexts are crate directories, so the paykit-rs repository needs
+# no Docker-owned files and its workspace target directory is never transferred.
 RUN --mount=from=paykit-lib,target=/contexts/paykit-lib,ro \
     --mount=from=paykit-sdk,target=/contexts/paykit-sdk,ro \
     --mount=from=locks,target=/contexts/locks,ro \
@@ -26,14 +31,18 @@ WORKDIR /build/paykit-server
 
 # Override only the copied manifest's Docker build source resolution. Exact
 # matches make dependency-pin drift fail closed; committed files stay unchanged.
-RUN sh scripts/prepare-local-docker-sources.sh
+RUN sh scripts/prepare-local-docker-sources.sh \
+    && cargo update --package locks-core
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/paykit-server/target \
-    cargo build --locked --release -p paykit-server --bins && \
+    cargo build --locked --release -p paykit-server \
+        --bin paykit-server \
+        --bin paykit-reader-demo \
+        --example paykit-companion-auth && \
     install -Dm755 target/release/paykit-server /out/paykit-server && \
-    install -Dm755 target/release/paykit-companion-auth /out/paykit-companion-auth && \
+    install -Dm755 target/release/examples/paykit-companion-auth /out/paykit-companion-auth && \
     install -Dm755 target/release/paykit-reader-demo /out/paykit-reader-demo
 
 FROM ${RUNTIME_IMAGE} AS runtime

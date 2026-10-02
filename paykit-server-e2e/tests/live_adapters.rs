@@ -8,14 +8,14 @@ use std::{
 use async_trait::async_trait;
 use bitcoin::{OutPoint, Txid};
 use paykit_lib::{
-    PaykitReceiverCapabilities, PaykitReceiverPath, PaymentAmount, PaymentEndpointIdentifier,
+    PaykitApp, PaykitAppCapabilities, PaykitAppId, PaymentAmount, PaymentEndpointIdentifier,
     PaymentReference, PaymentRequestTerms,
 };
 use paykit_sdk::{
-    InMemoryStorage, LinkedPeerState, PaykitSdk, PaykitSdkConfig, PaymentAdapter, PaymentTarget,
+    LinkedPeerState, PaykitSdk, PaykitSdkConfig, PaymentAdapter, PaymentTarget,
     PubkyLocalSecretKey, PubkyPublicKey, PubkySessionAccess, PubkySessionBootstrap,
-    PubkySessionProvider, PublicPaymentEndpointCandidate, PublicPaymentEndpointSelectionRequest,
-    PublicReceivingDetail, ReceiverNoiseSecretKey,
+    PubkySessionProvider, PubkySharedStateStorage, PublicPaymentEndpointCandidate,
+    PublicPaymentEndpointSelectionRequest, PublicReceivingDetail,
 };
 use paykit_server::{
     bitcoin::{ObservationTarget, TrackedOutput},
@@ -65,6 +65,22 @@ struct LivePaymentAdapter;
 
 #[async_trait]
 impl PaymentAdapter for LivePaymentAdapter {
+    async fn select_private_payment_endpoints(
+        &self,
+        request: &paykit_sdk::PrivatePaymentEndpointSelectionRequest,
+    ) -> paykit_sdk::Result<Vec<paykit_sdk::PrivatePaymentEndpointCandidate>> {
+        Ok(request.candidates.clone())
+    }
+
+    async fn build_private_payment_target(
+        &self,
+        endpoint: &paykit_sdk::PrivatePaymentEndpointCandidate,
+    ) -> paykit_sdk::Result<PaymentTarget> {
+        Ok(PaymentTarget {
+            payload: endpoint.payload.clone(),
+        })
+    }
+
     async fn current_public_receiving_details(
         &self,
     ) -> paykit_sdk::Result<Vec<PublicReceivingDetail>> {
@@ -88,38 +104,44 @@ impl PaymentAdapter for LivePaymentAdapter {
     }
 }
 
-type LiveSdk = PaykitSdk<InMemoryStorage, LiveSessionProvider, LivePaymentAdapter>;
+type LiveSdk = PaykitSdk<PubkySharedStateStorage, LiveSessionProvider, LivePaymentAdapter>;
 
 async fn live_sdk(
     bootstrap: &PubkySessionBootstrap,
     homeserver: &PubkyPublicKey,
-    receiver_path: PaykitReceiverPath,
+    app_id: PaykitAppId,
+    outgoing_payments: bool,
 ) -> (PubkyPublicKey, LiveSdk) {
     let account = bootstrap
         .sign_up(
             &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
-            ReceiverNoiseSecretKey::random(),
             homeserver,
             None,
-            &PaykitSdkConfig::new(receiver_path.clone()).required_session_capabilities(),
+            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
     let public_key = account.public_key.clone();
+    let provider = LiveSessionProvider::new(account.access);
     let sdk = PaykitSdk::new(
-        InMemoryStorage::default(),
-        LiveSessionProvider::new(account.access),
+        PubkySharedStateStorage::new(provider.clone()),
+        provider,
         LivePaymentAdapter,
-        PaykitSdkConfig::new(receiver_path),
-    )
-    .unwrap();
+        PaykitSdkConfig::new(app_id.as_str()).unwrap(),
+    );
     sdk.initialize().await.unwrap();
-    sdk.publish_paykit_receiver_marker(PaykitReceiverCapabilities {
-        private_payments: true,
-        payment_requests: true,
-        receipts: false,
-        outgoing_payments: false,
-    })
+    sdk.publish_paykit_app(
+        PaykitApp::new(
+            "Test App",
+            PaykitAppCapabilities {
+                private_payments: true,
+                payment_requests: true,
+                receipts: false,
+                outgoing_payments,
+            },
+        )
+        .unwrap(),
+    )
     .await
     .unwrap();
     (public_key, sdk)
@@ -128,17 +150,15 @@ async fn live_sdk(
 async fn establish_link(
     payee: &LiveSdk,
     payee_key: PubkyPublicKey,
-    payee_path: PaykitReceiverPath,
     payer: &LiveSdk,
     payer_key: PubkyPublicKey,
-    payer_path: PaykitReceiverPath,
 ) {
     payee
-        .initiate_link_with_peer(payer_key.clone(), payer_path.clone())
+        .initiate_link_with_peer(payer_key.clone())
         .await
         .unwrap();
     payer
-        .accept_link_with_peer(payee_key.clone(), payee_path.clone())
+        .accept_link_with_peer(payee_key.clone())
         .await
         .unwrap();
 
@@ -149,14 +169,14 @@ async fn establish_link(
         assert!(tokio::time::Instant::now() < deadline, "link timed out");
         if payee_state != LinkedPeerState::Linked {
             payee_state = payee
-                .advance_link_handshake(payer_key.clone(), payer_path.clone())
+                .advance_link_handshake(payer_key.clone())
                 .await
                 .unwrap()
                 .state;
         }
         if payer_state != LinkedPeerState::Linked {
             payer_state = payer
-                .advance_link_handshake(payee_key.clone(), payee_path.clone())
+                .advance_link_handshake(payee_key.clone())
                 .await
                 .unwrap()
                 .state;
@@ -166,58 +186,58 @@ async fn establish_link(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires the Pubky Core static testnet on localhost"]
-async fn live_pubky_marker_discovery_and_payment_request_delivery() {
+#[ignore = "requires the Pubky static testnet on localhost"]
+async fn live_pubky_registry_discovery_and_payment_request_delivery() {
     let pubky = Pubky::testnet().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky);
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky, "app.paykit.server").unwrap();
     let homeserver = PubkyPublicKey::from_raw_or_app_key(STATIC_HOMESERVER).unwrap();
-    let payee_path = PaykitReceiverPath::new("paykit/server").unwrap();
-    let payer_path = PaykitReceiverPath::new("bitkit/server").unwrap();
-    let (payee_key, payee) = live_sdk(&bootstrap, &homeserver, payee_path.clone()).await;
-    let (payer_key, payer) = live_sdk(&bootstrap, &homeserver, payer_path.clone()).await;
+    let payee_path = PaykitAppId::new("paykit-server").unwrap();
+    let payer_path = PaykitAppId::new("bitkit").unwrap();
+    let (payee_key, payee) = live_sdk(&bootstrap, &homeserver, payee_path.clone(), false).await;
+    let (payer_key, payer) = live_sdk(&bootstrap, &homeserver, payer_path.clone(), true).await;
 
-    let discovered_paths = payer
-        .paykit_receiver_paths(payee_key.clone())
-        .await
-        .unwrap();
-    assert!(discovered_paths.contains(&payee_path));
-    let marker = payer
-        .paykit_receiver_marker(payee_key.clone(), payee_path.clone())
+    let registry = payer
+        .paykit_app_registry(payee_key.clone())
         .await
         .unwrap()
         .unwrap();
-    assert!(marker.capabilities.payment_requests);
+    assert!(
+        registry
+            .apps()
+            .get(&payee_path)
+            .unwrap()
+            .capabilities()
+            .payment_requests
+    );
 
-    establish_link(
-        &payee,
-        payee_key.clone(),
-        payee_path.clone(),
-        &payer,
-        payer_key.clone(),
-        payer_path.clone(),
-    )
-    .await;
+    establish_link(&payee, payee_key.clone(), &payer, payer_key.clone()).await;
 
     let reference = uuid::Uuid::new_v4().to_string();
     let proposal = payee
         .propose_payment_request(
             payer_key.clone(),
-            payer_path.clone(),
-            PaymentRequestTerms {
-                amount: PaymentAmount::new("0.00000100", "BTC").unwrap(),
-                payment_reference: PaymentReference::new(reference.clone()).unwrap(),
-                proposal_expires_at: None,
-                recurrence: None,
-                accepted_payment_endpoint_identifiers: vec![
-                    PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
-                ],
-                metadata: serde_json::Map::new(),
-            },
+            PaymentRequestTerms::builder(
+                PaymentAmount::new("0.00000100", "btc").unwrap(),
+                PaymentReference::new(reference.clone()).unwrap(),
+                vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
+            )
+            .required_app_id(Some(payee_path.clone()))
+            .payment_endpoints(Some(std::collections::HashMap::from([(
+                PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+                paykit_lib::PaymentEndpointPayload::new(
+                    serde_json::json!({
+                        "value": "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
+                    })
+                    .to_string(),
+                ),
+            )])))
+            .build()
+            .unwrap(),
         )
         .await
         .unwrap();
     let send = payee
-        .process_outbound_private_messages(payer_key, payer_path)
+        .process_outbound_private_messages(payer_key)
         .await
         .unwrap();
     assert_eq!(send.attempted.len(), 1);
@@ -225,7 +245,7 @@ async fn live_pubky_marker_discovery_and_payment_request_delivery() {
     assert!(send.failed.is_empty());
 
     let intake = payer
-        .receive_private_messages(payee_key, payee_path)
+        .receive_private_messages(payee_key.clone())
         .await
         .unwrap();
     assert_eq!(intake.stream_item_ids.len(), 1);
@@ -233,13 +253,27 @@ async fn live_pubky_marker_discovery_and_payment_request_delivery() {
     let received = payer.actionable_received_payment_requests().await.unwrap();
     assert_eq!(received.len(), 1);
     assert_eq!(received[0].payment_request_id, proposal.payment_request_id);
+    let resolution = payer
+        .resolve_private_payment_request(
+            payee_key,
+            &paykit_lib::PaymentRequestId::new(proposal.payment_request_id).unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resolution.status,
+        paykit_sdk::PrivatePaymentResolutionStatus::Payable
+    );
+    assert_eq!(resolution.private_payment_list_version, None);
+    assert_eq!(resolution.payable_endpoints.len(), 1);
     assert_eq!(
         received[0].terms.as_ref().unwrap().payment_reference,
         reference
     );
 
     println!(
-        "live Pubky smoke: 1 marker discovered, 1 Payment Request sent, 1 Payment Request received"
+        "live Pubky smoke: 1 App Registry discovered, 1 Payment Request sent, 1 Payment Request received"
     );
 }
 

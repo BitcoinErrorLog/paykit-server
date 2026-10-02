@@ -20,23 +20,27 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bitcoin::bip32::Xpub;
-use paykit_lib::PaykitReceiverPath;
-use paykit_sdk::{PubkyPublicKey, PubkySessionAccess, ReceiverNoiseSecretKey};
+use paykit_sdk::{PaykitIdentitySecretKey, PubkyPublicKey, PubkySessionAccess};
+#[allow(deprecated, reason = "raw-token loopback has no grant-flow equivalent")]
 use pubky::{
-    AuthFlowKind, AuthToken, Capabilities, EncryptedHttpRelayInboxChannel, Pubky, PubkyAuthFlow,
-    PubkySession,
+    AuthFlowKind, AuthToken, Capabilities, EncryptedHttpRelayInboxChannel, Pubky,
+    PubkyCookieAuthFlow, PubkySession,
 };
-use rand::{TryRngCore, rngs::OsRng};
+use rand::{TryRng, rngs::SysRng};
 use url::Url;
 
 use crate::{
-    bitkit_claim::{ClaimError, WatchOnlyAccountClaim, required_capabilities},
+    bitkit_claim::{
+        ClaimError, SetupCompanionClaim, VerifiedCompanionClaim, required_capabilities,
+    },
     config::BitcoinNetwork,
     domain::locks::{CreatorPubky, parse_creator},
+    paykit::CreatorSessions,
     persistence::CreatorStore,
-    real_setup::{CreatorSetupCommit, MarkerPublisher, validate_xpub},
+    real_setup::{AppPublisher, CreatorSetupCommit, validate_xpub},
     setup_orchestration::VerifiedSetupCommit,
 };
+use zeroize::Zeroizing;
 
 /// How long the claim waits for the relay round-trip and homeserver session
 /// exchange before reporting the dependency unavailable.
@@ -121,10 +125,15 @@ impl SessionMinter for RelayLoopbackSessionMinter {
         capabilities: &Capabilities,
     ) -> Result<PubkySession, ManualClaimError> {
         let mut secret = [0u8; 32];
-        OsRng
+        SysRng
             .try_fill_bytes(&mut secret)
             .map_err(|_| ManualClaimError::SessionUnavailable)?;
-        let flow = PubkyAuthFlow::builder(capabilities, AuthFlowKind::signin())
+        // The loopback minter replays the caller's AuthToken through the relay
+        // channel the cookie flow owns. Grant flows mint through signer
+        // deep-linked JWS grants and have no raw-token produce path, so this
+        // minter deliberately stays on the cookie flow.
+        #[allow(deprecated, reason = "raw-token loopback has no grant-flow equivalent")]
+        let flow = PubkyCookieAuthFlow::builder(capabilities, AuthFlowKind::signin())
             .relay(self.auth_relay.clone())
             .client(self.pubky.client().clone())
             .client_secret(secret)
@@ -161,9 +170,9 @@ pub struct ManualClaimService {
     pubky: Pubky,
     minter: Arc<dyn SessionMinter>,
     creators: CreatorStore,
-    marker_publisher: Arc<dyn MarkerPublisher>,
+    sessions: CreatorSessions,
+    publisher: Arc<dyn AppPublisher>,
     bitcoin_network: BitcoinNetwork,
-    receiver_path: PaykitReceiverPath,
     required_capabilities: String,
 }
 
@@ -172,18 +181,18 @@ impl ManualClaimService {
         pubky: Pubky,
         minter: Arc<dyn SessionMinter>,
         creators: CreatorStore,
-        marker_publisher: Arc<dyn MarkerPublisher>,
+        marker_publisher: Arc<dyn AppPublisher>,
+        sessions: CreatorSessions,
         bitcoin_network: BitcoinNetwork,
-        receiver_path: PaykitReceiverPath,
     ) -> Self {
-        let required_capabilities = required_capabilities(&receiver_path);
+        let required_capabilities = required_capabilities();
         Self {
             pubky,
             minter,
             creators,
-            marker_publisher,
+            sessions,
+            publisher: marker_publisher,
             bitcoin_network,
-            receiver_path,
             required_capabilities,
         }
     }
@@ -223,38 +232,33 @@ impl ManualClaimService {
             return Err(ManualClaimError::InvalidToken);
         }
         let public_key = PubkyPublicKey::from_public_key(session.info().public_key());
-        let owner = public_key
-            .to_public_key()
-            .map_err(|_| ManualClaimError::InvalidToken)?;
         let creator: CreatorPubky =
             parse_creator(&public_key.to_app_key()).map_err(|_| ManualClaimError::InvalidToken)?;
-        let session_secret = session.export_secret();
+        let session_secret =
+            export_cookie_session_secret(&session).ok_or(ManualClaimError::Unavailable)?;
 
         let access = PubkySessionAccess {
             session: session.clone(),
             outbox_client: self.pubky.clone(),
             local_secret_key: None,
-            receiver_noise_secret_key: ReceiverNoiseSecretKey::random(),
+            paykit_identity_secret_key: None,
         };
         access
             .validate_for_capabilities(&self.required_capabilities)
             .map_err(|_| ManualClaimError::InvalidCapabilities)?;
 
         let commit = CreatorSetupCommit {
-            session,
-            public_storage_client: self.pubky.clone(),
-            owner,
+            access,
             creator: creator.clone(),
-            session_secret,
-            initial_noise_secret: access.receiver_noise_secret_key,
+            session_secret: Zeroizing::new(session_secret),
             creators: self.creators.clone(),
-            marker_publisher: self.marker_publisher.clone(),
+            sessions: self.sessions.clone(),
+            publisher: self.publisher.clone(),
             bitcoin_network: self.bitcoin_network.clone(),
-            receiver_path: self.receiver_path.clone(),
-            marker_capabilities: CreatorSetupCommit::marker_capabilities(),
+            reconnect: false,
         };
         commit
-            .publish_readback_and_commit(claim)
+            .publish_readback_and_commit(VerifiedCompanionClaim::Setup(claim))
             .await
             .map_err(|error| match error {
                 ClaimError::AccountMismatch => ManualClaimError::AccountMismatch,
@@ -284,15 +288,45 @@ fn validate_claimed_account(
     account_xpub: &str,
     account_index: u32,
     network: &BitcoinNetwork,
-) -> Result<WatchOnlyAccountClaim, ManualClaimError> {
+) -> Result<SetupCompanionClaim, ManualClaimError> {
     let xpub = Xpub::from_str(account_xpub).map_err(|_| ManualClaimError::InvalidXpub)?;
     let serialized_xpub = xpub.encode();
     validate_xpub(&serialized_xpub, account_index, network)
         .map_err(|_| ManualClaimError::InvalidXpub)?;
-    Ok(WatchOnlyAccountClaim {
+    Ok(SetupCompanionClaim {
         account_index,
         serialized_xpub,
+        // No companion app supplies the Paykit identity secret on this path,
+        // so the server mints one and holds it with the watch-only
+        // credentials. A later Bitkit reconnect replaces it under the
+        // shared-state key-generation rules; a repeat claim of the same
+        // account reuses the persisted secret (see the re-bind arm in
+        // `real_setup`).
+        paykit_identity_secret_key: fresh_identity_secret(),
     })
+}
+
+fn fresh_identity_secret() -> PaykitIdentitySecretKey {
+    let mut secret = [0u8; 32];
+    SysRng
+        .try_fill_bytes(&mut secret)
+        .ok()
+        // Generation 1 is the first valid generation; this path has no
+        // authorizer app to derive a key from the Pubky secret, so the server
+        // mints the account's Paykit authority the way the marker flow minted
+        // a receiver noise secret. A later Bitkit reconnect replaces it under
+        // the shared-state key-generation rules.
+        .and_then(|()| PaykitIdentitySecretKey::new(secret, 1).ok())
+        .expect("SysRng bytes and generation 1 form a valid identity secret")
+}
+
+/// The bearer secret of the cookie session the token loopback mints. Grant
+/// sessions export theirs through `GrantSessionView::export_local_secret`.
+#[allow(deprecated, reason = "cookie session from the raw-token loopback")]
+fn export_cookie_session_secret(session: &PubkySession) -> Option<String> {
+    session
+        .as_cookie()
+        .and_then(|cookie| cookie.export_secret())
 }
 
 #[cfg(test)]
