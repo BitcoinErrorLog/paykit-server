@@ -892,13 +892,14 @@ async fn concurrent_polls_are_limited_per_flow_and_globally() {
         tokio::task::yield_now().await;
     }
     assert_eq!(setup.poll(&first.flow_id).await, PollResult::Unavailable);
+    // Joined, not sequential: one flow's completion wakes every waiting poll, and a poll woken
+    // before its own flow completes returns pending.
     assert_eq!(
-        setup.trigger_completion(&first.flow_id).await,
-        PollResult::Complete
-    );
-    assert_eq!(
-        setup.trigger_completion(&second.flow_id).await,
-        PollResult::Complete
+        tokio::join!(
+            setup.trigger_completion(&first.flow_id),
+            setup.trigger_completion(&second.flow_id),
+        ),
+        (PollResult::Complete, PollResult::Complete)
     );
     assert_eq!(first_poll.await.unwrap(), PollResult::Complete);
     assert_eq!(second_poll.await.unwrap(), PollResult::Complete);
@@ -1108,7 +1109,7 @@ async fn reservation_releases_after_start_failure_terminal_completion_and_expiry
 }
 
 #[tokio::test]
-async fn cancelling_start_and_completion_releases_reservation() {
+async fn cancelling_start_releases_reservation() {
     let entered = Arc::new(AtomicUsize::new(0));
     let changed = Arc::new(Notify::new());
     let release = Arc::new(Semaphore::new(0));
@@ -1154,36 +1155,48 @@ async fn cancelling_start_and_completion_releases_reservation() {
     }
     release.add_permits(1);
     assert!(second.await.unwrap().is_ok());
+}
 
-    let completion_entered = Arc::new(Notify::new());
-    let setup = limited_service(
+#[tokio::test]
+async fn completion_survives_a_cancelled_request_and_then_releases_reservation() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let setup = SetupService::with_poll_timeout(
+        vec!["https://app.example".to_owned()],
         Arc::new(BlockingCompleter {
-            entered: completion_entered.clone(),
-            release: Arc::new(Notify::new()),
+            entered: entered.clone(),
+            release: release.clone(),
         }),
         Arc::new(ManualClock::default()),
-        100,
-        1,
+        runtime_limits(2, 4, 100, 1),
+        Duration::from_secs(5),
     );
     let flow = setup
         .begin(peer(), "https://app.example", "complete")
         .await
         .unwrap();
     let flow_id = flow.flow_id.clone();
-    let entered_wait = completion_entered.notified();
-    let completion = tokio::spawn({
+    let entered_wait = entered.notified();
+    let request = tokio::spawn({
         let setup = setup.clone();
         let flow_id = flow_id.clone();
         async move { setup.trigger_completion(&flow_id).await }
     });
     entered_wait.await;
-    completion.abort();
-    assert!(completion.await.unwrap_err().is_cancelled());
-    tokio::task::yield_now().await;
-    assert_eq!(setup.poll(&flow_id).await, PollResult::Failed);
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        setup
+            .begin(peer(), "https://app.example", "still-completing")
+            .await,
+        Err(BeginError::Unavailable)
+    );
+
+    release.notify_one();
+    assert_eq!(setup.poll(&flow_id).await, PollResult::Complete);
     assert!(
         setup
-            .begin(peer(), "https://app.example", "after-cancel")
+            .begin(peer(), "https://app.example", "after-complete")
             .await
             .is_ok()
     );

@@ -457,7 +457,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         )
         .await
         .unwrap();
-    // No wallet approval: cancelling the wait must not replace existing credentials.
+    // No wallet approval: a dropped wait must not replace existing credentials.
     assert!(
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
@@ -466,9 +466,10 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         .await
         .is_err()
     );
+    // The dropped request leaves completion running in its own task.
     assert_eq!(
         service.trigger_completion(&cancelled.flow_id).await,
-        PollResult::Failed
+        PollResult::PendingTimeout
     );
     assert_eq!(publisher.calls.load(Ordering::SeqCst), publication_calls);
     let unchanged = creators.load(&creator).await.unwrap();

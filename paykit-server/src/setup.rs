@@ -438,8 +438,12 @@ impl SetupService {
 
     /// Runs real completion for precisely this flow. A completion attempt is
     /// consumed once because Pubky AUTH approval is one-shot.
+    ///
+    /// Runs in its own task so a dropped request does not cancel it: a touch
+    /// browser is backgrounded while the creator approves in Bitkit. Same rule
+    /// as pubky/pubky-app#1411: the hand-off must not cancel the approval wait.
     pub async fn trigger_completion(&self, flow_id: &str) -> PollResult {
-        let (attempt, reservation) = {
+        let (attempt, reservation, remaining) = {
             let mut guard = self.inner.state.lock().await;
             let now = self.inner.clock.now();
             cleanup_expired(&mut guard, now);
@@ -460,36 +464,47 @@ impl SetupService {
                 flow.reservation
                     .take()
                     .expect("pending flow has a setup reservation"),
+                flow.expires_at.saturating_sub(now),
             )
         };
         let completion_lease =
             CompletionLease::new(self.inner.clone(), flow_id.to_owned(), reservation);
-        let completion = self.inner.completer.complete(attempt).await;
-        let mut guard = self.inner.state.lock().await;
-        let now = self.inner.clock.now();
-        cleanup_expired(&mut guard, now);
-        let result = match guard.flows.get_mut(flow_id) {
-            None => expired_or_unknown(&guard, flow_id),
-            Some(flow) => match completion {
-                Completion::DurableSuccess => {
-                    flow.status = FlowStatus::Completed;
-                    PollResult::Complete
-                }
-                // One-shot auth requests cannot safely be replayed after any
-                // completion failure. Fail closed rather than falsely retaining
-                // a consumed request as pending.
-                Completion::DefinitiveFailure
-                | Completion::TransientOverload
-                | Completion::TransientUnavailable => {
-                    flow.status = FlowStatus::Failed;
-                    PollResult::Failed
-                }
-            },
-        };
-        drop(guard);
-        self.inner.changed.notify_waiters();
-        completion_lease.disarm();
-        result
+        let inner = self.inner.clone();
+        let flow_id = flow_id.to_owned();
+        let completion = tokio::spawn(async move {
+            // No request bounds this task, so an approval that never arrives
+            // must stop at flow expiry.
+            let completion = tokio::time::timeout(remaining, inner.completer.complete(attempt))
+                .await
+                .unwrap_or(Completion::DefinitiveFailure);
+            let mut guard = inner.state.lock().await;
+            let now = inner.clock.now();
+            cleanup_expired(&mut guard, now);
+            let result = match guard.flows.get_mut(&flow_id) {
+                None => expired_or_unknown(&guard, &flow_id),
+                Some(flow) => match completion {
+                    Completion::DurableSuccess => {
+                        flow.status = FlowStatus::Completed;
+                        PollResult::Complete
+                    }
+                    // One-shot auth requests cannot safely be replayed after any
+                    // completion failure. Fail closed rather than falsely retaining
+                    // a consumed request as pending.
+                    Completion::DefinitiveFailure
+                    | Completion::TransientOverload
+                    | Completion::TransientUnavailable => {
+                        flow.status = FlowStatus::Failed;
+                        PollResult::Failed
+                    }
+                },
+            };
+            drop(guard);
+            inner.changed.notify_waiters();
+            completion_lease.disarm();
+            result
+        });
+        // A panicked or aborted task drops its armed lease, which fails the flow.
+        completion.await.unwrap_or(PollResult::Failed)
     }
 
     pub async fn poll(&self, flow_id: &str) -> PollResult {

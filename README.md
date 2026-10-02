@@ -77,8 +77,15 @@ offers the same request through a `Continue with Bitkit` deep link. Production
 has no companion handle, helper endpoint or state, helper UI, or helper in the
 production package/runtime surface.
 
-The iframe continues polling `POST /setup/{flow_id}/complete`. It never sends
-the auth URL, Creator secret, xpub, or companion payload through `postMessage`.
+The iframe continues polling `POST /setup/{flow_id}/complete`. Completion runs
+in a server-owned task, so a dropped poll does not fail the flow: on a touch
+device the browser is backgrounded while the Creator approves in Bitkit, and
+the next poll after the browser returns reports the outcome. pubky-app applies
+the same rule to its Pubky Ring sign-in: the hand-off to the signer app does not
+cancel the wait for approval (pubky/pubky-app#1411).
+
+The iframe never sends the auth URL, Creator secret, xpub, or companion payload
+through `postMessage`.
 There is no manual claim route. Completion posts only
 `{ type: "paykit-setup-callback", state }` or the same callback with a coarse
 error to the exact caller origin.
