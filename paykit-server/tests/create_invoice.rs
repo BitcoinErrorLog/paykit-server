@@ -1071,6 +1071,100 @@ async fn disabled_creation_maps_to_the_stable_http_code_on_the_locks_route() {
     );
 }
 
+/// This server's claim inbox as a buyer who also sells here publishes it.
+fn claim_inbox_marker() -> paykit_lib::PaykitReceiverMarker {
+    paykit_lib::PaykitReceiverMarker::new(
+        paykit_lib::PaykitReceiverPath::new("bitkit/server").unwrap(),
+        paykit_lib::PaykitReceiverCapabilities {
+            private_payments: true,
+            payment_requests: true,
+            receipts: false,
+            outgoing_payments: false,
+        },
+        paykit_lib::PublicKey::try_from_z32("tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy")
+            .unwrap(),
+    )
+}
+
+fn service_serving_claim_inboxes_at_bitkit_server(
+    markers: Vec<paykit_lib::PaykitReceiverMarker>,
+    store: Arc<FakeStore>,
+) -> CreateInvoiceService {
+    CreateInvoiceService::new(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeMarkers {
+            markers,
+            calls: AtomicUsize::default(),
+        }),
+        vec![paykit_server::config::ReceiverPathPriority::parse("bitkit".into()).unwrap()],
+        paykit_lib::PaykitReceiverPath::new("bitkit/server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        true,
+        store,
+        Arc::new(EmptyBaselineElectrum),
+        50,
+        400_000,
+        Arc::new(PaykitIntentBuilder::default()),
+    )
+}
+
+#[tokio::test]
+async fn a_reader_whose_only_receiver_is_this_servers_claim_inbox_is_not_payable() {
+    for markers in [vec![], vec![claim_inbox_marker()]] {
+        let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+        assert_eq!(
+            service_serving_claim_inboxes_at_bitkit_server(markers, store.clone())
+                .create(request())
+                .await,
+            Err(CreateInvoiceError::ReaderNotPayable)
+        );
+        assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn a_claim_inbox_only_reader_maps_to_409_reader_not_payable_on_the_locks_route() {
+    let key = SigningKey::from_bytes(&[15; 32]);
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let router = invoices_router(Arc::new(service_serving_claim_inboxes_at_bitkit_server(
+        vec![claim_inbox_marker()],
+        store.clone(),
+    )))
+    .layer(Extension(signed_auth(&key)));
+    let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "bundle_id": BUNDLE,
+        "expires_at": expires_at()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
+        "lock_resource": LOCK_RESOURCE,
+        "reader": reader()
+    }))
+    .unwrap();
+
+    let response = router
+        .oneshot(signed_invoice_request(&key, body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["code"],
+        "reader_not_payable"
+    );
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+}
+
 #[tokio::test]
 async fn fifteen_second_deadline_is_safe_and_does_not_commit() {
     let session = Arc::new(FakeSession {

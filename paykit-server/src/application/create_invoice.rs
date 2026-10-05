@@ -107,9 +107,10 @@ pub enum CreateInvoiceError {
     BaselineInProgress,
     DeadlineExceeded,
     Unavailable,
-    /// The reader publishes no Paykit receiver that takes both private
-    /// payments and Payment Requests: nothing can deliver the request. This
-    /// is the reader's setup, not a transient dependency failure.
+    /// The reader publishes no Paykit receiver, other than this server's own
+    /// claim inbox, that takes both private payments and Payment Requests:
+    /// nothing can deliver the request. This is the reader's setup, not a
+    /// transient dependency failure.
     ReaderNotPayable,
     /// New Bitcoin binds are administratively disabled on this stack.
     BitcoinCreationDisabled,
@@ -768,8 +769,9 @@ impl CreateInvoiceService {
             tokio::time::timeout(marker_remaining, self.markers.discover(&request.reader))
                 .await
                 .map_err(|_| CreateInvoiceError::DeadlineExceeded)??;
-        let selected = select_reader_marker(discovered, &self.marker_priority)
-            .ok_or(CreateInvoiceError::Unavailable)?;
+        let selected =
+            select_reader_marker(discovered, &self.marker_priority, &self.local_receiver_path)
+                .ok_or(CreateInvoiceError::ReaderNotPayable)?;
         let credentials_remaining = remaining(started, self.clock.now())?;
         let (xpub, account_index) =
             tokio::time::timeout(credentials_remaining, self.credentials.xpub(&creator))
