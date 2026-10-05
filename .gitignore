@@ -20,3 +20,6 @@
 .vscode/
 *.swp
 *.tmp
+
+# Python bytecode
+__pycache__/

@@ -4,6 +4,7 @@ This file records the immutable Paykit Server image connected on Railway
 production and staging. The latest migration is **0027** (first-seen payment
 facts).
 Update it only in a release closeout PR after a successful deploy proof.
+Deploy procedure and rollback: [deploy.md](deploy.md).
 
 | Field | Value |
 | --- | --- |
