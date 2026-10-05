@@ -14,8 +14,8 @@
 # 1 deployed but a post-check failed; 2 usage; 11 seat/target guard;
 # 12 deployment list failed; 13 live deployment ambiguous or in-flight;
 # 14 live digest mismatch; 15 stop not confirmed by Railway;
-# 16 old process still answering; 20 new deployment FAILED or CRASHED;
-# 17 observer lease unreadable; 21 image connect failed (seat down);
+# 16 old process still answering; 17 observer lease unreadable;
+# 20 new deployment FAILED or CRASHED; 21 image connect failed (seat down);
 # 22 new deployment not SUCCESS in time (seat down).
 set -uo pipefail
 
