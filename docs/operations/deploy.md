@@ -12,16 +12,23 @@ production.
 
 ## Why stop-then-start
 
-Readiness depends on observer leadership. A second replica is a non-leader and
-never reports Electrum ready while the old leader holds the lease, so a
-start-first (rolling) deploy fails Railway's healthcheck and deadlocks. Stopping
-first costs about one minute with no process; that is cheaper than the deadlock.
+The server supports one process only (`README.md`, Known limitations): no
+replicas and no active-active deployment, so the old process must be gone before
+the new one starts.
+
+Before migration 0026 a second replica could not report Electrum ready while the
+old one held the session advisory lock, so a start-first deploy failed Railway's
+healthcheck. Since 0026 observer leadership is a TTL row lease
+(`observer_leadership`) with a fencing token, and a standby replica can probe
+Electrum and pass `/health/ready`. A passing `/health/ready` therefore does not
+prove leadership; the script checks the lease row instead.
 
 The cost of stopping first is that a new image which fails at startup (for
 example `postgres migration failed`) leaves the seat down until the previous
 digest is reconnected. That happened once on production (about 7 minutes). The
-script guards against it by recording the rollback digest before the stop,
-checking startup logs, and printing the rollback image on every failure path.
+script records the rollback digest before the stop, fails fast when the connect
+fails or the new deployment does not reach `SUCCESS`, and prints the rollback
+image on every failure path.
 
 ## Railway quirk: a stopped deployment still says `SUCCESS`
 
@@ -39,13 +46,17 @@ answering 200 on three consecutive probes.
   token from `~/.railway/config.json` (`user.accessToken`, falling back to
   `user.token`) and never print it. GraphQL calls send a `User-Agent` header;
   without one Cloudflare answers 403 (error 1010).
-- A seats file with the Railway ids and public hosts of both seats, passed as
-  `PAYKIT_SEATS_FILE`. Keep it outside the repository. Required keys:
-  `STAGING_PROJECT_ID`, `STAGING_ENVIRONMENT_ID`, `STAGING_SERVICE_ID`,
-  `STAGING_HOST`, `PRODUCTION_PROJECT_ID`, `PRODUCTION_ENVIRONMENT_ID`,
-  `PRODUCTION_SERVICE_ID`, `PRODUCTION_HOST`. The script refuses a staging run
-  whose ids or host match production.
-- `python3`, `curl`, `rg`.
+- A seats file with the Railway ids, public hosts and database service names of
+  both seats, passed as `PAYKIT_SEATS_FILE`. Keep it outside the repository.
+  Required keys: `STAGING_PROJECT_ID`, `STAGING_ENVIRONMENT_ID`,
+  `STAGING_SERVICE_ID`, `STAGING_HOST`, `STAGING_DATABASE_SERVICE`,
+  `PRODUCTION_PROJECT_ID`, `PRODUCTION_ENVIRONMENT_ID`, `PRODUCTION_SERVICE_ID`,
+  `PRODUCTION_HOST`, `PRODUCTION_DATABASE_SERVICE`. The script refuses a seats
+  file in which the two seats share an id or a host.
+- `python3`, `curl`, `rg`, and `psql` (default `/opt/homebrew/opt/libpq/bin`,
+  override with `PAYKIT_PG_CLIENT_BIN`). The lease check runs one read-only
+  `SELECT` on `observer_leadership` through `railway connect`; only the parsed
+  row (`holder|live|fence`) is saved, never the tunnel output.
 - An evidence directory for the run's logs and JSON snapshots.
 
 ## Procedure
@@ -63,7 +74,7 @@ answering 200 on three consecutive probes.
    [production-image.md](production-image.md); it is also printed by the dry run.
 4. **Dry run each seat.** Read-only: lists deployments, selects the live
    deployment, checks nothing is in flight, checks the live digest, reads
-   `/health/ready`.
+   `/health/ready` (warns when not ready) and the observer lease.
 
    ```bash
    PAYKIT_SEATS_FILE=<seats.env> scripts/release/deploy-seat.sh --dry-run \
@@ -73,10 +84,11 @@ answering 200 on three consecutive probes.
 5. **Deploy staging**: the same command without `--dry-run`. The script stops
    the old deployment, waits until it is confirmed gone, connects the new image,
    waits for `SUCCESS`, then checks: new digest, exactly one running deployment,
-   old deployment still stopped, source SHA and `listening` in the startup logs,
-   no `[ERROR]`/panic lines, three `/health/ready` probes (staging expects
-   `bitcoin_creation_enabled: false`), and observer leadership in the logs.
-   Exit 0 means every check passed.
+   old deployment still stopped, the source SHA in the startup metadata line,
+   no `[ERROR]`/panic lines, three `/health/ready` probes with `/health/live`
+   200 (staging expects `bitcoin_creation_enabled: false`), and a live observer
+   lease whose fence is higher than before the stop (the fence only increments
+   when the holder changes). Exit 0 means every check passed.
 6. **Deploy production** the same way. Production health additionally requires
    a `production:` `stack_id`, `bitcoin_creation_enabled: true` and
    `bitcoin_offer_available: true`.
@@ -90,7 +102,7 @@ answering 200 on three consecutive probes.
 | Code | Meaning | Seat state |
 | --- | --- | --- |
 | 0 | Deployed, every check passed (or dry run passed) | New image live |
-| 1 | Deployed, a post-check failed | New image live; read the `CHECK FAIL` lines |
+| 1 | New deployment is `SUCCESS` but a post-check failed | New image running; read the `CHECK FAIL` lines |
 | 2 | Usage or input error | Unchanged |
 | 11 | Seat or target guard | Unchanged |
 | 12 | Deployment list failed | Unchanged |
@@ -98,7 +110,10 @@ answering 200 on three consecutive probes.
 | 14 | Live digest differs from the expected one | Unchanged |
 | 15 | Railway did not confirm the stop | Unknown: check the list and `/health/live` |
 | 16 | Old process still answering after the stop | Old deployment may still be live |
+| 17 | Observer lease unreadable (preflight) | Unchanged |
 | 20 | New deployment `FAILED` or `CRASHED` | **Down**: roll back |
+| 21 | Image connect failed | **Down** (old stopped): roll back |
+| 22 | New deployment not `SUCCESS` within 20 minutes | **Down** or starting: check, then roll back |
 
 ## Rollback
 
