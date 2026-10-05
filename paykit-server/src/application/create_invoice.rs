@@ -771,7 +771,7 @@ impl CreateInvoiceService {
                 .map_err(|_| CreateInvoiceError::DeadlineExceeded)??;
         let selected =
             select_reader_marker(discovered, &self.marker_priority, &self.local_receiver_path)
-                .ok_or(CreateInvoiceError::Unavailable)?;
+                .ok_or(CreateInvoiceError::ReaderNotPayable)?;
         let credentials_remaining = remaining(started, self.clock.now())?;
         let (xpub, account_index) =
             tokio::time::timeout(credentials_remaining, self.credentials.xpub(&creator))
