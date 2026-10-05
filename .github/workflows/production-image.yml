@@ -12,7 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/bitcoinerrorlog/paykit-server
+  IMAGE_NAME: paykit-server
 
 jobs:
   check:
@@ -20,6 +20,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
+      # GHCR names must be lowercase, and the owner follows the repository
+      # through a transfer.
+      - name: Resolve image name from repository owner
+        run: |
+          set -eu
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE=ghcr.io/$owner/$IMAGE_NAME" >> "$GITHUB_ENV"
+
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -72,6 +80,7 @@ jobs:
           docker buildx build \
             --file Dockerfile.production \
             --build-arg "SOURCE_SHA=$SOURCE_SHA" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --tag "$IMAGE:sha-$SOURCE_SHA" \
             --provenance=true \
             --sbom=true \
@@ -112,6 +121,14 @@ jobs:
       contents: read
       packages: write
     steps:
+      # GHCR names must be lowercase, and the owner follows the repository
+      # through a transfer.
+      - name: Resolve image name from repository owner
+        run: |
+          set -eu
+          owner="$(printf '%s' "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE=ghcr.io/$owner/$IMAGE_NAME" >> "$GITHUB_ENV"
+
       - name: Check out repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -138,6 +155,7 @@ jobs:
           docker buildx build \
             --file Dockerfile.production \
             --build-arg "SOURCE_SHA=$SOURCE_SHA" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
             --tag "$IMAGE:sha-$SOURCE_SHA" \
             --provenance=true \
             --sbom=true \
