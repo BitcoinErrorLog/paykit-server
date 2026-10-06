@@ -5,6 +5,11 @@
 
 [http]
 listen_addr = "127.0.0.1:8080"
+# Exact number of reverse proxies in front of this listener that each append one
+# X-Forwarded-For entry. 0 keys per-IP setup limits by the TCP peer and ignores
+# the header. A value above the real proxy count lets clients pick their own
+# limiter key. At most 8.
+trusted_proxy_hops = 0
 
 [locks]
 # Use the exact Pubky rendered by Locks as credentials.lock_server_public_key.

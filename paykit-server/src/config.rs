@@ -17,6 +17,10 @@ pub const PAYKIT_CLIENT_ID: &str = "app.paykit.server";
 /// Paykit App owning server endpoints and Payment Requests.
 pub const PAYKIT_APP_ID: &str = "paykit-server";
 
+/// Largest accepted `http.trusted_proxy_hops`. Real proxy chains are a few hops long; a larger
+/// value is a misconfiguration that would key per-IP policy by client-supplied entries.
+pub const MAX_TRUSTED_PROXY_HOPS: u8 = 8;
+
 #[derive(Debug)]
 pub struct Config {
     pub http: HttpConfig,
@@ -67,7 +71,10 @@ impl Config {
         let allowed_origins = validate_allowed_origins(raw.setup.allowed_origins)?;
 
         let config = Self {
-            http: HttpConfig { listen_addr },
+            http: HttpConfig {
+                listen_addr,
+                trusted_proxy_hops: raw.http.trusted_proxy_hops,
+            },
             locks: LocksConfig { trusted_public_key },
             setup: SetupConfig {
                 allowed_origins,
@@ -190,6 +197,9 @@ impl Config {
             return Err(ConfigError::ValueTooLarge(
                 "rate_limits.max_pending_setup_flows",
             ));
+        }
+        if self.http.trusted_proxy_hops > MAX_TRUSTED_PROXY_HOPS {
+            return Err(ConfigError::ValueTooLarge("http.trusted_proxy_hops"));
         }
         Ok(())
     }
@@ -323,11 +333,17 @@ impl fmt::Debug for MasterKey {
 #[derive(Debug)]
 pub struct HttpConfig {
     listen_addr: SocketAddr,
+    trusted_proxy_hops: u8,
 }
 
 impl HttpConfig {
     pub fn listen_addr(&self) -> SocketAddr {
         self.listen_addr
+    }
+
+    /// Reverse proxies in front of the listener that each append one `X-Forwarded-For` entry.
+    pub fn trusted_proxy_hops(&self) -> u8 {
+        self.trusted_proxy_hops
     }
 }
 
@@ -646,6 +662,8 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawHttpConfig {
     listen_addr: String,
+    #[serde(default)]
+    trusted_proxy_hops: u8,
 }
 
 #[derive(Deserialize)]
