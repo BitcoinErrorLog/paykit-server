@@ -55,13 +55,22 @@ async fn delegated_server_preserves_wallet_registry_and_contacts_across_restart(
     let wallet_bootstrap =
         PubkySessionBootstrap::with_pubky(client.clone(), "app.bitkit.wallet").unwrap();
     let wallet_auth = wallet_bootstrap
-        .sign_up(&root, &home, None, PAYKIT_SESSION_CAPABILITIES)
+        .sign_up(
+            &root,
+            &home,
+            None,
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
+        )
         .await
         .unwrap();
     let owner = wallet_auth.public_key.clone();
     let wallet_access = wallet_auth.access;
     let wallet = sdk(wallet_access.clone(), "bitkit");
     wallet.initialize().await.unwrap();
+    wallet
+        .publish_paykit_noise_key_authorization()
+        .await
+        .unwrap();
     let wallet_app = PaykitApp::new(
         "Bitkit",
         PaykitAppCapabilities {
@@ -104,6 +113,11 @@ async fn delegated_server_preserves_wallet_registry_and_contacts_across_restart(
     let claim = parse_unsigned_payload(payload.as_slice()).unwrap();
     access.paykit_identity_secret_key = Some(claim.paykit_identity_secret_key);
     assert!(access.local_secret_key.is_none());
+    assert!(
+        access
+            .validate_for_capabilities(paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES)
+            .is_err()
+    );
     assert_eq!(access.public_key().unwrap(), owner);
     SharedAppPublisher.verify_key(&access).await.unwrap();
     SharedAppPublisher.publish(access.clone()).await.unwrap();

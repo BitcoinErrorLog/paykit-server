@@ -97,7 +97,11 @@ Under the Creator setup lock, reconnect loads the existing account index and xpu
 and retains them exactly. A missing Creator cannot be created by reconnect. Initial
 setup cannot overwrite an existing binding, including one awaiting publication retry.
 The same Paykit generation must retain the same secret; lower
-generations are rejected, and a higher generation must match the App Registry.
+generations are rejected, and the delegated key and generation must match the
+Creator's identity-signed Paykit Noise Key Authorization. Bitkit publishes that
+record before delegation using its owner-only authorizer session; Server receives
+neither the Pubky root secret nor authorization-path write access. The App Registry
+is discovery metadata, not key authority.
 Unexpected account material and failed verification leave existing credentials and setup
 readiness unchanged. An abandoned approval performs no durable writes. Bitkit
 must retain existing account tracking/data on rejection or cancellation.

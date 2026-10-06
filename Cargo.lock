@@ -3202,14 +3202,15 @@ dependencies = [
 
 [[package]]
 name = "paykit-lib"
-version = "0.1.0-rc59"
-source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.0-rc59#7b75d28c2679656a0d1c6e1ef6d8ee9881c9be07"
+version = "0.1.0-rc63"
+source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.0-rc63#cec06146ceeefdb9341a00208388514d1aef47ac"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "blake3",
  "chacha20poly1305 0.10.1",
  "chrono",
+ "hex",
  "pubky 0.14.0",
  "pubky-noise",
  "reqwest",
@@ -3224,8 +3225,8 @@ dependencies = [
 
 [[package]]
 name = "paykit-sdk"
-version = "0.1.0-rc59"
-source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.0-rc59#7b75d28c2679656a0d1c6e1ef6d8ee9881c9be07"
+version = "0.1.0-rc63"
+source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.0-rc63#cec06146ceeefdb9341a00208388514d1aef47ac"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3235,6 +3236,7 @@ dependencies = [
  "chacha20poly1305 0.10.1",
  "chrono",
  "crypto_secretbox",
+ "futures-util",
  "hex",
  "paykit-lib",
  "postcard",
@@ -3246,6 +3248,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
  "url",
  "zeroize",
 ]
@@ -3872,9 +3875,8 @@ dependencies = [
 
 [[package]]
 name = "pubky-noise"
-version = "0.1.0-rc11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e314e7716f68f48f5438650ed958753bc18ff5aca70bc46c1e3e77be3b7bae6"
+version = "0.1.0-rc12"
+source = "git+https://github.com/pubky/pubky-noise?rev=5c06ff552912bd131d163403bec2360ab31dff10#5c06ff552912bd131d163403bec2360ab31dff10"
 dependencies = [
  "chacha20poly1305 0.10.1",
  "curve25519-dalek 5.0.0",
@@ -3883,6 +3885,7 @@ dependencies = [
  "hex",
  "pubky 0.14.0",
  "rand 0.9.5",
+ "reqwest",
  "sha2 0.11.0",
  "snow",
 ]
@@ -5293,7 +5296,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -6013,7 +6016,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

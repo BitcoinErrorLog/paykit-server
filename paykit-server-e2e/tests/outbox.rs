@@ -550,11 +550,19 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             &PubkyLocalSecretKey::new(creator_keypair.secret_key()),
             &homeserver,
             None,
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
+        )
+        .await
+        .unwrap();
+    // Persist only the ordinary delegated grant, not the owner's authorizer scope.
+    let creator_grant = bootstrap
+        .sign_in(
+            &PubkyLocalSecretKey::new(creator_keypair.secret_key()),
             paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
-    let creator_session_secret = creator_bootstrap
+    let creator_session_secret = creator_grant
         .export_session_secret()
         .await
         .unwrap()
@@ -581,7 +589,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             &PubkyLocalSecretKey::new(peer_keypair.secret_key()),
             &homeserver,
             None,
-            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
@@ -763,17 +771,37 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         )
         .await
         .unwrap();
-    // A stored linked peer may no longer publish an App Registry. Its intake
-    // failure must degrade maintenance without blocking the healthy peer's sends.
+    // This inactive peer has valid key authorization but no App Registry or receive
+    // snapshot. Its intake failure must not block the healthy peer's sends.
     let missing_registry_peer = bootstrap
         .sign_up(
             &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
             &homeserver,
             None,
-            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
+    let missing_registry_provider =
+        sdk_fixtures::TestSessionProvider::new(missing_registry_peer.access);
+    let missing_registry_sdk = paykit_sdk::PaykitSdk::new(
+        paykit_sdk::PubkySharedStateStorage::new(missing_registry_provider.clone()),
+        missing_registry_provider,
+        sdk_fixtures::TestPaymentAdapter,
+        paykit_sdk::PaykitSdkConfig::new("bitkit").unwrap(),
+    );
+    missing_registry_sdk.initialize().await.unwrap();
+    let missing_registry_authorization = missing_registry_sdk
+        .publish_paykit_noise_key_authorization()
+        .await
+        .unwrap();
+    assert!(
+        missing_registry_sdk
+            .paykit_app_registry(missing_registry_peer.public_key.clone())
+            .await
+            .unwrap()
+            .is_none()
+    );
     let creators = CreatorStore::new(database.pool(), crypto.clone());
     let config = PaykitConfig {
         client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
@@ -832,6 +860,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         .transaction(|tx| {
             let mut linked_peer = tx.linked_peer(&peer_bootstrap.public_key).unwrap();
             linked_peer.counterparty = missing_registry_peer.public_key.clone();
+            linked_peer.noise_key_authorization = Some(missing_registry_authorization.clone());
             tx.save_linked_peer(linked_peer);
             Ok(())
         })

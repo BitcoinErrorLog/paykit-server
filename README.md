@@ -34,7 +34,8 @@ Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report sec
 
 The [architecture contract](docs/architecture.md) describes shared identity,
 credential ownership, and immutable invoice attribution. Rust dependencies use
-the published Paykit Git tag `v0.1.0-rc59`, pinned by `Cargo.lock`.
+the published Paykit Git tag `v0.1.0-rc63`
+(`cec06146ceeefdb9341a00208388514d1aef47ac`), pinned by `Cargo.lock`.
 
 ## Executable boundary
 
@@ -95,12 +96,20 @@ There is no manual claim route. Completion posts only
 `{ type: "paykit-setup-callback", state }` or the same callback with a coarse
 error to the exact caller origin.
 
-Bitkit authorizes `/pub/paykit/:rw`. The server requests two independent
+Before delegation, Bitkit publishes the identity-signed Paykit Noise Key
+Authorization using `PAYKIT_AUTHORIZER_SESSION_CAPABILITIES` and
+`publish_paykit_noise_key_authorization()`, before publishing private app
+capabilities. That owner-only scope includes
+`/pub/paykit-authority/v0/current-key.json:rw`; it must never be granted to Server.
+The App Registry remains discovery metadata, not key authority.
+
+Bitkit authorizes only `/pub/paykit/:rw` for Server. The server requests two independent
 permissions as `x-bitkit-claim=paykit-access-v1.watch-only-account-v1` and Bitkit
 returns a signed, encrypted companion claim. Its 124-byte payload contains the BIP84
 account index, address kind, serialized xpub, Paykit key generation, and 32-byte
 Paykit identity secret; the signature adds 64 bytes. The server verifies the
-delegated key against the Creator's App Registry, persists credentials, then
+delegated key and generation against the Creator's signed Noise key authorization,
+persists credentials, then
 publishes only the `paykit-server` app entry through the SDK. Other apps and
 shared history remain intact. Failed publication leaves setup incomplete and
 retryable. Reauthorization preserves the account/xpub and accepts only the same

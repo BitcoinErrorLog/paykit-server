@@ -117,7 +117,7 @@ async fn live_sdk(
             &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
             homeserver,
             None,
-            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
@@ -130,6 +130,7 @@ async fn live_sdk(
         PaykitSdkConfig::new(app_id.as_str()).unwrap(),
     );
     sdk.initialize().await.unwrap();
+    sdk.publish_paykit_noise_key_authorization().await.unwrap();
     sdk.publish_paykit_app(
         PaykitApp::new(
             "Test App",

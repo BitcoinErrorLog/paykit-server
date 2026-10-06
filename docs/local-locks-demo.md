@@ -14,13 +14,14 @@ and exact Locks release selected in `Cargo.toml`:
 
 ```bash
 docker buildx build --load \
-  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#v0.1.0-rc59:paykit-lib' \
-  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#v0.1.0-rc59:paykit-sdk' \
+  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#v0.1.0-rc63:paykit-lib' \
+  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#v0.1.0-rc63:paykit-sdk' \
   --build-context locks='https://github.com/pubky/locks.git#v0.1.0-rc8' \
   -f Dockerfile.local \
   -t paykit-server:local .
 ```
 
+The Paykit tag resolves to `cec06146ceeefdb9341a00208388514d1aef47ac`.
 These contexts are anonymously reachable and reproducible. Update the URLs
 together with the corresponding `Cargo.toml` pins; exact dependency-pin matches
 make source drift fail closed.
@@ -124,8 +125,14 @@ The private stdin file uses the **Creator's** root secret:
 
 Use a separate authorizer app ID and state file, only for `prepare`. Keep the
 input private and outside tracked source, then remove it; never send the root
-secret to Paykit Server or put it in argv. In the approval below, use generation
-`1` for a fresh identity or the existing registry generation; never reset state.
+secret to Paykit Server or put it in argv. `prepare` uses
+`PAYKIT_AUTHORIZER_SESSION_CAPABILITIES` to publish the identity-signed Paykit Noise
+Key Authorization before private app capabilities. Its additional
+`/pub/paykit-authority/v0/current-key.json:rw` capability stays with the authorizer;
+the exported Server grant remains `/pub/paykit/:rw`.
+In the approval below, use generation `1` for a fresh identity or the existing
+signed authorization's generation; never reset state. The independent Reader
+must also run `prepare` for its own identity before exchanging private messages.
 
 ### Approve server setup
 

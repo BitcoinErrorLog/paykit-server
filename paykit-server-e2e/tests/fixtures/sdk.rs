@@ -103,6 +103,7 @@ pub async fn hosted_sdk(access: PubkySessionAccess, app_id: &str, counter_seed: 
         paykit_sdk::PaykitSdkConfig::new(app_id).unwrap(),
     );
     sdk.initialize().await.unwrap();
+    sdk.publish_paykit_noise_key_authorization().await.unwrap();
     let mut backup = sdk.export_backup_state().await.unwrap();
     backup.next_outbound_private_message_id = counter_seed;
     sdk.restore_backup_state(backup).await.unwrap();

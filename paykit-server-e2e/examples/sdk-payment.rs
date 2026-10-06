@@ -118,6 +118,7 @@ async fn sdk(access: PubkySessionAccess) -> Result<Sdk> {
         PaykitSdkConfig::new(APP)?,
     );
     sdk.initialize().await?;
+    sdk.publish_paykit_noise_key_authorization().await?;
     sdk.publish_paykit_app(PaykitApp::new(
         "SDK example",
         PaykitAppCapabilities {
@@ -423,7 +424,12 @@ async fn main() -> Result<()> {
         .with_auth_relay(relay.local_url().join("inbox")?.as_str())?;
     let creator_root = PubkyLocalSecretKey::new(Keypair::random().secret_key());
     let creator_auth = bootstrap
-        .sign_up(&creator_root, &home, None, PAYKIT_SESSION_CAPABILITIES)
+        .sign_up(
+            &creator_root,
+            &home,
+            None,
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
+        )
         .await?;
     let creator = creator_auth.public_key.clone();
     let _creator_sdk = sdk(creator_auth.access).await?;
@@ -432,7 +438,7 @@ async fn main() -> Result<()> {
             &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
             &home,
             None,
-            PAYKIT_SESSION_CAPABILITIES,
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
         )
         .await?;
     let reader = reader_auth.public_key.clone();

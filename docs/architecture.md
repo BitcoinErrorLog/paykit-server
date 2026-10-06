@@ -14,11 +14,21 @@ Bitcoin spending keys or the Pubky identity secret. The account index and xpub
 cannot change through reauthorization.
 
 The companion claim is bound to the AUTH identity, secret, and exact permission
-list. Setup verifies the delegated key against the public App Registry before
+list. Before delegation or private app publication, the identity owner uses
+`PAYKIT_AUTHORIZER_SESSION_CAPABILITIES` and
+`publish_paykit_noise_key_authorization()` to publish its signed current Noise key.
+Only that owner session can write `/pub/paykit-authority/v0/current-key.json`;
+Server's ordinary Paykit grant must not include that path.
+Setup verifies the delegated key and generation against the identity-signed
+Paykit Noise Key Authorization before
 persisting credentials. Under the Creator setup lock, it persists credentials,
 publishes the `paykit-server` app through SDK locks, reads that app back, and marks
 setup complete. Publication failure leaves retryable credentials and never
 rewrites another app's registry entry. See [the wire contract](bitkit-companion-claim.md).
+
+Session readiness also verifies the signed authorization. Missing, tampered, or
+mismatched records fail validation; the App Registry supplies discovery metadata
+and app capabilities, not key authority.
 
 Setup, status queries, and workers use one process-owned session cache. Independently
 restoring a live grant can invalidate its bearer. A changed persisted session or

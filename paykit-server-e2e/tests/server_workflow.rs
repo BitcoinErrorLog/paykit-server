@@ -243,7 +243,7 @@ async fn create_creator(
     .unwrap()
     .sign_in(
         &PubkyLocalSecretKey::new(keypair.secret_key()),
-        paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
+        paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
     )
     .await
     .unwrap();
@@ -278,7 +278,7 @@ async fn create_peer_with_access(
             &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
             homeserver,
             None,
-            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();

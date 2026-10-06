@@ -605,16 +605,21 @@ async fn shared_foreign_app_records_do_not_poison_existing_invoice_refresh_or_ne
             &creator_root,
             &homeserver,
             None,
-            PAYKIT_SESSION_CAPABILITIES,
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
     let creator = parse_creator(&format!("pubky{}", creator_account.public_key)).unwrap();
+    // The Server receives a separate grant without authorization-path access.
+    let creator_grant = bootstrap
+        .sign_in(&creator_root, PAYKIT_SESSION_CAPABILITIES)
+        .await
+        .unwrap();
     let creators = CreatorStore::new(database.pool(), crypto.clone());
     let creator_row = creators
         .create(&CreatorCredentials::new(
             creator.clone(),
-            creator_account
+            creator_grant
                 .export_session_secret()
                 .await
                 .unwrap()
@@ -634,7 +639,7 @@ async fn shared_foreign_app_records_do_not_poison_existing_invoice_refresh_or_ne
             &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
             &homeserver,
             None,
-            PAYKIT_SESSION_CAPABILITIES,
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();
