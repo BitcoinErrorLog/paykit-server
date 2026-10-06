@@ -78,7 +78,8 @@ BLAKE3(UTF8(received_claim_type) || UTF8("|") || auth_secret)
 
 Verification uses the Creator established by normal Pubky AUTH, not a name or
 query hint. It checks the exact length/schema, signature, xpub network/depth/index,
-and delegated key against the wallet-published App Registry before durable writes.
+and delegated key against the identity-signed Paykit Noise Key Authorization
+before durable writes.
 Each setup attempt is consumed once. A prior claim cannot be rebound to a new
 AUTH secret, query parameter, permission selection, or list order.
 
