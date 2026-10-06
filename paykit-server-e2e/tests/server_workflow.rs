@@ -27,7 +27,8 @@ use locks_core::{
     },
 };
 use paykit_sdk::{
-    LinkedPeerState, PubkyLocalSecretKey, PubkyPublicKey, PubkySessionAccess, PubkySessionBootstrap,
+    LinkedPeerState, PubkyLocalSecretKey, PubkyPublicKey, PubkySessionAccess,
+    PubkySessionBootstrap, SdkBackupState,
 };
 use paykit_server::{
     Server,
@@ -509,6 +510,21 @@ async fn wait_until_ready(address: SocketAddr) {
     }
 }
 
+async fn creator_backup_state(sdk: &CreatorSdk) -> SdkBackupState {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match sdk.export_backup_state().await {
+            Ok(state) => return state,
+            Err(error)
+                if error.is_concurrent_update() && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("creator backup read failed: {error}"),
+        }
+    }
+}
+
 async fn wait_for_completion(
     pool: &PgPool,
     address: SocketAddr,
@@ -952,8 +968,8 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         vec!["delivered".to_owned(), "delivered".to_owned(),]
     );
 
-    let state_a = creator_a.sdk.export_backup_state().await.unwrap();
-    let state_b = creator_b.sdk.export_backup_state().await.unwrap();
+    let state_a = creator_backup_state(&creator_a.sdk).await;
+    let state_b = creator_backup_state(&creator_b.sdk).await;
     for state in [&state_a, &state_b] {
         assert_eq!(state.outbound_private_messages.len(), 1);
         assert!(
@@ -1093,11 +1109,21 @@ async fn open_invoice(
     bundle: &str,
 ) -> Uuid {
     let before = outbox_ids(pool).await;
-    let response = send_http(
-        address,
-        invoice_request(signing_key, fixture, reader, bundle),
-    )
-    .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let response = loop {
+        let response = send_http(
+            address,
+            invoice_request(signing_key, fixture, reader, bundle),
+        )
+        .await;
+        let session_unavailable = response.status == StatusCode::SERVICE_UNAVAILABLE
+            && serde_json::from_slice::<serde_json::Value>(&response.body)
+                .is_ok_and(|body| body["error"]["code"] == "creator_session_unavailable");
+        if !session_unavailable || tokio::time::Instant::now() >= deadline {
+            break response;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert_eq!(
         response.status,
         StatusCode::OK,
@@ -1155,7 +1181,7 @@ async fn wait_for_fresh_server_link_state(
         assert_eq!(response.status, StatusCode::OK);
         let state = serde_json::from_slice::<serde_json::Value>(&response.body).unwrap();
         let public_state = state["state"].as_str().unwrap();
-        let storage = expected.fixture.sdk.export_backup_state().await.unwrap();
+        let storage = creator_backup_state(&expected.fixture.sdk).await;
         let fresh_generation = storage.encrypted_link_states.iter().any(|link| {
             &link.counterparty == expected.reader_key && link.generation > expected.old_generation
         });
@@ -1269,7 +1295,7 @@ async fn server_relinks_when_the_reader_publishes_a_recovery_marker() {
         "first Payment Request row never settled"
     );
     let reader_key = PubkyPublicKey::from_raw_or_app_key(reader.to_string()).unwrap();
-    let linked_state = creator.sdk.export_backup_state().await.unwrap();
+    let linked_state = creator_backup_state(&creator.sdk).await;
     let old_generation = linked_state
         .encrypted_link_states
         .iter()
@@ -1427,11 +1453,8 @@ async fn malformed_recovery_marker_keeps_exact_handoff_retryable_until_repaired(
         outbox_row_is_delivered(&pool, first_payment, Duration::from_secs(10)).await,
         "first Payment Request row never settled"
     );
-    let next_outbound_before = creator
-        .sdk
-        .export_backup_state()
+    let next_outbound_before = creator_backup_state(&creator.sdk)
         .await
-        .unwrap()
         .next_outbound_private_message_id;
 
     publish_unreadable_recovery_marker(&peer_sdk, &peer_access, &reader_key, &creator_key).await;
@@ -1463,11 +1486,8 @@ async fn malformed_recovery_marker_keeps_exact_handoff_retryable_until_repaired(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(
-        creator
-            .sdk
-            .export_backup_state()
+        creator_backup_state(&creator.sdk)
             .await
-            .unwrap()
             .next_outbound_private_message_id,
         next_outbound_before,
         "request was enqueued while recovery marker lookup failed"
