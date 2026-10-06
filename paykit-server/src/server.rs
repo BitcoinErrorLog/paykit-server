@@ -246,7 +246,11 @@ impl Server {
             });
         let setup_status_service = Arc::new(SetupStatusService::new(session_validator));
         let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
-        let business_routes = http::setup::setup_router(setup).merge(
+        let business_routes = http::setup::setup_router_with_trusted_proxy_hops(
+            setup,
+            config.http.trusted_proxy_hops(),
+        )
+        .merge(
             http::invoices::invoices_router(invoice_service)
                 .merge(http::connection_status::connection_status_router(
                     connection_status_service,

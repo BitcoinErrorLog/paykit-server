@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use paykit_server::config::{Config, ConfigEnvironment, ConfigError, PaykitNetwork};
+use paykit_server::config::{
+    Config, ConfigEnvironment, ConfigError, MAX_TRUSTED_PROXY_HOPS, PaykitNetwork,
+};
 
 const KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
@@ -194,6 +196,38 @@ fn accepts_supported_paykit_network_and_rejects_retired_url_keys() {
         1,
     );
     assert!(Config::from_toml_and_environment(&retired, environment()).is_err());
+}
+
+#[test]
+fn trusted_proxy_hops_defaults_to_zero_and_rejects_values_above_the_maximum() {
+    let with_hops = |hops: &str| {
+        valid_toml().replace(
+            "listen_addr = \"127.0.0.1:8080\"",
+            &format!("listen_addr = \"127.0.0.1:8080\"\ntrusted_proxy_hops = {hops}"),
+        )
+    };
+
+    let default = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
+    assert_eq!(default.http.trusted_proxy_hops(), 0);
+    for hops in [0, 1, MAX_TRUSTED_PROXY_HOPS] {
+        let config =
+            Config::from_toml_and_environment(&with_hops(&hops.to_string()), environment())
+                .unwrap();
+        assert_eq!(config.http.trusted_proxy_hops(), hops);
+    }
+    assert!(matches!(
+        Config::from_toml_and_environment(
+            &with_hops(&(MAX_TRUSTED_PROXY_HOPS + 1).to_string()),
+            environment()
+        ),
+        Err(ConfigError::ValueTooLarge("http.trusted_proxy_hops"))
+    ));
+    for invalid in ["-1", "256", "\"1\"", "1.0"] {
+        assert!(matches!(
+            Config::from_toml_and_environment(&with_hops(invalid), environment()),
+            Err(ConfigError::Toml)
+        ));
+    }
 }
 
 #[test]

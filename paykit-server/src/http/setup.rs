@@ -2,7 +2,7 @@ use axum::{
     Router,
     body::Body,
     extract::{ConnectInfo, Path, RawQuery, State},
-    http::{HeaderValue, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::Response,
     routing::{get, post},
 };
@@ -11,38 +11,68 @@ use serde_json::json;
 use std::net::SocketAddr;
 
 use crate::domain::locks::{CreatorPubky, parse_creator};
+use crate::http::client_ip::client_ip;
 use crate::setup::{BeginError, PollResult, SetupService, StartedFlow};
 
+/// Setup routes keyed by the TCP peer, for a listener with no reverse proxy in front.
 pub fn setup_router(service: SetupService) -> Router {
+    setup_router_with_trusted_proxy_hops(service, 0)
+}
+
+/// Setup routes keyed by the client that `trusted_proxy_hops` reverse proxies forwarded; see
+/// [`client_ip`].
+pub fn setup_router_with_trusted_proxy_hops(
+    service: SetupService,
+    trusted_proxy_hops: u8,
+) -> Router {
     Router::new()
         .route("/setup", get(begin))
         .route("/setup/reconnect", get(reconnect))
         .route("/setup/{flow_id}/complete", post(complete))
-        .with_state(service)
+        .with_state(SetupRoutes {
+            service,
+            trusted_proxy_hops,
+        })
+}
+
+#[derive(Clone)]
+struct SetupRoutes {
+    service: SetupService,
+    trusted_proxy_hops: u8,
 }
 
 async fn begin(
-    State(service): State<SetupService>,
+    State(SetupRoutes {
+        service,
+        trusted_proxy_hops,
+    }): State<SetupRoutes>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
     let Some((return_to, state, None)) = parse_setup_query(query.as_deref(), false) else {
         return invalid_request();
     };
-    response_for_begin(service.begin(peer.ip(), &return_to, &state).await)
+    let client = client_ip(peer, &headers, trusted_proxy_hops);
+    response_for_begin(service.begin(client, &return_to, &state).await)
 }
 
 async fn reconnect(
-    State(service): State<SetupService>,
+    State(SetupRoutes {
+        service,
+        trusted_proxy_hops,
+    }): State<SetupRoutes>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response<Body> {
     let Some((return_to, state, Some(creator))) = parse_setup_query(query.as_deref(), true) else {
         return invalid_request();
     };
+    let client = client_ip(peer, &headers, trusted_proxy_hops);
     response_for_begin(
         service
-            .begin_reconnect(peer.ip(), &return_to, &state, &creator)
+            .begin_reconnect(client, &return_to, &state, &creator)
             .await,
     )
 }
@@ -65,7 +95,7 @@ fn response_for_begin(result: Result<StartedFlow, BeginError>) -> Response<Body>
 }
 
 async fn complete(
-    State(service): State<SetupService>,
+    State(SetupRoutes { service, .. }): State<SetupRoutes>,
     Path(flow_id): Path<String>,
 ) -> Response<Body> {
     response_for_poll(service.complete_and_poll(&flow_id).await)

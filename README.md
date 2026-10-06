@@ -219,6 +219,19 @@ new setup flow emits one labeled authorization URL log line for operator
 retrieval. The URL is a bearer secret; the local operator owns access to and
 retention of those logs.
 
+`rate_limits.setup_per_ip_per_minute` applies to `GET /setup` and
+`GET /setup/reconnect` per client IP. With the default `http.trusted_proxy_hops = 0`
+that IP is the TCP peer and `X-Forwarded-For` is ignored. Behind a reverse proxy or
+load balancer the TCP peer is the proxy, so every client shares one setup bucket.
+Set `http.trusted_proxy_hops` to the exact number of proxies in front of the server
+that each append one `X-Forwarded-For` entry; the server then uses the entry that
+many positions from the right across all header lines, and falls back to the TCP
+peer when that entry is missing or not an IP address. Entries further left are
+client-supplied and are never used. A value larger than the real proxy count
+selects a client-supplied entry, so any client can choose its own bucket and bypass
+the limit; only set it when the listener is reachable exclusively through those
+proxies. A smaller value keys clients by a proxy address. Values above 8 are rejected.
+
 The parser rejects the retired `[inbox]` section. The executable exposes no payer
 inbox API or worker, and the baseline schema contains no payer inbox tables.
 

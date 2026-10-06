@@ -111,6 +111,13 @@ fn check_config_rejects_runtime_invalid_bind_and_electrum_values() {
         ),
         (
             config(true).replace(
+                "listen_addr = \"127.0.0.1:3001\"",
+                "listen_addr = \"127.0.0.1:3001\"\ntrusted_proxy_hops = 9",
+            ),
+            "http.trusted_proxy_hops",
+        ),
+        (
+            config(true).replace(
                 "tcp://127.0.0.1:50001",
                 "tcp://127.0.0.1:50001/path?query=yes",
             ),
