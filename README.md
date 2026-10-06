@@ -78,7 +78,11 @@ not payment or verification completion.
 
 `GET /setup` is the production Bitkit setup surface. On desktop it renders the
 normal secret-bearing Pubky Auth request as a QR code; on touch devices it
-offers the same request through a `Continue with Bitkit` deep link. Production
+offers the same request through a `Continue with Bitkit` deep link. On Android
+the link becomes an intent URL naming the Bitkit build for `bitcoin.network`
+(`to.bitkit`, `to.bitkit.tnet` or `to.bitkit.dev`), because Pubky Ring also
+handles `pubkyauth://` links; signet has no Bitkit build and keeps the plain
+link. The QR always carries the plain `pubkyauth://` request. Production
 has no companion handle, helper endpoint or state, helper UI, or helper in the
 production package/runtime surface.
 
