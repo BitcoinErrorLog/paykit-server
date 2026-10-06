@@ -5,7 +5,7 @@
 This is `BitcoinErrorLog/paykit-server` (branch `marketplace-rails`), a fork
 of the official [`pubky/paykit-server`](https://github.com/pubky/paykit-server)
 used by the Pubky Marketplace's deployed payment rails
-(`BitcoinErrorLog/pubky-payment-rails`). No upstream PRs are filed while the
+(`pubky/pubky-payment-rails`). No upstream PRs are filed while the
 protocol shape settles.
 
 **Added over upstream:**
