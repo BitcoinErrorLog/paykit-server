@@ -64,6 +64,8 @@ pub enum CreateInvoiceError {
     LockNotFound,
     LockUnavailable,
     Conflict,
+    /// The Reader's App Registry was read and cannot receive or pay this request.
+    ReaderNotPayable,
     DeadlineExceeded,
     Unavailable,
 }
@@ -76,6 +78,8 @@ pub trait SessionValidator: Send + Sync {
 pub trait LockFetcher: Send + Sync {
     async fn fetch(&self, resource: &PubkyLockResource) -> Result<ContentLock, LockFetchError>;
 }
+/// `Ok(None)` means the Reader's homeserver answered that no App Registry is
+/// published. Storage, transport, and malformed-data failures must be errors.
 #[async_trait]
 pub trait AppRegistryDiscovery: Send + Sync {
     async fn discover(
@@ -483,8 +487,11 @@ impl CreateInvoiceService {
         )
         .await
         .map_err(|_| CreateInvoiceError::DeadlineExceeded)??;
+        // Discovery succeeded, so a missing or incapable registry is a definite
+        // answer about this Reader rather than a dependency outage. Retrying the
+        // same request cannot succeed until the Reader publishes a capable app.
         if !discovered.as_ref().is_some_and(reader_is_capable) {
-            return Err(CreateInvoiceError::Unavailable);
+            return Err(CreateInvoiceError::ReaderNotPayable);
         }
         let credentials_remaining = remaining(started, self.clock.now())?;
         let (xpub, account_index) =

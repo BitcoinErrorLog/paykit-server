@@ -22,6 +22,7 @@ pub enum ApiError {
     InternalError,
     LockNotFound,
     LockResourceUnavailable,
+    ReaderNotPayable,
 }
 
 #[derive(Serialize)]
@@ -112,6 +113,11 @@ impl ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "lock_resource_unavailable",
                 "lock resource is unavailable",
+            ),
+            Self::ReaderNotPayable => (
+                StatusCode::CONFLICT,
+                "reader_not_payable",
+                "reader has no Paykit app able to pay requests",
             ),
         }
     }

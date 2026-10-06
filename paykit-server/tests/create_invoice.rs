@@ -830,6 +830,264 @@ impl AppRegistryDiscovery for FakeRegistries {
     }
 }
 
+struct FailingRegistries {
+    error: CreateInvoiceError,
+}
+
+#[async_trait]
+impl AppRegistryDiscovery for FailingRegistries {
+    async fn discover(
+        &self,
+        _reader: &paykit_server::domain::locks::ReaderPubky,
+    ) -> Result<Option<paykit_lib::PaykitAppRegistry>, CreateInvoiceError> {
+        Err(self.error)
+    }
+}
+
+struct StalledRegistries;
+
+#[async_trait]
+impl AppRegistryDiscovery for StalledRegistries {
+    async fn discover(
+        &self,
+        _reader: &paykit_server::domain::locks::ReaderPubky,
+    ) -> Result<Option<paykit_lib::PaykitAppRegistry>, CreateInvoiceError> {
+        std::future::pending().await
+    }
+}
+
+struct CountingCredentials {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl CreatorXpubProvider for CountingCredentials {
+    async fn xpub(&self, creator: &CreatorPubky) -> Result<(String, u32), PersistenceError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        FakeCredentials.xpub(creator).await
+    }
+}
+
+fn registry_service(
+    registries: Arc<dyn AppRegistryDiscovery>,
+    credentials: Arc<CountingCredentials>,
+    store: Arc<FakeStore>,
+) -> CreateInvoiceService {
+    CreateInvoiceService::new(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        registries,
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        credentials,
+        BitcoinNetwork::Mainnet,
+        store,
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
+    )
+}
+
+fn registry_with_app(
+    capabilities: paykit_lib::PaykitAppCapabilities,
+) -> paykit_lib::PaykitAppRegistry {
+    let mut registry = paykit_lib::PaykitAppRegistry::new(Some(
+        paykit_lib::derive_paykit_noise_public_key(&[8; 32]),
+    ));
+    registry
+        .register_app(
+            paykit_lib::PaykitAppId::new("wallet").unwrap(),
+            paykit_lib::PaykitApp::new("Wallet", capabilities).unwrap(),
+        )
+        .unwrap();
+    registry
+}
+
+#[tokio::test]
+async fn reader_payability_is_decided_before_credentials_or_persistence() {
+    let capable = paykit_lib::PaykitAppCapabilities {
+        private_payments: true,
+        payment_requests: true,
+        receipts: false,
+        outgoing_payments: true,
+    };
+    for (registry, expected) in [
+        (Some(registry_with_app(capable)), Ok(())),
+        (None, Err(CreateInvoiceError::ReaderNotPayable)),
+        (
+            Some(paykit_lib::PaykitAppRegistry::new(None)),
+            Err(CreateInvoiceError::ReaderNotPayable),
+        ),
+        (
+            Some(registry_with_app(paykit_lib::PaykitAppCapabilities {
+                outgoing_payments: false,
+                ..capable
+            })),
+            Err(CreateInvoiceError::ReaderNotPayable),
+        ),
+        (
+            Some(registry_with_app(paykit_lib::PaykitAppCapabilities {
+                payment_requests: false,
+                ..capable
+            })),
+            Err(CreateInvoiceError::ReaderNotPayable),
+        ),
+    ] {
+        let registries = Arc::new(FakeRegistries {
+            registry,
+            calls: AtomicUsize::default(),
+        });
+        let credentials = Arc::new(CountingCredentials {
+            calls: AtomicUsize::default(),
+        });
+        let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+
+        let result = registry_service(registries.clone(), credentials.clone(), store.clone())
+            .create(request())
+            .await;
+
+        assert_eq!(result.map(|_| ()), expected);
+        assert_eq!(registries.calls.load(Ordering::SeqCst), 1);
+        let proceeded = usize::from(expected.is_ok());
+        assert_eq!(credentials.calls.load(Ordering::SeqCst), proceeded);
+        assert_eq!(store.create_calls.load(Ordering::SeqCst), proceeded);
+    }
+}
+
+#[tokio::test]
+async fn registry_discovery_failures_remain_dependency_errors() {
+    for error in [
+        CreateInvoiceError::Unavailable,
+        CreateInvoiceError::InvalidRequest,
+    ] {
+        let credentials = Arc::new(CountingCredentials {
+            calls: AtomicUsize::default(),
+        });
+        let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+
+        assert_eq!(
+            registry_service(
+                Arc::new(FailingRegistries { error }),
+                credentials.clone(),
+                store.clone(),
+            )
+            .create(request())
+            .await,
+            Err(error)
+        );
+        assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn stalled_registry_discovery_is_a_deadline_not_a_payability_answer() {
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+    let start = Instant::now();
+    let service = CreateInvoiceService::with_clock(
+        Arc::new(FakeSession {
+            result: Ok(()),
+            calls: AtomicUsize::default(),
+            creators: Mutex::new(vec![]),
+        }),
+        Arc::new(FakeLocks {
+            result: Ok(valid_lock()),
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(StalledRegistries),
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        Arc::new(FakeCredentials),
+        BitcoinNetwork::Mainnet,
+        store.clone(),
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Mainnet)),
+        Arc::new(FixedClock::new([
+            start,
+            start,
+            start,
+            start,
+            start + Duration::from_secs(15) - Duration::from_millis(10),
+        ])),
+    );
+
+    assert_eq!(
+        service.create(request()).await,
+        Err(CreateInvoiceError::DeadlineExceeded)
+    );
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn exact_replay_survives_a_reader_that_is_no_longer_payable() {
+    let registries = Arc::new(FakeRegistries {
+        registry: None,
+        calls: AtomicUsize::default(),
+    });
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::ExactReplay));
+
+    let result = registry_service(
+        registries.clone(),
+        Arc::new(CountingCredentials {
+            calls: AtomicUsize::default(),
+        }),
+        store,
+    )
+    .create(request())
+    .await
+    .unwrap();
+
+    assert!(result.replayed());
+    assert_eq!(registries.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn signed_router_maps_reader_not_payable_to_a_stable_conflict() {
+    let key = SigningKey::from_bytes(&[15; 32]);
+    let locks_request = || {
+        serde_json_canonicalizer::to_vec(&serde_json::json!({
+            "bundle_id": BUNDLE,
+            "lock_resource": LOCK_RESOURCE,
+            "reader": reader()
+        }))
+        .unwrap()
+    };
+    let router = |registry| {
+        invoices_router(Arc::new(registry_service(
+            Arc::new(FakeRegistries {
+                registry,
+                calls: AtomicUsize::default(),
+            }),
+            Arc::new(CountingCredentials {
+                calls: AtomicUsize::default(),
+            }),
+            Arc::new(FakeStore::with_preflight(InvoicePreflight::New)),
+        )))
+        .layer(Extension(signed_auth(&key)))
+    };
+
+    let response = router(Some(capable_registry()))
+        .oneshot(signed_invoice_request(&key, locks_request()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = router(Some(paykit_lib::PaykitAppRegistry::new(None)))
+        .oneshot(signed_invoice_request(&key, locks_request()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+        serde_json::json!({"error":{"code":"reader_not_payable","message":"reader has no Paykit app able to pay requests"}})
+    );
+}
+
 struct CapturingIntentStore {
     captured: Mutex<Vec<DeliveryIntentV1>>,
 }

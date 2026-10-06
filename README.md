@@ -294,7 +294,12 @@ The later SDK handoff is not exactly once. Server delivery is at least once:
 The invoice API returns after durable intent commit. It does not wait for Encrypted Link establishment or remote delivery.
 
 Requests address the Reader identity, not a receiver folder. The Reader's App
-Registry must advertise a private-payment app capable of paying requests.
+Registry must advertise a private-payment app capable of paying requests. When
+the Reader's homeserver answers with no App Registry, or with one lacking a Noise
+key or such an app, a new invoice returns `409` with code `reader_not_payable`
+before any address allocation or persistence. Repeating the request cannot
+succeed until the Reader publishes a capable app. Registry read failures and
+timeouts remain `503` `dependency_unavailable` and `dependency_timeout`.
 Readers resolve each Payment Request by ID through the SDK request-aware resolver.
 Bound destinations have no Payment List version and never fall back to mutable
 private or public lists. Another invoice or app cannot replace the destination.

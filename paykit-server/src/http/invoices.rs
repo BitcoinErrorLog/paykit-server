@@ -99,6 +99,7 @@ fn invoice_error(error: CreateInvoiceError) -> Response {
         CreateInvoiceError::Unavailable => ApiError::DependencyUnavailable.into_response(),
         CreateInvoiceError::LockNotFound => ApiError::LockNotFound.into_response(),
         CreateInvoiceError::Conflict => ApiError::InvoiceConflict.into_response(),
+        CreateInvoiceError::ReaderNotPayable => ApiError::ReaderNotPayable.into_response(),
         CreateInvoiceError::DeadlineExceeded => ApiError::DependencyTimeout.into_response(),
     }
 }
