@@ -85,6 +85,15 @@ pub enum PaymentRequestStatusError {
     Unavailable,
 }
 
+impl PaymentRequestStatusError {
+    pub(crate) const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::Conflict => "conflict",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 #[async_trait]
 pub trait PaymentRequestStatusOperations: Send + Sync {
     async fn lookup(

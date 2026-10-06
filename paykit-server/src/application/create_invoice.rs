@@ -68,6 +68,21 @@ pub enum CreateInvoiceError {
     Unavailable,
 }
 
+impl CreateInvoiceError {
+    pub(crate) const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::CreatorSessionInvalid => "creator_session_invalid",
+            Self::CreatorSessionUnavailable => "creator_session_unavailable",
+            Self::LockNotFound => "lock_not_found",
+            Self::LockUnavailable => "lock_unavailable",
+            Self::Conflict => "conflict",
+            Self::DeadlineExceeded => "deadline_exceeded",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
 #[async_trait]
 pub trait SessionValidator: Send + Sync {
     async fn validate(&self, creator: &CreatorPubky) -> Result<(), SessionValidationError>;
@@ -268,17 +283,30 @@ impl InvoicePayloadFactory for DerivedInvoicePayloads<'_> {
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         let address =
             derive_bip84_p2wpkh_address(&self.xpub, self.account_index, &self.network, child_index)
-                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                .map_err(|error| {
+                    diagnose("address_derivation", error);
+                    PersistenceError::CorruptOrMissing
+                })?;
         let terms = self
             .intents
             .payment_request_terms(self.request, self.lock, &address)
-            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            .map_err(|error| {
+                diagnose("payment_terms_construction", error);
+                PersistenceError::CorruptOrMissing
+            })?;
         let payment_request_intent = DeliveryIntentV1::payment_request(
             self.request.reader.to_string(),
             self.app_id.clone(),
             &terms,
         )
-        .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        .map_err(|_| {
+            crate::diagnostics::failure(
+                "invoice_create",
+                "delivery_intent_construction",
+                "serialization_failed",
+            );
+            PersistenceError::CorruptOrMissing
+        })?;
         Ok(InvoicePayloads {
             payment_request_intent,
             bitcoin_address: address,
@@ -427,19 +455,21 @@ impl CreateInvoiceService {
         let creator = request.lock_resource.creator().clone();
         let bundle_binding = request.bundle_id.to_string().into_bytes();
         let lock_resource_binding = request.lock_resource.to_string().into_bytes();
-        let payment_request_binding = request_binding(&request)?;
-        let preflight_remaining = remaining(started, self.clock.now())?;
+        let payment_request_binding = request_binding(&request).inspect_err(|&error| {
+            diagnose("request_binding", error);
+        })?;
+        let preflight_remaining = remaining_at(started, self.clock.now(), "invoice_preflight")?;
         match tokio::time::timeout(
             preflight_remaining,
             self.store
                 .preflight(&creator, &bundle_binding, &payment_request_binding),
         )
         .await
-        .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
-        .map_err(map_store)?
+        .map_err(|_| deadline("invoice_preflight"))?
+        .map_err(|error| store_failure("invoice_preflight", error))?
         {
             InvoicePreflight::ExactReplay => {
-                let replay_remaining = remaining(started, self.clock.now())?;
+                let replay_remaining = remaining_at(started, self.clock.now(), "exact_replay")?;
                 return tokio::time::timeout(
                     replay_remaining,
                     self.store.exact_replay(
@@ -450,48 +480,85 @@ impl CreateInvoiceService {
                     ),
                 )
                 .await
-                .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
-                .map_err(map_store);
+                .map_err(|_| deadline("exact_replay"))?
+                .map_err(|error| store_failure("exact_replay", error));
             }
-            InvoicePreflight::Conflict => return Err(CreateInvoiceError::Conflict),
+            InvoicePreflight::Conflict => {
+                diagnose("invoice_preflight", CreateInvoiceError::Conflict);
+                return Err(CreateInvoiceError::Conflict);
+            }
             InvoicePreflight::New => {}
         }
-        let session_remaining = remaining(started, self.clock.now())?;
+        let session_remaining = remaining_at(started, self.clock.now(), "creator_session")?;
         tokio::time::timeout(session_remaining, self.sessions.validate(&creator))
             .await
-            .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
+            .map_err(|_| deadline("creator_session"))?
             .map_err(|error| match error {
-                SessionValidationError::Invalid => CreateInvoiceError::CreatorSessionInvalid,
+                SessionValidationError::Invalid => {
+                    diagnose("creator_session", CreateInvoiceError::CreatorSessionInvalid);
+                    CreateInvoiceError::CreatorSessionInvalid
+                }
                 SessionValidationError::Unavailable => {
+                    diagnose(
+                        "creator_session",
+                        CreateInvoiceError::CreatorSessionUnavailable,
+                    );
                     CreateInvoiceError::CreatorSessionUnavailable
                 }
             })?;
-        let lock_remaining = remaining(started, self.clock.now())?;
+        let lock_remaining = remaining_at(started, self.clock.now(), "lock_fetch")?;
         let lock = tokio::time::timeout(lock_remaining, self.locks.fetch(&request.lock_resource))
             .await
-            .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
+            .map_err(|_| deadline("lock_fetch"))?
             .map_err(|error| match error {
-                LockFetchError::NotFound => CreateInvoiceError::LockNotFound,
-                LockFetchError::Unavailable => CreateInvoiceError::LockUnavailable,
-                LockFetchError::Invalid => CreateInvoiceError::InvalidRequest,
+                LockFetchError::NotFound => {
+                    diagnose("lock_fetch", CreateInvoiceError::LockNotFound);
+                    CreateInvoiceError::LockNotFound
+                }
+                LockFetchError::Unavailable => {
+                    diagnose("lock_fetch", CreateInvoiceError::LockUnavailable);
+                    CreateInvoiceError::LockUnavailable
+                }
+                LockFetchError::Invalid => {
+                    diagnose("lock_fetch", CreateInvoiceError::InvalidRequest);
+                    CreateInvoiceError::InvalidRequest
+                }
             })?;
-        validate_lock(&request, &lock)?;
-        let registry_remaining = remaining(started, self.clock.now())?;
+        validate_lock(&request, &lock).inspect_err(|&error| {
+            diagnose("lock_validation", error);
+        })?;
+        let registry_remaining = remaining_at(started, self.clock.now(), "reader_app_registry")?;
         let discovered = tokio::time::timeout(
             registry_remaining,
             self.registries.discover(&request.reader),
         )
         .await
-        .map_err(|_| CreateInvoiceError::DeadlineExceeded)??;
-        if !discovered.as_ref().is_some_and(reader_is_capable) {
+        .map_err(|_| deadline("reader_app_registry"))?
+        .inspect_err(|&error| {
+            diagnose("reader_app_registry_fetch", error);
+        })?;
+        let Some(discovered) = discovered else {
+            crate::diagnostics::failure(
+                "invoice_create",
+                "reader_app_registry_check",
+                "registry_missing",
+            );
+            return Err(CreateInvoiceError::Unavailable);
+        };
+        if !reader_is_capable(&discovered) {
+            crate::diagnostics::failure(
+                "invoice_create",
+                "reader_app_registry_check",
+                "required_capability_missing",
+            );
             return Err(CreateInvoiceError::Unavailable);
         }
-        let credentials_remaining = remaining(started, self.clock.now())?;
+        let credentials_remaining = remaining_at(started, self.clock.now(), "creator_xpub_load")?;
         let (xpub, account_index) =
             tokio::time::timeout(credentials_remaining, self.credentials.xpub(&creator))
                 .await
-                .map_err(|_| CreateInvoiceError::DeadlineExceeded)?
-                .map_err(map_store)?;
+                .map_err(|_| deadline("creator_xpub_load"))?
+                .map_err(|error| store_failure("creator_xpub_load", error))?;
         let invoice_payloads = DerivedInvoicePayloads {
             intents: self.intents.clone(),
             xpub,
@@ -501,7 +568,7 @@ impl CreateInvoiceService {
             lock: &lock,
             app_id: self.app_id.clone(),
         };
-        remaining(started, self.clock.now())?;
+        remaining_at(started, self.clock.now(), "create_atomic")?;
         // Once PostgreSQL mutation starts it must be awaited to a factual
         // commit/rollback result. Canceling this future at the HTTP deadline
         // could otherwise return failure while COMMIT succeeds concurrently.
@@ -518,7 +585,7 @@ impl CreateInvoiceService {
                 payment_window_seconds: self.payment_window.as_secs(),
             })
             .await
-            .map_err(map_store)
+            .map_err(|error| store_failure("create_atomic", error))
     }
 }
 
@@ -534,6 +601,31 @@ fn remaining(start: Instant, now: Instant) -> Result<Duration, CreateInvoiceErro
     }
     Ok(remaining)
 }
+
+fn remaining_at(
+    start: Instant,
+    now: Instant,
+    stage: &'static str,
+) -> Result<Duration, CreateInvoiceError> {
+    remaining(start, now).inspect_err(|&error| {
+        diagnose(stage, error);
+    })
+}
+
+fn deadline(stage: &'static str) -> CreateInvoiceError {
+    diagnose(stage, CreateInvoiceError::DeadlineExceeded);
+    CreateInvoiceError::DeadlineExceeded
+}
+
+fn store_failure(stage: &'static str, error: PersistenceError) -> CreateInvoiceError {
+    crate::diagnostics::failure("invoice_create", stage, error.diagnostic_label());
+    map_store(error)
+}
+
+fn diagnose(stage: &'static str, error: CreateInvoiceError) {
+    crate::diagnostics::failure("invoice_create", stage, error.diagnostic_label());
+}
+
 fn map_store(error: PersistenceError) -> CreateInvoiceError {
     match error {
         PersistenceError::Conflict => CreateInvoiceError::Conflict,

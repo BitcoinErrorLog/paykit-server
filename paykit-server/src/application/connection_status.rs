@@ -95,11 +95,25 @@ impl ConnectionStatusService {
             .bindings
             .binding(creator, bundle_id)
             .await
-            .map_err(|_| ConnectionStatusError::Unavailable)?
+            .map_err(|error| {
+                crate::diagnostics::failure(
+                    "connection_status",
+                    "invoice_binding_load",
+                    error.diagnostic_label(),
+                );
+                ConnectionStatusError::Unavailable
+            })?
             .ok_or(ConnectionStatusError::NotFound)?;
         self.peers
             .connection_state(creator, &binding)
             .await
-            .map_err(|_| ConnectionStatusError::Unavailable)
+            .map_err(|error| {
+                crate::diagnostics::failure(
+                    "connection_status",
+                    "peer_state_load",
+                    error.diagnostic_label(),
+                );
+                ConnectionStatusError::Unavailable
+            })
     }
 }

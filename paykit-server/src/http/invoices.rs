@@ -64,14 +64,22 @@ async fn create(
 
 fn response(result: crate::persistence::AtomicInvoiceResult) -> Result<InvoiceResponse, ApiError> {
     Ok(InvoiceResponse {
-        invoice_created_at: result
-            .invoice_created_at()
-            .format(&Rfc3339)
-            .map_err(|_| ApiError::InternalError)?,
-        payment_deadline: result
-            .payment_deadline()
-            .format(&Rfc3339)
-            .map_err(|_| ApiError::InternalError)?,
+        invoice_created_at: result.invoice_created_at().format(&Rfc3339).map_err(|_| {
+            crate::diagnostics::failure(
+                "invoice_create",
+                "response_serialization",
+                "invalid_invoice_created_at",
+            );
+            ApiError::InternalError
+        })?,
+        payment_deadline: result.payment_deadline().format(&Rfc3339).map_err(|_| {
+            crate::diagnostics::failure(
+                "invoice_create",
+                "response_serialization",
+                "invalid_payment_deadline",
+            );
+            ApiError::InternalError
+        })?,
     })
 }
 
@@ -87,6 +95,11 @@ fn parse(body: InvoiceBody) -> Result<CreateInvoiceRequest, ApiError> {
 }
 
 fn invoice_error(error: CreateInvoiceError) -> Response {
+    crate::diagnostics::failure(
+        "invoice_create",
+        "application_service",
+        error.diagnostic_label(),
+    );
     match error {
         CreateInvoiceError::InvalidRequest => ApiError::InvalidRequest.into_response(),
         CreateInvoiceError::CreatorSessionInvalid => {

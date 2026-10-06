@@ -97,3 +97,16 @@ pub enum PersistenceError {
     #[error("persistence input is invalid")]
     InvalidInput,
 }
+
+impl PersistenceError {
+    pub(crate) const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::DeploymentMismatch => "deployment_mismatch",
+            Self::CorruptOrMissing => "corrupt_or_missing",
+            Self::ReauthenticationMismatch => "reauthentication_mismatch",
+            Self::Unavailable => "unavailable",
+            Self::Conflict => "conflict",
+            Self::InvalidInput => "invalid_input",
+        }
+    }
+}

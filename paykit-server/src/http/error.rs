@@ -36,6 +36,10 @@ struct ErrorBody {
 }
 
 impl ApiError {
+    pub(crate) const fn code(self) -> &'static str {
+        self.details().1
+    }
+
     const fn details(self) -> (StatusCode, &'static str, &'static str) {
         match self {
             Self::InvalidRequest => (
@@ -133,6 +137,10 @@ impl IntoResponse for ApiError {
                 "1".parse().expect("static header value"),
             );
         }
+        super::request_diagnostics::annotate(
+            &mut response,
+            super::request_diagnostics::OutcomeFailureClass::api(self),
+        );
         response
     }
 }

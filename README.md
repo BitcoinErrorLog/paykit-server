@@ -190,6 +190,29 @@ Do not put database credentials or the master key in TOML, logs, shell history, 
 
 Production logging allowlists only the `paykit_server` target at INFO and above. Dependency targets are disabled because upstream diagnostics may contain identities, URLs, or response text.
 
+`POST /invoices` and the Locks-facing `POST /payment-requests/status`,
+`POST /connections/status`, and `POST /setup/status` polls emit one coarse
+outcome event for each request reaching the application, including admission
+rejections. Completed-event fields are HTTP status, elapsed milliseconds, a
+closed failure class, and an opaque request ID. Status events also carry a closed
+`payment_request_status`, `connection_status`, or `setup_status` operation
+label. A request cancelled or unwound before producing a response emits the
+same event with failure class `cancelled`, no fabricated HTTP status, and no
+response header. Expected status-poll outcomes, including typed dependency
+failures and ordinary cancellation, remain DEBUG-only; an unclassified server
+error or handler panic is WARN to avoid outage-driven INFO/WARN log storms.
+Failures inside these request flows also emit one WARN event at the narrowest
+known source. Its closed fields are `operation`, `stage`, `category`, and the
+same opaque request ID returned in `X-Request-ID`; raw errors, identities, keys,
+signatures, bodies, and URLs are excluded. Outer error mappings are fallback
+sites only, so one request emits at most one source-failure warning. When a
+source warning was emitted, the coarse completion event remains DEBUG-only.
+Locks may supply `X-Request-ID` only as a canonical UUIDv4; other values are ignored
+without being echoed or logged, and Paykit Server generates a replacement UUIDv4.
+Successful outcomes remain DEBUG-only. A `503` produced by a reverse proxy before the
+request reaches Paykit Server cannot produce this application event and must be
+diagnosed from proxy telemetry.
+
 `setup.log_authorization_url` defaults to `false` and must remain false for
 production. When explicitly enabled in the generated local-demo config, each
 new setup flow emits one labeled authorization URL log line for operator

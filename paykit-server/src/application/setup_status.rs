@@ -45,7 +45,22 @@ impl SetupStatusService {
         match tokio::time::timeout(self.timeout, self.sessions.validate(creator)).await {
             Ok(Ok(())) => SetupStatus::Ready,
             Ok(Err(SessionValidationError::Invalid)) => SetupStatus::SetupRequired,
-            Ok(Err(SessionValidationError::Unavailable)) | Err(_) => SetupStatus::Unavailable,
+            Ok(Err(SessionValidationError::Unavailable)) => {
+                crate::diagnostics::failure(
+                    "setup_status",
+                    "creator_session_validation",
+                    "unavailable",
+                );
+                SetupStatus::Unavailable
+            }
+            Err(_) => {
+                crate::diagnostics::failure(
+                    "setup_status",
+                    "creator_session_validation",
+                    "timeout",
+                );
+                SetupStatus::Unavailable
+            }
         }
     }
 }

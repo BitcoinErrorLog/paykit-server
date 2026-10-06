@@ -64,12 +64,28 @@ async fn status(
             PaymentRequestLifecycleState::InvalidConflict => ApiError::Conflict.into_response(),
             _ => match PaymentRequestStatusResponse::try_from(summary) {
                 Ok(response) => axum::Json(response).into_response(),
-                Err(()) => ApiError::Unavailable.into_response(),
+                Err(()) => {
+                    crate::diagnostics::failure(
+                        "payment_request_status",
+                        "response_serialization",
+                        "invalid_timestamp",
+                    );
+                    ApiError::Unavailable.into_response()
+                }
             },
         },
         Ok(None) => ApiError::InvoiceNotFound.into_response(),
-        Err(PaymentRequestStatusError::Conflict) => ApiError::Conflict.into_response(),
-        Err(PaymentRequestStatusError::Unavailable) => ApiError::Unavailable.into_response(),
+        Err(error) => {
+            crate::diagnostics::failure(
+                "payment_request_status",
+                "status_lookup",
+                error.diagnostic_label(),
+            );
+            match error {
+                PaymentRequestStatusError::Conflict => ApiError::Conflict.into_response(),
+                PaymentRequestStatusError::Unavailable => ApiError::Unavailable.into_response(),
+            }
+        }
     }
 }
 

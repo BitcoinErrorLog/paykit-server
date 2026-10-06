@@ -393,14 +393,36 @@ impl PaykitAdapter {
         let required_targets = lifecycles
             .required_receive_targets_for_bundle(self.creator_id, bundle_id)
             .await
-            .map_err(|_| PaymentRequestStatusError::Unavailable)?;
-        let parsed_targets =
-            parse_receive_targets(&required_targets).map_err(map_lifecycle_status_error)?;
+            .map_err(|error| {
+                crate::diagnostics::failure(
+                    "payment_request_status",
+                    "receive_targets_load",
+                    error.diagnostic_label(),
+                );
+                PaymentRequestStatusError::Unavailable
+            })?;
+        let parsed_targets = parse_receive_targets(&required_targets).map_err(|error| {
+            let mapped = map_lifecycle_status_error(error);
+            crate::diagnostics::failure(
+                "payment_request_status",
+                "receive_targets_parse",
+                mapped.diagnostic_label(),
+            );
+            mapped
+        })?;
         refresh_then(
             || async {
                 self.refresh_payment_requests_locked(lifecycles, Some(&parsed_targets))
                     .await
-                    .map_err(map_lifecycle_status_error)
+                    .map_err(|error| {
+                        let mapped = map_lifecycle_status_error(error);
+                        crate::diagnostics::failure(
+                            "payment_request_status",
+                            "paykit_reconciliation",
+                            mapped.diagnostic_label(),
+                        );
+                        mapped
+                    })
             },
             || async {
                 statuses
@@ -411,7 +433,14 @@ impl PaykitAdapter {
                         &required_targets,
                     )
                     .await
-                    .map_err(|_| PaymentRequestStatusError::Unavailable)
+                    .map_err(|error| {
+                        crate::diagnostics::failure(
+                            "payment_request_status",
+                            "status_projection_load",
+                            error.diagnostic_label(),
+                        );
+                        PaymentRequestStatusError::Unavailable
+                    })
             },
         )
         .await
