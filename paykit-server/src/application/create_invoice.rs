@@ -36,6 +36,8 @@ use crate::{
 };
 
 const REQUEST_DEADLINE: Duration = Duration::from_secs(15);
+const REGISTRY_READ_ATTEMPTS: usize = 3;
+const REGISTRY_RETRY_DELAY_CAPS_MS: [u64; REGISTRY_READ_ATTEMPTS - 1] = [333, 667];
 
 #[derive(Clone, Debug)]
 pub struct CreateInvoiceRequest {
@@ -57,6 +59,12 @@ pub enum LockFetchError {
     Invalid,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegistryDiscoveryError {
+    InvalidRequest,
+    Unavailable,
+    Malformed,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreateInvoiceError {
     InvalidRequest,
     CreatorSessionInvalid,
@@ -64,6 +72,10 @@ pub enum CreateInvoiceError {
     LockNotFound,
     LockUnavailable,
     Conflict,
+    ReaderSetupPending,
+    ReaderNotPayable,
+    ReaderRegistryUnavailable,
+    ReaderRegistryMalformed,
     DeadlineExceeded,
     Unavailable,
 }
@@ -77,6 +89,10 @@ impl CreateInvoiceError {
             Self::LockNotFound => "lock_not_found",
             Self::LockUnavailable => "lock_unavailable",
             Self::Conflict => "conflict",
+            Self::ReaderSetupPending => "reader_setup_pending",
+            Self::ReaderNotPayable => "reader_not_payable",
+            Self::ReaderRegistryUnavailable => "reader_registry_unavailable",
+            Self::ReaderRegistryMalformed => "reader_registry_malformed",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::Unavailable => "unavailable",
         }
@@ -93,10 +109,28 @@ pub trait LockFetcher: Send + Sync {
 }
 #[async_trait]
 pub trait AppRegistryDiscovery: Send + Sync {
+    /// `Ok(None)` is reserved for a clean homeserver not-found/gone response.
+    /// Read/transport failures and fetched invalid data remain typed errors.
     async fn discover(
         &self,
         reader: &ReaderPubky,
-    ) -> Result<Option<PaykitAppRegistry>, CreateInvoiceError>;
+    ) -> Result<Option<PaykitAppRegistry>, RegistryDiscoveryError>;
+}
+
+#[async_trait]
+pub trait RegistryRetryDelay: Send + Sync {
+    async fn wait(&self, retry_index: usize);
+}
+
+#[derive(Default)]
+struct FullJitterRegistryRetryDelay;
+
+#[async_trait]
+impl RegistryRetryDelay for FullJitterRegistryRetryDelay {
+    async fn wait(&self, retry_index: usize) {
+        let cap_ms = REGISTRY_RETRY_DELAY_CAPS_MS[retry_index];
+        tokio::time::sleep(Duration::from_millis(rand::random_range(0..=cap_ms))).await;
+    }
 }
 #[async_trait]
 pub trait CreatorXpubProvider: Send + Sync {
@@ -335,6 +369,7 @@ pub struct CreateInvoiceService {
     store: Arc<dyn InvoicePersistence>,
     intents: Arc<dyn IntentBuilder>,
     clock: Arc<dyn DeadlineClock>,
+    registry_retry_delay: Arc<dyn RegistryRetryDelay>,
     proposal_acceptance_window: Duration,
     payment_window: Duration,
 }
@@ -385,6 +420,7 @@ impl CreateInvoiceService {
             store,
             intents,
             clock,
+            Arc::new(FullJitterRegistryRetryDelay),
             Duration::from_secs(60 * 60),
             Duration::from_secs(24 * 60 * 60),
         )
@@ -413,8 +449,66 @@ impl CreateInvoiceService {
             store,
             intents,
             Arc::new(SystemDeadlineClock),
+            Arc::new(FullJitterRegistryRetryDelay),
             proposal_acceptance_window,
             payment_window,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_registry_retry(
+        sessions: Arc<dyn SessionValidator>,
+        locks: Arc<dyn LockFetcher>,
+        registries: Arc<dyn AppRegistryDiscovery>,
+        app_id: PaykitAppId,
+        credentials: Arc<dyn CreatorXpubProvider>,
+        bitcoin_network: crate::config::BitcoinNetwork,
+        store: Arc<dyn InvoicePersistence>,
+        intents: Arc<dyn IntentBuilder>,
+        registry_retry_delay: Arc<dyn RegistryRetryDelay>,
+    ) -> Self {
+        Self::with_clock_and_windows(
+            sessions,
+            locks,
+            registries,
+            app_id,
+            credentials,
+            bitcoin_network,
+            store,
+            intents,
+            Arc::new(SystemDeadlineClock),
+            registry_retry_delay,
+            Duration::from_secs(60 * 60),
+            Duration::from_secs(24 * 60 * 60),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_clock_and_registry_retry(
+        sessions: Arc<dyn SessionValidator>,
+        locks: Arc<dyn LockFetcher>,
+        registries: Arc<dyn AppRegistryDiscovery>,
+        app_id: PaykitAppId,
+        credentials: Arc<dyn CreatorXpubProvider>,
+        bitcoin_network: crate::config::BitcoinNetwork,
+        store: Arc<dyn InvoicePersistence>,
+        intents: Arc<dyn IntentBuilder>,
+        clock: Arc<dyn DeadlineClock>,
+        registry_retry_delay: Arc<dyn RegistryRetryDelay>,
+    ) -> Self {
+        Self::with_clock_and_windows(
+            sessions,
+            locks,
+            registries,
+            app_id,
+            credentials,
+            bitcoin_network,
+            store,
+            intents,
+            clock,
+            registry_retry_delay,
+            Duration::from_secs(60 * 60),
+            Duration::from_secs(24 * 60 * 60),
         )
     }
 
@@ -429,6 +523,7 @@ impl CreateInvoiceService {
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
         clock: Arc<dyn DeadlineClock>,
+        registry_retry_delay: Arc<dyn RegistryRetryDelay>,
         proposal_acceptance_window: Duration,
         payment_window: Duration,
     ) -> Self {
@@ -442,6 +537,7 @@ impl CreateInvoiceService {
             store,
             intents,
             clock,
+            registry_retry_delay,
             proposal_acceptance_window,
             payment_window,
         }
@@ -527,31 +623,65 @@ impl CreateInvoiceService {
         validate_lock(&request, &lock).inspect_err(|&error| {
             diagnose("lock_validation", error);
         })?;
-        let registry_remaining = remaining_at(started, self.clock.now(), "reader_app_registry")?;
-        let discovered = tokio::time::timeout(
-            registry_remaining,
-            self.registries.discover(&request.reader),
-        )
-        .await
-        .map_err(|_| deadline("reader_app_registry"))?
-        .inspect_err(|&error| {
-            diagnose("reader_app_registry_fetch", error);
-        })?;
-        let Some(discovered) = discovered else {
-            crate::diagnostics::failure(
-                "invoice_create",
-                "reader_app_registry_check",
-                "registry_missing",
-            );
-            return Err(CreateInvoiceError::Unavailable);
+        let mut registry_attempt = 1;
+        let discovered = loop {
+            let registry_remaining =
+                remaining_at(started, self.clock.now(), "reader_app_registry")?;
+            let result = tokio::time::timeout(
+                registry_remaining,
+                self.registries.discover(&request.reader),
+            )
+            .await
+            .map_err(|_| deadline("reader_app_registry"))?;
+            match result {
+                Ok(Some(registry)) => break registry,
+                Ok(None) if registry_attempt < REGISTRY_READ_ATTEMPTS => {
+                    let delay_remaining =
+                        remaining_at(started, self.clock.now(), "reader_app_registry_retry")?;
+                    tokio::time::timeout(
+                        delay_remaining,
+                        self.registry_retry_delay.wait(registry_attempt - 1),
+                    )
+                    .await
+                    .map_err(|_| deadline("reader_app_registry_retry"))?;
+                    registry_attempt += 1;
+                }
+                Ok(None) => {
+                    diagnose(
+                        "reader_app_registry_check",
+                        CreateInvoiceError::ReaderSetupPending,
+                    );
+                    return Err(CreateInvoiceError::ReaderSetupPending);
+                }
+                Err(RegistryDiscoveryError::InvalidRequest) => {
+                    diagnose(
+                        "reader_app_registry_identity",
+                        CreateInvoiceError::InvalidRequest,
+                    );
+                    return Err(CreateInvoiceError::InvalidRequest);
+                }
+                Err(RegistryDiscoveryError::Unavailable) => {
+                    diagnose(
+                        "reader_app_registry_fetch",
+                        CreateInvoiceError::ReaderRegistryUnavailable,
+                    );
+                    return Err(CreateInvoiceError::ReaderRegistryUnavailable);
+                }
+                Err(RegistryDiscoveryError::Malformed) => {
+                    diagnose(
+                        "reader_app_registry_parse",
+                        CreateInvoiceError::ReaderRegistryMalformed,
+                    );
+                    return Err(CreateInvoiceError::ReaderRegistryMalformed);
+                }
+            }
         };
         if !reader_is_capable(&discovered) {
-            crate::diagnostics::failure(
-                "invoice_create",
+            diagnose(
                 "reader_app_registry_check",
-                "required_capability_missing",
+                CreateInvoiceError::ReaderNotPayable,
             );
-            return Err(CreateInvoiceError::Unavailable);
+            return Err(CreateInvoiceError::ReaderNotPayable);
         }
         let credentials_remaining = remaining_at(started, self.clock.now(), "creator_xpub_load")?;
         let (xpub, account_index) =
@@ -689,4 +819,16 @@ fn extract_terms(lock: &ContentLock) -> Result<CriterionAmount, CreateInvoiceErr
             .ok_or(CreateInvoiceError::InvalidRequest)?,
     )
     .map_err(|_| CreateInvoiceError::InvalidRequest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_retry_policy_is_three_reads_with_at_most_one_second_of_delay() {
+        assert_eq!(REGISTRY_READ_ATTEMPTS, 3);
+        assert_eq!(REGISTRY_RETRY_DELAY_CAPS_MS.len(), 2);
+        assert_eq!(REGISTRY_RETRY_DELAY_CAPS_MS.iter().sum::<u64>(), 1_000);
+    }
 }

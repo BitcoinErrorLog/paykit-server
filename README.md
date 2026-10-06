@@ -330,7 +330,30 @@ The later SDK handoff is not exactly once. Server delivery is at least once:
 The invoice API returns after durable intent commit. It does not wait for Encrypted Link establishment or remote delivery.
 
 Requests address the Reader identity, not a receiver folder. The Reader's App
-Registry must advertise a private-payment app capable of paying requests.
+Registry must advertise a private-payment app capable of paying requests. New
+invoice admission reads a cleanly missing registry at most three times, using
+full-jitter delays whose combined maximum is one second inside the existing
+15-second request deadline. Exhausted clean absence returns `503`
+`reader_setup_pending` with the safe message `reader wallet setup needed` and
+no `Retry-After` header; a present but incapable registry returns terminal `409`
+`reader_not_payable`. Transport/read failures return `503`
+`reader_registry_unavailable`, malformed or oversized registry data returns
+`502` `reader_registry_malformed`, and request-wide exhaustion remains `503`
+`dependency_timeout`. Invalid Reader identifiers return `400` `invalid_request`
+before discovery; malformed remote registry data remains a distinct `502`.
+These failures occur before xpub loading, address allocation, invoice
+persistence, or outbox insertion. Exact replay is checked first and returns its
+existing invoice without live registry discovery.
+
+Locks caller policy is code-specific, not status-class-wide. Its backend may
+retry `reader_setup_pending` and `reader_registry_malformed` only within the
+original fixed 10-minute invoice-admission deadline; retries must never extend
+that deadline. `reader_not_payable` is terminal. Marketplace UI must surface
+`Reader wallet setup needed` immediately for `reader_setup_pending`, even while
+bounded backend retries remain possible, and provide an explicit wallet-setup
+or user retry action instead of rendering generic `Paykit unavailable` or
+automatically following `503` responses. This UI mapping and retry orchestration
+are a required Marketplace-repository follow-up; they are not implemented here.
 Readers resolve each Payment Request by ID through the SDK request-aware resolver.
 Bound destinations have no Payment List version and never fall back to mutable
 private or public lists. Another invoice or app cannot replace the destination.
