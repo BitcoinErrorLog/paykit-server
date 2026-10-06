@@ -103,6 +103,11 @@ capabilities. That owner-only scope includes
 `/pub/paykit-authority/v0/current-key.json:rw`; it must never be granted to Server.
 The App Registry remains discovery metadata, not key authority.
 
+An existing Creator without signed key authorization is not ready until its
+authorizer publishes that record. Reconnect refreshes delegated credentials while
+preserving the account and invoices; signed authorization does not require a
+database reset.
+
 Bitkit authorizes only `/pub/paykit/:rw` for Server. The server requests two independent
 permissions as `x-bitkit-claim=paykit-access-v1.watch-only-account-v1` and Bitkit
 returns a signed, encrypted companion claim. Its 124-byte payload contains the BIP84

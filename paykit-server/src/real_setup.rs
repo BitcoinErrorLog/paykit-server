@@ -489,4 +489,40 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn delegated_key_rejects_authorized_static_key_substitution() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        let identity = pubky::Keypair::random();
+        let key = paykit_sdk::PaykitIdentitySecretKey::new([9; 32], 2).unwrap();
+        let authorization = PaykitNoiseKeyAuthorization::sign(
+            &identity,
+            &paykit_lib::derive_paykit_noise_secret_key(key.as_bytes()),
+            key.key_generation(),
+        )
+        .unwrap();
+        let substituted_static_key = [8; 32];
+        let signed_bytes = [
+            b"paykit.noise_key_authorization/v1\0".as_slice(),
+            authorization.owner().as_bytes(),
+            authorization.noise_public_key().as_bytes(),
+            &substituted_static_key,
+            &key.key_generation().to_be_bytes(),
+        ]
+        .concat();
+        let mut wire = serde_json::to_value(&authorization).unwrap();
+        wire["noise_static_public_key"] = serde_json::json!("08".repeat(32));
+        wire["signature"] =
+            serde_json::json!(STANDARD.encode(identity.sign(&signed_bytes).to_bytes()));
+        let substituted: PaykitNoiseKeyAuthorization = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            substituted.noise_public_key(),
+            authorization.noise_public_key()
+        );
+        assert_eq!(
+            verify_authorized_key(&substituted, &key),
+            Err(ClaimError::AuthenticationFailed)
+        );
+    }
 }
