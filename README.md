@@ -364,13 +364,53 @@ response fixtures for Locks are published under
 
 ## Payer, proof, and receipt exclusions
 
-The server receives and durably projects Paykit Payment Request acceptance, rejection, proof, and cancellation records from its local SDK state. It exposes no payer inbox or proof-submission API. Direct invoice-address observation remains the only Bitcoin payment-attribution input; Paykit Server never decides Locks access.
+The server receives and durably projects Paykit Payment Request acceptance, rejection, proof, and cancellation records from the identity's shared SDK state. It exposes no payer inbox or proof-submission API. Direct invoice-address observation remains the only Bitcoin payment-attribution input; Paykit Server never decides Locks access.
 
 Paykit Receipt issuance, Receipt Access delivery, and receipt storage are unsupported.
 
 ## Retention and data lifecycle
 
 There is no payload-retention or pruning contract, retention worker, runtime idle eviction, or SDK compaction contract. Operators must treat encrypted Creator, SDK, invoice, assignment, outbox, internal relay, and Bitcoin observation records as retained according to current database/SDK behavior. Any deletion policy requires a separate product and migration decision.
+
+### Backup and recovery
+
+Back up the whole PostgreSQL database as one consistent snapshot, including
+deployment metadata, Creator credentials and address counters, assignments,
+invoices, observations, outbox, and internal relay records.
+
+Encrypted identity-wide SDK state lives on each Creator's homeserver, not in
+PostgreSQL. A database backup does not include it, and public homeserver files
+alone are not a backup of it. Any separately retained SDK backup contains private
+state and must be encrypted and access-controlled. The server does not create a
+coordinated database-and-homeserver backup.
+
+Keep the matching `PAYKIT_MASTER_KEY` recoverable in the deployment secret store,
+separately from database dumps. The database alone cannot decrypt its records.
+Also retain the deployment configuration and exact server release/commit and
+`Cargo.lock`: SDK state decoding depends on the pinned Paykit version. Restrict
+access to backup files and never include credentials in logs or support bundles.
+
+Test recovery into a separate database with the original release, key, and
+deployment configuration. Block outbound network access and do not direct Locks
+traffic to the test instance: a running server starts delivery workers. Startup
+checks deployment invariants and authenticates Creator credentials and encrypted
+payment records before binding. Hosted SDK state is checked by
+SDK operations, not database startup. `--check-config` alone does not read or
+verify stored data. Confirm record counts and address counters as well;
+successful startup does not prove the backup is complete or the hosted state
+is usable.
+
+For a live recovery, stop the old instance before starting its replacement.
+Other authorized apps can still change hosted state while the server is stopped.
+Do not reset a database or generate a new master key to bypass a decode or
+integrity failure; retain the original data and investigate with its matching
+release. Restoring an older snapshot is not automatically safe to resume:
+addresses may have been allocated, invoices paid, or Noise messages sent since
+the snapshot. Those differences need reconciliation before delivery resumes to
+avoid address reuse, duplicate requests, or stale Encrypted Link state. Backup
+preservation does not implement that reconciliation. Do not overwrite current
+hosted state with an older blob; coordinate recovery with the identity owner and
+other authorized apps through the SDK's recovery flow.
 
 ## Known limitations
 
