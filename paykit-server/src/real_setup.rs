@@ -6,7 +6,7 @@
 use async_trait::async_trait;
 use bitcoin::bip32::Xpub;
 use ed25519_dalek::VerifyingKey;
-use paykit_lib::{PaykitApp, PaykitAppCapabilities, PaykitAppRegistry};
+use paykit_lib::{PaykitApp, PaykitAppCapabilities, PaykitNoiseKeyAuthorization};
 use paykit_sdk::{
     PaykitSdk, PaykitSdkConfig, PubkySessionAccess, PubkySessionProvider, PubkySharedStateStorage,
 };
@@ -91,14 +91,17 @@ impl PubkySessionProvider for SetupSessionProvider {
     }
 }
 
-/// Verifies delegated material against the wallet-published identity authority.
-pub fn verify_registry_key(
-    registry: &PaykitAppRegistry,
+/// Verifies delegated material against a verified, identity-signed authorization.
+pub fn verify_authorized_key(
+    authorization: &PaykitNoiseKeyAuthorization,
     key: &paykit_sdk::PaykitIdentitySecretKey,
 ) -> Result<(), ClaimError> {
-    if registry.key_generation() != key.key_generation()
-        || registry.noise_public_key()
-            != Some(&paykit_lib::derive_paykit_noise_public_key(key.as_bytes()))
+    let noise_secret = Zeroizing::new(paykit_lib::derive_paykit_noise_secret_key(key.as_bytes()));
+    if authorization.key_generation() != key.key_generation()
+        || authorization.noise_public_key()
+            != &paykit_lib::derive_paykit_noise_public_key(key.as_bytes())
+        || authorization.noise_static_public_key()
+            != &paykit_lib::pubky_noise::derive_static_public_key(&noise_secret)
     {
         return Err(ClaimError::AuthenticationFailed);
     }
@@ -116,21 +119,23 @@ impl AppPublisher for SharedAppPublisher {
             .public_key()
             .and_then(|key| key.to_public_key())
             .map_err(|_| ClaimError::AuthenticationFailed)?;
-        let registry =
-            paykit_lib::get_paykit_app_registry(&access.outbox_client.public_storage(), &owner)
-                .await
-                .map_err(|error| {
-                    emit_setup_stage(
-                        SetupStage::IdentityValidate,
-                        SetupOutcome::Failed,
-                        registry_failure_class(&error),
-                    );
-                    ClaimError::InvalidEnvelope
-                })?
-                .ok_or(ClaimError::AuthenticationFailed)?;
+        let authorization = paykit_lib::get_paykit_noise_key_authorization(
+            &access.outbox_client.public_storage(),
+            &owner,
+        )
+        .await
+        .map_err(|error| {
+            emit_setup_stage(
+                SetupStage::IdentityValidate,
+                SetupOutcome::Failed,
+                registry_failure_class(&error),
+            );
+            ClaimError::InvalidEnvelope
+        })?
+        .ok_or(ClaimError::AuthenticationFailed)?;
         stage_result(
             SetupStage::IdentityValidate,
-            verify_registry_key(&registry, key),
+            verify_authorized_key(&authorization, key),
             claim_failure_class,
         )
     }
@@ -406,7 +411,7 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                     .validate_reauthentication(&credentials)
                     .map_err(|_| ClaimError::InvalidPayload)?;
             }
-            // Registry authority is verified before either credential or shared-state writes.
+            // Key authorization is verified before either credential or shared-state writes.
             self.publisher.verify_key(&access).await?;
             let persisted = if existing.is_some() {
                 self.creators.reauthenticate(&credentials).await
@@ -465,24 +470,59 @@ mod tests {
     }
 
     #[test]
-    fn delegated_key_must_match_registry_material_and_generation() {
+    fn delegated_key_must_match_authorized_material_and_generation() {
         let key = paykit_sdk::PaykitIdentitySecretKey::new([9; 32], 2).unwrap();
-        let mut registry = PaykitAppRegistry::new(None);
-        registry
-            .set_noise_public_key(
-                paykit_lib::derive_paykit_noise_public_key(key.as_bytes()),
-                2,
-            )
-            .unwrap();
-        assert_eq!(verify_registry_key(&registry, &key), Ok(()));
+        let authorization = PaykitNoiseKeyAuthorization::sign(
+            &pubky::Keypair::random(),
+            &paykit_lib::derive_paykit_noise_secret_key(key.as_bytes()),
+            2,
+        )
+        .unwrap();
+        assert_eq!(verify_authorized_key(&authorization, &key), Ok(()));
         for wrong in [
             paykit_sdk::PaykitIdentitySecretKey::new([8; 32], 2).unwrap(),
             paykit_sdk::PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
         ] {
             assert_eq!(
-                verify_registry_key(&registry, &wrong),
+                verify_authorized_key(&authorization, &wrong),
                 Err(ClaimError::AuthenticationFailed)
             );
         }
+    }
+
+    #[test]
+    fn delegated_key_rejects_authorized_static_key_substitution() {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        let identity = pubky::Keypair::random();
+        let key = paykit_sdk::PaykitIdentitySecretKey::new([9; 32], 2).unwrap();
+        let authorization = PaykitNoiseKeyAuthorization::sign(
+            &identity,
+            &paykit_lib::derive_paykit_noise_secret_key(key.as_bytes()),
+            key.key_generation(),
+        )
+        .unwrap();
+        let substituted_static_key = [8; 32];
+        let signed_bytes = [
+            b"paykit.noise_key_authorization/v1\0".as_slice(),
+            authorization.owner().as_bytes(),
+            authorization.noise_public_key().as_bytes(),
+            &substituted_static_key,
+            &key.key_generation().to_be_bytes(),
+        ]
+        .concat();
+        let mut wire = serde_json::to_value(&authorization).unwrap();
+        wire["noise_static_public_key"] = serde_json::json!("08".repeat(32));
+        wire["signature"] =
+            serde_json::json!(STANDARD.encode(identity.sign(&signed_bytes).to_bytes()));
+        let substituted: PaykitNoiseKeyAuthorization = serde_json::from_value(wire).unwrap();
+        assert_eq!(
+            substituted.noise_public_key(),
+            authorization.noise_public_key()
+        );
+        assert_eq!(
+            verify_authorized_key(&substituted, &key),
+            Err(ClaimError::AuthenticationFailed)
+        );
     }
 }

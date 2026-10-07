@@ -290,7 +290,7 @@ impl std::fmt::Debug for PaykitAdapter {
 impl PaykitAdapter {
     /// Persists the mixed private stream before the SDK sends confirmations.
     /// No request is claimed, accepted, or executed by the server.
-    /// Contention returns `ConcurrentUpdate` for the next poll; other failures take precedence.
+    /// Lock or revision contention is deferred to the next poll; other failures take precedence.
     pub async fn maintain_transport(&self) -> paykit_sdk::Result<()> {
         let _guard = self.mutation_lock.lock().await;
         let peers = self.sdk.linked_peers().await?;
@@ -828,7 +828,10 @@ fn check_transport_results(results: &[paykit_sdk::Result<()>]) -> paykit_sdk::Re
     let mut deferred = false;
     for result in results {
         if let Err(error) = result {
-            if error.is_concurrent_update() {
+            if matches!(
+                error,
+                PaykitSdkError::ConcurrentUpdate { .. } | PaykitSdkError::SharedStateBusy { .. }
+            ) {
                 deferred = true;
             } else {
                 return Err(PaykitSdkError::Transport {
@@ -1341,15 +1344,26 @@ mod tests {
             ..Default::default()
         });
         assert!(check_transport_results(&[Ok(()), sent]).is_ok());
-        let deferred = Err(PaykitSdkError::ConcurrentUpdate {
-            context: "peer operation owned by another app".into(),
-            source: None,
-        });
-        assert!(
-            check_transport_results(&[Ok(()), deferred])
-                .unwrap_err()
-                .is_concurrent_update()
-        );
+    }
+
+    #[test]
+    fn transport_health_defers_lock_and_revision_contention() {
+        for error in [
+            PaykitSdkError::ConcurrentUpdate {
+                context: "peer operation owned by another app".into(),
+                source: None,
+            },
+            PaykitSdkError::SharedStateBusy {
+                context: "shared state remains locked".into(),
+                source: None,
+            },
+        ] {
+            assert!(
+                check_transport_results(&[Ok(()), Err(error), Ok(())])
+                    .unwrap_err()
+                    .is_concurrent_update()
+            );
+        }
     }
 
     #[test]
@@ -1360,7 +1374,7 @@ mod tests {
                 context: private_error.into(),
                 source: None,
             }),
-            Err(PaykitSdkError::SharedStateBusy {
+            Err(PaykitSdkError::Storage {
                 context: private_error.into(),
                 source: None,
             }),
@@ -1395,14 +1409,15 @@ mod tests {
             failures.push(check_send_report(report));
         }
         for failure in failures {
-            let deferred = || {
-                Err(PaykitSdkError::ConcurrentUpdate {
-                    context: private_error.into(),
-                    source: None,
-                })
-            };
-            let error =
-                check_transport_results(&[deferred(), failure, Ok(()), deferred()]).unwrap_err();
+            let locked = Err(PaykitSdkError::SharedStateBusy {
+                context: private_error.into(),
+                source: None,
+            });
+            let conflict = Err(PaykitSdkError::ConcurrentUpdate {
+                context: private_error.into(),
+                source: None,
+            });
+            let error = check_transport_results(&[locked, failure, Ok(()), conflict]).unwrap_err();
             assert!(matches!(
                 error,
                 PaykitSdkError::Transport { source: None, .. }

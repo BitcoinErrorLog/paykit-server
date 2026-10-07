@@ -3202,15 +3202,16 @@ dependencies = [
 
 [[package]]
 name = "paykit-lib"
-version = "0.1.0-rc59"
-source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.0-rc59#7b75d28c2679656a0d1c6e1ef6d8ee9881c9be07"
+version = "0.1.0-rc71"
+source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.0-rc71#e4e58d3ee6c6aa19d6262d4cd96a58890a65b6fa"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "blake3",
  "chacha20poly1305 0.10.1",
  "chrono",
- "pubky 0.14.0",
+ "hex",
+ "pubky 0.15.0",
  "pubky-noise",
  "reqwest",
  "serde",
@@ -3224,8 +3225,8 @@ dependencies = [
 
 [[package]]
 name = "paykit-sdk"
-version = "0.1.0-rc59"
-source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.0-rc59#7b75d28c2679656a0d1c6e1ef6d8ee9881c9be07"
+version = "0.1.0-rc71"
+source = "git+https://github.com/pubky/paykit-rs.git?tag=v0.1.0-rc71#e4e58d3ee6c6aa19d6262d4cd96a58890a65b6fa"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3235,10 +3236,11 @@ dependencies = [
  "chacha20poly1305 0.10.1",
  "chrono",
  "crypto_secretbox",
+ "futures-util",
  "hex",
  "paykit-lib",
  "postcard",
- "pubky 0.14.0",
+ "pubky 0.15.0",
  "pubky-noise",
  "reqwest",
  "serde",
@@ -3246,6 +3248,7 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
  "url",
  "zeroize",
 ]
@@ -3273,7 +3276,7 @@ dependencies = [
  "paykit-sdk",
  "postcard",
  "prometheus-client",
- "pubky 0.14.0",
+ "pubky 0.15.0",
  "qrcode",
  "rand 0.10.2",
  "rustls-pki-types",
@@ -3311,7 +3314,7 @@ dependencies = [
  "paykit-sdk",
  "paykit-server",
  "postcard",
- "pubky 0.14.0",
+ "pubky 0.15.0",
  "pubky-testnet",
  "serde",
  "serde_json",
@@ -3430,9 +3433,9 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pkarr"
-version = "8.0.0"
+version = "8.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3248274a604751c9a6749137cebfe0ddfc8b4b0e31c779515c4f984c937a4dac"
+checksum = "0fa6e085dac5eb00b309bfafd0fa0db088a7d3aaad4b5de75db4732e7c7f7595"
 dependencies = [
  "async-compat",
  "base32",
@@ -3733,9 +3736,9 @@ dependencies = [
 
 [[package]]
 name = "pubky"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2099d521cacff9a1bf2ad48978d4601608d80860d7b08f7ecb0ced98bb63b628"
+checksum = "c298b2ec3f482618764c4bdc5cd69a9e52515e95e315d8f2dd946b83e4d03362"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -3748,7 +3751,7 @@ dependencies = [
  "lru 0.18.3",
  "percent-encoding",
  "pkarr",
- "pubky-common 0.14.0",
+ "pubky-common 0.15.0",
  "reqwest",
  "rustls",
  "serde",
@@ -3786,9 +3789,9 @@ dependencies = [
 
 [[package]]
 name = "pubky-common"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9b32c46e101fa9b94fcb3f3baa5751d3f696b3823508697a4f407281cbe9c4c"
+checksum = "e4a8b4c4831885f025577109215022f7e785b8c421b516cdfe1b510c8f2653fe"
 dependencies = [
  "argon2 0.6.0",
  "base64 0.23.1",
@@ -3808,9 +3811,9 @@ dependencies = [
 
 [[package]]
 name = "pubky-homeserver"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "589e60c62bb93c146f3e9a6db24869de853c7097e9b0a6d5021f3922c6ef8a2e"
+checksum = "4cbc89e3ca5186cba5db4f6ff714b2a01761d27590c04ad8dc64a5eeccd427ac"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -3845,7 +3848,7 @@ dependencies = [
  "percent-encoding",
  "pkarr",
  "prometheus",
- "pubky-common 0.14.0",
+ "pubky-common 0.15.0",
  "pubky_test_utils",
  "rand 0.10.2",
  "reqwest",
@@ -3872,26 +3875,27 @@ dependencies = [
 
 [[package]]
 name = "pubky-noise"
-version = "0.1.0-rc11"
+version = "0.1.0-rc13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e314e7716f68f48f5438650ed958753bc18ff5aca70bc46c1e3e77be3b7bae6"
+checksum = "d05863db1f5683e6c539c384eb7d9372451faad4770916b279bf6e1de2a5008a"
 dependencies = [
  "chacha20poly1305 0.10.1",
  "curve25519-dalek 5.0.0",
  "ed25519-dalek 3.0.0",
  "getrandom 0.3.4",
  "hex",
- "pubky 0.14.0",
+ "pubky 0.15.0",
  "rand 0.9.5",
+ "reqwest",
  "sha2 0.11.0",
  "snow",
 ]
 
 [[package]]
 name = "pubky-testnet"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b91bf40a96d6444da350dd4afc6e0af9d9ea86eae306a561ff8aeab2470b330"
+checksum = "e0185542bf65d51e11f99c8016184907bb0f6c5aebc21571af14bb707cb77560"
 dependencies = [
  "anyhow",
  "clap",
@@ -3899,8 +3903,8 @@ dependencies = [
  "mainline",
  "pkarr",
  "pkarr-relay",
- "pubky 0.14.0",
- "pubky-common 0.14.0",
+ "pubky 0.15.0",
+ "pubky-common 0.15.0",
  "pubky-homeserver",
  "pubky_test_utils",
  "tempfile",
@@ -5293,7 +5297,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -6013,7 +6017,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

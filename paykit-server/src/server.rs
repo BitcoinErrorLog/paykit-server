@@ -414,7 +414,10 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
             let maintained = match creator_adapter(&workers, creator).await {
                 Ok(adapter) => match adapter.maintain_transport().await {
                     Ok(()) => true,
-                    Err(error) if error.is_concurrent_update() => {
+                    Err(
+                        PaykitSdkError::ConcurrentUpdate { .. }
+                        | PaykitSdkError::SharedStateBusy { .. },
+                    ) => {
                         deferred = true;
                         true
                     }
@@ -947,6 +950,19 @@ impl SessionValidator for CreatorSessionValidator {
                 let mapped = map_session_validation_error(error);
                 session_failure("session_public_key", mapped)
             })?;
+        let authorization = paykit_lib::get_paykit_noise_key_authorization(
+            &access.outbox_client.public_storage(),
+            &owner,
+        )
+        .await
+        .map_err(|error| match error {
+            paykit_lib::PaykitError::Transport { .. } => session_failure(
+                "creator_noise_key_authorization_fetch",
+                SessionValidationError::Unavailable,
+            ),
+            _ => SessionValidationError::Invalid,
+        })?
+        .ok_or(SessionValidationError::Invalid)?;
         let registry =
             paykit_lib::get_paykit_app_registry(&access.outbox_client.public_storage(), &owner)
                 .await
@@ -961,7 +977,7 @@ impl SessionValidator for CreatorSessionValidator {
             .paykit_identity_secret_key
             .as_ref()
             .ok_or(SessionValidationError::Invalid)?;
-        crate::real_setup::verify_registry_key(&registry, key)
+        crate::real_setup::verify_authorized_key(&authorization, key)
             .map_err(|_| SessionValidationError::Invalid)?;
         let app_id =
             paykit_lib::PaykitAppId::new(crate::config::PAYKIT_APP_ID).expect("static app id");

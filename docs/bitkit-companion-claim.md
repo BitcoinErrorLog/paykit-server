@@ -78,7 +78,8 @@ BLAKE3(UTF8(received_claim_type) || UTF8("|") || auth_secret)
 
 Verification uses the Creator established by normal Pubky AUTH, not a name or
 query hint. It checks the exact length/schema, signature, xpub network/depth/index,
-and delegated key against the wallet-published App Registry before durable writes.
+and delegated key against the identity-signed Paykit Noise Key Authorization
+before durable writes.
 Each setup attempt is consumed once. A prior claim cannot be rebound to a new
 AUTH secret, query parameter, permission selection, or list order.
 
@@ -97,7 +98,11 @@ Under the Creator setup lock, reconnect loads the existing account index and xpu
 and retains them exactly. A missing Creator cannot be created by reconnect. Initial
 setup cannot overwrite an existing binding, including one awaiting publication retry.
 The same Paykit generation must retain the same secret; lower
-generations are rejected, and a higher generation must match the App Registry.
+generations are rejected, and the delegated key and generation must match the
+Creator's identity-signed Paykit Noise Key Authorization. Bitkit publishes that
+record before delegation using its owner-only authorizer session; Server receives
+neither the Pubky root secret nor authorization-path write access. The App Registry
+is discovery metadata, not key authority.
 Unexpected account material and failed verification leave existing credentials and setup
 readiness unchanged. An abandoned approval performs no durable writes. Bitkit
 must retain existing account tracking/data on rejection or cancellation.

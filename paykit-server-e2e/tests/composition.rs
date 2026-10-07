@@ -89,7 +89,7 @@ async fn create_creator(
     .unwrap()
     .sign_in(
         &PubkyLocalSecretKey::new(keypair.secret_key()),
-        paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
+        paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
     )
     .await
     .unwrap();
@@ -195,7 +195,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
             &PubkyLocalSecretKey::new(Keypair::random().secret_key()),
             &homeserver,
             None,
-            paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
         )
         .await
         .unwrap();

@@ -33,8 +33,10 @@ it with regtest Bitcoin.
 Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report security problems through the private process in [`SECURITY.md`](SECURITY.md), not a public issue.
 
 The [architecture contract](docs/architecture.md) describes shared identity,
-credential ownership, and immutable invoice attribution. Rust dependencies use
-the published Paykit Git tag `v0.1.0-rc59`, pinned by `Cargo.lock`.
+credential ownership, and immutable invoice attribution. Rust dependencies pin
+the Paykit `v0.1.0-rc71` release tag in `Cargo.toml`; `Cargo.lock` fixes its
+resolved commit at `e4e58d3ee6c6aa19d6262d4cd96a58890a65b6fa`.
+Direct `pubky` and `pubky-testnet` dependencies are pinned to `0.15.0`.
 
 ## Executable boundary
 
@@ -99,12 +101,25 @@ There is no manual claim route. Completion posts only
 `{ type: "paykit-setup-callback", state }` or the same callback with a coarse
 error to the exact caller origin.
 
-Bitkit authorizes `/pub/paykit/:rw`. The server requests two independent
+Before delegation, Bitkit publishes the identity-signed Paykit Noise Key
+Authorization using `PAYKIT_AUTHORIZER_SESSION_CAPABILITIES` and
+`publish_paykit_noise_key_authorization()`, before publishing private app
+capabilities. That owner-only scope includes
+`/pub/paykit-authority/v0/current-key.json:rw`; it must never be granted to Server.
+The App Registry remains discovery metadata, not key authority.
+
+An existing Creator without signed key authorization is not ready until its
+authorizer publishes that record. Reconnect refreshes delegated credentials while
+preserving the account and invoices; signed authorization does not require a
+database reset.
+
+Bitkit authorizes only `/pub/paykit/:rw` for Server. The server requests two independent
 permissions as `x-bitkit-claim=paykit-access-v1.watch-only-account-v1` and Bitkit
 returns a signed, encrypted companion claim. Its 124-byte payload contains the BIP84
 account index, address kind, serialized xpub, Paykit key generation, and 32-byte
 Paykit identity secret; the signature adds 64 bytes. The server verifies the
-delegated key against the Creator's App Registry, persists credentials, then
+delegated key and generation against the Creator's signed Noise key authorization,
+persists credentials, then
 publishes only the `paykit-server` app entry through the SDK. Other apps and
 shared history remain intact. Failed publication leaves setup incomplete and
 retryable. Reauthorization preserves the account/xpub and accepts only the same
@@ -164,6 +179,12 @@ Different Creators may use the same numeric child index because their xpubs and 
 ## Persistence, startup, and upgrades
 
 PostgreSQL stores server credentials, address allocation, invoices, and delivery intents. The Paykit SDK stores encrypted identity-wide state on the Creator's homeserver under WebDAV locks; it is not cached as an authoritative PostgreSQL SDK blob. Other authorized apps can advance the same links and delivery queue. A background worker receives private messages and processes outbound work without executing wallet payments.
+
+Shared hosted-state deployments require Pubky Homeserver **0.15 or newer**.
+Upgrade the deployed homeserver separately; updating Server's client dependencies
+does not upgrade that service. The SDK still requires commit-time fencing of
+expired lock holders and durable publication of complete files. Its five-minute
+uncertain-write cooldown remains in place and does not replace those requirements.
 
 Startup holds a session advisory lock while applying the single schema baseline. Before binding HTTP it verifies immutable deployment metadata and authenticates every persisted Creator credential, invoice payment record, and Bitcoin observation. Missing, corrupt, swapped, conflicting, or wrong-key database state aborts startup with a secret-free error. Hosted Paykit state is checked during SDK operations and setup readiness; failures do not create a replacement local state.
 

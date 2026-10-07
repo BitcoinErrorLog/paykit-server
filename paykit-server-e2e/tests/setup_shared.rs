@@ -296,10 +296,16 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         .unwrap()
         .with_auth_relay(relay.local_url().join("inbox").unwrap().as_str())
         .unwrap();
-    let root = PubkyLocalSecretKey::new(pubky::Keypair::random().secret_key());
+    let root_keypair = pubky::Keypair::random();
+    let root = PubkyLocalSecretKey::new(root_keypair.secret_key());
     let home = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let wallet_auth = bootstrap
-        .sign_up(&root, &home, None, PAYKIT_SESSION_CAPABILITIES)
+        .sign_up(
+            &root,
+            &home,
+            None,
+            paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
+        )
         .await
         .unwrap();
     let owner = wallet_auth.public_key.clone();
@@ -373,6 +379,45 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
             .is_err()
     );
     let wrong = PaykitIdentitySecretKey::new([3; 32], 1).unwrap();
+    let authorization = wallet
+        .paykit_noise_key_authorization(owner.clone())
+        .await
+        .unwrap();
+    let authorization_path = paykit_lib::PAYKIT_NOISE_KEY_AUTHORIZATION_PATH;
+    let owner_storage = wallet_auth.access.session.storage();
+    owner_storage.delete(authorization_path).await.unwrap();
+    assert_eq!(
+        complete(&service, &bootstrap, &root, &key, 0).await,
+        PollResult::Failed
+    );
+    assert!(creators.load_optional(&creator).await.unwrap().is_none());
+    assert_eq!(publisher.calls.load(Ordering::SeqCst), 0);
+
+    let mut tampered = serde_json::to_value(&authorization).unwrap();
+    tampered["key_generation"] = serde_json::json!(2);
+    let mismatched =
+        paykit_lib::PaykitNoiseKeyAuthorization::sign(&root_keypair, &[9; 32], 1).unwrap();
+    // Raw owner writes inject invalid remote records without weakening SDK publication.
+    for invalid in [tampered, serde_json::to_value(mismatched).unwrap()] {
+        owner_storage
+            .put_json(authorization_path, &invalid)
+            .await
+            .unwrap();
+        assert_eq!(
+            complete(&service, &bootstrap, &root, &key, 0).await,
+            PollResult::Failed
+        );
+        assert!(creators.load_optional(&creator).await.unwrap().is_none());
+        assert_eq!(publisher.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            wallet.paykit_app_registry(owner.clone()).await.unwrap(),
+            Some(before.clone())
+        );
+    }
+    owner_storage
+        .put_json(authorization_path, &authorization)
+        .await
+        .unwrap();
     assert_eq!(
         complete(&service, &bootstrap, &root, &wrong, 0).await,
         PollResult::Failed
@@ -531,6 +576,11 @@ poll_interval = "1s"
     );
     let access = provider.load_session_access().await.unwrap().unwrap();
     assert!(access.local_secret_key.is_none());
+    assert!(
+        access
+            .validate_for_capabilities(paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES)
+            .is_err()
+    );
     assert_eq!(access.public_key().unwrap(), owner);
     let refreshed = access
         .session

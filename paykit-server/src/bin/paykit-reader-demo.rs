@@ -223,15 +223,19 @@ async fn execute(
             .map_err(|_| Failure::ProtocolFailed)?
             .sign_in(
                 &PubkyLocalSecretKey::new(*reader_secret),
-                paykit_sdk::PAYKIT_SESSION_CAPABILITIES,
+                if matches!(operation, Operation::Prepare) {
+                    paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES
+                } else {
+                    paykit_sdk::PAYKIT_SESSION_CAPABILITIES
+                },
             ),
     )
     .await?
     .map_err(|_| Failure::ProtocolFailed)?;
     let reader_pubky = session.public_key;
-    let registry = within_receive_deadline(
+    let authorization = within_receive_deadline(
         receive_deadline,
-        paykit_lib::get_paykit_app_registry(
+        paykit_lib::get_paykit_noise_key_authorization(
             &pubky.public_storage(),
             &reader_pubky
                 .to_public_key()
@@ -240,9 +244,9 @@ async fn execute(
     )
     .await?
     .map_err(|_| Failure::ProtocolFailed)?;
-    let generation = registry
+    let generation = authorization
         .as_ref()
-        .map_or(1, |registry| registry.key_generation());
+        .map_or(1, |authorization| authorization.key_generation());
     let key = PubkyLocalSecretKey::new(*reader_secret)
         .derive_paykit_identity_secret_key(generation)
         .map_err(|_| Failure::ProtocolFailed)?;
@@ -338,6 +342,9 @@ async fn prepare(
     config: &Config,
     reader_pubky: PubkyPublicKey,
 ) -> Result<PrepareOutput, Failure> {
+    sdk.publish_paykit_noise_key_authorization()
+        .await
+        .map_err(|_| Failure::ProtocolFailed)?;
     let published = sdk
         .publish_paykit_app(
             paykit_lib::PaykitApp::new(
