@@ -1137,21 +1137,61 @@ impl AppRegistryDiscovery for PubkyAppRegistryDiscovery {
         let reader = PubkyPublicKey::from_raw_or_app_key(reader.to_string())
             .and_then(|key| key.to_public_key())
             .map_err(|_| RegistryDiscoveryError::InvalidRequest)?;
-        // Deserializing the record verifies the identity signature and pins the owner.
-        match get_paykit_noise_key_authorization(&self.storage, &reader).await {
-            Ok(Some(_)) => Ok(ReaderAuthorization::Verified),
-            Ok(None) | Err(PaykitError::NotFound(_)) => Ok(ReaderAuthorization::Missing),
-            Err(PaykitError::InvalidData { .. } | PaykitError::Validation(_)) => {
-                Ok(ReaderAuthorization::Invalid)
-            }
-            Err(PaykitError::Transport { .. }) => Err(RegistryDiscoveryError::Unavailable),
+        reader_authorization(get_paykit_noise_key_authorization(&self.storage, &reader).await)
+    }
+}
+
+/// Deserializing the record verifies the identity signature and pins the owner,
+/// so only `Ok(Some(_))` is verified.
+fn reader_authorization<T>(
+    fetched: Result<Option<T>, PaykitError>,
+) -> Result<ReaderAuthorization, RegistryDiscoveryError> {
+    match fetched {
+        Ok(Some(_)) => Ok(ReaderAuthorization::Verified),
+        Ok(None) | Err(PaykitError::NotFound(_)) => Ok(ReaderAuthorization::Missing),
+        Err(PaykitError::InvalidData { .. } | PaykitError::Validation(_)) => {
+            Ok(ReaderAuthorization::Invalid)
         }
+        Err(PaykitError::Transport { .. }) => Err(RegistryDiscoveryError::Unavailable),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_authorization_is_verified_only_for_a_fetched_record() {
+        let cases = [
+            (Ok(Some(())), Ok(ReaderAuthorization::Verified)),
+            (Ok(None), Ok(ReaderAuthorization::Missing)),
+            (
+                Err(PaykitError::NotFound("gone".into())),
+                Ok(ReaderAuthorization::Missing),
+            ),
+            (
+                Err(PaykitError::InvalidData {
+                    context: "bad signature".into(),
+                    source: None,
+                }),
+                Ok(ReaderAuthorization::Invalid),
+            ),
+            (
+                Err(PaykitError::Validation("other owner".into())),
+                Ok(ReaderAuthorization::Invalid),
+            ),
+            (
+                Err(PaykitError::Transport {
+                    context: "read failed".into(),
+                    source: anyhow::anyhow!("connection reset"),
+                }),
+                Err(RegistryDiscoveryError::Unavailable),
+            ),
+        ];
+        for (fetched, expected) in cases {
+            assert_eq!(reader_authorization(fetched), expected);
+        }
+    }
 
     #[tokio::test]
     async fn setup_auth_relay_matches_the_configured_pubky_network() {
