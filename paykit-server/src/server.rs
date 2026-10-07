@@ -7,7 +7,8 @@ use crate::{
         connection_status::ConnectionStatusService,
         create_invoice::{
             AppRegistryDiscovery, CreateInvoiceService, LockFetchError, LockFetcher,
-            PaykitIntentBuilder, RegistryDiscoveryError, SessionValidationError, SessionValidator,
+            PaykitIntentBuilder, ReaderAuthorization, RegistryDiscoveryError,
+            SessionValidationError, SessionValidator,
         },
         payment_drain::{
             PaymentDrainCleanupToken, PaymentDrainError, PaymentDrainOperations,
@@ -44,7 +45,9 @@ use crate::{
 use async_trait::async_trait;
 use axum::{Extension, Router};
 use locks_core::lock_policy::ContentLock;
-use paykit_lib::{PaykitAppRegistry, PaykitError, get_paykit_app_registry};
+use paykit_lib::{
+    PaykitAppRegistry, PaykitError, get_paykit_app_registry, get_paykit_noise_key_authorization,
+};
 use paykit_sdk::{PaykitSdkError, PubkyPublicKey, PubkySessionBootstrap, PubkySessionProvider};
 use pubky::{Pubky, errors::RequestError};
 use sqlx::PgPool;
@@ -1166,6 +1169,24 @@ impl AppRegistryDiscovery for PubkyAppRegistryDiscovery {
                     Err(RegistryDiscoveryError::Malformed)
                 }
             })
+    }
+
+    async fn authorization(
+        &self,
+        reader: &ReaderPubky,
+    ) -> Result<ReaderAuthorization, RegistryDiscoveryError> {
+        let reader = PubkyPublicKey::from_raw_or_app_key(reader.to_string())
+            .and_then(|key| key.to_public_key())
+            .map_err(|_| RegistryDiscoveryError::InvalidRequest)?;
+        // Deserializing the record verifies the identity signature and pins the owner.
+        match get_paykit_noise_key_authorization(&self.storage, &reader).await {
+            Ok(Some(_)) => Ok(ReaderAuthorization::Verified),
+            Ok(None) | Err(PaykitError::NotFound(_)) => Ok(ReaderAuthorization::Missing),
+            Err(PaykitError::InvalidData { .. } | PaykitError::Validation(_)) => {
+                Ok(ReaderAuthorization::Invalid)
+            }
+            Err(PaykitError::Transport { .. }) => Err(RegistryDiscoveryError::Unavailable),
+        }
     }
 }
 

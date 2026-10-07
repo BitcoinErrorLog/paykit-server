@@ -10,7 +10,10 @@ use paykit_lib::PaykitAppRegistry;
 use paykit_sdk::OutboundPrivateMessageStatus;
 
 use crate::{
-    application::semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    application::{
+        create_invoice::ReaderAuthorization,
+        semantic_intent::{DeliveryIntentV1, DeliveryOperationV1},
+    },
     persistence::{ClaimedHandoff, ClaimedOutbox, OutboxStore, PersistenceError},
 };
 use std::time::Duration;
@@ -140,6 +143,9 @@ pub trait Adapter: Send + Sync {
 
     async fn fetch_registry(&self, reader: &str)
     -> Result<Option<PaykitAppRegistry>, HandoffError>;
+    /// The Reader's signed Noise Key Authorization, checked before link setup,
+    /// which verifies it again.
+    async fn fetch_authorization(&self, reader: &str) -> Result<ReaderAuthorization, HandoffError>;
     async fn observe_recovery_marker(&self, reader: &str) -> Result<(), HandoffError>;
     async fn ensure_link_with_peer(&self, reader: &str) -> Result<(), HandoffError>;
     async fn propose_payment_request(
@@ -182,6 +188,24 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
         return Err(HandoffFailure::Retryable(
             RetryableHandoffStage::RegistryIncapable,
         ));
+    }
+    // Retryable like an incapable registry: the Reader can still publish or fix it.
+    match adapter
+        .fetch_authorization(intent.reader_pubky())
+        .await
+        .map_err(|error| at_stage(error, RetryableHandoffStage::ReaderAuthorizationFetch))?
+    {
+        ReaderAuthorization::Verified => {}
+        ReaderAuthorization::Missing => {
+            return Err(HandoffFailure::Retryable(
+                RetryableHandoffStage::ReaderAuthorizationMissing,
+            ));
+        }
+        ReaderAuthorization::Invalid => {
+            return Err(HandoffFailure::Retryable(
+                RetryableHandoffStage::ReaderAuthorizationInvalid,
+            ));
+        }
     }
     adapter
         .observe_recovery_marker(intent.reader_pubky())
