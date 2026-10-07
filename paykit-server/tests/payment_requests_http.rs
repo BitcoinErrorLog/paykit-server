@@ -10,8 +10,8 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
 use paykit_server::{
     application::payment_request_status::{
-        PaymentRequestStatusError, PaymentRequestStatusOperations, PaymentRequestStatusSummary,
-        PaymentState,
+        BitcoinPaymentStatus, PaymentRequestStatusError, PaymentRequestStatusOperations,
+        PaymentRequestStatusSummary, PaymentState, UsdtPaymentStatus,
     },
     config::{Config, ConfigEnvironment},
     domain::{
@@ -131,8 +131,12 @@ fn summary(
         payment_state,
         timestamp("2026-08-11T09:00:00Z"),
         timestamp("2026-08-12T09:00:00Z"),
-        3,
-        true,
+        Some(BitcoinPaymentStatus {
+            confirmations: 3,
+            amount_matched: true,
+            paid_on_time: false,
+        }),
+        None,
     )
 }
 
@@ -153,7 +157,7 @@ async fn per_bundle_status_returns_only_the_exact_orthogonal_facts() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response_body(response).await,
-        r#"{"request_state":"accepted","payment_state":"confirmed","invoice_created_at":"2026-08-11T09:00:00Z","payment_deadline":"2026-08-12T09:00:00Z","confirmations":3,"amount_matched":true}"#
+        r#"{"request_state":"accepted","payment_state":"confirmed","invoice_created_at":"2026-08-11T09:00:00Z","payment_deadline":"2026-08-12T09:00:00Z","bitcoin":{"confirmations":3,"amount_matched":true,"paid_on_time":false},"usdt_arbitrum":null}"#
     );
 }
 
@@ -329,4 +333,39 @@ async fn recovery_and_invalid_conflict_are_not_successful_statuses() {
     .await
     .unwrap();
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn status_keeps_bitcoin_and_arbitrum_settlement_facts_separate() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let facts = PaymentRequestStatusSummary::new(
+        PaymentRequestLifecycleState::ProofSubmitted,
+        PaymentState::Confirmed,
+        timestamp("2026-08-11T09:00:00Z"),
+        timestamp("2026-08-12T09:00:00Z"),
+        Some(BitcoinPaymentStatus {
+            confirmations: 6,
+            amount_matched: true,
+            paid_on_time: true,
+        }),
+        Some(UsdtPaymentStatus {
+            confirmations: 200,
+            amount_matched: true,
+            paid_on_time: false,
+            finalized: false,
+        }),
+    );
+    let response = router(&key, Ok(Some(facts)))
+        .oneshot(signed_request(&key, body()))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&response_body(response).await).unwrap();
+    assert_eq!(
+        body,
+        serde_json::from_str::<serde_json::Value>(include_str!(
+            "../../docs/fixtures/payment-request-status/dual-asset-confirmed.json"
+        ))
+        .unwrap()
+    );
 }

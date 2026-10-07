@@ -7,8 +7,8 @@
 use std::{collections::BTreeMap, fmt};
 
 use paykit_lib::{
-    PaykitAppId, PaymentAmount, PaymentEndpointIdentifier, PaymentReference, PaymentRequestId,
-    PaymentRequestTerms,
+    PaykitAppId, PaymentAmount, PaymentDeadline, PaymentEndpointIdentifier, PaymentEndpointPayload,
+    PaymentReference, PaymentRequestId, PaymentRequestTerms,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -34,6 +34,7 @@ pub enum DeliveryOperationV1 {
 pub struct PaymentTermsV1 {
     pub amount: String,
     pub asset: String,
+    pub rates: Vec<paykit_lib::ConversionRate>,
     pub payment_reference: String,
     pub proposal_expires_at: Option<String>,
     pub payment_deadline: Option<String>,
@@ -78,7 +79,10 @@ impl DeliveryIntentV1 {
         terms: &PaymentRequestTerms,
     ) -> Result<Self, DeliveryIntentError> {
         if terms.recurrence().is_some()
-            || terms.conversion().is_some()
+            || matches!(
+                terms.conversion(),
+                Some(paykit_lib::PaymentConversion::PerPeriod {})
+            )
             || terms.required_app_id() != Some(&app_id)
         {
             return Err(DeliveryIntentError::Invalid);
@@ -91,6 +95,10 @@ impl DeliveryIntentV1 {
                 terms: PaymentTermsV1 {
                     amount: terms.amount().value().to_owned(),
                     asset: terms.amount().asset().to_owned(),
+                    rates: match terms.conversion() {
+                        Some(paykit_lib::PaymentConversion::Fixed { rates }) => rates.clone(),
+                        _ => Vec::new(),
+                    },
                     payment_reference: terms.payment_reference().to_string(),
                     proposal_expires_at: terms.proposal_expires_at().clone(),
                     payment_deadline: terms
@@ -243,6 +251,21 @@ impl DeliveryIntentV1 {
 }
 
 fn validate_terms(terms: &PaymentTermsV1) -> Result<(), DeliveryIntentError> {
+    let event = paykit_lib::PaymentRequestEvent::Request(paykit_lib::PaymentRequest::new(
+        paykit_lib::EventId::new_v4(),
+        PaymentRequestId::new_v4(),
+        terms.to_sdk()?,
+    ));
+    // IDs have fixed wire width; these validation-only IDs are never persisted or sent.
+    let wire = paykit_lib::serialize_payment_request_event(
+        &PaykitAppId::new(crate::config::PAYKIT_APP_ID)
+            .map_err(|_| DeliveryIntentError::Invalid)?,
+        &event,
+    )
+    .map_err(|_| DeliveryIntentError::Invalid)?;
+    if wire.len() > paykit_lib::pubky_noise::snow_crypto::PUBKY_NOISE_MSG_LEN {
+        return Err(DeliveryIntentError::Invalid);
+    }
     if PaymentReference::new(terms.payment_reference.clone()).is_err()
         || PaymentAmount::new(terms.amount.clone(), terms.asset.clone()).is_err()
         || terms.accepted_endpoint_identifiers.is_empty()
@@ -309,5 +332,56 @@ impl fmt::Debug for DeliveryOperationV1 {
 impl fmt::Debug for PaymentTermsV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("PaymentTermsV1 { .. }")
+    }
+}
+
+impl PaymentTermsV1 {
+    pub fn to_sdk(&self) -> Result<PaymentRequestTerms, DeliveryIntentError> {
+        let amount = PaymentAmount::new(self.amount.clone(), self.asset.clone())
+            .map_err(|_| DeliveryIntentError::Invalid)?;
+        let payment_reference = PaymentReference::new(self.payment_reference.clone())
+            .map_err(|_| DeliveryIntentError::Invalid)?;
+        let accepted_payment_endpoint_identifiers = self
+            .accepted_endpoint_identifiers
+            .iter()
+            .cloned()
+            .map(PaymentEndpointIdentifier::new)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| DeliveryIntentError::Invalid)?;
+        PaymentRequestTerms::builder(
+            amount,
+            payment_reference,
+            accepted_payment_endpoint_identifiers,
+        )
+        .conversion(
+            (!self.rates.is_empty()).then(|| paykit_lib::PaymentConversion::Fixed {
+                rates: self.rates.clone(),
+            }),
+        )
+        .proposal_expires_at(self.proposal_expires_at.clone())
+        .payment_deadline(
+            self.payment_deadline
+                .clone()
+                .map(|timestamp| PaymentDeadline::At { timestamp }),
+        )
+        .required_app_id(Some(
+            paykit_lib::PaykitAppId::new(crate::config::PAYKIT_APP_ID)
+                .map_err(|_| DeliveryIntentError::Invalid)?,
+        ))
+        .payment_endpoints(Some(
+            self.payment_endpoints
+                .iter()
+                .map(|(identifier, payload)| {
+                    Ok((
+                        PaymentEndpointIdentifier::new(identifier.clone())
+                            .map_err(|_| DeliveryIntentError::Invalid)?,
+                        PaymentEndpointPayload::new(payload.clone()),
+                    ))
+                })
+                .collect::<Result<_, DeliveryIntentError>>()?,
+        ))
+        .metadata(self.metadata.clone())
+        .build()
+        .map_err(|_| DeliveryIntentError::Invalid)
     }
 }

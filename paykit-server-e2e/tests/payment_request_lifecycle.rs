@@ -190,6 +190,7 @@ fn projection(
             terms: PaymentTermsV1 {
                 amount: "1".into(),
                 asset: "btc".into(),
+                rates: Vec::new(),
                 payment_reference: payment_request_id.clone(),
                 proposal_expires_at: None,
                 payment_deadline: None,

@@ -76,6 +76,10 @@ pub enum ServerBuildError {
     Electrum,
     #[error("could not construct server cryptography")]
     Crypto,
+    #[error("could not construct Arbitrum verification")]
+    Arbitrum,
+    #[error("could not construct exchange-rate client")]
+    ExchangeRates,
 }
 
 /// Concrete process-owned server components.
@@ -93,6 +97,7 @@ struct WorkerComponents {
     invoices: InvoiceStore,
     payment_request_lifecycles: PaymentRequestLifecycleStore,
     electrum: Arc<dyn ElectrumPort>,
+    usdt: Option<crate::usdt::ArbitrumVerifier>,
     paykit: PaykitConfig,
     bitcoin_network: crate::config::BitcoinNetwork,
     outbox_poll_interval: Duration,
@@ -171,8 +176,18 @@ impl Server {
         )?;
         let relay = Arc::new(PubkyCompanionRelay::new(pubky.client().clone()));
         let sessions = CreatorSessions::new(creators.clone(), pubky.clone(), config.paykit.clone());
+        let mut auth_starter = BitkitAuthStarter::new(bootstrap);
+        let usdt = config
+            .usdt
+            .as_ref()
+            .map(|config| crate::usdt::ArbitrumVerifier::new(config.rpc_url.clone()))
+            .transpose()
+            .map_err(|_| ServerBuildError::Arbitrum)?;
+        if config.usdt.is_some() {
+            auth_starter = auth_starter.with_usdt();
+        }
         let setup_completer = Arc::new(RealSetupCompleter::new(
-            BitkitAuthStarter::new(bootstrap),
+            auth_starter,
             relay,
             creators.clone(),
             sessions.clone(),
@@ -203,26 +218,34 @@ impl Server {
             creators: creators.clone(),
             sessions: sessions.clone(),
         });
-        let invoice_service = Arc::new(CreateInvoiceService::with_invoice_windows(
-            session_validator.clone(),
-            Arc::new(PubkyLockFetcher {
-                storage: pubky.public_storage(),
-                max_bytes: config.limits.lock_resource_bytes,
-                timeout: config.limits.lock_fetch_timeout,
-            }),
-            Arc::new(PubkyAppRegistryDiscovery {
-                storage: pubky.public_storage(),
-            }),
-            config.paykit.app_id.clone(),
-            Arc::new(creators.clone()),
-            config.deployment_invariants().bitcoin_network.clone(),
-            Arc::new(invoices.clone()),
-            Arc::new(PaykitIntentBuilder::new(
+        let invoice_service = Arc::new(
+            CreateInvoiceService::with_invoice_windows(
+                session_validator.clone(),
+                Arc::new(PubkyLockFetcher {
+                    storage: pubky.public_storage(),
+                    max_bytes: config.limits.lock_resource_bytes,
+                    timeout: config.limits.lock_fetch_timeout,
+                }),
+                Arc::new(PubkyAppRegistryDiscovery {
+                    storage: pubky.public_storage(),
+                }),
+                config.paykit.app_id.clone(),
+                Arc::new(creators.clone()),
                 config.deployment_invariants().bitcoin_network.clone(),
+                Arc::new(invoices.clone()),
+                Arc::new(PaykitIntentBuilder::new(
+                    config.deployment_invariants().bitcoin_network.clone(),
+                )),
+                config.paykit.proposal_acceptance_window,
+                config.paykit.payment_window,
+            )
+            .with_usdt(usdt.is_some())
+            .with_conversion_payment_window(config.paykit.conversion_payment_window)
+            .with_exchange_rates(Arc::new(
+                crate::application::invoice_pricing::BlocktankRates::new()
+                    .map_err(|_| ServerBuildError::ExchangeRates)?,
             )),
-            config.paykit.proposal_acceptance_window,
-            config.paykit.payment_window,
-        ));
+        );
         let connection_status_service = Arc::new(ConnectionStatusService::new(
             Arc::new(invoices.clone()),
             Arc::new(sessions.clone()),
@@ -235,6 +258,8 @@ impl Server {
                 sessions: sessions.clone(),
                 lifecycles: payment_request_lifecycles.clone(),
                 drains: payment_drains,
+                invoices: invoices.clone(),
+                usdt: usdt.clone(),
                 paykit: config.paykit.clone(),
             });
         let payment_request_status_operations: Arc<dyn PaymentRequestStatusOperations> =
@@ -243,9 +268,13 @@ impl Server {
                 sessions: sessions.clone(),
                 lifecycles: payment_request_lifecycles.clone(),
                 statuses: invoices.clone(),
+                usdt: usdt.clone(),
                 paykit: config.paykit.clone(),
             });
-        let setup_status_service = Arc::new(SetupStatusService::new(session_validator));
+        let setup_status_service = Arc::new(
+            SetupStatusService::new(session_validator)
+                .with_receiving(Arc::new(creators.clone()), usdt.is_some()),
+        );
         let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
         let business_routes = http::setup::setup_router_with_trusted_proxy_hops(
             setup,
@@ -281,6 +310,7 @@ impl Server {
             invoices,
             payment_request_lifecycles,
             electrum,
+            usdt,
             paykit: config.paykit.clone(),
             bitcoin_network: config.deployment_invariants().bitcoin_network.clone(),
             outbox_poll_interval: config.outbox.poll_interval,
@@ -457,6 +487,8 @@ struct ProductionPaymentDrainOperations {
     sessions: CreatorSessions,
     lifecycles: PaymentRequestLifecycleStore,
     drains: PaymentDrainStore,
+    invoices: InvoiceStore,
+    usdt: Option<crate::usdt::ArbitrumVerifier>,
     paykit: PaykitConfig,
 }
 
@@ -484,7 +516,8 @@ impl PaymentDrainOperations for ProductionPaymentDrainOperations {
         }
         let sessions = self.sessions.provider(lock_resource.creator());
         let adapter = PaykitAdapter::new(creator_id, sessions, &self.paykit)
-            .map_err(|_| PaymentDrainError::Unavailable)?;
+            .map_err(|_| PaymentDrainError::Unavailable)?
+            .with_usdt(self.invoices.clone(), self.usdt.clone());
         adapter
             .reconcile_and_create_payment_drain(&self.lifecycles, &self.drains, lock_resource)
             .await
@@ -533,6 +566,7 @@ struct ProductionPaymentRequestStatusOperations {
     sessions: CreatorSessions,
     lifecycles: PaymentRequestLifecycleStore,
     statuses: InvoiceStore,
+    usdt: Option<crate::usdt::ArbitrumVerifier>,
     paykit: PaykitConfig,
 }
 
@@ -576,14 +610,16 @@ impl PaymentRequestStatusOperations for ProductionPaymentRequestStatusOperations
             return Err(PaymentRequestStatusError::Unavailable);
         }
         let sessions = self.sessions.provider(creator);
-        let adapter = PaykitAdapter::new(creator_id, sessions, &self.paykit).map_err(|_| {
-            crate::diagnostics::failure(
-                "payment_request_status",
-                "paykit_adapter_construction",
-                "invalid_configuration",
-            );
-            PaymentRequestStatusError::Unavailable
-        })?;
+        let adapter = PaykitAdapter::new(creator_id, sessions, &self.paykit)
+            .map_err(|_| {
+                crate::diagnostics::failure(
+                    "payment_request_status",
+                    "paykit_adapter_construction",
+                    "invalid_configuration",
+                );
+                PaymentRequestStatusError::Unavailable
+            })?
+            .with_usdt(self.statuses.clone(), self.usdt.clone());
         adapter
             .reconcile_and_lookup_payment_request_status(
                 &self.lifecycles,
@@ -610,6 +646,7 @@ async fn creator_adapter(
     let creator = credentials.creator().clone();
     let sessions = workers.sessions.provider(&creator);
     PaykitAdapter::new(creator_id, sessions, &workers.paykit)
+        .map(|adapter| adapter.with_usdt(workers.invoices.clone(), workers.usdt.clone()))
         .map_err(|_| AdapterBuildError::Permanent)
 }
 

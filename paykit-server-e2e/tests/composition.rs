@@ -36,7 +36,6 @@ impl InvoicePayloadFactory for Payloads {
         let address = format!("{}-{child_index}", self.address_prefix);
         Ok(InvoicePayloads {
             payment_request_intent: common::payment_intent(&self.reader, address.clone()),
-            bitcoin_address: address,
         })
     }
 }
@@ -76,8 +75,11 @@ async fn create_creator(
             PubkyLocalSecretKey::new(keypair.secret_key())
                 .derive_paykit_identity_secret_key(1)
                 .unwrap(),
-            format!("test-xpub-{counter_seed}"),
-            0,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: format!("test-xpub-{counter_seed}").into(),
+                account_index: 0,
+            }),
+            None,
         ))
         .await
         .unwrap();
@@ -240,7 +242,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
                 reader: reader.clone(),
                 address_prefix: "creator-a-address",
             },
-            required_sats: 100,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })
@@ -257,7 +259,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
                 reader: reader.clone(),
                 address_prefix: "creator-b-address",
             },
-            required_sats: 200,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })
@@ -276,7 +278,7 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
                 reader: unreachable_reader.clone(),
                 address_prefix: "creator-c-address",
             },
-            required_sats: 300,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })

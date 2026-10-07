@@ -88,8 +88,11 @@ fn credentials_for(
         creator,
         session.to_owned(),
         PaykitIdentitySecretKey::new(noise, 1).unwrap(),
-        xpub.to_owned(),
-        index,
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: xpub.to_owned().into(),
+            account_index: index,
+        }),
+        None,
     )
 }
 fn credentials(session: &str, xpub: &str, index: u32, noise: [u8; 32]) -> CreatorCredentials {
@@ -161,8 +164,20 @@ async fn startup_authenticates_two_independent_creators_before_returning_ready_d
     let ready_creators = CreatorStore::new(&ready_pool, ready_crypto.clone());
     let first = ready_creators.load(&creator()).await.unwrap();
     let second = ready_creators.load(&other_creator()).await.unwrap();
-    assert_eq!((first.xpub(), first.account_index()), (XPUB, 7));
-    assert_eq!((second.xpub(), second.account_index()), ("other-xpub", 19));
+    assert_eq!(
+        (
+            first.bitcoin_account().unwrap().xpub.as_str(),
+            first.bitcoin_account().unwrap().account_index
+        ),
+        (XPUB, 7)
+    );
+    assert_eq!(
+        (
+            second.bitcoin_account().unwrap().xpub.as_str(),
+            second.bitcoin_account().unwrap().account_index
+        ),
+        ("other-xpub", 19)
+    );
     ready_pool.close().await;
     database.cleanup().await;
 }
@@ -189,11 +204,17 @@ async fn exact_creator_id_lookup_is_isolated_and_never_falls_back() {
     let first_loaded = creators.load_by_id(first.id()).await.unwrap();
     let second_loaded = creators.load_by_id(second.id()).await.unwrap();
     assert_eq!(
-        (first_loaded.creator(), first_loaded.xpub()),
+        (
+            first_loaded.creator(),
+            first_loaded.bitcoin_account().unwrap().xpub.as_str()
+        ),
         (&creator(), XPUB)
     );
     assert_eq!(
-        (second_loaded.creator(), second_loaded.xpub()),
+        (
+            second_loaded.creator(),
+            second_loaded.bitcoin_account().unwrap().xpub.as_str()
+        ),
         (&other_creator(), OTHER_XPUB)
     );
     assert!(matches!(
@@ -457,8 +478,8 @@ async fn creator_authority_round_trips_only_through_ciphertext() {
         .unwrap();
     let loaded = creators.load(&creator()).await.unwrap();
     assert_eq!(loaded.session_secret(), SESSION);
-    assert_eq!(loaded.xpub(), XPUB);
-    assert_eq!(loaded.account_index(), 7);
+    assert_eq!(loaded.bitcoin_account().unwrap().xpub.as_str(), XPUB);
+    assert_eq!(loaded.bitcoin_account().unwrap().account_index, 7);
     assert_eq!(loaded.paykit_identity_secret().as_bytes(), &[9; 32]);
     let row = sqlx::query("SELECT credential_envelope FROM creators")
         .fetch_one(database.pool())
@@ -520,7 +541,7 @@ async fn reauthentication_preserves_key_index_and_assignments_and_rejects_accoun
     let restored = creators.load(&creator()).await.unwrap();
     assert_eq!(restored.session_secret(), "new-session");
     assert_eq!(restored.paykit_identity_secret().as_bytes(), &[9; 32]);
-    assert_eq!(restored.account_index(), 7);
+    assert_eq!(restored.bitcoin_account().unwrap().account_index, 7);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM reader_assignments")
             .fetch_one(database.pool())
@@ -568,8 +589,11 @@ async fn reauthentication_requires_monotonic_key_generation_and_marks_setup_inco
         creator(),
         "rotated-session".into(),
         PaykitIdentitySecretKey::new([8; 32], 2).unwrap(),
-        XPUB.into(),
-        7,
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: XPUB.to_owned().into(),
+            account_index: 7,
+        }),
+        None,
     );
     creators.reauthenticate(&rotated).await.unwrap();
     assert!(!creators.setup_complete(&creator()).await.unwrap());
@@ -591,6 +615,45 @@ async fn reauthentication_requires_monotonic_key_generation_and_marks_setup_inco
     assert_eq!(
         creators.load(&creator()).await.unwrap().session_secret(),
         "rotated-session"
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn reauthentication_can_add_but_cannot_replace_approved_usdt_details() {
+    use paykit_server::domain::receiving::UsdtAddress;
+    let database = TestDatabase::create().await;
+    let creators = stores(&database).await;
+    let original = credentials(SESSION, XPUB, 7, [9; 32]);
+    creators.create(&original).await.unwrap();
+    let address =
+        UsdtAddress::try_from("0x2222222222222222222222222222222222222222".to_owned()).unwrap();
+    let updated = CreatorCredentials::new(
+        creator(),
+        "new-session".into(),
+        PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+        original.bitcoin_account().cloned(),
+        Some(address.clone()),
+    );
+    creators.reauthenticate(&updated).await.unwrap();
+    assert_eq!(
+        creators.load(&creator()).await.unwrap().usdt_address(),
+        Some(&address)
+    );
+    let replacement = CreatorCredentials::new(
+        creator(),
+        "bad".into(),
+        PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+        original.bitcoin_account().cloned(),
+        Some(
+            UsdtAddress::try_from("0x3333333333333333333333333333333333333333".to_owned()).unwrap(),
+        ),
+    );
+    assert!(creators.reauthenticate(&replacement).await.is_err());
+    assert!(creators.reauthenticate(&original).await.is_err());
+    assert_eq!(
+        creators.load(&creator()).await.unwrap().usdt_address(),
+        Some(&address)
     );
     database.cleanup().await;
 }

@@ -32,7 +32,6 @@ impl InvoicePayloadFactory for Payloads {
                 &reader(),
                 format!("bitcoin-address-{child_index}"),
             ),
-            bitcoin_address: format!("bitcoin-address-{child_index}"),
         })
     }
 }
@@ -74,8 +73,11 @@ async fn store(database: &TestDatabase) -> InvoiceStore {
             creator(),
             "session".into(),
             PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
-            "xpub".into(),
-            0,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: "xpub".to_owned().into(),
+                account_index: 0,
+            }),
+            None,
         ))
         .await
         .unwrap();
@@ -99,7 +101,7 @@ async fn invoice_for(
             lock_resource_binding: b"payment-observation-lock",
             payment_request_binding: request,
             invoice_payloads: &PAYLOADS,
-            required_sats: 100,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })
@@ -113,7 +115,6 @@ impl InvoicePayloadFactory for FixedPayloads {
     fn for_child_index(&self, _child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         Ok(InvoicePayloads {
             payment_request_intent: common::payment_intent(&reader(), self.0.to_owned()),
-            bitcoin_address: self.0.into(),
         })
     }
 }
@@ -124,8 +125,11 @@ async fn create_other_creator(database: &TestDatabase) {
             other_creator(),
             "other-session".into(),
             PaykitIdentitySecretKey::new([8; 32], 1).unwrap(),
-            "other-xpub".into(),
-            0,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: "other-xpub".to_owned().into(),
+                account_index: 0,
+            }),
+            None,
         ))
         .await
         .unwrap();
@@ -145,7 +149,7 @@ async fn other_creator_invoice(
             lock_resource_binding: b"payment-observation-lock",
             payment_request_binding: request,
             invoice_payloads: &FixedPayloads(address),
-            required_sats: 100,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })
@@ -204,7 +208,7 @@ async fn batch_invoice(database: &TestDatabase) -> (InvoiceStore, uuid::Uuid) {
             lock_resource_binding: b"batch-lock",
             payment_request_binding: b"batch-request",
             invoice_payloads: &FixedPayloads(REGTEST_ADDRESS),
-            required_sats: 100,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })

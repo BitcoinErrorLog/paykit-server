@@ -1,7 +1,7 @@
 # Shared Paykit integration
 
 Paykit Server runs as one process with multiple isolated Creator accounts. It owns
-Locks invoice workflows and Bitcoin observation, but delegates Paykit protocol
+Locks invoice workflows and direct Bitcoin/USDT observation, but delegates Paykit protocol
 state, Encrypted Links, App Registry updates, and private message delivery to the
 published Paykit SDK. Domain terminology follows the dependency's `THESAURUS.md`.
 
@@ -9,9 +9,8 @@ published Paykit SDK. Domain terminology follows the dependency's `THESAURUS.md`
 
 Bitkit grants Pubky access to `/pub/paykit/:rw` and delegates a generation-bound
 Paykit Identity Secret. Initial setup also requests a BIP84 account xpub; reconnect
-requests only Paykit access for an existing Creator. The server never receives
-Bitcoin spending keys or the Pubky identity secret. The account index and xpub
-cannot change through reauthorization.
+preserves the Bitcoin account for an existing Creator. When USDT is enabled, setup and reconnect also request an optional Arbitrum receiving address. The server never receives
+Bitcoin spending keys or the Pubky identity secret. Receiving details cannot change through reauthorization; a previously omitted USDT address may be added.
 
 The companion claim is bound to the AUTH identity, secret, and exact permission
 list. Before delegation or private app publication, the identity owner uses
@@ -38,7 +37,7 @@ reuse the live handle.
 ## State ownership
 
 PostgreSQL owns encrypted Creator credentials, address allocation, reader
-assignments, invoices, Bitcoin observations, and fenced delivery intents. AEAD
+assignments, invoices, payment observations, and fenced delivery intents. AEAD
 binds private payloads to their type, Creator, and row; keyed lookup hashes support
 queries without plaintext identities or payment details.
 
@@ -59,7 +58,7 @@ and is not a substitute for those storage guarantees.
 A database transaction allocates one fresh BIP84 address per invoice and persists
 the complete Payment Request with that address in `payment_endpoints` and
 `required_app_id = "paykit-server"`. Exact replay returns the same invoice,
-assignment, terms, and outbox row. A different invoice cannot reuse its address.
+assignment, terms, and outbox row. Invoices accepting Bitcoin cannot reuse its address. Invoices accepting USDT share the approved address and attribute individual transfers through verified request proofs. Both options may belong to one invoice; fixed conversion rates and per-option amounts are persisted with its immutable terms.
 Reader discovery checks that at least one registered app supports private payments,
 Payment Requests, and outgoing payments; it does not select a receiver path.
 
@@ -67,11 +66,12 @@ SDK handoff is at least once. Reconciliation identifies the exact outbound ID an
 app; only SDK `Sent` means delivered, not payer acknowledgement. See
 [outbox recovery](outbox-recovery.md) for leases and retry behavior.
 
-Only direct observation of the invoice address attributes payment. Shared private
-events, payer identity, Payment Proofs, and connection state cannot settle an
-invoice. One amount-matched output is required; split outputs are not aggregated.
-An amount-matched output freezes at one confirmation and becomes final at six.
+Bitcoin attribution uses direct observation of the invoice-specific address. USDT attribution combines an authenticated, request-bound ERC-20 account signature with independent Arbitrum receipt verification. Neither SDK lifecycle state nor a transaction hash alone proves settlement. One amount-matched output is required; split outputs are not aggregated.
+A Bitcoin amount-matched output freezes at one confirmation and becomes final at six. USDT observations remain reorg-sensitive until the RPC finalized block covers the receipt; their unique transfer identity cannot settle another invoice.
+USDT verification shares a bounded five-second chain-tip snapshot across Creator adapters. Each receipt and canonical block is read afresh. Persisted observation check times limit background refreshes of present transfers to once per minute; explicit status reads bypass this delay, and missing transfers remain eligible on every receive cycle.
 No spending, refunds, receipt issuance, or horizontal replicas are supported.
 
 Upgrade policy and operational limits are in the [README](../README.md);
 validation commands are in [CONTRIBUTING](../CONTRIBUTING.md).
+
+Invoice pricing uses the same Blocktank BTC/USD feed as Bitkit. Fixed Paykit rates determine exact amounts in either asset; verification never fetches another market price. Bitcoin and USDT observers update their own evidence under the invoice lock and rebuild the shared payment status from both. The published request is the authority for destinations and amounts, avoiding independently supplied settlement amounts.

@@ -8,6 +8,8 @@ use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use crate::domain::receiving::{BitcoinAccount, UsdtAddress};
+
 use crate::{
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
     domain::locks::{CreatorPubky, parse_creator},
@@ -19,8 +21,8 @@ pub struct CreatorCredentials {
     creator: CreatorPubky,
     session_secret: Zeroizing<String>,
     paykit_identity_secret: PaykitIdentitySecretKey,
-    xpub: Zeroizing<String>,
-    account_index: u32,
+    bitcoin_account: Option<BitcoinAccount>,
+    usdt_address: Option<UsdtAddress>,
 }
 
 impl fmt::Debug for CreatorCredentials {
@@ -30,36 +32,20 @@ impl fmt::Debug for CreatorCredentials {
 }
 
 impl CreatorCredentials {
-    /// Constructs creator authority from canonical identity and SDK secret wrappers.
+    /// Constructs creator authority with explicitly approved receiving details.
     pub fn new(
         creator: CreatorPubky,
         session_secret: String,
         paykit_identity_secret: PaykitIdentitySecretKey,
-        xpub: String,
-        account_index: u32,
-    ) -> Self {
-        Self::from_secret_parts(
-            creator,
-            Zeroizing::new(session_secret),
-            paykit_identity_secret,
-            Zeroizing::new(xpub),
-            account_index,
-        )
-    }
-
-    fn from_secret_parts(
-        creator: CreatorPubky,
-        session_secret: Zeroizing<String>,
-        paykit_identity_secret: PaykitIdentitySecretKey,
-        xpub: Zeroizing<String>,
-        account_index: u32,
+        bitcoin_account: Option<BitcoinAccount>,
+        usdt_address: Option<UsdtAddress>,
     ) -> Self {
         Self {
             creator,
-            session_secret,
+            session_secret: Zeroizing::new(session_secret),
             paykit_identity_secret,
-            xpub,
-            account_index,
+            bitcoin_account,
+            usdt_address,
         }
     }
 
@@ -75,13 +61,12 @@ impl CreatorCredentials {
     pub fn paykit_identity_secret(&self) -> &PaykitIdentitySecretKey {
         &self.paykit_identity_secret
     }
-    /// Borrows the exact persisted account xpub.
-    pub fn xpub(&self) -> &str {
-        self.xpub.as_str()
+    pub fn bitcoin_account(&self) -> Option<&BitcoinAccount> {
+        self.bitcoin_account.as_ref()
     }
-    /// Returns the immutable account index.
-    pub fn account_index(&self) -> u32 {
-        self.account_index
+
+    pub fn usdt_address(&self) -> Option<&UsdtAddress> {
+        self.usdt_address.as_ref()
     }
 
     /// Rejects account changes, key rollback, and key substitution within a generation.
@@ -89,8 +74,8 @@ impl CreatorCredentials {
         let current = &self.paykit_identity_secret;
         let next = &replacement.paykit_identity_secret;
         if self.creator != replacement.creator
-            || self.xpub != replacement.xpub
-            || self.account_index != replacement.account_index
+            || self.bitcoin_account != replacement.bitcoin_account
+            || (self.usdt_address.is_some() && self.usdt_address != replacement.usdt_address)
             || next.key_generation() < current.key_generation()
             || (next.key_generation() == current.key_generation() && next != current)
         {
@@ -107,8 +92,8 @@ impl CreatorCredentials {
             session_secret: self.session_secret.as_str(),
             paykit_identity_secret: self.paykit_identity_secret.as_bytes(),
             key_generation: self.paykit_identity_secret.key_generation(),
-            xpub: self.xpub.as_str(),
-            account_index: self.account_index,
+            bitcoin_account: self.bitcoin_account.as_ref(),
+            usdt_address: self.usdt_address.as_ref(),
         };
         postcard::to_allocvec(&wire)
             .map(Zeroizing::new)
@@ -123,14 +108,17 @@ impl CreatorCredentials {
         }
         let creator =
             parse_creator(&wire.creator).map_err(|_| PersistenceError::CorruptOrMissing)?;
-        Ok(Self::from_secret_parts(
+        Ok(Self {
             creator,
-            wire.session_secret,
-            PaykitIdentitySecretKey::new(*wire.paykit_identity_secret, wire.key_generation)
-                .map_err(|_| PersistenceError::CorruptOrMissing)?,
-            wire.xpub,
-            wire.account_index,
-        ))
+            session_secret: wire.session_secret,
+            paykit_identity_secret: PaykitIdentitySecretKey::new(
+                *wire.paykit_identity_secret,
+                wire.key_generation,
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?,
+            bitcoin_account: wire.bitcoin_account,
+            usdt_address: wire.usdt_address,
+        })
     }
 }
 
@@ -141,8 +129,8 @@ struct CreatorCredentialsV1Ref<'a> {
     session_secret: &'a str,
     paykit_identity_secret: &'a [u8; 32],
     key_generation: u64,
-    xpub: &'a str,
-    account_index: u32,
+    bitcoin_account: Option<&'a BitcoinAccount>,
+    usdt_address: Option<&'a UsdtAddress>,
 }
 
 #[derive(Deserialize)]
@@ -152,8 +140,8 @@ struct CreatorCredentialsV1 {
     session_secret: Zeroizing<String>,
     paykit_identity_secret: Zeroizing<[u8; 32]>,
     key_generation: u64,
-    xpub: Zeroizing<String>,
-    account_index: u32,
+    bitcoin_account: Option<BitcoinAccount>,
+    usdt_address: Option<UsdtAddress>,
 }
 
 /// Immutable identity assigned to a persisted creator row.
@@ -460,8 +448,11 @@ mod tests {
             parse_creator("pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy").unwrap(),
             "session".into(),
             PaykitIdentitySecretKey::new([secret; 32], generation).unwrap(),
-            "account".into(),
-            7,
+            Some(crate::domain::receiving::BitcoinAccount {
+                xpub: zeroize::Zeroizing::new("account".into()),
+                account_index: 7,
+            }),
+            None,
         )
     }
 
@@ -473,8 +464,8 @@ mod tests {
             decoded.paykit_identity_secret(),
             expected.paykit_identity_secret()
         );
-        assert_eq!(decoded.account_index(), 7);
-        assert_eq!(decoded.xpub(), "account");
+        assert_eq!(decoded.bitcoin_account().unwrap().account_index, 7);
+        assert_eq!(decoded.bitcoin_account().unwrap().xpub.as_str(), "account");
         assert_eq!(format!("{decoded:?}"), "CreatorCredentials(<redacted>)");
     }
 
@@ -498,10 +489,10 @@ mod tests {
             );
         }
         let mut replacement = credentials(8, 4);
-        replacement.account_index = 8;
+        replacement.bitcoin_account.as_mut().unwrap().account_index = 8;
         assert!(current.validate_reauthentication(&replacement).is_err());
-        replacement.account_index = 7;
-        replacement.xpub = Zeroizing::new("different".into());
+        replacement.bitcoin_account.as_mut().unwrap().account_index = 7;
+        replacement.bitcoin_account.as_mut().unwrap().xpub = Zeroizing::new("different".into());
         assert!(current.validate_reauthentication(&replacement).is_err());
     }
 }

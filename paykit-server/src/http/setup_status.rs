@@ -17,6 +17,7 @@ use crate::{
 #[derive(Deserialize)]
 struct SetupStatusBody {
     creator: String,
+    asset: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -38,7 +39,13 @@ async fn status(
         Ok(creator) => creator,
         Err(_) => return ApiError::InvalidRequest.into_response(),
     };
-    let status = service.status(&creator).await;
+    let status = match body.asset {
+        Some(asset) => match crate::domain::invoice::CriterionAsset::parse(&asset) {
+            Ok(asset) => service.status_for_asset(&creator, asset).await,
+            Err(_) => return ApiError::InvalidRequest.into_response(),
+        },
+        None => service.status(&creator).await,
+    };
     axum::Json(SetupStatusResponse {
         status: status.as_str(),
     })

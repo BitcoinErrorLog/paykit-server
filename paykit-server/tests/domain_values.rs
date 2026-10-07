@@ -177,7 +177,7 @@ fn domain_pubky_lock_resource_debug_redacts_canonical_resource() {
 }
 
 #[test]
-fn domain_criterion_accepts_only_exact_btc_and_positive_decimal_u64_satoshis() {
+fn domain_criterion_accepts_supported_assets_and_positive_decimal_u64_satoshis() {
     assert_eq!(CriterionAsset::parse("BTC").unwrap().as_str(), "BTC");
     for invalid in ["btc", "BTC ", " BTC", "ETH", ""] {
         assert!(
@@ -186,11 +186,11 @@ fn domain_criterion_accepts_only_exact_btc_and_positive_decimal_u64_satoshis() {
         );
     }
 
-    assert_eq!(CriterionAmount::parse("1").unwrap().as_sats(), 1);
+    assert_eq!(CriterionAmount::parse("1").unwrap().units(), 1);
     assert_eq!(
         CriterionAmount::parse("18446744073709551615")
             .unwrap()
-            .as_sats(),
+            .units(),
         u64::MAX
     );
     for invalid in [

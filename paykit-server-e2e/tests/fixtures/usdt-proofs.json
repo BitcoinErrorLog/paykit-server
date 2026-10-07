@@ -1,0 +1,67 @@
+{
+  "generator": "viem 2; public secp256k1 test key 1",
+  "sender": "0x7e5f4552091a69125d5dfcb7b8c2659029395bdf",
+  "recipient": "0x2222222222222222222222222222222222222222",
+  "proofs": [
+    {
+      "binding": {
+        "payer": "tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+        "payee": "tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+        "paymentAppId": "paykit-server",
+        "paymentRequestId": "00000000-0000-4000-8000-000000000001",
+        "paymentReference": "10000000-0000-4000-8000-000000000001",
+        "paymentEndpointIdentifier": "usdt-arbitrum-address",
+        "periodStartsAt": "",
+        "periodEndsAt": "",
+        "conversionQuoteId": ""
+      },
+      "proof": {
+        "type": "erc20-transfer-eip712",
+        "chain_id": "42161",
+        "transaction_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "receipt_log_index": "1",
+        "signature": "0x1e81cbabd4fc219c305379d75360b0bed7921638ee80db3c2e0925b701ac41980e3d2a7e506042a1f7e8031d31496c9650d15c18699f2cd4d89337b84de4b07c1b"
+      }
+    },
+    {
+      "binding": {
+        "payer": "tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+        "payee": "tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+        "paymentAppId": "paykit-server",
+        "paymentRequestId": "00000000-0000-4000-8000-000000000002",
+        "paymentReference": "10000000-0000-4000-8000-000000000002",
+        "paymentEndpointIdentifier": "usdt-arbitrum-address",
+        "periodStartsAt": "",
+        "periodEndsAt": "",
+        "conversionQuoteId": ""
+      },
+      "proof": {
+        "type": "erc20-transfer-eip712",
+        "chain_id": "42161",
+        "transaction_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "receipt_log_index": "1",
+        "signature": "0xaf6dbcc63f7410c3836366c79d1d2737e4510fa5dd83a6ca6cf8d53dc7e329184c56d17a5bd7bf2a6de78599ab3615482522a6f4dd722abba28091d4635e24d91b"
+      }
+    },
+    {
+      "binding": {
+        "payer": "tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+        "payee": "tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+        "paymentAppId": "paykit-server",
+        "paymentRequestId": "00000000-0000-4000-8000-000000000003",
+        "paymentReference": "10000000-0000-4000-8000-000000000003",
+        "paymentEndpointIdentifier": "usdt-arbitrum-address",
+        "periodStartsAt": "",
+        "periodEndsAt": "",
+        "conversionQuoteId": ""
+      },
+      "proof": {
+        "type": "erc20-transfer-eip712",
+        "chain_id": "42161",
+        "transaction_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+        "receipt_log_index": "1",
+        "signature": "0xa7f210d36bd1921f4bc0561473c174fec902850f88003a04b9ba6987c10028050c4edb75361328a8c8a3504945f4b5ab52882785c32adb82d581140bca761de21c"
+      }
+    }
+  ]
+}

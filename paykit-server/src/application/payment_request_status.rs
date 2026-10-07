@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde::Serialize;
 use time::OffsetDateTime;
 
 use crate::domain::{
@@ -25,14 +26,34 @@ impl PaymentState {
     }
 }
 
+/// Current Bitcoin output facts. Amount-matched confirmation counts are capped at six.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct BitcoinPaymentStatus {
+    pub confirmations: u32,
+    pub amount_matched: bool,
+    /// A full payment was verified within the inclusive invoice payment window.
+    pub paid_on_time: bool,
+}
+
+/// Current verified USDT0 receipt facts on Arbitrum One (chain 42161).
+/// L2 confirmation counts do not imply L1 finality.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct UsdtPaymentStatus {
+    pub confirmations: u32,
+    pub amount_matched: bool,
+    /// A full payment was verified within the inclusive invoice payment window.
+    pub paid_on_time: bool,
+    pub finalized: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaymentRequestStatusSummary {
     request_state: PaymentRequestLifecycleState,
     payment_state: PaymentState,
     invoice_created_at: OffsetDateTime,
     payment_deadline: OffsetDateTime,
-    confirmations: u32,
-    amount_matched: bool,
+    bitcoin: Option<BitcoinPaymentStatus>,
+    usdt_arbitrum: Option<UsdtPaymentStatus>,
 }
 
 impl PaymentRequestStatusSummary {
@@ -41,16 +62,16 @@ impl PaymentRequestStatusSummary {
         payment_state: PaymentState,
         invoice_created_at: OffsetDateTime,
         payment_deadline: OffsetDateTime,
-        confirmations: u32,
-        amount_matched: bool,
+        bitcoin: Option<BitcoinPaymentStatus>,
+        usdt_arbitrum: Option<UsdtPaymentStatus>,
     ) -> Self {
         Self {
             request_state,
             payment_state,
             invoice_created_at,
             payment_deadline,
-            confirmations,
-            amount_matched,
+            bitcoin,
+            usdt_arbitrum,
         }
     }
 
@@ -70,12 +91,12 @@ impl PaymentRequestStatusSummary {
         self.payment_deadline
     }
 
-    pub const fn confirmations(&self) -> u32 {
-        self.confirmations
+    pub const fn bitcoin(&self) -> Option<BitcoinPaymentStatus> {
+        self.bitcoin
     }
 
-    pub const fn amount_matched(&self) -> bool {
-        self.amount_matched
+    pub const fn usdt_arbitrum(&self) -> Option<UsdtPaymentStatus> {
+        self.usdt_arbitrum
     }
 }
 

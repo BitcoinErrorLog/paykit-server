@@ -38,6 +38,7 @@ impl core::fmt::Debug for StartedBitkitAuth {
 pub struct BitkitAuthStarter {
     bootstrap: paykit_sdk::PubkySessionBootstrap,
     capabilities: String,
+    setup_selection: String,
 }
 
 impl BitkitAuthStarter {
@@ -45,14 +46,24 @@ impl BitkitAuthStarter {
         Self {
             bootstrap,
             capabilities: required_capabilities(),
+            setup_selection: setup_claim_selection(),
         }
+    }
+
+    pub fn with_usdt(mut self) -> Self {
+        self.setup_selection = format!(
+            "{}.{}",
+            setup_claim_selection(),
+            crate::bitkit_claim::USDT_ADDRESS_CLAIM
+        );
+        self
     }
 
     pub async fn start(&self) -> Result<StartedBitkitAuth, ClaimError> {
         self.start_request(false).await
     }
 
-    /// Requests only delegated Paykit authority; the server retains its account binding.
+    /// Refreshes delegated authority and optionally requests a missing USDT receiving address.
     pub async fn start_reconnect(&self) -> Result<StartedBitkitAuth, ClaimError> {
         self.start_request(true).await
     }
@@ -69,9 +80,21 @@ impl BitkitAuthStarter {
             return Err(ClaimError::InvalidAuthRequest);
         }
         let selection = if reconnect {
-            PAYKIT_ACCESS_CLAIM.to_owned()
+            if self
+                .setup_selection
+                .split('.')
+                .any(|item| item == crate::bitkit_claim::USDT_ADDRESS_CLAIM)
+            {
+                format!(
+                    "{}.{}",
+                    PAYKIT_ACCESS_CLAIM,
+                    crate::bitkit_claim::USDT_ADDRESS_CLAIM
+                )
+            } else {
+                PAYKIT_ACCESS_CLAIM.to_owned()
+            }
         } else {
-            setup_claim_selection()
+            self.setup_selection.clone()
         };
         url.query_pairs_mut()
             .append_pair(QUERY_PARAMETER, &selection);

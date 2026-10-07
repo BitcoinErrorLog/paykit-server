@@ -11,7 +11,8 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::{
     application::payment_request_status::{
-        PaymentRequestStatusError, PaymentRequestStatusOperations, PaymentRequestStatusSummary,
+        BitcoinPaymentStatus, PaymentRequestStatusError, PaymentRequestStatusOperations,
+        PaymentRequestStatusSummary, UsdtPaymentStatus,
     },
     domain::{
         locks::{parse_bundle_id, parse_creator},
@@ -32,8 +33,8 @@ struct PaymentRequestStatusResponse {
     payment_state: &'static str,
     invoice_created_at: String,
     payment_deadline: String,
-    confirmations: u32,
-    amount_matched: bool,
+    bitcoin: Option<BitcoinPaymentStatus>,
+    usdt_arbitrum: Option<UsdtPaymentStatus>,
 }
 
 pub fn payment_requests_router(operations: Arc<dyn PaymentRequestStatusOperations>) -> Router {
@@ -101,8 +102,8 @@ impl TryFrom<PaymentRequestStatusSummary> for PaymentRequestStatusResponse {
                 .format(&Rfc3339)
                 .map_err(|_| ())?,
             payment_deadline: value.payment_deadline().format(&Rfc3339).map_err(|_| ())?,
-            confirmations: value.confirmations(),
-            amount_matched: value.amount_matched(),
+            bitcoin: value.bitcoin(),
+            usdt_arbitrum: value.usdt_arbitrum(),
         })
     }
 }

@@ -15,6 +15,10 @@ test-utils = []
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
+alloy-primitives.workspace = true
+alloy-sol-types.workspace = true
+reqwest.workspace = true
+secp256k1.workspace = true
 axum.workspace = true
 base64.workspace = true
 bitcoin.workspace = true

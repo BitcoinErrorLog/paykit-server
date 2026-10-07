@@ -18,8 +18,8 @@ use locks_core::{
     lock_policy::{ContentLock, VerifierType},
 };
 use paykit_lib::{
-    PaykitAppId, PaykitAppRegistry, PaymentAmount, PaymentEndpointIdentifier,
-    PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
+    ConversionRate, PaykitAppId, PaykitAppRegistry, PaymentAmount, PaymentConversion,
+    PaymentEndpointIdentifier, PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
 };
 use serde_json::{Map, Value};
 
@@ -133,14 +133,21 @@ impl RegistryRetryDelay for FullJitterRegistryRetryDelay {
     }
 }
 #[async_trait]
-pub trait CreatorXpubProvider: Send + Sync {
-    async fn xpub(&self, creator: &CreatorPubky) -> Result<(String, u32), PersistenceError>;
+pub trait CreatorReceivingProvider: Send + Sync {
+    async fn receiving(&self, creator: &CreatorPubky)
+    -> Result<ReceivingDetails, PersistenceError>;
 }
 #[async_trait]
-impl CreatorXpubProvider for CreatorStore {
-    async fn xpub(&self, creator: &CreatorPubky) -> Result<(String, u32), PersistenceError> {
+impl CreatorReceivingProvider for CreatorStore {
+    async fn receiving(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<ReceivingDetails, PersistenceError> {
         let credentials = self.load(creator).await?;
-        Ok((credentials.xpub().to_owned(), credentials.account_index()))
+        Ok(ReceivingDetails {
+            bitcoin: credentials.bitcoin_account().cloned(),
+            usdt: credentials.usdt_address().cloned(),
+        })
     }
 }
 #[async_trait]
@@ -196,8 +203,19 @@ pub trait IntentBuilder: Send + Sync {
         &self,
         request: &CreateInvoiceRequest,
         lock: &ContentLock,
-        address: &str,
+        addresses: &ReceivingAddresses,
+        rates: &[ConversionRate],
     ) -> Result<PaymentRequestTerms, CreateInvoiceError>;
+}
+
+pub struct ReceivingDetails {
+    pub bitcoin: Option<crate::domain::receiving::BitcoinAccount>,
+    pub usdt: Option<crate::domain::receiving::UsdtAddress>,
+}
+
+pub struct ReceivingAddresses {
+    pub bitcoin: Option<String>,
+    pub usdt: Option<crate::domain::receiving::UsdtAddress>,
 }
 
 pub struct PaykitIntentBuilder {
@@ -224,44 +242,49 @@ impl IntentBuilder for PaykitIntentBuilder {
         &self,
         request: &CreateInvoiceRequest,
         lock: &ContentLock,
-        address: &str,
+        addresses: &ReceivingAddresses,
+        rates: &[ConversionRate],
     ) -> Result<PaymentRequestTerms, CreateInvoiceError> {
-        if address.is_empty() {
-            return Err(CreateInvoiceError::InvalidRequest);
+        let (asset, amount) = extract_terms(lock)?;
+        let mut endpoints = HashMap::new();
+        if let Some(address) = &addresses.bitcoin {
+            endpoints.insert(
+                PaymentEndpointIdentifier::new(self.p2wpkh_identifier())
+                    .map_err(|_| CreateInvoiceError::InvalidRequest)?,
+                PaymentEndpointPayload::new(serde_json::json!({"value": address}).to_string()),
+            );
         }
-        let identifier = PaymentEndpointIdentifier::new(self.p2wpkh_identifier())
-            .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-        let payload = serde_json::to_string(&serde_json::json!({ "value": address }))
-            .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-        let amount = extract_terms(lock)?;
-        let sats = amount.as_sats();
+        if let Some(address) = &addresses.usdt {
+            endpoints.insert(
+                PaymentEndpointIdentifier::new(crate::domain::receiving::USDT_ENDPOINT)
+                    .map_err(|_| CreateInvoiceError::InvalidRequest)?,
+                PaymentEndpointPayload::new(address.endpoint().to_string()),
+            );
+        }
+        let mut identifiers: Vec<_> = endpoints.keys().cloned().collect();
+        identifiers.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         let mut metadata = Map::new();
         metadata.insert(
             "bundle_id".into(),
             Value::String(request.bundle_id.to_string()),
         );
-        metadata.insert(
-            "lock_resource".into(),
-            Value::String(request.lock_resource.to_string()),
-        );
-        metadata.insert("reader".into(), Value::String(request.reader.to_string()));
         PaymentRequestTerms::builder(
             PaymentAmount::new(
-                format!("{}.{:08}", sats / 100_000_000, sats % 100_000_000),
-                "btc",
+                asset.decimal_amount(amount.units()),
+                asset.as_str().to_ascii_lowercase(),
             )
             .map_err(|_| CreateInvoiceError::InvalidRequest)?,
             PaymentReference::new(uuid::Uuid::new_v4().hyphenated().to_string())
                 .map_err(|_| CreateInvoiceError::InvalidRequest)?,
-            vec![identifier.clone()],
+            identifiers,
         )
         .required_app_id(Some(
             PaykitAppId::new(crate::config::PAYKIT_APP_ID).expect("static app id"),
         ))
-        .payment_endpoints(Some(HashMap::from([(
-            identifier,
-            PaymentEndpointPayload::new(payload),
-        )])))
+        .payment_endpoints(Some(endpoints))
+        .conversion((!rates.is_empty()).then(|| PaymentConversion::Fixed {
+            rates: rates.to_vec(),
+        }))
         .metadata(metadata)
         .build()
         .map_err(|_| CreateInvoiceError::InvalidRequest)
@@ -306,8 +329,8 @@ pub fn derive_bip84_p2wpkh_address(
 
 struct DerivedInvoicePayloads<'a> {
     intents: Arc<dyn IntentBuilder>,
-    xpub: String,
-    account_index: u32,
+    receiving: ReceivingDetails,
+    rates: Vec<ConversionRate>,
     network: crate::config::BitcoinNetwork,
     request: &'a CreateInvoiceRequest,
     lock: &'a ContentLock,
@@ -315,15 +338,26 @@ struct DerivedInvoicePayloads<'a> {
 }
 impl InvoicePayloadFactory for DerivedInvoicePayloads<'_> {
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
-        let address =
-            derive_bip84_p2wpkh_address(&self.xpub, self.account_index, &self.network, child_index)
-                .map_err(|error| {
-                    diagnose("address_derivation", error);
-                    PersistenceError::CorruptOrMissing
-                })?;
+        let addresses = ReceivingAddresses {
+            bitcoin: self
+                .receiving
+                .bitcoin
+                .as_ref()
+                .map(|account| {
+                    derive_bip84_p2wpkh_address(
+                        &account.xpub,
+                        account.account_index,
+                        &self.network,
+                        child_index,
+                    )
+                    .map_err(|_| PersistenceError::CorruptOrMissing)
+                })
+                .transpose()?,
+            usdt: self.receiving.usdt.clone(),
+        };
         let terms = self
             .intents
-            .payment_request_terms(self.request, self.lock, &address)
+            .payment_request_terms(self.request, self.lock, &addresses, &self.rates)
             .map_err(|error| {
                 diagnose("payment_terms_construction", error);
                 PersistenceError::CorruptOrMissing
@@ -343,7 +377,6 @@ impl InvoicePayloadFactory for DerivedInvoicePayloads<'_> {
         })?;
         Ok(InvoicePayloads {
             payment_request_intent,
-            bitcoin_address: address,
         })
     }
 }
@@ -364,7 +397,9 @@ pub struct CreateInvoiceService {
     locks: Arc<dyn LockFetcher>,
     registries: Arc<dyn AppRegistryDiscovery>,
     app_id: PaykitAppId,
-    credentials: Arc<dyn CreatorXpubProvider>,
+    credentials: Arc<dyn CreatorReceivingProvider>,
+    usdt_enabled: bool,
+    rates: Option<Arc<dyn super::invoice_pricing::ExchangeRates>>,
     bitcoin_network: crate::config::BitcoinNetwork,
     store: Arc<dyn InvoicePersistence>,
     intents: Arc<dyn IntentBuilder>,
@@ -372,6 +407,7 @@ pub struct CreateInvoiceService {
     registry_retry_delay: Arc<dyn RegistryRetryDelay>,
     proposal_acceptance_window: Duration,
     payment_window: Duration,
+    conversion_payment_window: Duration,
 }
 impl CreateInvoiceService {
     #[allow(clippy::too_many_arguments)]
@@ -380,7 +416,7 @@ impl CreateInvoiceService {
         locks: Arc<dyn LockFetcher>,
         registries: Arc<dyn AppRegistryDiscovery>,
         app_id: PaykitAppId,
-        credentials: Arc<dyn CreatorXpubProvider>,
+        credentials: Arc<dyn CreatorReceivingProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
@@ -404,7 +440,7 @@ impl CreateInvoiceService {
         locks: Arc<dyn LockFetcher>,
         registries: Arc<dyn AppRegistryDiscovery>,
         app_id: PaykitAppId,
-        credentials: Arc<dyn CreatorXpubProvider>,
+        credentials: Arc<dyn CreatorReceivingProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
@@ -432,7 +468,7 @@ impl CreateInvoiceService {
         locks: Arc<dyn LockFetcher>,
         registries: Arc<dyn AppRegistryDiscovery>,
         app_id: PaykitAppId,
-        credentials: Arc<dyn CreatorXpubProvider>,
+        credentials: Arc<dyn CreatorReceivingProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
@@ -461,7 +497,7 @@ impl CreateInvoiceService {
         locks: Arc<dyn LockFetcher>,
         registries: Arc<dyn AppRegistryDiscovery>,
         app_id: PaykitAppId,
-        credentials: Arc<dyn CreatorXpubProvider>,
+        credentials: Arc<dyn CreatorReceivingProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
@@ -489,7 +525,7 @@ impl CreateInvoiceService {
         locks: Arc<dyn LockFetcher>,
         registries: Arc<dyn AppRegistryDiscovery>,
         app_id: PaykitAppId,
-        credentials: Arc<dyn CreatorXpubProvider>,
+        credentials: Arc<dyn CreatorReceivingProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
@@ -518,7 +554,7 @@ impl CreateInvoiceService {
         locks: Arc<dyn LockFetcher>,
         registries: Arc<dyn AppRegistryDiscovery>,
         app_id: PaykitAppId,
-        credentials: Arc<dyn CreatorXpubProvider>,
+        credentials: Arc<dyn CreatorReceivingProvider>,
         bitcoin_network: crate::config::BitcoinNetwork,
         store: Arc<dyn InvoicePersistence>,
         intents: Arc<dyn IntentBuilder>,
@@ -533,6 +569,8 @@ impl CreateInvoiceService {
             registries,
             app_id,
             credentials,
+            usdt_enabled: false,
+            rates: None,
             bitcoin_network,
             store,
             intents,
@@ -540,7 +578,26 @@ impl CreateInvoiceService {
             registry_retry_delay,
             proposal_acceptance_window,
             payment_window,
+            conversion_payment_window: Duration::from_secs(3600),
         }
+    }
+
+    pub fn with_usdt(mut self, enabled: bool) -> Self {
+        self.usdt_enabled = enabled;
+        self
+    }
+
+    pub fn with_conversion_payment_window(mut self, window: Duration) -> Self {
+        self.conversion_payment_window = window;
+        self
+    }
+
+    pub fn with_exchange_rates(
+        mut self,
+        rates: Arc<dyn super::invoice_pricing::ExchangeRates>,
+    ) -> Self {
+        self.rates = Some(rates);
+        self
     }
 
     pub async fn create(
@@ -683,16 +740,59 @@ impl CreateInvoiceService {
             );
             return Err(CreateInvoiceError::ReaderNotPayable);
         }
-        let credentials_remaining = remaining_at(started, self.clock.now(), "creator_xpub_load")?;
-        let (xpub, account_index) =
-            tokio::time::timeout(credentials_remaining, self.credentials.xpub(&creator))
+        let credentials_remaining =
+            remaining_at(started, self.clock.now(), "creator_receiving_details")?;
+        let (asset, _) = extract_terms(&lock)?;
+        if asset == CriterionAsset::Usdt && !self.usdt_enabled {
+            return Err(CreateInvoiceError::InvalidRequest);
+        }
+        let mut receiving =
+            tokio::time::timeout(credentials_remaining, self.credentials.receiving(&creator))
                 .await
-                .map_err(|_| deadline("creator_xpub_load"))?
-                .map_err(|error| store_failure("creator_xpub_load", error))?;
+                .map_err(|_| deadline("creator_receiving_details"))?
+                .map_err(|error| store_failure("creator_receiving_details", error))?;
+        if !self.usdt_enabled {
+            receiving.usdt = None;
+        }
+        if receiving.bitcoin.is_none() && receiving.usdt.is_none() {
+            return Err(CreateInvoiceError::InvalidRequest);
+        }
+        let cross_btc = (asset == CriterionAsset::Btc && receiving.usdt.is_some())
+            || (asset != CriterionAsset::Btc && receiving.bitcoin.is_some());
+        let price = if cross_btc {
+            let provider = self.rates.as_ref().ok_or(CreateInvoiceError::Unavailable)?;
+            Some(
+                tokio::time::timeout(
+                    remaining_at(started, self.clock.now(), "exchange_rate")?,
+                    provider.usd_per_btc(),
+                )
+                .await
+                .map_err(|_| deadline("exchange_rate"))??,
+            )
+        } else {
+            None
+        };
+        let rates = super::invoice_pricing::conversion_rates(
+            asset,
+            receiving.bitcoin.is_some(),
+            receiving.usdt.is_some(),
+            price.as_deref(),
+        )?;
+        let payment_window = if cross_btc {
+            self.payment_window.min(self.conversion_payment_window)
+        } else {
+            self.payment_window
+        };
+        let acceptance_window = if cross_btc {
+            self.proposal_acceptance_window
+                .min(Duration::from_secs(payment_window.as_secs() / 2))
+        } else {
+            self.proposal_acceptance_window
+        };
         let invoice_payloads = DerivedInvoicePayloads {
             intents: self.intents.clone(),
-            xpub,
-            account_index,
+            receiving,
+            rates,
             network: self.bitcoin_network.clone(),
             request: &request,
             lock: &lock,
@@ -710,9 +810,8 @@ impl CreateInvoiceService {
                 lock_resource_binding: &lock_resource_binding,
                 payment_request_binding: &payment_request_binding,
                 invoice_payloads: &invoice_payloads,
-                required_sats: extract_terms(&lock)?.as_sats(),
-                proposal_acceptance_seconds: self.proposal_acceptance_window.as_secs(),
-                payment_window_seconds: self.payment_window.as_secs(),
+                proposal_acceptance_seconds: acceptance_window.as_secs(),
+                payment_window_seconds: payment_window.as_secs(),
             })
             .await
             .map_err(|error| store_failure("create_atomic", error))
@@ -797,13 +896,15 @@ fn validate_lock(
     .map_err(|_| CreateInvoiceError::InvalidRequest)?;
     Ok(())
 }
-fn extract_terms(lock: &ContentLock) -> Result<CriterionAmount, CreateInvoiceError> {
+fn extract_terms(
+    lock: &ContentLock,
+) -> Result<(CriterionAsset, CriterionAmount), CreateInvoiceError> {
     let criterion = lock
         .criteria
         .iter()
         .find(|criterion| criterion.verifier_type == VerifierType::PaykitPayment)
         .ok_or(CreateInvoiceError::InvalidRequest)?;
-    CriterionAsset::parse(
+    let asset = CriterionAsset::parse(
         criterion
             .params
             .get("asset")
@@ -811,14 +912,15 @@ fn extract_terms(lock: &ContentLock) -> Result<CriterionAmount, CreateInvoiceErr
             .ok_or(CreateInvoiceError::InvalidRequest)?,
     )
     .map_err(|_| CreateInvoiceError::InvalidRequest)?;
-    CriterionAmount::parse(
+    let amount = CriterionAmount::parse(
         criterion
             .params
             .get("amount")
             .and_then(Value::as_str)
             .ok_or(CreateInvoiceError::InvalidRequest)?,
     )
-    .map_err(|_| CreateInvoiceError::InvalidRequest)
+    .map_err(|_| CreateInvoiceError::InvalidRequest)?;
+    Ok((asset, amount))
 }
 
 #[cfg(test)]

@@ -156,6 +156,10 @@ impl Crypto {
         )
     }
 
+    pub fn usdt_transfer_lookup_hash(&self, identity: &[u8]) -> LookupHash {
+        self.domain_separated_lookup_hash(b"paykit-server:usdt-transfer", identity)
+    }
+
     fn domain_separated_lookup_hash(&self, domain: &[u8], logical_bytes: &[u8]) -> LookupHash {
         let mut mac = match <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&*self.lookup_hmac_key)
         {
@@ -187,6 +191,7 @@ pub enum EnvelopeType {
     InvoicePaymentRecord,
     /// An encrypted Bitcoin outpoint and observed amount.
     BitcoinObservation,
+    UsdtObservation,
     /// Versioned server-owned semantic inputs for an outbound SDK handoff.
     OutboxSemanticIntent,
     /// Canonical addressed lock resource bound to one operational drain.
@@ -201,6 +206,7 @@ impl EnvelopeType {
             Self::Invoice => b"invoice",
             Self::InvoicePaymentRecord => b"invoice-payment-record",
             Self::BitcoinObservation => b"bitcoin-observation",
+            Self::UsdtObservation => b"usdt-observation",
             Self::OutboxSemanticIntent => b"outbox-semantic-intent",
             Self::PaymentDrain => b"payment-drain",
         }
@@ -267,6 +273,15 @@ impl EnvelopeContext {
         invoice_id: Uuid,
     ) -> Self {
         let mut context = Self::bitcoin_observation(creator_lookup_hash, row_id);
+        context.parent_row_id = Some(invoice_id);
+        context
+    }
+    pub fn usdt_observation(
+        creator_lookup_hash: LookupHash,
+        row_id: Uuid,
+        invoice_id: Uuid,
+    ) -> Self {
+        let mut context = Self::new(EnvelopeType::UsdtObservation, creator_lookup_hash, row_id);
         context.parent_row_id = Some(invoice_id);
         context
     }

@@ -525,10 +525,10 @@ mod tests {
         );
         assert_eq!(request.claim.unsigned_payload().len(), 124);
         let parsed = parse_unsigned_payload(request.claim.unsigned_payload()).unwrap();
-        assert_eq!(parsed.account_index, 0);
+        assert_eq!(parsed.bitcoin_account.as_ref().unwrap().account_index, 0);
         assert_eq!(parsed.paykit_identity_secret_key.key_generation(), 2);
         assert_eq!(
-            parsed.serialized_xpub,
+            parsed.bitcoin_account.as_ref().unwrap().serialized_xpub,
             account_xpub(Network::Testnet, 0).encode()
         );
     }
@@ -616,9 +616,9 @@ mod tests {
         let verifying_key =
             ed25519_dalek::VerifyingKey::from_bytes(creator.public_key().as_bytes()).unwrap();
         let claim = decrypt_and_verify(&encrypted_claim, &request, &verifying_key).unwrap();
-        assert_eq!(claim.account_index, 0);
+        assert_eq!(claim.bitcoin_account.as_ref().unwrap().account_index, 0);
         assert_eq!(
-            claim.serialized_xpub,
+            claim.bitcoin_account.as_ref().unwrap().serialized_xpub,
             account_xpub(Network::Testnet, 0).encode()
         );
         assert_eq!(

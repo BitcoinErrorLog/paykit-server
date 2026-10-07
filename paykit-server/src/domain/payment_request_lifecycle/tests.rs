@@ -60,6 +60,7 @@ fn lifecycle_projection_debug_redacts_correlation_metadata() {
             terms: PaymentTermsV1 {
                 amount: "1".into(),
                 asset: "btc".into(),
+                rates: Vec::new(),
                 payment_reference: "reference-secret".into(),
                 proposal_expires_at: None,
                 payment_deadline: None,

@@ -125,8 +125,11 @@ async fn production_workers_publish_startup_evidence_before_readiness() {
             creator.clone(),
             "invalid-session".into(),
             paykit_sdk::PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
-            "unused-xpub".into(),
-            0,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: "unused-xpub".to_owned().into(),
+                account_index: 0,
+            }),
+            None,
         ))
         .await
         .unwrap();

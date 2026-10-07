@@ -7,10 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use paykit_lib::{
-    PaykitAppId, PaymentAmount, PaymentDeadline, PaymentEndpointIdentifier, PaymentEndpointPayload,
-    PaymentReference, PaymentRequestId, PaymentRequestTerms,
-};
+use paykit_lib::{PaykitAppId, PaymentRequestId};
 use paykit_sdk::{
     LinkedPeerState, OutboundPrivateMessageStatus, OutboundPrivateSendReport,
     PAYKIT_SESSION_CAPABILITIES, PaykitSdk, PaykitSdkConfig, PaykitSdkError, PaymentAdapter,
@@ -270,6 +267,7 @@ pub struct PaykitAdapter {
     creator: CreatorPubky,
     app_id: PaykitAppId,
     mutation_lock: Arc<TokioMutex<()>>,
+    usdt: Option<(InvoiceStore, crate::usdt::ArbitrumVerifier)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -343,7 +341,17 @@ impl PaykitAdapter {
             creator_id,
             creator,
             app_id: config.app_id.clone(),
+            usdt: None,
         })
+    }
+
+    pub fn with_usdt(
+        mut self,
+        invoices: InvoiceStore,
+        verifier: Option<crate::usdt::ArbitrumVerifier>,
+    ) -> Self {
+        self.usdt = verifier.map(|verifier| (invoices, verifier));
+        self
     }
 
     /// Receives linked-peer messages and durably projects the SDK's canonical
@@ -353,7 +361,9 @@ impl PaykitAdapter {
         lifecycles: &PaymentRequestLifecycleStore,
     ) -> Result<(), LifecycleSyncError> {
         let _guard = self.mutation_lock.lock().await;
-        self.refresh_payment_requests_locked(lifecycles, None).await
+        self.refresh_payment_requests_locked(lifecycles, None)
+            .await?;
+        self.observe_usdt_requests(None).await
     }
 
     async fn refresh_payment_requests_locked(
@@ -378,7 +388,32 @@ impl PaykitAdapter {
                 .map_err(map_projection_persistence_error)?;
             Ok(())
         })
-        .await
+        .await?;
+        Ok(())
+    }
+
+    async fn observe_usdt_requests(
+        &self,
+        bundle: Option<&BundleId>,
+    ) -> Result<(), LifecycleSyncError> {
+        let Some((invoices, verifier)) = &self.usdt else {
+            return Ok(());
+        };
+        let records = self
+            .sdk
+            .payment_requests()
+            .await
+            .map_err(|_| LifecycleSyncError::Sdk)?;
+        let mut result = Ok(());
+        for record in &records {
+            if let Err(error) = invoices
+                .observe_usdt_request(self.creator_id, &self.creator, record, verifier, bundle)
+                .await
+            {
+                result = Err(map_projection_persistence_error(error));
+            }
+        }
+        result
     }
 
     /// Receives and projects fresh canonical state before returning status, all
@@ -425,6 +460,9 @@ impl PaykitAdapter {
                     })
             },
             || async {
+                self.observe_usdt_requests(Some(bundle_id))
+                    .await
+                    .map_err(map_lifecycle_status_error)?;
                 statuses
                     .payment_request_status_after_receive(
                         lifecycles,
@@ -732,6 +770,13 @@ fn lifecycle_projection(
             terms: PaymentTermsV1 {
                 amount: terms.amount.value.clone(),
                 asset: terms.amount.asset.clone(),
+                rates: match &terms.conversion {
+                    Some(paykit_lib::PaymentConversion::Fixed { rates }) => rates.clone(),
+                    Some(paykit_lib::PaymentConversion::PerPeriod {}) => {
+                        return Err(LifecycleSyncError::InvalidProjection);
+                    }
+                    None => Vec::new(),
+                },
                 payment_reference: terms.payment_reference.clone(),
                 proposal_expires_at: terms.proposal_expires_at.clone(),
                 payment_deadline: terms
@@ -898,52 +943,6 @@ fn retryable_recovery_observation(error: HandoffError) -> HandoffError {
     }
 }
 
-fn payment_terms(terms: &PaymentTermsV1) -> Result<PaymentRequestTerms, HandoffError> {
-    let amount = PaymentAmount::new(terms.amount.clone(), terms.asset.clone())
-        .map_err(|_| HandoffError::Permanent)?;
-    let payment_reference = PaymentReference::new(terms.payment_reference.clone())
-        .map_err(|_| HandoffError::Permanent)?;
-    let accepted_payment_endpoint_identifiers = terms
-        .accepted_endpoint_identifiers
-        .iter()
-        .cloned()
-        .map(PaymentEndpointIdentifier::new)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| HandoffError::Permanent)?;
-    PaymentRequestTerms::builder(
-        amount,
-        payment_reference,
-        accepted_payment_endpoint_identifiers,
-    )
-    .proposal_expires_at(terms.proposal_expires_at.clone())
-    .payment_deadline(
-        terms
-            .payment_deadline
-            .clone()
-            .map(|timestamp| PaymentDeadline::At { timestamp }),
-    )
-    .required_app_id(Some(
-        paykit_lib::PaykitAppId::new(crate::config::PAYKIT_APP_ID)
-            .map_err(|_| HandoffError::Permanent)?,
-    ))
-    .payment_endpoints(Some(
-        terms
-            .payment_endpoints
-            .iter()
-            .map(|(identifier, payload)| {
-                Ok((
-                    PaymentEndpointIdentifier::new(identifier.clone())
-                        .map_err(|_| HandoffError::Permanent)?,
-                    PaymentEndpointPayload::new(payload.clone()),
-                ))
-            })
-            .collect::<Result<_, HandoffError>>()?,
-    ))
-    .metadata(terms.metadata.clone())
-    .build()
-    .map_err(|_| HandoffError::Permanent)
-}
-
 #[async_trait]
 impl Adapter for PaykitAdapter {
     async fn execute_claimed_handoff(
@@ -1014,7 +1013,7 @@ impl Adapter for PaykitAdapter {
         let reader = parse_peer(reader)?;
         let record = self
             .sdk
-            .propose_payment_request(reader, payment_terms(terms)?)
+            .propose_payment_request(reader, terms.to_sdk().map_err(|_| HandoffError::Permanent)?)
             .await
             .map_err(classify)?;
         Ok(HandoffResult::PaymentRequestProposal {
@@ -1677,6 +1676,7 @@ mod tests {
                 terms: PaymentTermsV1 {
                     amount: "1".into(),
                     asset: "btc".into(),
+                    rates: Vec::new(),
                     payment_reference: Uuid::new_v4().to_string(),
                     proposal_expires_at: None,
                     payment_deadline: None,

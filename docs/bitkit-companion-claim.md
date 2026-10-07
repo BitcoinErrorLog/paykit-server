@@ -1,13 +1,12 @@
 # Bitkit companion claim contract
 
-Initial Paykit Server setup requests both Paykit access and a new watch-only BIP84 account.
-Explicit reconnect requests only Paykit access and retains the server's account binding.
+Initial setup requests Paykit access and a new watch-only BIP84 account. Enabling USDT additionally requests optional `usdt-address-v1`. Reconnect retains the Bitcoin account and can add optional USDT receiving details.
 The SDK companion API signs and encrypts the application payload. The request
 requires the exact `/pub/paykit/:rw` capability.
 
 The `x-bitkit-claim` query parameter must occur exactly once. Its value is a
 dot-separated list of independent permission identifiers: `paykit-access-v1`
-and `watch-only-account-v1`. The supported permission selections are:
+`watch-only-account-v1`, and optional `usdt-address-v1`. Selections without USDT use these binary layouts:
 
 | Permission list (SDK `claim_type`) | Unsigned bytes | Contents |
 | --- | ---: | --- |
@@ -31,8 +30,7 @@ responses fail closed. Bitkit displays each requested permission
 independently and must not export a Paykit secret for watch-only approval, or
 allocate/track an account for Paykit-only approval.
 
-Initial server setup requires both permissions and rejects one-only requests and replies.
-Reconnect requires only `paykit-access-v1` and rejects watch-only or combined replies.
+Initial setup requires Paykit access and a receiving detail. Reconnect requests Paykit access, optionally with USDT, and rejects new Bitcoin account material.
 The demo validates that both were
 requested before deriving or exporting any key. `AuthRequest` retains the exact
 validated list and AUTH secret; channel derivation and verification take that
@@ -89,10 +87,9 @@ The caller opens `GET /setup/reconnect` with `creator`, `return_to`, and `state`
 The canonical Creator must already exist before an AUTH request is created. It is
 retained in the in-memory flow and must exactly match the identity authenticated
 by Pubky AUTH; a different authorizer fails before credential writes or publication.
-The URL requests only `x-bitkit-claim=paykit-access-v1`. Its 41 unsigned bytes
+Without USDT enabled, the URL requests `x-bitkit-claim=paykit-access-v1`. Its 41 unsigned bytes
 contain version, generation, and Paykit secret; with the signature and encryption
-envelope the relay body is 145 bytes. No account bytes or native account picker
-participate. Client IDs, display names, and relay URLs never select an account.
+envelope the relay body is 145 bytes. No Bitcoin account bytes or native account picker participate. Client IDs, display names, and relay URLs never select an account.
 
 Under the Creator setup lock, reconnect loads the existing account index and xpub
 and retains them exactly. A missing Creator cannot be created by reconnect. Initial
@@ -128,3 +125,28 @@ signing/encryption API and rejects a reordered response binding. Single-permissi
 payload tests check the 84/41-byte forms, initial setup rejection, and exact Paykit-only reconnect. The
 PostgreSQL/Pubky setup composition covers valid BIP84 accounts,
 rejected and cancelled reconnects, preserved pending invoices, and key rotation.
+
+## Optional USDT permission
+
+If the exact permission list includes `usdt-address-v1`, the unsigned payload is
+UTF-8 JSON. It contains `paykit_access` when requested, `bitcoin_account` when
+requested, and `usdt-arbitrum-address` only if the user approves USDT sharing:
+
+```json
+{
+  "paykit_access": {"key_generation": 3, "secret": "<32 bytes, unpadded base64url>"},
+  "bitcoin_account": {"account_index": 7, "address_type": "nativeSegwit", "xpub": "<account xpub>"},
+  "usdt-arbitrum-address": {"value": "0x2222222222222222222222222222222222222222", "chain_id": "42161", "token": "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9"}
+}
+```
+
+Omitting the USDT field is an authenticated decline, not malformed setup. An
+unavailable address can be skipped while approving Bitcoin. No BTC or USDT
+spending key is shared. Reconnect requests `paykit-access-v1.usdt-address-v1`
+when enabled; omission retains the existing address, and a different existing
+address is rejected. JSON order is irrelevant to parsing, but the signature is
+verified over the original bytes. The same signature/channel/encryption rules
+above apply to the variable-length JSON payload (maximum 2048 unsigned bytes).
+Generation is a nonzero unsigned 64-bit integer; parse it without floating point.
+The receiver rejects unknown fields, unsupported token/network and zero or
+malformed receiving addresses. Binary-only selections remain fixed-size.

@@ -232,8 +232,11 @@ async fn create_creator(
             PubkyLocalSecretKey::new(keypair.secret_key())
                 .derive_paykit_identity_secret_key(1)
                 .unwrap(),
-            xpub.clone(),
-            account_index,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: xpub.clone().into(),
+                account_index,
+            }),
+            None,
         ))
         .await
         .unwrap();
@@ -744,8 +747,7 @@ async fn assert_persisted_workflow_inputs(
                 && terms.payment_endpoints.len() == 1
                 && terms.payment_endpoints["btc-testnet-p2wpkh"] == expected_payload
                 && terms.metadata.get("bundle_id") == Some(&serde_json::json!(bundle))
-                && terms.metadata.get("lock_resource")
-                    == Some(&serde_json::json!(fixture.lock_resource))
+                && terms.metadata.len() == 1
         );
     }
     assert_eq!(ids.len(), 6, "workflow row identifiers must be distinct");

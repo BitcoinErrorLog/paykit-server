@@ -1,7 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
 use crate::{
-    application::create_invoice::{SessionValidationError, SessionValidator},
+    application::create_invoice::{
+        CreatorReceivingProvider, SessionValidationError, SessionValidator,
+    },
     domain::locks::CreatorPubky,
 };
 
@@ -28,6 +30,8 @@ impl SetupStatus {
 /// Validates whether persisted Creator authority is currently usable.
 pub struct SetupStatusService {
     sessions: Arc<dyn SessionValidator>,
+    receiving: Option<Arc<dyn CreatorReceivingProvider>>,
+    usdt_enabled: bool,
     timeout: Duration,
 }
 
@@ -38,7 +42,51 @@ impl SetupStatusService {
 
     #[doc(hidden)]
     pub fn with_timeout(sessions: Arc<dyn SessionValidator>, timeout: Duration) -> Self {
-        Self { sessions, timeout }
+        Self {
+            sessions,
+            timeout,
+            receiving: None,
+            usdt_enabled: false,
+        }
+    }
+
+    pub fn with_receiving(
+        mut self,
+        receiving: Arc<dyn CreatorReceivingProvider>,
+        usdt_enabled: bool,
+    ) -> Self {
+        self.receiving = Some(receiving);
+        self.usdt_enabled = usdt_enabled;
+        self
+    }
+
+    pub async fn status_for_asset(
+        &self,
+        creator: &CreatorPubky,
+        asset: crate::domain::invoice::CriterionAsset,
+    ) -> SetupStatus {
+        let status = self.status(creator).await;
+        if status != SetupStatus::Ready {
+            return status;
+        }
+        if asset == crate::domain::invoice::CriterionAsset::Usdt && !self.usdt_enabled {
+            return SetupStatus::SetupRequired;
+        }
+        let Some(receiving) = &self.receiving else {
+            return SetupStatus::SetupRequired;
+        };
+        match tokio::time::timeout(self.timeout, receiving.receiving(creator)).await {
+            Ok(Ok(details))
+                if details.bitcoin.is_some() || (self.usdt_enabled && details.usdt.is_some()) =>
+            {
+                SetupStatus::Ready
+            }
+            Ok(Ok(_)) => SetupStatus::SetupRequired,
+            Ok(Err(crate::persistence::PersistenceError::InvalidInput)) => {
+                SetupStatus::SetupRequired
+            }
+            _ => SetupStatus::Unavailable,
+        }
     }
 
     pub async fn status(&self, creator: &CreatorPubky) -> SetupStatus {

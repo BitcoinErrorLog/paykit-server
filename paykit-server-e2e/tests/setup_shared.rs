@@ -54,7 +54,6 @@ impl InvoicePayloadFactory for AccountPayloads<'_> {
         .unwrap();
         Ok(InvoicePayloads {
             payment_request_intent: common::payment_intent(self.0, address.clone()),
-            bitcoin_address: address,
         })
     }
 }
@@ -73,7 +72,7 @@ async fn allocate_invoice(
             lock_resource_binding: binding,
             payment_request_binding: binding,
             invoice_payloads: &AccountPayloads(reader),
-            required_sats: 100,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })
@@ -336,6 +335,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
             network: paykit_server::config::PaykitNetwork::Testnet,
             proposal_acceptance_window: Duration::from_secs(60 * 60),
             payment_window: Duration::from_secs(24 * 60 * 60),
+            conversion_payment_window: std::time::Duration::from_secs(3600),
         },
     );
     let publisher = Arc::new(FailAfterPublication {
@@ -526,8 +526,20 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
     let unchanged = creators.load(&creator).await.unwrap();
     assert!(unchanged.session_secret() == original.session_secret());
     assert_eq!(unchanged.paykit_identity_secret(), &key);
-    assert_eq!(unchanged.xpub(), original.xpub());
-    assert_eq!(creators.load(&creator).await.unwrap().account_index(), 0);
+    assert_eq!(
+        unchanged.bitcoin_account().unwrap().xpub.as_str(),
+        original.bitcoin_account().unwrap().xpub.as_str()
+    );
+    assert_eq!(
+        creators
+            .load(&creator)
+            .await
+            .unwrap()
+            .bitcoin_account()
+            .unwrap()
+            .account_index,
+        0
+    );
     assert!(creators.setup_complete(&creator).await.unwrap());
     assert_eq!(business_rows(&database).await, before_reconnect);
     assert_eq!(
@@ -535,10 +547,20 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         PollResult::Complete
     );
     let refreshed_credentials = creators.load(&creator).await.unwrap();
-    assert_eq!(refreshed_credentials.xpub(), original.xpub());
     assert_eq!(
-        refreshed_credentials.account_index(),
-        original.account_index()
+        refreshed_credentials
+            .bitcoin_account()
+            .unwrap()
+            .xpub
+            .as_str(),
+        original.bitcoin_account().unwrap().xpub.as_str()
+    );
+    assert_eq!(
+        refreshed_credentials
+            .bitcoin_account()
+            .unwrap()
+            .account_index,
+        original.bitcoin_account().unwrap().account_index
     );
     assert_eq!(refreshed_credentials.paykit_identity_secret(), &key);
     assert_eq!(business_rows(&database).await, before_reconnect);
@@ -615,8 +637,14 @@ poll_interval = "1s"
         PollResult::Failed
     );
     let rotated = creators.load(&creator).await.unwrap();
-    assert_eq!(rotated.xpub(), original.xpub());
-    assert_eq!(rotated.account_index(), original.account_index());
+    assert_eq!(
+        rotated.bitcoin_account().unwrap().xpub.as_str(),
+        original.bitcoin_account().unwrap().xpub.as_str()
+    );
+    assert_eq!(
+        rotated.bitcoin_account().unwrap().account_index,
+        original.bitcoin_account().unwrap().account_index
+    );
     assert_eq!(rotated.paykit_identity_secret(), &replacement);
     assert!(creators.setup_complete(&creator).await.unwrap());
     assert_eq!(business_rows(&database).await, before_reconnect);

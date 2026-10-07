@@ -58,35 +58,58 @@ impl InvoiceIdentity {
     }
 }
 
-/// The only supported Locks payment-criterion asset.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct CriterionAsset;
+/// Denominations accepted in a Locks payment criterion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum CriterionAsset {
+    Btc,
+    Usd,
+    Usdt,
+}
 
 impl CriterionAsset {
-    /// Parses the exact accepted asset spelling, `BTC`.
     pub fn parse(value: &str) -> Result<Self, CriterionAssetError> {
-        if value == "BTC" {
-            Ok(Self)
-        } else {
-            Err(CriterionAssetError::UnsupportedAsset)
+        match value {
+            "BTC" => Ok(Self::Btc),
+            "USD" => Ok(Self::Usd),
+            "USDT" => Ok(Self::Usdt),
+            _ => Err(CriterionAssetError::UnsupportedAsset),
         }
     }
 
-    /// Returns the exact supported asset spelling.
-    pub fn as_str(&self) -> &'static str {
-        "BTC"
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Btc => "BTC",
+            Self::Usd => "USD",
+            Self::Usdt => "USDT",
+        }
+    }
+
+    pub fn decimals(self) -> u32 {
+        match self {
+            Self::Btc => 8,
+            Self::Usd => 2,
+            Self::Usdt => 6,
+        }
+    }
+
+    pub fn decimal_amount(self, units: u64) -> String {
+        match self {
+            Self::Usd => format!("{}.{:02}", units / 100, units % 100),
+            Self::Btc => format!("{}.{:08}", units / 100_000_000, units % 100_000_000),
+            Self::Usdt => format!("{}.{:06}", units / 1_000_000, units % 1_000_000),
+        }
     }
 }
 
 /// Error returned when an unsupported criterion asset is supplied.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum CriterionAssetError {
-    /// The asset was not the exact uppercase string `BTC`.
-    #[error("criterion asset must be exact uppercase BTC")]
+    /// The asset is not supported.
+    #[error("criterion asset must be BTC, USD or USDT")]
     UnsupportedAsset,
 }
 
-/// A positive Locks criterion amount expressed in integer satoshis.
+/// A positive Locks criterion amount expressed in integer asset base units.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CriterionAmount(u64);
 
@@ -100,18 +123,18 @@ impl CriterionAmount {
             return Err(CriterionAmountError::NotUnsignedDecimalInteger);
         }
 
-        let sats = value
+        let units = value
             .parse::<u64>()
             .map_err(|_| CriterionAmountError::OutOfRange)?;
-        if sats == 0 {
+        if units == 0 {
             return Err(CriterionAmountError::Zero);
         }
 
-        Ok(Self(sats))
+        Ok(Self(units))
     }
 
-    /// Returns the settlement-authoritative integer satoshi amount.
-    pub fn as_sats(&self) -> u64 {
+    /// Returns the settlement-authoritative integer base-unit amount.
+    pub fn units(&self) -> u64 {
         self.0
     }
 }

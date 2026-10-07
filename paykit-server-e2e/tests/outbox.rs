@@ -5,10 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use paykit_lib::{
-    PaykitAppRegistry, PaymentAmount, PaymentEndpointIdentifier, PaymentEndpointPayload,
-    PaymentReference, PaymentRequestTerms,
-};
+use paykit_lib::PaykitAppRegistry;
 use paykit_sdk::{
     LinkedPeerState, OutboundPrivateMessageStatus, PaykitIdentitySecretKey, PubkyLocalSecretKey,
     PubkyPublicKey, PubkySessionBootstrap, StorageAdapter,
@@ -68,9 +65,32 @@ struct Payloads {
 impl InvoicePayloadFactory for Payloads {
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         let address = format!("outbox-test-address-{child_index}");
+        let base = common::payment_intent(&self.reader, address);
+        let mut terms = base.terms().unwrap().clone();
+        terms.rates = vec![paykit_lib::ConversionRate {
+            asset: "usdt".into(),
+            value: "81000".into(),
+        }];
+        terms
+            .accepted_endpoint_identifiers
+            .push("usdt-arbitrum-address".into());
+        terms.payment_endpoints.insert(
+            "usdt-arbitrum-address".into(),
+            paykit_server::domain::receiving::UsdtAddress::try_from(
+                "0x2222222222222222222222222222222222222222".to_owned(),
+            )
+            .unwrap()
+            .endpoint()
+            .to_string(),
+        );
         Ok(InvoicePayloads {
-            payment_request_intent: common::payment_intent(&self.reader, address.clone()),
-            bitcoin_address: address,
+            payment_request_intent:
+                paykit_server::application::semantic_intent::DeliveryIntentV1::payment_request(
+                    self.reader.to_string(),
+                    common::app_id(),
+                    &terms.to_sdk().unwrap(),
+                )
+                .unwrap(),
         })
     }
 }
@@ -186,8 +206,11 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
             creator.clone(),
             "session-secret".into(),
             PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
-            "xpub-secret".into(),
-            0,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: "xpub-secret".to_owned().into(),
+                account_index: 0,
+            }),
+            None,
         ))
         .await
         .unwrap();
@@ -202,7 +225,7 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
             lock_resource_binding: b"outbox-lock",
             payment_request_binding: b"outbox-payment-request",
             invoice_payloads: &payloads,
-            required_sats: 100,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })
@@ -224,7 +247,7 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
             .unwrap()
             .payment_endpoints
             .len(),
-        1
+        2
     );
     let retry_adapter = ReconciliationAdapter {
         statuses: Mutex::new(VecDeque::new()),
@@ -343,7 +366,7 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
             .unwrap()
             .payment_endpoints
             .len(),
-        1
+        2
     );
     let ids: (String, Option<String>, Option<String>) = sqlx::query_as(
         "SELECT sdk_outbound_message_id, sdk_event_id, sdk_payment_request_id FROM outbox WHERE id = $1",
@@ -575,8 +598,11 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             PubkyLocalSecretKey::new(creator_keypair.secret_key())
                 .derive_paykit_identity_secret_key(1)
                 .unwrap(),
-            "unused-test-xpub".into(),
-            0,
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: "unused-test-xpub".to_owned().into(),
+                account_index: 0,
+            }),
+            None,
         ))
         .await
         .unwrap();
@@ -636,7 +662,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             invoice_payloads: &Payloads {
                 reader: reader.clone(),
             },
-            required_sats: 100,
+
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
         })
@@ -651,35 +677,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         .unwrap();
     assert_eq!(first_claim.id(), invoice.payment_request_outbox_id());
     let intent = outbox.delivery_intent(&first_claim).unwrap();
-    let terms = intent.terms().unwrap();
-    let terms = PaymentRequestTerms::builder(
-        PaymentAmount::new(terms.amount.clone(), terms.asset.clone()).unwrap(),
-        PaymentReference::new(terms.payment_reference.clone()).unwrap(),
-        terms
-            .accepted_endpoint_identifiers
-            .iter()
-            .cloned()
-            .map(PaymentEndpointIdentifier::new)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap(),
-    )
-    .required_app_id(Some(common::app_id()))
-    .payment_endpoints(Some(
-        terms
-            .payment_endpoints
-            .iter()
-            .map(|(identifier, payload)| {
-                (
-                    PaymentEndpointIdentifier::new(identifier.clone()).unwrap(),
-                    PaymentEndpointPayload::new(payload.clone()),
-                )
-            })
-            .collect(),
-    ))
-    .proposal_expires_at(terms.proposal_expires_at.clone())
-    .metadata(terms.metadata.clone())
-    .build()
-    .unwrap();
+    let terms = intent.terms().unwrap().to_sdk().unwrap();
 
     let first = creator_sdk
         .propose_payment_request(peer_bootstrap.public_key.clone(), terms.clone())
@@ -809,6 +807,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         network: PaykitNetwork::Testnet,
         proposal_acceptance_window: Duration::from_secs(60 * 60),
         payment_window: Duration::from_secs(24 * 60 * 60),
+        conversion_payment_window: std::time::Duration::from_secs(3600),
     };
     let sessions = CreatorSessions::new(creators.clone(), testnet.sdk().unwrap(), config.clone());
     let provider = sessions.provider(&creator);
@@ -920,9 +919,22 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             paykit_sdk::PrivatePaymentResolutionStatus::Payable
         );
         assert_eq!(resolution.private_payment_list_version, None);
+        assert_eq!(resolution.payable_endpoints.len(), 2);
+        for endpoint in resolution.payable_endpoints {
+            assert!(
+                intent
+                    .terms()
+                    .unwrap()
+                    .payment_endpoints
+                    .values()
+                    .any(|payload| payload == &endpoint.target.payload)
+            );
+        }
         assert_eq!(
-            resolution.payable_endpoints[0].target.payload,
-            intent.terms().unwrap().payment_endpoints["btc-bitcoin-p2wpkh"]
+            request.terms.unwrap().conversion,
+            Some(paykit_lib::PaymentConversion::Fixed {
+                rates: intent.terms().unwrap().rates.clone()
+            })
         );
     }
 

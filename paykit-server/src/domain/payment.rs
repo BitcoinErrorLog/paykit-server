@@ -183,7 +183,7 @@ impl PaymentBinding {
     /// Creates an unobserved payment binding for an invoice amount.
     pub fn undetected(invoice_amount: CriterionAmount) -> Self {
         Self {
-            invoice_sats: invoice_amount.as_sats(),
+            invoice_sats: invoice_amount.units(),
             observed_sats: None,
             confirmations: 0,
         }
@@ -198,9 +198,9 @@ impl PaymentBinding {
         observed_sats: u64,
         confirmations: u32,
     ) -> Self {
-        let amount_matched = observed_sats >= invoice_amount.as_sats();
+        let amount_matched = observed_sats >= invoice_amount.units();
         Self {
-            invoice_sats: invoice_amount.as_sats(),
+            invoice_sats: invoice_amount.units(),
             observed_sats: Some(observed_sats),
             confirmations: if amount_matched {
                 confirmations.min(6)

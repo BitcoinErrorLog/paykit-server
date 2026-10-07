@@ -34,6 +34,8 @@ app_id = "paykit-server"
 # complete before payment_window, measured from same invoice creation instant.
 proposal_acceptance_window = "1h"
 payment_window = "24h"
+# BTC conversion quotes expire sooner. Acceptance is capped at half this window.
+conversion_payment_window = "1h"
 # "testnet" targets the pinned Pubky client's fixed localhost testnet ports.
 # Run the Pubky static testnet; this is not a hosted public network.
 network = "testnet"
@@ -72,3 +74,8 @@ max_completion_polls = 200
 
 [shutdown]
 drain_timeout = "30s"
+
+# Optional direct Arbitrum One USDT0 receiving and receipt verification.
+# Keep provider credentials in the operator-owned config, never in client URLs.
+# [usdt]
+# rpc_url = "https://your-arbitrum-rpc.example/"

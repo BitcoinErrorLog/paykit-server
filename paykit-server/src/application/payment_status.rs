@@ -1,4 +1,4 @@
-//! Read-only payment status lookup backed only by durable invoice facts.
+//! Read-only Bitcoin status lookup backed only by durable invoice facts.
 
 use std::sync::Arc;
 
@@ -43,7 +43,7 @@ impl StatusRepository for InvoiceStore {
     }
 }
 
-/// The exact, secret-free Locks-facing status response.
+/// The secret-free Bitcoin observation response. Request settlement uses the per-rail status API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaymentStatusResponse {
     status: &'static str,

@@ -28,6 +28,7 @@ pub struct Config {
     pub setup: SetupConfig,
     pub paykit: PaykitConfig,
     pub electrum: ElectrumConfig,
+    pub usdt: Option<UsdtConfig>,
     pub outbox: OutboxConfig,
     pub limits: LimitsConfig,
     pub rate_limits: RateLimitsConfig,
@@ -86,6 +87,7 @@ impl Config {
                 network: PaykitNetwork::parse(&raw.paykit.network)?,
                 proposal_acceptance_window: raw.paykit.proposal_acceptance_window,
                 payment_window: raw.paykit.payment_window,
+                conversion_payment_window: raw.paykit.conversion_payment_window,
             },
             electrum: ElectrumConfig {
                 endpoint: electrum_endpoint,
@@ -93,6 +95,7 @@ impl Config {
                 request_timeout: raw.electrum.request_timeout,
                 connect_retries: raw.electrum.connect_retries,
             },
+            usdt: raw.usdt.map(UsdtConfig::try_from).transpose()?,
             outbox: OutboxConfig::from(raw.outbox),
             limits: LimitsConfig::from(raw.limits),
             rate_limits: RateLimitsConfig::from(raw.rate_limits),
@@ -186,7 +189,9 @@ impl Config {
         if self.outbox.retry_initial > self.outbox.retry_max {
             return Err(ConfigError::InconsistentRetries("outbox"));
         }
-        if self.paykit.proposal_acceptance_window.is_zero()
+        if self.paykit.conversion_payment_window.as_secs() < 2
+            || self.paykit.conversion_payment_window.subsec_nanos() != 0
+            || self.paykit.proposal_acceptance_window.is_zero()
             || self.paykit.proposal_acceptance_window.subsec_nanos() != 0
             || self.paykit.payment_window.subsec_nanos() != 0
             || self.paykit.proposal_acceptance_window >= self.paykit.payment_window
@@ -358,6 +363,46 @@ pub struct SetupConfig {
     pub log_authorization_url: bool,
 }
 
+/// Optional direct Arbitrum USDT observation and receiving permissions.
+#[derive(Clone)]
+pub struct UsdtConfig {
+    pub rpc_url: Url,
+}
+
+impl fmt::Debug for UsdtConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UsdtConfig")
+            .field("rpc_url", &"<redacted>")
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawUsdtConfig {
+    rpc_url: String,
+}
+
+impl TryFrom<RawUsdtConfig> for UsdtConfig {
+    type Error = ConfigError;
+    fn try_from(value: RawUsdtConfig) -> Result<Self, Self::Error> {
+        let rpc_url = Url::parse(&value.rpc_url).map_err(|_| ConfigError::InvalidUsdtRpc)?;
+        let local = matches!(
+            rpc_url.host_str(),
+            Some("localhost" | "127.0.0.1" | "[::1]")
+        );
+        if (rpc_url.scheme() != "https" && !(local && rpc_url.scheme() == "http"))
+            || rpc_url.host_str().is_none()
+            || rpc_url.fragment().is_some()
+            || !rpc_url.username().is_empty()
+            || rpc_url.password().is_some()
+        {
+            return Err(ConfigError::InvalidUsdtRpc);
+        }
+        Ok(Self { rpc_url })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PaykitConfig {
     pub client_id: ClientId,
@@ -365,6 +410,7 @@ pub struct PaykitConfig {
     pub network: PaykitNetwork,
     pub proposal_acceptance_window: Duration,
     pub payment_window: Duration,
+    pub conversion_payment_window: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -514,6 +560,8 @@ impl fmt::Debug for ElectrumEndpoint {
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("invalid Arbitrum RPC configuration")]
+    InvalidUsdtRpc,
     #[error("configuration TOML is invalid")]
     Toml,
     #[error("PAYKIT_DATABASE_URL is required")]
@@ -558,7 +606,9 @@ pub enum ConfigError {
     EmptyReceiverPathPriority,
     #[error("paykit.receiver_path_priority must not contain duplicates")]
     DuplicateReceiverPathPriority,
-    #[error("paykit proposal acceptance window must be positive and shorter than payment window")]
+    #[error(
+        "paykit windows must use whole seconds; acceptance must be positive and shorter than payment, and conversion must be at least two seconds"
+    )]
     InvalidInvoiceWindows,
     #[error("{0} must be greater than zero")]
     ZeroDuration(&'static str),
@@ -649,6 +699,7 @@ struct RawConfig {
     paykit: RawPaykitConfig,
     bitcoin: RawBitcoinConfig,
     electrum: RawElectrumConfig,
+    usdt: Option<RawUsdtConfig>,
     outbox: RawOutboxConfig,
     #[serde(default)]
     limits: RawLimitsConfig,
@@ -693,6 +744,11 @@ struct RawPaykitConfig {
     proposal_acceptance_window: Duration,
     #[serde(default = "default_payment_window", with = "humantime_serde")]
     payment_window: Duration,
+    #[serde(
+        default = "default_proposal_acceptance_window",
+        with = "humantime_serde"
+    )]
+    conversion_payment_window: Duration,
 }
 
 const fn default_proposal_acceptance_window() -> Duration {

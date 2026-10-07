@@ -179,3 +179,49 @@ async fn status_route_requires_pinned_locks_signature_and_closed_canonical_body(
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }
+
+#[tokio::test]
+async fn asset_readiness_requires_the_optional_receiving_permission() {
+    use paykit_server::application::create_invoice::{CreatorReceivingProvider, ReceivingDetails};
+    use paykit_server::domain::{
+        invoice::CriterionAsset, locks::parse_creator, receiving::UsdtAddress,
+    };
+    use paykit_server::persistence::PersistenceError;
+    struct Receiving(bool);
+    #[async_trait]
+    impl CreatorReceivingProvider for Receiving {
+        async fn receiving(
+            &self,
+            _creator: &CreatorPubky,
+        ) -> Result<ReceivingDetails, PersistenceError> {
+            if self.0 {
+                Ok(ReceivingDetails {
+                    bitcoin: None,
+                    usdt: Some(
+                        UsdtAddress::try_from(
+                            "0x2222222222222222222222222222222222222222".to_owned(),
+                        )
+                        .unwrap(),
+                    ),
+                })
+            } else {
+                Err(PersistenceError::InvalidInput)
+            }
+        }
+    }
+    for (enabled, approved, expected) in [
+        (false, true, SetupStatus::SetupRequired),
+        (true, false, SetupStatus::SetupRequired),
+        (true, true, SetupStatus::Ready),
+    ] {
+        let sut = SetupStatusService::new(Arc::new(FakeSessionValidator {
+            result: Mutex::new(Some(Ok(()))),
+        }))
+        .with_receiving(Arc::new(Receiving(approved)), enabled);
+        assert_eq!(
+            sut.status_for_asset(&parse_creator(CREATOR).unwrap(), CriterionAsset::Usdt)
+                .await,
+            expected
+        );
+    }
+}

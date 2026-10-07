@@ -377,34 +377,63 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                 self.creators.load_optional(&self.creator).await,
                 persistence_failure_class,
             )?;
-            // Account binding comes only from initial setup, never a reconnect payload.
-            let (xpub, account_index, key) = match (self.reconnect, claim, existing.as_ref()) {
-                (false, VerifiedCompanionClaim::Setup(claim), None) => (
-                    stage_result(
-                        SetupStage::XpubValidate,
-                        validate_xpub(
-                            &claim.serialized_xpub,
-                            claim.account_index,
-                            &self.bitcoin_network,
-                        ),
-                        claim_failure_class,
-                    )?,
-                    claim.account_index,
-                    claim.paykit_identity_secret_key,
-                ),
-                (true, VerifiedCompanionClaim::Reconnect(key), Some(existing)) => {
-                    (existing.xpub().to_owned(), existing.account_index(), key)
-                }
-                _ => return Err(ClaimError::InvalidPayload),
-            };
+            // Reconnect preserves Bitcoin derivation and can add an optional USDT address.
+            let (bitcoin_account, usdt_address, key) =
+                match (self.reconnect, claim, existing.as_ref()) {
+                    (false, VerifiedCompanionClaim::Setup(claim), None) => {
+                        let account = claim
+                            .bitcoin_account
+                            .map(|account| {
+                                let xpub = stage_result(
+                                    SetupStage::XpubValidate,
+                                    validate_xpub(
+                                        &account.serialized_xpub,
+                                        account.account_index,
+                                        &self.bitcoin_network,
+                                    ),
+                                    claim_failure_class,
+                                )?;
+                                Ok(crate::domain::receiving::BitcoinAccount {
+                                    xpub: Zeroizing::new(xpub),
+                                    account_index: account.account_index,
+                                })
+                            })
+                            .transpose()?;
+                        (
+                            account,
+                            claim.usdt_address,
+                            claim.paykit_identity_secret_key,
+                        )
+                    }
+                    (true, VerifiedCompanionClaim::Setup(claim), Some(existing))
+                        if claim.bitcoin_account.is_none() =>
+                    {
+                        (
+                            existing.bitcoin_account().cloned(),
+                            claim
+                                .usdt_address
+                                .or_else(|| existing.usdt_address().cloned()),
+                            claim.paykit_identity_secret_key,
+                        )
+                    }
+                    (true, VerifiedCompanionClaim::Reconnect(key), Some(existing)) => (
+                        existing.bitcoin_account().cloned(),
+                        existing.usdt_address().cloned(),
+                        key,
+                    ),
+                    _ => return Err(ClaimError::InvalidPayload),
+                };
+            if bitcoin_account.is_none() && usdt_address.is_none() {
+                return Err(ClaimError::InvalidPayload);
+            }
             let mut access = self.access.clone();
             access.paykit_identity_secret_key = Some(key.clone());
             let credentials = CreatorCredentials::new(
                 self.creator.clone(),
                 self.session_secret.to_string(),
                 key,
-                xpub,
-                account_index,
+                bitcoin_account,
+                usdt_address,
             );
             if let Some(existing) = &existing {
                 existing

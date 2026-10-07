@@ -22,7 +22,9 @@ pub const WATCH_ONLY_ACCOUNT_CLAIM: &str = "watch-only-account-v1";
 pub const LOCAL_DEMO_CAPABILITIES: &str = PAYKIT_SESSION_CAPABILITIES;
 pub const UNSIGNED_PAYLOAD_LEN: usize = 124;
 pub const RECONNECT_PAYLOAD_LEN: usize = 41;
+pub const USDT_ADDRESS_CLAIM: &str = "usdt-address-v1";
 const NONCE_LEN: usize = 24;
+const MAX_PAYLOAD_LEN: usize = 2048;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct AuthRequest {
@@ -54,14 +56,18 @@ impl AuthRequest {
     }
 }
 
-/// Both permissions required by server setup, decoded from one signed companion payload.
+/// Receiving details and delegated Paykit access approved by the creator.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SetupCompanionClaim {
-    pub account_index: u32,
-    /// Exact serialized 78-byte BIP account xpub. It is kept binary until the
-    /// configured Bitcoin-network validator turns it into a persisted form.
-    pub serialized_xpub: [u8; 78],
+    pub bitcoin_account: Option<ClaimBitcoinAccount>,
     pub paykit_identity_secret_key: PaykitIdentitySecretKey,
+    pub usdt_address: Option<crate::domain::receiving::UsdtAddress>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimBitcoinAccount {
+    pub account_index: u32,
+    pub serialized_xpub: [u8; 78],
 }
 
 /// Verified authority for an initial account binding or an explicit reconnect.
@@ -122,7 +128,9 @@ fn parse_request(
     let auth = parse_pubky_auth_url(value).map_err(|_| ClaimError::InvalidAuthRequest)?;
     let claim_type = unique_query(&url, QUERY_PARAMETER)?;
     if reconnect {
-        if claim_type != PAYKIT_ACCESS_CLAIM {
+        if claim_type != PAYKIT_ACCESS_CLAIM
+            && claim_type != format!("{PAYKIT_ACCESS_CLAIM}.{USDT_ADDRESS_CLAIM}")
+        {
             return Err(ClaimError::InvalidAuthRequest);
         }
     } else {
@@ -157,15 +165,17 @@ fn parse_request(
 fn validate_setup_claim_selection(value: &str) -> Result<(), ClaimError> {
     let mut paykit_access = false;
     let mut watch_only_account = false;
+    let mut usdt_address = false;
     for item in value.split('.') {
         match item {
             PAYKIT_ACCESS_CLAIM if !paykit_access => paykit_access = true,
             WATCH_ONLY_ACCOUNT_CLAIM if !watch_only_account => watch_only_account = true,
+            USDT_ADDRESS_CLAIM if !usdt_address => usdt_address = true,
             _ => return Err(ClaimError::InvalidAuthRequest),
         }
     }
     // Single-permission selections are valid in Bitkit, but cannot authorize server setup.
-    if !paykit_access || !watch_only_account {
+    if !paykit_access || !(watch_only_account || usdt_address) {
         return Err(ClaimError::InvalidAuthRequest);
     }
     Ok(())
@@ -222,9 +232,12 @@ pub fn parse_unsigned_payload(value: &[u8]) -> Result<SetupCompanionClaim, Claim
         PaykitIdentitySecretKey::new(value[92..].try_into().expect("checked length"), generation)
             .map_err(|_| ClaimError::InvalidPayload)?;
     Ok(SetupCompanionClaim {
-        account_index,
-        serialized_xpub,
+        bitcoin_account: Some(ClaimBitcoinAccount {
+            account_index,
+            serialized_xpub,
+        }),
         paykit_identity_secret_key,
+        usdt_address: None,
     })
 }
 
@@ -237,8 +250,16 @@ pub fn decrypt_and_verify(
     creator: &VerifyingKey,
 ) -> Result<SetupCompanionClaim, ClaimError> {
     validate_setup_claim_selection(request.claim_type())?;
-    let plaintext = verify_envelope(relay_body, request, creator, UNSIGNED_PAYLOAD_LEN)?;
-    parse_unsigned_payload(&plaintext)
+    let plaintext = verify_envelope(relay_body, request, creator)?;
+    if request
+        .claim_type()
+        .split('.')
+        .any(|item| item == USDT_ADDRESS_CLAIM)
+    {
+        parse_receiving_payload(&plaintext, request)
+    } else {
+        parse_unsigned_payload(&plaintext)
+    }
 }
 
 /// Verifies the exact 41-byte Paykit-only reconnect payload against its AUTH identity.
@@ -250,8 +271,8 @@ pub fn decrypt_and_verify_reconnect(
     if request.claim_type() != PAYKIT_ACCESS_CLAIM {
         return Err(ClaimError::InvalidAuthRequest);
     }
-    let payload = verify_envelope(relay_body, request, creator, RECONNECT_PAYLOAD_LEN)?;
-    if payload[0] != 1 {
+    let payload = verify_envelope(relay_body, request, creator)?;
+    if payload.len() != RECONNECT_PAYLOAD_LEN || payload[0] != 1 {
         return Err(ClaimError::InvalidPayload);
     }
     let generation = u64::from_be_bytes(payload[1..9].try_into().expect("checked length"));
@@ -259,13 +280,100 @@ pub fn decrypt_and_verify_reconnect(
         .map_err(|_| ClaimError::InvalidPayload)
 }
 
+/// The USDT permission uses named fields so declining it is an authenticated omission.
+fn parse_receiving_payload(
+    value: &[u8],
+    request: &AuthRequest,
+) -> Result<SetupCompanionClaim, ClaimError> {
+    use crate::domain::receiving::{USDT_CHAIN_ID, USDT_TOKEN, UsdtAddress};
+    use std::str::FromStr;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Payload {
+        paykit_access: Access,
+        bitcoin_account: Option<Account>,
+        #[serde(rename = "usdt-arbitrum-address")]
+        usdt: Option<Endpoint>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Access {
+        key_generation: u64,
+        secret: Zeroizing<String>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Account {
+        account_index: u32,
+        address_type: String,
+        xpub: Zeroizing<String>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Endpoint {
+        value: String,
+        chain_id: String,
+        token: String,
+    }
+    let payload: Payload = serde_json::from_slice(value).map_err(|_| ClaimError::InvalidPayload)?;
+    let includes_bitcoin = request
+        .claim_type()
+        .split('.')
+        .any(|item| item == WATCH_ONLY_ACCOUNT_CLAIM);
+    if payload.bitcoin_account.is_some() != includes_bitcoin {
+        return Err(ClaimError::InvalidPayload);
+    }
+    let bitcoin_account = match payload.bitcoin_account {
+        Some(account) => {
+            if account.address_type != "nativeSegwit" || account.account_index >= 1 << 31 {
+                return Err(ClaimError::InvalidPayload);
+            }
+            let xpub = bitcoin::bip32::Xpub::from_str(&account.xpub)
+                .map_err(|_| ClaimError::InvalidPayload)?;
+            Some(ClaimBitcoinAccount {
+                account_index: account.account_index,
+                serialized_xpub: xpub.encode(),
+            })
+        }
+        None => None,
+    };
+    let usdt_address = payload
+        .usdt
+        .map(|endpoint| {
+            if endpoint.chain_id != USDT_CHAIN_ID
+                || !endpoint.token.eq_ignore_ascii_case(USDT_TOKEN)
+            {
+                return Err(ClaimError::InvalidPayload);
+            }
+            UsdtAddress::try_from(endpoint.value).map_err(|_| ClaimError::InvalidPayload)
+        })
+        .transpose()?;
+    let secret = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(payload.paykit_access.secret.as_bytes())
+            .map_err(|_| ClaimError::InvalidPayload)?,
+    );
+    let key = secret
+        .as_slice()
+        .try_into()
+        .map_err(|_| ClaimError::InvalidPayload)?;
+    Ok(SetupCompanionClaim {
+        bitcoin_account,
+        usdt_address,
+        paykit_identity_secret_key: PaykitIdentitySecretKey::new(
+            key,
+            payload.paykit_access.key_generation,
+        )
+        .map_err(|_| ClaimError::InvalidPayload)?,
+    })
+}
+
 fn verify_envelope(
     relay_body: &[u8],
     request: &AuthRequest,
     creator: &VerifyingKey,
-    unsigned_len: usize,
 ) -> Result<Zeroizing<Vec<u8>>, ClaimError> {
-    if relay_body.len() < NONCE_LEN + 16 {
+    if !(NONCE_LEN + 16 + 64..=NONCE_LEN + 16 + MAX_PAYLOAD_LEN + 64).contains(&relay_body.len()) {
         return Err(ClaimError::InvalidEnvelope);
     }
     let cipher = XSalsa20Poly1305::new(request.secret().into());
@@ -274,9 +382,10 @@ fn verify_envelope(
             .decrypt((&relay_body[..NONCE_LEN]).into(), &relay_body[NONCE_LEN..])
             .map_err(|_| ClaimError::AuthenticationFailed)?,
     );
-    if plaintext.len() != unsigned_len + 64 {
-        return Err(ClaimError::InvalidEnvelope);
-    }
+    let unsigned_len = plaintext
+        .len()
+        .checked_sub(64)
+        .ok_or(ClaimError::InvalidEnvelope)?;
     let signature = Signature::from_slice(&plaintext[unsigned_len..])
         .map_err(|_| ClaimError::InvalidEnvelope)?;
     let mut signable = Zeroizing::new(Vec::with_capacity(
@@ -296,6 +405,68 @@ mod tests {
     use super::*;
     use crypto_secretbox::aead::Aead;
     use ed25519_dalek::{Signer, SigningKey};
+
+    #[test]
+    fn optional_usdt_is_authenticated_and_bound_to_the_requested_permissions() {
+        let secret = [7; 32];
+        let signer = SigningKey::from_bytes(&[5; 32]);
+        let selection = format!("{PAYKIT_ACCESS_CLAIM}.{USDT_ADDRESS_CLAIM}");
+        let request = parse_auth_request(
+            &auth_with_selection(&secret, &selection),
+            LOCAL_DEMO_CAPABILITIES,
+        )
+        .unwrap();
+        // The same JSON key material is asserted by both mobile claim codecs.
+        let mut payload = serde_json::json!({"paykit_access":{"key_generation":3,"secret":"CwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCwsLCws"}});
+        for share in [false, true] {
+            if share {
+                payload["usdt-arbitrum-address"] = serde_json::json!({
+                "value":"0x1111111111111111111111111111111111111111", "chain_id":"42161",
+                "token":crate::domain::receiving::USDT_TOKEN});
+            }
+            let body = signed_envelope(
+                &secret,
+                &secret,
+                &signer,
+                QUERY_PARAMETER,
+                &selection,
+                &serde_json::to_vec(&payload).unwrap(),
+            );
+            let claim = decrypt_and_verify(&body, &request, &signer.verifying_key()).unwrap();
+            assert_eq!(claim.usdt_address.is_some(), share);
+            assert!(claim.bitcoin_account.is_none());
+            assert_eq!(
+                claim.paykit_identity_secret_key,
+                PaykitIdentitySecretKey::new([11; 32], 3).unwrap()
+            );
+        }
+        payload["usdt-arbitrum-address"]["chain_id"] = "1".into();
+        let body = signed_envelope(
+            &secret,
+            &secret,
+            &signer,
+            QUERY_PARAMETER,
+            &selection,
+            &serde_json::to_vec(&payload).unwrap(),
+        );
+        assert_eq!(
+            decrypt_and_verify(&body, &request, &signer.verifying_key()),
+            Err(ClaimError::InvalidPayload)
+        );
+        let bitcoin_request = request_for_optional_bitcoin(&secret);
+        assert!(decrypt_and_verify(&body, &bitcoin_request, &signer.verifying_key()).is_err());
+    }
+
+    fn request_for_optional_bitcoin(secret: &[u8; 32]) -> AuthRequest {
+        parse_auth_request(
+            &auth_with_selection(
+                secret,
+                &format!("{}.{USDT_ADDRESS_CLAIM}", setup_claim_selection()),
+            ),
+            LOCAL_DEMO_CAPABILITIES,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn reconnect_verifies_only_paykit_access_and_binds_the_authorizer() {
@@ -536,8 +707,11 @@ mod tests {
                 &unsigned(),
             );
             let claim = decrypt_and_verify(&body, &parsed, &key.verifying_key()).unwrap();
-            assert_eq!(claim.account_index, 7);
-            assert_eq!(claim.serialized_xpub, [9; 78]);
+            assert_eq!(claim.bitcoin_account.as_ref().unwrap().account_index, 7);
+            assert_eq!(
+                claim.bitcoin_account.as_ref().unwrap().serialized_xpub,
+                [9; 78]
+            );
             assert_eq!(
                 claim.paykit_identity_secret_key,
                 PaykitIdentitySecretKey::new([11; 32], 3).unwrap()
@@ -592,7 +766,7 @@ mod tests {
             );
             assert_eq!(
                 decrypt_and_verify(&body, &request(&secret), &key.verifying_key()),
-                Err(ClaimError::InvalidEnvelope)
+                Err(ClaimError::InvalidPayload)
             );
         }
     }
@@ -716,8 +890,14 @@ mod tests {
             expected
         );
         let decoded = parse_unsigned_payload(&expected).unwrap();
-        assert_eq!(decoded.account_index, fixture.account_index);
-        assert_eq!(decoded.serialized_xpub, xpub);
+        assert_eq!(
+            decoded.bitcoin_account.as_ref().unwrap().account_index,
+            fixture.account_index
+        );
+        assert_eq!(
+            decoded.bitcoin_account.as_ref().unwrap().serialized_xpub,
+            xpub
+        );
         assert_eq!(decoded.paykit_identity_secret_key, key);
         assert!(format!("{decoded:?}").contains("<redacted>"));
         assert!(!format!("{decoded:?}").contains("11, 11"));

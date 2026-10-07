@@ -101,8 +101,8 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
     assert_eq!(status.payment_state(), PaymentState::Confirmed);
     assert_eq!(status.invoice_created_at(), created_at);
     assert_eq!(status.payment_deadline(), deadline);
-    assert_eq!(status.confirmations(), 3);
-    assert!(status.amount_matched());
+    assert_eq!(status.bitcoin().unwrap().confirmations, 3);
+    assert!(status.bitcoin().unwrap().amount_matched);
     assert_confirmed_payment(&store, &creator, &bundle).await;
 
     let tied_at = created_at + time::Duration::seconds(1);
@@ -192,8 +192,8 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
         .unwrap()
         .unwrap();
     assert_eq!(tied.request_state(), PaymentRequestLifecycleState::Rejected);
-    assert_eq!(tied.confirmations(), 3);
-    assert!(tied.amount_matched());
+    assert_eq!(tied.bitcoin().unwrap().confirmations, 3);
+    assert!(tied.bitcoin().unwrap().amount_matched);
     assert_confirmed_payment(&store, &creator, &bundle).await;
 
     sqlx::query(
@@ -217,8 +217,8 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
         rejected_undetected.payment_state(),
         PaymentState::Undetected
     );
-    assert_eq!(rejected_undetected.confirmations(), 0);
-    assert!(!rejected_undetected.amount_matched());
+    assert!(rejected_undetected.bitcoin().is_none());
+    assert!(rejected_undetected.usdt_arbitrum().is_none());
     assert_eq!(
         store.payment_status(&creator, &bundle).await.unwrap(),
         Some(PersistedPaymentStatus::Undetected)
@@ -250,8 +250,8 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
         PaymentRequestLifecycleState::Canceled
     );
     assert_eq!(canceled.payment_state(), PaymentState::Confirmed);
-    assert_eq!(canceled.confirmations(), 3);
-    assert!(canceled.amount_matched());
+    assert_eq!(canceled.bitcoin().unwrap().confirmations, 3);
+    assert!(canceled.bitcoin().unwrap().amount_matched);
     assert_confirmed_payment(&store, &creator, &bundle).await;
 
     sqlx::query(
@@ -286,8 +286,8 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
         .unwrap()
         .unwrap();
     assert_eq!(expired.payment_state(), PaymentState::Expired);
-    assert_eq!(expired.confirmations(), 3);
-    assert!(expired.amount_matched());
+    assert_eq!(expired.bitcoin().unwrap().confirmations, 3);
+    assert!(expired.bitcoin().unwrap().amount_matched);
     assert_eq!(
         expired.request_state(),
         PaymentRequestLifecycleState::Rejected
@@ -321,8 +321,8 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
         PaymentRequestLifecycleState::Accepted
     );
     assert_eq!(accepted_expired.payment_state(), PaymentState::Expired);
-    assert_eq!(accepted_expired.confirmations(), 3);
-    assert!(accepted_expired.amount_matched());
+    assert_eq!(accepted_expired.bitcoin().unwrap().confirmations, 3);
+    assert!(accepted_expired.bitcoin().unwrap().amount_matched);
     assert_confirmed_payment(&store, &creator, &bundle).await;
 
     sqlx::query(
@@ -343,8 +343,8 @@ async fn per_bundle_status_joins_canonical_lifecycle_and_payment_facts() {
         PaymentRequestLifecycleState::ProposalExpired
     );
     assert_eq!(proposal_expired.payment_state(), PaymentState::Expired);
-    assert_eq!(proposal_expired.confirmations(), 3);
-    assert!(proposal_expired.amount_matched());
+    assert_eq!(proposal_expired.bitcoin().unwrap().confirmations, 3);
+    assert!(proposal_expired.bitcoin().unwrap().amount_matched);
     assert_confirmed_payment(&store, &creator, &bundle).await;
 
     let absent = PaymentRequestStatusOperations::lookup(

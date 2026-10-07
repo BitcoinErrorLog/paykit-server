@@ -5,13 +5,14 @@ use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
 use uuid::Uuid;
 
-const REQUIRED_TABLES: [&str; 6] = [
+const REQUIRED_TABLES: [&str; 7] = [
     "deployment_metadata",
     "creators",
     "reader_assignments",
     "invoices",
     "outbox",
     "bitcoin_observations",
+    "usdt_observations",
 ];
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
@@ -54,7 +55,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=8).collect::<Vec<_>>());
+    assert_eq!(applied_versions, (1..=9).collect::<Vec<_>>());
 
     let plaintext_creator_pubky_columns: Vec<String> = sqlx::query_scalar(
         "SELECT table_name \
@@ -74,7 +75,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
          FROM information_schema.columns
          WHERE table_schema = 'public'
            AND column_name IN
-               ('derivation_index', 'bitcoin_address', 'required_sats', 'outpoint',
+               ('derivation_index', 'bitcoin_address', 'required_amount', 'outpoint',
                 'observed_sats', 'bound_outpoint_lookup_hash')
          ORDER BY table_name, column_name",
     )
@@ -90,7 +91,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
          FROM information_schema.columns
          WHERE table_schema = 'public'
            AND column_name IN
-               ('payment_record_envelope', 'bitcoin_address_lookup_hash',
+               ('payment_record_envelope',
                 'derivation_index_lookup_hash',
                 'observation_envelope', 'outpoint_lookup_hash',
                 'reader_lookup_hash', 'bundle_lookup_hash')
