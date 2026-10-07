@@ -196,7 +196,8 @@ impl Server {
                 max_pending_setup_flows: config.rate_limits.max_pending_setup_flows(),
             },
             config.setup.log_authorization_url,
-        );
+        )
+        .with_bitcoin_network(config.deployment_invariants().bitcoin_network.clone());
 
         let session_validator = Arc::new(CreatorSessionValidator {
             creators: creators.clone(),

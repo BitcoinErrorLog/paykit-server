@@ -9,7 +9,9 @@ use axum::{
 use qrcode::{QrCode, render::svg};
 use serde_json::json;
 use std::net::SocketAddr;
+use url::Url;
 
+use crate::config::BitcoinNetwork;
 use crate::domain::locks::{CreatorPubky, parse_creator};
 use crate::http::client_ip::client_ip;
 use crate::setup::{BeginError, PollResult, SetupService, StartedFlow};
@@ -54,7 +56,10 @@ async fn begin(
         return invalid_request();
     };
     let client = client_ip(peer, &headers, trusted_proxy_hops);
-    response_for_begin(service.begin(client, &return_to, &state).await)
+    response_for_begin(
+        service.begin(client, &return_to, &state).await,
+        service.bitcoin_network(),
+    )
 }
 
 async fn reconnect(
@@ -74,12 +79,16 @@ async fn reconnect(
         service
             .begin_reconnect(client, &return_to, &state, &creator)
             .await,
+        service.bitcoin_network(),
     )
 }
 
-fn response_for_begin(result: Result<StartedFlow, BeginError>) -> Response<Body> {
+fn response_for_begin(
+    result: Result<StartedFlow, BeginError>,
+    bitcoin_network: Option<&BitcoinNetwork>,
+) -> Response<Body> {
     match result {
-        Ok(flow) => iframe_response(flow),
+        Ok(flow) => iframe_response(flow, bitcoin_network),
         Err(BeginError::InvalidRequest) => invalid_request(),
         Err(BeginError::RateLimited) => safe_response_with_retry(
             StatusCode::TOO_MANY_REQUESTS,
@@ -121,15 +130,21 @@ fn parse_setup_query(
     Some((return_to?, state?, creator))
 }
 
-fn iframe_response(flow: StartedFlow) -> Response<Body> {
+fn iframe_response(flow: StartedFlow, bitcoin_network: Option<&BitcoinNetwork>) -> Response<Body> {
     let flow_id = json_for_script(&flow.flow_id);
     let state = json_for_script(&flow.state);
     let origin = json_for_script(&flow.origin);
     let authorization_url = html_for_text(&flow.authorization_url);
+    // Like the plain link, the intent URL stays in the markup and out of the script source.
+    let android_href = bitcoin_network
+        .and_then(bitkit_android_package)
+        .and_then(|package| bitkit_android_intent_url(&flow.authorization_url, package))
+        .map(|intent_url| format!(" data-android-href=\"{}\"", html_for_text(&intent_url)))
+        .unwrap_or_default();
     let qr_svg = render_authorization_qr_svg(&flow.authorization_url);
     let css = SETUP_CSS;
     let shell = format!(
-        "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{css}</style><main><span class=\"qr\" data-testid=\"paykit-auth-qr\">{qr_svg}</span><a class=\"bitkit-btn\" href=\"{authorization_url}\">Continue with Bitkit</a></main><script>\nconst flowId={flow_id};const state={state};const targetOrigin={origin};\nconst retryable=new Set([408,425,429,502,503,504]);let delay=500;\nasync function poll(){{try{{const response=await fetch('/setup/'+flowId+'/complete',{{method:'POST'}});if(response.status===200){{window.parent.postMessage({{type:'paykit-setup-callback',state}},targetOrigin);return;}}if(!retryable.has(response.status)){{window.parent.postMessage({{type:'paykit-setup-callback',state,error:'setup-failed'}},targetOrigin);return;}}}}catch(_error){{}}setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script>"
+        "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{css}</style><main><span class=\"qr\" data-testid=\"paykit-auth-qr\">{qr_svg}</span><a class=\"bitkit-btn\" href=\"{authorization_url}\"{android_href}>Continue with Bitkit</a></main><script>\nconst bitkitButton=document.querySelector('.bitkit-btn');if(bitkitButton.dataset.androidHref&&/Android/i.test(navigator.userAgent)){{bitkitButton.href=bitkitButton.dataset.androidHref;}}\nconst flowId={flow_id};const state={state};const targetOrigin={origin};\nconst retryable=new Set([408,425,429,502,503,504]);let delay=500;\nasync function poll(){{try{{const response=await fetch('/setup/'+flowId+'/complete',{{method:'POST'}});if(response.status===200){{window.parent.postMessage({{type:'paykit-setup-callback',state}},targetOrigin);return;}}if(!retryable.has(response.status)){{window.parent.postMessage({{type:'paykit-setup-callback',state,error:'setup-failed'}},targetOrigin);return;}}}}catch(_error){{}}setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script>"
     );
     let mut response = Response::new(Body::from(shell));
     *response.status_mut() = StatusCode::OK;
@@ -183,6 +198,44 @@ fn render_authorization_qr_svg(authorization_url: &str) -> String {
             "<svg",
             "<svg aria-label=\"Bitkit authorization QR code\" role=\"img\"",
         )
+}
+
+/// Bitkit Android application ID per network (synonymdev/bitkit-android product flavors). Bitkit
+/// ships no signet build, so signet keeps the plain link.
+fn bitkit_android_package(network: &BitcoinNetwork) -> Option<&'static str> {
+    match network {
+        BitcoinNetwork::Mainnet => Some("to.bitkit"),
+        BitcoinNetwork::Testnet => Some("to.bitkit.tnet"),
+        BitcoinNetwork::Regtest => Some("to.bitkit.dev"),
+        BitcoinNetwork::Signet => None,
+    }
+}
+
+const PUBKYAUTH_PREFIX: &str = "pubkyauth://";
+
+/// The `pubkyauth` hosts Bitkit Android registers.
+const BITKIT_PUBKYAUTH_HOSTS: [&str; 2] = ["signin_grant", "signup_grant"];
+
+/// Android intent URL that opens `authorization_url` only in the given Bitkit package.
+///
+/// Pubky Ring registers the whole `pubkyauth` scheme and an intent filter cannot match the
+/// `x-bitkit-claim` parameter, so on Android the plain link opens an app chooser. Everything after
+/// the scheme is kept byte for byte. Android reads the intent parameters after the last `#`, so a
+/// `;` in the query is plain data, while a URL with a fragment is refused rather than rewritten.
+/// Anything other than a canonical Bitkit grant URL gets no intent and keeps the plain link.
+fn bitkit_android_intent_url(authorization_url: &str, package: &str) -> Option<String> {
+    let rest = authorization_url.strip_prefix(PUBKYAUTH_PREFIX)?;
+    let url = Url::parse(authorization_url).ok()?;
+    let canonical_grant = url.as_str() == authorization_url
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url
+            .host_str()
+            .is_some_and(|host| BITKIT_PUBKYAUTH_HOSTS.contains(&host));
+    canonical_grant
+        .then(|| format!("intent://{rest}#Intent;scheme=pubkyauth;package={package};end"))
 }
 
 fn html_for_text(value: &str) -> String {
@@ -262,4 +315,77 @@ fn safe_response_with_retry(
         .headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from_static(retry_after));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GRANT_URL: &str = "pubkyauth://signin_grant?caps=%2Fpub%2Fpaykit%2F%3Arw&relay=https%3A%2F%2Frelay.example%2Finbox&secret=abc-_123&x-bitkit-claim=watch-only-account-v1";
+
+    #[test]
+    fn bitkit_package_follows_the_configured_network() {
+        assert_eq!(
+            bitkit_android_package(&BitcoinNetwork::Mainnet),
+            Some("to.bitkit")
+        );
+        assert_eq!(
+            bitkit_android_package(&BitcoinNetwork::Testnet),
+            Some("to.bitkit.tnet")
+        );
+        assert_eq!(
+            bitkit_android_package(&BitcoinNetwork::Regtest),
+            Some("to.bitkit.dev")
+        );
+        assert_eq!(bitkit_android_package(&BitcoinNetwork::Signet), None);
+    }
+
+    #[test]
+    fn intent_url_names_the_package_and_keeps_the_grant_byte_for_byte() {
+        for package in ["to.bitkit", "to.bitkit.tnet", "to.bitkit.dev"] {
+            assert_eq!(
+                bitkit_android_intent_url(GRANT_URL, package).as_deref(),
+                Some(
+                    format!(
+                        "intent://{}#Intent;scheme=pubkyauth;package={package};end",
+                        &GRANT_URL[PUBKYAUTH_PREFIX.len()..]
+                    )
+                    .as_str()
+                )
+            );
+        }
+        assert_eq!(
+            bitkit_android_intent_url("pubkyauth://signup_grant/path?a=%3B%23&b=;&c", "to.bitkit")
+                .as_deref(),
+            Some(
+                "intent://signup_grant/path?a=%3B%23&b=;&c#Intent;scheme=pubkyauth;package=to.bitkit;end"
+            )
+        );
+    }
+
+    #[test]
+    fn intent_url_is_refused_for_anything_but_a_canonical_bitkit_grant() {
+        for authorization_url in [
+            "",
+            "signin_grant?secret=abc",
+            "https://signin_grant?secret=abc",
+            "PUBKYAUTH://signin_grant?secret=abc",
+            "pubkyring://signin_grant?secret=abc",
+            "pubkyauth://signin?secret=abc",
+            "pubkyauth:///signin_grant?secret=abc",
+            "pubkyauth://signin_grant.example?secret=abc",
+            "pubkyauth://user@signin_grant?secret=abc",
+            "pubkyauth://signin_grant:1?secret=abc",
+            "pubkyauth://signin_grant?secret=abc#Intent;package=evil.app;end",
+            "pubkyauth://signin_grant?secret=abc#",
+            "pubkyauth://signin_grant?label=\"><script>",
+            "pubkyauth://signin_grant?label=a b",
+        ] {
+            assert_eq!(
+                bitkit_android_intent_url(authorization_url, "to.bitkit"),
+                None,
+                "{authorization_url}"
+            );
+        }
+    }
 }

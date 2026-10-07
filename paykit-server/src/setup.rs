@@ -15,6 +15,7 @@ use rand::{TryRng, rngs::SysRng};
 use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
+use crate::config::BitcoinNetwork;
 use crate::domain::locks::CreatorPubky;
 
 const FLOW_LIFETIME: Duration = Duration::from_secs(5 * 60);
@@ -111,6 +112,7 @@ impl Clock for ManualClock {
 #[derive(Clone)]
 pub struct SetupService {
     inner: Arc<Inner>,
+    bitcoin_network: Option<BitcoinNetwork>,
 }
 
 struct Inner {
@@ -347,7 +349,19 @@ impl SetupService {
                 active_polls: AtomicUsize::new(0),
                 changed: Notify::new(),
             }),
+            bitcoin_network: None,
         }
+    }
+
+    /// Names the Bitcoin network of the Bitkit build that completes setup, so the
+    /// iframe can address that build directly on Android.
+    pub fn with_bitcoin_network(mut self, network: BitcoinNetwork) -> Self {
+        self.bitcoin_network = Some(network);
+        self
+    }
+
+    pub fn bitcoin_network(&self) -> Option<&BitcoinNetwork> {
+        self.bitcoin_network.as_ref()
     }
 
     pub async fn begin(
