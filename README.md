@@ -34,8 +34,8 @@ Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report sec
 
 The [architecture contract](docs/architecture.md) describes shared identity,
 credential ownership, and immutable invoice attribution. Rust dependencies use
-the published Paykit Git tag `v0.1.0-rc65`
-(`7185ae7da9315028e5331442d71d739c27f1442c`), pinned by `Cargo.lock`.
+the published Paykit Git tag `v0.1.0-rc66`
+(`a96161a6bc5f202dd0b4517202386dcc957099a5`), pinned by `Cargo.lock`.
 
 ## Executable boundary
 
