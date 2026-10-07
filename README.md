@@ -34,8 +34,8 @@ Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report sec
 
 The [architecture contract](docs/architecture.md) describes shared identity,
 credential ownership, and immutable invoice attribution. Rust dependencies pin
-the Paykit `v0.1.0-rc70` release tag in `Cargo.toml`; `Cargo.lock` fixes its
-resolved commit at `2ea4b2b82494435d56bda45393ad1497d24a32e9`.
+the Paykit `v0.1.0-rc71` release tag in `Cargo.toml`; `Cargo.lock` fixes its
+resolved commit at `e4e58d3ee6c6aa19d6262d4cd96a58890a65b6fa`.
 Direct `pubky` and `pubky-testnet` dependencies are pinned to `0.15.0`.
 
 ## Executable boundary
