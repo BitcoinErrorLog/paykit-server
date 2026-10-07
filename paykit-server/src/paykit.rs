@@ -975,6 +975,21 @@ impl Adapter for PaykitAdapter {
         self.sdk.paykit_app_registry(reader).await.map_err(classify)
     }
 
+    async fn fetch_authorization(
+        &self,
+        reader: &str,
+    ) -> Result<crate::application::create_invoice::ReaderAuthorization, HandoffError> {
+        use crate::application::create_invoice::ReaderAuthorization;
+        let reader = parse_peer(reader)?;
+        match self.sdk.paykit_noise_key_authorization(reader).await {
+            Ok(_) => Ok(ReaderAuthorization::Verified),
+            Err(PaykitSdkError::NotFound { .. }) => Ok(ReaderAuthorization::Missing),
+            // A bad signature, wrong owner or unreadable record.
+            Err(PaykitSdkError::Protocol { .. }) => Ok(ReaderAuthorization::Invalid),
+            Err(error) => Err(classify(error)),
+        }
+    }
+
     async fn observe_recovery_marker(&self, reader: &str) -> Result<(), HandoffError> {
         let reader = parse_peer(reader)?;
         self.sdk

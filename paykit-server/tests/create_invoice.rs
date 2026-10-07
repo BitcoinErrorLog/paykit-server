@@ -27,8 +27,8 @@ use paykit_server::{
     application::create_invoice::{
         AppRegistryDiscovery, CreateInvoiceError, CreateInvoiceRequest, CreateInvoiceService,
         CreatorXpubProvider, DeadlineClock, IntentBuilder, InvoicePersistence, LockFetchError,
-        LockFetcher, PaykitIntentBuilder, RegistryDiscoveryError, RegistryRetryDelay,
-        SessionValidationError, SessionValidator, derive_bip84_p2wpkh_address,
+        LockFetcher, PaykitIntentBuilder, ReaderAuthorization, RegistryDiscoveryError,
+        RegistryRetryDelay, SessionValidationError, SessionValidator, derive_bip84_p2wpkh_address,
     },
     application::semantic_intent::DeliveryIntentV1,
     config::{BitcoinNetwork, Config, ConfigEnvironment},
@@ -871,6 +871,13 @@ impl AppRegistryDiscovery for FakeRegistries {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(self.registry.clone())
     }
+
+    async fn authorization(
+        &self,
+        _reader: &paykit_server::domain::locks::ReaderPubky,
+    ) -> Result<ReaderAuthorization, RegistryDiscoveryError> {
+        Ok(ReaderAuthorization::Verified)
+    }
 }
 
 struct SequencedRegistries {
@@ -886,6 +893,55 @@ impl AppRegistryDiscovery for SequencedRegistries {
     ) -> Result<Option<paykit_lib::PaykitAppRegistry>, RegistryDiscoveryError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.results.lock().unwrap().pop_front().unwrap()
+    }
+
+    async fn authorization(
+        &self,
+        _reader: &paykit_server::domain::locks::ReaderPubky,
+    ) -> Result<ReaderAuthorization, RegistryDiscoveryError> {
+        Ok(ReaderAuthorization::Verified)
+    }
+}
+
+/// A Reader with a capable App Registry and a scripted authorization answer.
+struct AuthorizationRegistries {
+    authorization: Result<ReaderAuthorization, RegistryDiscoveryError>,
+    capable: bool,
+    registry_calls: AtomicUsize,
+    authorization_calls: AtomicUsize,
+}
+
+impl AuthorizationRegistries {
+    fn new(authorization: Result<ReaderAuthorization, RegistryDiscoveryError>) -> Self {
+        Self {
+            authorization,
+            capable: true,
+            registry_calls: AtomicUsize::default(),
+            authorization_calls: AtomicUsize::default(),
+        }
+    }
+}
+
+#[async_trait]
+impl AppRegistryDiscovery for AuthorizationRegistries {
+    async fn discover(
+        &self,
+        _reader: &paykit_server::domain::locks::ReaderPubky,
+    ) -> Result<Option<paykit_lib::PaykitAppRegistry>, RegistryDiscoveryError> {
+        self.registry_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(if self.capable {
+            capable_registry()
+        } else {
+            paykit_lib::PaykitAppRegistry::new(None)
+        }))
+    }
+
+    async fn authorization(
+        &self,
+        _reader: &paykit_server::domain::locks::ReaderPubky,
+    ) -> Result<ReaderAuthorization, RegistryDiscoveryError> {
+        self.authorization_calls.fetch_add(1, Ordering::SeqCst);
+        self.authorization
     }
 }
 
@@ -1391,4 +1447,158 @@ fn delivery_intent_is_closed_and_contains_complete_sdk_inputs_not_final_wire_ids
             .windows(b"payment_request_id".len())
             .any(|window| window == b"payment_request_id")
     );
+}
+
+#[tokio::test]
+async fn reader_authorization_gates_admission_before_any_side_effect() {
+    let cases = [
+        (
+            Ok(ReaderAuthorization::Missing),
+            CreateInvoiceError::ReaderSetupPending,
+        ),
+        (
+            Ok(ReaderAuthorization::Invalid),
+            CreateInvoiceError::ReaderNotPayable,
+        ),
+        (
+            Err(RegistryDiscoveryError::Unavailable),
+            CreateInvoiceError::ReaderRegistryUnavailable,
+        ),
+        (
+            Err(RegistryDiscoveryError::InvalidRequest),
+            CreateInvoiceError::InvalidRequest,
+        ),
+    ];
+    for (authorization, expected) in cases {
+        let registries = Arc::new(AuthorizationRegistries::new(authorization));
+        let credentials = Arc::new(CountingCredentials {
+            calls: AtomicUsize::default(),
+        });
+        let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+
+        assert_eq!(
+            registry_service(
+                registries.clone(),
+                Arc::new(ImmediateRetryDelay::default()),
+                credentials.clone(),
+                store.clone(),
+            )
+            .create(request())
+            .await,
+            Err(expected)
+        );
+        assert_eq!(registries.authorization_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(credentials.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.create_calls.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn verified_reader_authorization_admits_the_invoice() {
+    let registries = Arc::new(AuthorizationRegistries::new(Ok(
+        ReaderAuthorization::Verified,
+    )));
+    let store = Arc::new(FakeStore::with_preflight(InvoicePreflight::New));
+
+    let result = registry_service(
+        registries.clone(),
+        Arc::new(ImmediateRetryDelay::default()),
+        Arc::new(CountingCredentials {
+            calls: AtomicUsize::default(),
+        }),
+        store.clone(),
+    )
+    .create(request())
+    .await;
+
+    assert!(result.is_ok());
+    assert_eq!(registries.authorization_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(store.create_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn incapable_registry_and_exact_replay_never_read_the_authorization() {
+    let mut incapable = AuthorizationRegistries::new(Ok(ReaderAuthorization::Verified));
+    incapable.capable = false;
+    let incapable = Arc::new(incapable);
+    assert_eq!(
+        registry_service(
+            incapable.clone(),
+            Arc::new(ImmediateRetryDelay::default()),
+            Arc::new(CountingCredentials {
+                calls: AtomicUsize::default(),
+            }),
+            Arc::new(FakeStore::with_preflight(InvoicePreflight::New)),
+        )
+        .create(request())
+        .await,
+        Err(CreateInvoiceError::ReaderNotPayable)
+    );
+    assert_eq!(incapable.authorization_calls.load(Ordering::SeqCst), 0);
+
+    let replayed = Arc::new(AuthorizationRegistries::new(Ok(
+        ReaderAuthorization::Missing,
+    )));
+    let result = registry_service(
+        replayed.clone(),
+        Arc::new(ImmediateRetryDelay::default()),
+        Arc::new(CountingCredentials {
+            calls: AtomicUsize::default(),
+        }),
+        Arc::new(FakeStore::with_preflight(InvoicePreflight::ExactReplay)),
+    )
+    .create(request())
+    .await
+    .unwrap();
+    assert!(result.replayed());
+    assert_eq!(replayed.authorization_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn signed_router_maps_missing_and_invalid_reader_authorization() {
+    let key = SigningKey::from_bytes(&[17; 32]);
+    for (authorization, status, code, message) in [
+        (
+            ReaderAuthorization::Missing,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "reader_setup_pending",
+            "reader wallet setup needed",
+        ),
+        (
+            ReaderAuthorization::Invalid,
+            StatusCode::CONFLICT,
+            "reader_not_payable",
+            "reader has no Paykit app able to pay requests",
+        ),
+    ] {
+        let router = invoices_router(Arc::new(registry_service(
+            Arc::new(AuthorizationRegistries::new(Ok(authorization))),
+            Arc::new(ImmediateRetryDelay::default()),
+            Arc::new(CountingCredentials {
+                calls: AtomicUsize::default(),
+            }),
+            Arc::new(FakeStore::with_preflight(InvoicePreflight::New)),
+        )))
+        .layer(Extension(signed_auth(&key)));
+        let body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+            "bundle_id": BUNDLE,
+            "lock_resource": LOCK_RESOURCE,
+            "reader": reader()
+        }))
+        .unwrap();
+
+        let response = router
+            .oneshot(signed_invoice_request(&key, body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert!(!response.headers().contains_key("retry-after"));
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"error":{"code":code,"message":message}})
+        );
+    }
 }

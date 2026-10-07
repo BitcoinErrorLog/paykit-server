@@ -355,6 +355,13 @@ no `Retry-After` header; a present but incapable registry returns terminal `409`
 `502` `reader_registry_malformed`, and request-wide exhaustion remains `503`
 `dependency_timeout`. Invalid Reader identifiers return `400` `invalid_request`
 before discovery; malformed remote registry data remains a distinct `502`.
+A capable registry is not enough on its own: admission then reads the Reader's
+identity-signed Paykit Noise Key Authorization once. A missing record returns
+`503` `reader_setup_pending` (no `Retry-After`), and a record that fails
+verification (bad signature, another owner, unreadable) returns `409`
+`reader_not_payable`. A read failure returns `503` `reader_registry_unavailable`.
+Link setup still verifies the authorization before any delivery, because it can
+change after admission.
 These failures occur before xpub loading, address allocation, invoice
 persistence, or outbox insertion. Exact replay is checked first and returns its
 existing invoice without live registry discovery.
