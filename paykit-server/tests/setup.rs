@@ -26,7 +26,7 @@ use paykit_server::{
     bitkit_claim::LOCAL_DEMO_CAPABILITIES,
     bitkit_setup::append_bitkit_claim,
     config::{BitcoinNetwork, PAYKIT_CLIENT_ID},
-    http::setup::setup_router,
+    http::setup::{setup_router, setup_router_with_trusted_proxy_hops},
     real_setup::validate_xpub,
     setup::{
         BeginError, Completion, ManualClock, PollResult, SetupAttempt, SetupCompleter, SetupLimits,
@@ -1030,6 +1030,61 @@ async fn setup_policy_uses_transport_ip_and_ignores_forwarded_for() {
             .status(),
         StatusCode::OK
     );
+}
+
+#[tokio::test]
+async fn setup_policy_keys_forwarded_clients_only_behind_trusted_proxies() {
+    let creator = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
+    let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    let begin = "/setup?return_to=https://app.example".to_owned();
+    let reconnect = format!("/setup/reconnect?return_to=https://app.example&creator={creator}");
+    for trusted_proxy_hops in [0, 1] {
+        for route in [&begin, &reconnect] {
+            let completer: Arc<dyn SetupCompleter> = if route == &begin {
+                Arc::new(MockCompleter::new([]))
+            } else {
+                Arc::new(ReconnectCompleter(
+                    paykit_server::domain::locks::parse_creator(creator).unwrap(),
+                ))
+            };
+            let router = setup_router_with_trusted_proxy_hops(
+                limited_service(completer, Arc::new(ManualClock::default()), 1, 10),
+                trusted_proxy_hops,
+            );
+            let status = async |forwarded_for: &str, state: &str| {
+                let mut request = Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("{route}&state={state}"))
+                    .header("X-Forwarded-For", forwarded_for)
+                    .body(Body::empty())
+                    .unwrap();
+                request
+                    .extensions_mut()
+                    .insert(ConnectInfo(SocketAddr::new(proxy, 443)));
+                router.clone().oneshot(request).await.unwrap().status()
+            };
+
+            assert_eq!(status("198.51.100.1", "one").await, StatusCode::OK);
+            assert_eq!(
+                status("203.0.113.2", "two").await,
+                if trusted_proxy_hops == 0 {
+                    StatusCode::TOO_MANY_REQUESTS
+                } else {
+                    StatusCode::OK
+                },
+                "{route} trusted_proxy_hops={trusted_proxy_hops}"
+            );
+            assert_eq!(
+                status("203.0.113.2", "three").await,
+                StatusCode::TOO_MANY_REQUESTS
+            );
+            assert_eq!(
+                status("203.0.113.4, 198.51.100.1", "four").await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{route}: a client-prepended entry must not select a fresh bucket"
+            );
+        }
+    }
 }
 
 #[tokio::test]
