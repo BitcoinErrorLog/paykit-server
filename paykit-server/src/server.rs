@@ -409,7 +409,10 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
             let maintained = match creator_adapter(&workers, creator).await {
                 Ok(adapter) => match adapter.maintain_transport().await {
                     Ok(()) => true,
-                    Err(error) if error.is_concurrent_update() => {
+                    Err(
+                        PaykitSdkError::ConcurrentUpdate { .. }
+                        | PaykitSdkError::SharedStateBusy { .. },
+                    ) => {
                         deferred = true;
                         true
                     }

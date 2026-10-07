@@ -33,9 +33,9 @@ it with regtest Bitcoin.
 Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report security problems through the private process in [`SECURITY.md`](SECURITY.md), not a public issue.
 
 The [architecture contract](docs/architecture.md) describes shared identity,
-credential ownership, and immutable invoice attribution. Rust dependencies use
-the published Paykit Git tag `v0.1.0-rc68`
-(`3576ea0cb0bf72b5fddd241f1d48ade20a3bc545`), pinned by `Cargo.lock`.
+credential ownership, and immutable invoice attribution. Rust dependencies pin
+the Paykit `v0.1.0-rc69` release commit
+`dd97fc9a4fa82e3d49fd3744157a3b8c5e1ba689` in `Cargo.toml` and `Cargo.lock`.
 
 ## Executable boundary
 

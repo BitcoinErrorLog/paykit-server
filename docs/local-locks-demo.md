@@ -14,14 +14,14 @@ and exact Locks release selected in `Cargo.toml`:
 
 ```bash
 docker buildx build --load \
-  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#v0.1.0-rc68:paykit-lib' \
-  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#v0.1.0-rc68:paykit-sdk' \
+  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#dd97fc9a4fa82e3d49fd3744157a3b8c5e1ba689:paykit-lib' \
+  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#dd97fc9a4fa82e3d49fd3744157a3b8c5e1ba689:paykit-sdk' \
   --build-context locks='https://github.com/pubky/locks.git#v0.1.0-rc8' \
   -f Dockerfile.local \
   -t paykit-server:local .
 ```
 
-The Paykit tag resolves to `3576ea0cb0bf72b5fddd241f1d48ade20a3bc545`.
+The Paykit commit is the `v0.1.0-rc69` release.
 These contexts are anonymously reachable and reproducible. Update the URLs
 together with the corresponding `Cargo.toml` pins; exact dependency-pin matches
 make source drift fail closed.
