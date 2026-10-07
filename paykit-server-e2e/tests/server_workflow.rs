@@ -27,7 +27,7 @@ use locks_core::{
     },
 };
 use paykit_sdk::{
-    LinkedPeerState, PubkyLocalSecretKey, PubkyPublicKey, PubkySessionAccess,
+    LinkedPeerState, PaykitSdkError, PubkyLocalSecretKey, PubkyPublicKey, PubkySessionAccess,
     PubkySessionBootstrap, SdkBackupState,
 };
 use paykit_server::{
@@ -516,7 +516,11 @@ async fn creator_backup_state(sdk: &CreatorSdk) -> SdkBackupState {
         match sdk.export_backup_state().await {
             Ok(state) => return state,
             Err(error)
-                if error.is_concurrent_update() && tokio::time::Instant::now() < deadline =>
+                if matches!(
+                    error,
+                    PaykitSdkError::ConcurrentUpdate { .. }
+                        | PaykitSdkError::SharedStateBusy { .. }
+                ) && tokio::time::Instant::now() < deadline =>
             {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
