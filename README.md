@@ -34,8 +34,9 @@ Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report sec
 
 The [architecture contract](docs/architecture.md) describes shared identity,
 credential ownership, and immutable invoice attribution. Rust dependencies pin
-the Paykit `v0.1.0-rc69` release tag in `Cargo.toml`; `Cargo.lock` fixes its
-resolved commit at `dd97fc9a4fa82e3d49fd3744157a3b8c5e1ba689`.
+the Paykit `v0.1.0-rc70` release tag in `Cargo.toml`; `Cargo.lock` fixes its
+resolved commit at `2ea4b2b82494435d56bda45393ad1497d24a32e9`.
+Direct `pubky` and `pubky-testnet` dependencies are pinned to `0.15.0`.
 
 ## Executable boundary
 
@@ -174,6 +175,12 @@ Different Creators may use the same numeric child index because their xpubs and 
 ## Persistence, startup, and upgrades
 
 PostgreSQL stores server credentials, address allocation, invoices, and delivery intents. The Paykit SDK stores encrypted identity-wide state on the Creator's homeserver under WebDAV locks; it is not cached as an authoritative PostgreSQL SDK blob. Other authorized apps can advance the same links and delivery queue. A background worker receives private messages and processes outbound work without executing wallet payments.
+
+Shared hosted-state deployments require Pubky Homeserver **0.15 or newer**.
+Upgrade the deployed homeserver separately; updating Server's client dependencies
+does not upgrade that service. The SDK still requires commit-time fencing of
+expired lock holders and durable publication of complete files. Its five-minute
+uncertain-write cooldown remains in place and does not replace those requirements.
 
 Startup holds a session advisory lock while applying the single schema baseline. Before binding HTTP it verifies immutable deployment metadata and authenticates every persisted Creator credential, invoice payment record, and Bitcoin observation. Missing, corrupt, swapped, conflicting, or wrong-key database state aborts startup with a secret-free error. Hosted Paykit state is checked during SDK operations and setup readiness; failures do not create a replacement local state.
 
