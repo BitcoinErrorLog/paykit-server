@@ -3476,8 +3476,8 @@ dependencies = [
 
 [[package]]
 name = "locks-core"
-version = "0.1.0-rc8"
-source = "git+https://github.com/pubky/locks.git?tag=v0.1.0-rc8#b3dc87c961f6b907d76cde9c4a28f00670d5231e"
+version = "0.1.0-rc9"
+source = "git+https://github.com/pubky/locks.git?tag=v0.1.0-rc9#8a954e425ebf4903c03dfc9939c21aeddf799f88"
 dependencies = [
  "base32",
  "blake3",
@@ -4079,7 +4079,7 @@ dependencies = [
 
 [[package]]
 name = "paykit-server"
-version = "0.1.0-rc8"
+version = "0.1.0-rc9"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -4128,7 +4128,7 @@ dependencies = [
 
 [[package]]
 name = "paykit-server-e2e"
-version = "0.1.0-rc8"
+version = "0.1.0-rc9"
 dependencies = [
  "anyhow",
  "async-trait",

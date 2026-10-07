@@ -1,6 +1,6 @@
 [package]
 name = "paykit-server"
-version = "0.1.0-rc8"
+version = "0.1.0-rc9"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
