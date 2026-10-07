@@ -14,14 +14,14 @@ and exact Locks release selected in `Cargo.toml`:
 
 ```bash
 docker buildx build --load \
-  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#v0.1.0-rc69:paykit-lib' \
-  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#v0.1.0-rc69:paykit-sdk' \
+  --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#v0.1.0-rc71:paykit-lib' \
+  --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#v0.1.0-rc71:paykit-sdk' \
   --build-context locks='https://github.com/pubky/locks.git#v0.1.0-rc8' \
   -f Dockerfile.local \
   -t paykit-server:local .
 ```
 
-The Paykit contexts use the `v0.1.0-rc69` release tag.
+The Paykit contexts use the `v0.1.0-rc71` release tag.
 These contexts are anonymously reachable and reproducible. Update the URLs
 together with the corresponding `Cargo.toml` pins; exact dependency-pin matches
 make source drift fail closed.
@@ -62,6 +62,11 @@ Final pinned Debian image:
 - contains no source tree, Cargo cache, runnable config, DB credentials, or application secrets.
 
 Supply `PAYKIT_CONFIG`, `PAYKIT_DATABASE_URL`, and `PAYKIT_MASTER_KEY` at runtime. Mount generated ignored local config. The calling Compose definition owns mounts, environment values, infrastructure image pins, and helper command overrides.
+
+The deployed Pubky Homeserver must run 0.15 or newer. Rebuilding this image does
+not upgrade the homeserver managed by the calling Compose stack. The SDK's
+five-minute uncertain-write cooldown remains in place; see the
+[shared-state deployment requirements](../README.md#persistence-startup-and-upgrades).
 
 ## Generated local config contract
 

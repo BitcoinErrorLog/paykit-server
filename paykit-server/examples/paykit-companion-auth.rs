@@ -681,6 +681,7 @@ mod tests {
                     Err(error) => panic!("fixture accept failed: {error}"),
                 }
             };
+            stream.set_nonblocking(false).unwrap();
             stream.set_read_timeout(Some(FIXTURE_DEADLINE)).unwrap();
             let mut request_line = Vec::new();
             loop {

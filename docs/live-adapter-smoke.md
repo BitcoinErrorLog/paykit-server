@@ -7,8 +7,10 @@ passing deterministic suite does not establish external interoperability.
 ## Pubky App Registry and Payment Request
 
 Use a local static Pubky testnet compatible with the pinned `pubky` and
-`pubky-testnet` 0.14 dependencies. It must expose the SDK's fixed localhost
-testnet ports. Do not run against a retained integration fixture without its
+`pubky-testnet` 0.15.0 dependencies, with Pubky Homeserver 0.15 or newer. It must
+expose the SDK's fixed localhost testnet ports. Upgrading client dependencies
+does not upgrade a separately operated homeserver.
+Do not run against a retained integration fixture without its
 operator's approval: this test creates identities and sends a test Payment Request.
 
 ```bash
