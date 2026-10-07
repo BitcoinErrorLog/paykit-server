@@ -790,12 +790,19 @@ impl CreateInvoiceService {
                 );
                 return Err(CreateInvoiceError::InvalidRequest);
             }
-            Err(RegistryDiscoveryError::Unavailable | RegistryDiscoveryError::Malformed) => {
+            Err(RegistryDiscoveryError::Unavailable) => {
                 diagnose(
                     "reader_authorization_fetch",
                     CreateInvoiceError::ReaderRegistryUnavailable,
                 );
                 return Err(CreateInvoiceError::ReaderRegistryUnavailable);
+            }
+            Err(RegistryDiscoveryError::Malformed) => {
+                diagnose(
+                    "reader_authorization_parse",
+                    CreateInvoiceError::ReaderRegistryMalformed,
+                );
+                return Err(CreateInvoiceError::ReaderRegistryMalformed);
             }
         }
         let credentials_remaining =
