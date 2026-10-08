@@ -4151,6 +4151,7 @@ dependencies = [
  "time",
  "tokio",
  "tower",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]

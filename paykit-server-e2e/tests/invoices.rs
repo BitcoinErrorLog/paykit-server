@@ -196,6 +196,118 @@ async fn committed_admissions_coalesce_and_failed_commits_do_not_wake() {
 }
 
 #[tokio::test]
+async fn creator_discovery_does_not_lease_and_claims_recheck_due_work() {
+    use paykit_server::persistence::OutboxStore;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let other = second_creator();
+    let reader = reader();
+    CreatorStore::new(database.pool(), crypto())
+        .create(&CreatorCredentials::new(
+            other.clone(),
+            "other-session".into(),
+            PaykitIdentitySecretKey::new([8; 32], 1).unwrap(),
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: "other-xpub".to_owned().into(),
+                account_index: 0,
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    for (owner, bundle, address_prefix) in [
+        (&creator, b"first".as_slice(), "first-creator"),
+        (&creator, b"second", "first-creator"),
+        (&other, b"third", "other-creator"),
+    ] {
+        let payloads = CreatorPayloads { address_prefix };
+        let mut admission = input(owner, &reader, bundle, bundle);
+        admission.invoice_payloads = &payloads;
+        store.create_atomic(admission).await.unwrap();
+    }
+    let outbox = OutboxStore::new(database.pool(), crypto());
+    let candidates = outbox.due_creator_ids(&[], 16).await.unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(
+        outbox.due_creator_ids(&[], 1).await.unwrap(),
+        candidates[..1]
+    );
+    assert_eq!(
+        outbox.due_creator_ids(&candidates[..1], 16).await.unwrap(),
+        candidates[1..]
+    );
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox WHERE status = 'queued' AND attempt_count = 0 AND claim_token IS NULL",
+    ).fetch_one(database.pool()).await.unwrap();
+    assert_eq!(queued, 3, "candidate discovery consumed a lease");
+
+    let claim = outbox
+        .claim_for_creator(Uuid::new_v4(), candidates[1], Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.creator_id(), candidates[1]);
+    assert!(outbox.claim_handoff_eligible(&claim).await.unwrap());
+
+    sqlx::query(
+        "UPDATE outbox SET next_attempt_at = NOW() + INTERVAL '1 hour' WHERE creator_id = $1",
+    )
+    .bind(candidates[0])
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        outbox
+            .claim_for_creator(Uuid::new_v4(), candidates[0], Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_none(),
+        "claim ignored the current due time"
+    );
+
+    sqlx::query("UPDATE outbox SET next_attempt_at = NOW() WHERE creator_id = $1")
+        .bind(candidates[0])
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE lock_payment_generations SET current_generation = current_generation + 1 WHERE creator_id = $1")
+        .bind(candidates[0]).execute(database.pool()).await.unwrap();
+    assert!(
+        outbox
+            .due_creator_ids(&[candidates[1]], 16)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        outbox
+            .claim_for_creator(Uuid::new_v4(), candidates[0], Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_none(),
+        "claim ignored the generation fence"
+    );
+    sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+        .bind(claim.id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let reclaimed = outbox
+        .claim_for_creator(Uuid::new_v4(), claim.creator_id(), Duration::from_secs(30))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reclaimed.id(), claim.id());
+    assert!(!outbox.claim_handoff_eligible(&claim).await.unwrap());
+    assert!(outbox.claim_handoff_eligible(&reclaimed).await.unwrap());
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn connection_binding_uses_persisted_reader_identity_without_mutating_business_rows() {
     let database = TestDatabase::create().await;
     let invoices = invoice_store(&database).await;

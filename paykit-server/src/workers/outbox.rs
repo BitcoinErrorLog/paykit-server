@@ -253,6 +253,21 @@ pub async fn process_claim_with_health(
     claim: &ClaimedOutbox,
     retry_schedule: RetrySchedule,
 ) -> Result<(bool, ProcessingHealth), PersistenceError> {
+    process_claim_with(store, claim, retry_schedule, |intent| async move {
+        adapter.execute_claimed_handoff(store, claim, &intent).await
+    })
+    .await
+}
+
+pub(crate) async fn process_claim_with<F>(
+    store: &OutboxStore,
+    claim: &ClaimedOutbox,
+    retry_schedule: RetrySchedule,
+    execute: impl FnOnce(DeliveryIntentV1) -> F,
+) -> Result<(bool, ProcessingHealth), PersistenceError>
+where
+    F: std::future::Future<Output = Result<HandoffResult, HandoffFailure>>,
+{
     let intent = match store.delivery_intent(claim) {
         Ok(intent) => intent,
         Err(_) => {
@@ -262,7 +277,7 @@ pub async fn process_claim_with_health(
                 .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
         }
     };
-    match adapter.execute_claimed_handoff(store, claim, &intent).await {
+    match execute(intent).await {
         Ok(result) => store
             .mark_handed_off(claim, &result)
             .await

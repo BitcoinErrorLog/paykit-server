@@ -33,5 +33,6 @@ serde.workspace = true
 serde_json.workspace = true
 serde_json_canonicalizer.workspace = true
 time.workspace = true
+tracing-subscriber.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-relay = { version = "0.7", default-features = false, features = ["server"] }

@@ -392,6 +392,10 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
         .await
         .unwrap();
     assert_eq!(request_claims.len(), 1);
+    assert!(
+        !outbox.delivery_available().await.unwrap(),
+        "leasing a retry must not report recovery"
+    );
     sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
         .bind(request_claims[0].id())
         .execute(database.pool())

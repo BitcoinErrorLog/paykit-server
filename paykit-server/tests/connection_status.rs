@@ -40,7 +40,7 @@ impl ConnectionBindingRepository for FakeBindings {
 }
 
 struct FakePeers {
-    result: Result<PaykitConnectionState, PersistenceError>,
+    result: Result<PaykitConnectionState, ConnectionStatusError>,
     calls: Mutex<Vec<(String, String)>>,
 }
 
@@ -50,7 +50,7 @@ impl PeerConnectionStateRepository for FakePeers {
         &self,
         creator: &CreatorPubky,
         binding: &ConnectionBinding,
-    ) -> Result<PaykitConnectionState, PersistenceError> {
+    ) -> Result<PaykitConnectionState, ConnectionStatusError> {
         self.calls
             .lock()
             .unwrap()
@@ -65,7 +65,7 @@ fn binding() -> ConnectionBinding {
 
 fn service(
     binding_result: Result<Option<ConnectionBinding>, PersistenceError>,
-    state_result: Result<PaykitConnectionState, PersistenceError>,
+    state_result: Result<PaykitConnectionState, ConnectionStatusError>,
 ) -> (Arc<ConnectionStatusService>, Arc<FakePeers>) {
     let peers = Arc::new(FakePeers {
         result: state_result,
@@ -257,6 +257,38 @@ async fn endpoint_preserves_not_found_storage_and_auth_failures_as_errors() {
             .status(),
         StatusCode::UNAUTHORIZED
     );
+}
+
+#[tokio::test]
+async fn endpoint_distinguishes_busy_state_from_other_peer_read_failures() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    for (error, status, code) in [
+        (
+            ConnectionStatusError::Busy,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "dependency_unavailable",
+        ),
+        (
+            ConnectionStatusError::Unavailable,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+        ),
+    ] {
+        let (service, _) = service(Ok(Some(binding())), Err(error));
+        let router = connection_status_router(service).layer(Extension(Arc::new(
+            SignedServiceAuth::from_config(&config_for(&key)),
+        )));
+        let request_body =
+            format!(r#"{{"bundle_id":"{BUNDLE}","creator":"{CREATOR}"}}"#).into_bytes();
+        let response = router
+            .oneshot(signed_request(&key, request_body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        let response: serde_json::Value = serde_json::from_str(&body(response).await).unwrap();
+        assert_eq!(response["error"]["code"], code);
+        assert!(response.get("state").is_none());
+    }
 }
 
 #[tokio::test]

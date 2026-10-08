@@ -25,7 +25,7 @@ use crate::{
     crypto::Crypto,
     domain::locks::{BundleId, CreatorPubky, PubkyLockResource, ReaderPubky},
     http::{self, auth::SignedServiceAuth},
-    paykit::{CreatorSessions, PaykitAdapter},
+    paykit::{CreatorSessions, PaykitAdapter, creator_mutation_lock},
     persistence::{
         CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PaymentDrainStore,
         PaymentRequestLifecycleStore, PersistenceError,
@@ -35,10 +35,10 @@ use crate::{
     setup::{SetupLimits, SetupService, SystemClock},
     setup_orchestration::PubkyCompanionRelay,
     workers::{
+        creator_tasks::CreatorTasks,
         observer::{ElectrumAdapter, ElectrumPort, ObserverError, observe_once},
         outbox::{
-            ProcessingHealth, RetrySchedule, process_claim_with_health,
-            process_reconciliation_with_health,
+            ProcessingHealth, RetrySchedule, process_claim_with, process_reconciliation_with_health,
         },
     },
 };
@@ -696,102 +696,139 @@ fn outbox_retry_schedule(
 
 async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
     let owner = Uuid::new_v4();
-    let mut next_poll_delay = Duration::ZERO;
+    let limit = usize::try_from(workers.outbox_batch_size).expect("validated outbox batch size");
+    let mut tasks = CreatorTasks::new(limit, runtime.clone());
+    let mut next_poll = tokio::time::Instant::now();
     loop {
-        tokio::select! {
+        let completed = tokio::select! {
             _ = runtime.cancelled() => break,
-            _ = workers.invoices.wait_for_admission() => {},
-            _ = tokio::time::sleep(next_poll_delay) => {}
-        }
+            result = tasks.join_next(), if !tasks.is_empty() => result,
+            _ = workers.invoices.wait_for_admission() => None,
+            _ = tokio::time::sleep_until(next_poll) => None,
+        };
         if !runtime.may_start_worker_claim() {
             break;
         }
-        let claims = match workers
-            .outbox
-            .claim(
-                owner,
-                workers.outbox_batch_size,
-                workers.outbox_lease_duration,
-            )
-            .await
-        {
-            Ok(claims) => {
-                runtime.set_outbox_enqueue_available(true);
-                claims
-            }
-            Err(_) => {
-                runtime.set_outbox_enqueue_available(false);
-                next_poll_delay = workers.outbox_poll_interval;
-                continue;
-            }
-        };
-        let mut batch = JoinSet::new();
-        for claim in claims {
-            let workers = workers.clone();
-            batch.spawn(async move {
-                let retry_schedule = outbox_retry_schedule(
-                    workers.outbox_retry_initial,
-                    workers.outbox_retry_max,
-                    workers.rapid_link_retry_attempts,
-                    workers.rapid_link_retry_interval,
-                    claim.attempt_count(),
-                );
-                match creator_adapter(&workers, claim.creator_id()).await {
-                    Ok(adapter) => {
-                        process_claim_with_health(&workers.outbox, &adapter, &claim, retry_schedule)
-                            .await
-                    }
-                    Err(AdapterBuildError::Permanent) => workers
-                        .outbox
-                        .mark_permanently_failed(&claim)
-                        .await
-                        .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
-                    Err(AdapterBuildError::Unavailable) => workers
-                        .outbox
-                        .mark_retryable(
-                            &claim,
-                            retry_schedule.default_delay(),
-                            OutboxRetryClass::AdapterUnavailable,
-                        )
-                        .await
-                        .map(|transitioned| {
-                            (
-                                transitioned,
-                                ProcessingHealth::Retryable(retry_schedule.default_delay()),
-                            )
-                        }),
-                }
-            });
+        let now = tokio::time::Instant::now();
+        if next_poll <= now {
+            next_poll = now + workers.outbox_poll_interval;
         }
-        let mut delivery_available = true;
         let mut outbox_available = true;
-        next_poll_delay = workers.outbox_poll_interval;
-        while let Some(result) = batch.join_next().await {
+        if let Some((_, result)) = completed {
             match result {
-                Ok(Ok((_, ProcessingHealth::Available))) => {}
-                Ok(Ok((_, ProcessingHealth::Retryable(delay)))) => {
-                    delivery_available = false;
-                    next_poll_delay = next_poll_delay.min(delay);
+                Ok(Some((true, ProcessingHealth::Retryable(delay)))) => {
+                    next_poll = next_poll.min(now + delay);
                 }
-                Ok(Ok((_, ProcessingHealth::PermanentFailure))) => {
-                    delivery_available = false;
+                Ok(_) => {}
+                Err(_) => {
+                    outbox_available = false;
                 }
-                Ok(Err(_)) => outbox_available = false,
-                Err(_) => panic!("owned outbox claim task exited unexpectedly"),
+            }
+        }
+        if outbox_available && tasks.available_slots() > 0 {
+            match workers
+                .outbox
+                .due_creator_ids(
+                    &tasks.active_creators(),
+                    i64::try_from(tasks.available_slots()).expect("bounded Creator task capacity"),
+                )
+                .await
+            {
+                Ok(creators) => {
+                    for creator in creators {
+                        tasks.try_spawn(
+                            creator,
+                            process_creator_outbox(
+                                workers.clone(),
+                                runtime.clone(),
+                                owner,
+                                creator,
+                            ),
+                        );
+                    }
+                }
+                Err(_) => outbox_available = false,
             }
         }
         match workers.outbox.delivery_available().await {
             Ok(persisted_available) => {
-                delivery_available &= persisted_available;
+                runtime.set_paykit_enqueue_available(persisted_available);
+                runtime.set_outbox_enqueue_available(outbox_available);
             }
             Err(_) => {
-                delivery_available = false;
-                outbox_available = false;
+                runtime.set_paykit_enqueue_available(false);
+                runtime.set_outbox_enqueue_available(false);
             }
         }
-        runtime.set_paykit_enqueue_available(delivery_available);
-        runtime.set_outbox_enqueue_available(outbox_available);
     }
+    // Finish admitted effects. The server's drain deadline still bounds shutdown.
+    while tasks.join_next().await.is_some() {}
+}
+
+async fn process_creator_outbox(
+    workers: Arc<WorkerComponents>,
+    runtime: Arc<Runtime>,
+    owner: Uuid,
+    creator: Uuid,
+) -> Result<Option<(bool, ProcessingHealth)>, PersistenceError> {
+    let guard = tokio::select! {
+        _ = runtime.cancelled() => return Ok(None),
+        guard = creator_mutation_lock(creator).lock_owned() => guard,
+    };
+    if !runtime.may_start_worker_claim() {
+        return Ok(None);
+    }
+    // No row is leased while waiting for a scheduler slot or Creator ownership.
+    let Some(claim) = workers
+        .outbox
+        .claim_for_creator(owner, creator, workers.outbox_lease_duration)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let retry_schedule = outbox_retry_schedule(
+        workers.outbox_retry_initial,
+        workers.outbox_retry_max,
+        workers.rapid_link_retry_attempts,
+        workers.rapid_link_retry_interval,
+        claim.attempt_count(),
+    );
+    let result = match creator_adapter(&workers, creator).await {
+        Ok(adapter) => {
+            process_claim_with(&workers.outbox, &claim, retry_schedule, |intent| {
+                let adapter = &adapter;
+                let guard = &guard;
+                let store = &workers.outbox;
+                let claim = &claim;
+                async move {
+                    adapter
+                        .execute_claimed_handoff_with_guard(guard, store, claim, &intent)
+                        .await
+                }
+            })
+            .await
+        }
+        Err(AdapterBuildError::Permanent) => workers
+            .outbox
+            .mark_permanently_failed(&claim)
+            .await
+            .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
+        Err(AdapterBuildError::Unavailable) => workers
+            .outbox
+            .mark_retryable(
+                &claim,
+                retry_schedule.default_delay(),
+                OutboxRetryClass::AdapterUnavailable,
+            )
+            .await
+            .map(|transitioned| {
+                (
+                    transitioned,
+                    ProcessingHealth::Retryable(retry_schedule.default_delay()),
+                )
+            }),
+    };
+    result.map(Some)
 }
 
 async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
@@ -1421,6 +1458,37 @@ mod tests {
 
     #[tokio::test]
     async fn production_spawn_path_owns_all_four_workers() {
+        let server = test_server().await;
+        let mut tasks = spawn_owned_workers(server.workers, server.runtime);
+        assert_eq!(tasks.len(), 4);
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_creator_lock_wait_before_claiming() {
+        let server = test_server().await;
+        let creator = Uuid::new_v4();
+        let guard = creator_mutation_lock(creator).lock_owned().await;
+        let work = process_creator_outbox(
+            Arc::new(server.workers),
+            server.runtime.clone(),
+            Uuid::new_v4(),
+            creator,
+        );
+        tokio::pin!(work);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut work)
+                .await
+                .is_err()
+        );
+        server.runtime.begin_shutdown();
+        // The fixture's database is unreachable; a claim attempt would return an error.
+        assert_eq!(work.await.unwrap(), None);
+        drop(guard);
+    }
+
+    async fn test_server() -> Server {
         let config = Config::from_toml_and_environment(
             &format!(
                 r#"
@@ -1453,10 +1521,6 @@ poll_interval = "1s"
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://127.0.0.1:1/paykit")
             .unwrap();
-        let server = Server::build(config, pool).await.unwrap();
-        let mut tasks = spawn_owned_workers(server.workers, server.runtime);
-        assert_eq!(tasks.len(), 4);
-        tasks.abort_all();
-        while tasks.join_next().await.is_some() {}
+        Server::build(config, pool).await.unwrap()
     }
 }

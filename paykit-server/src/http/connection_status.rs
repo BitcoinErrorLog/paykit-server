@@ -48,6 +48,7 @@ async fn status(
     match service.status(&creator, &bundle_id).await {
         Ok(state) => axum::Json(ConnectionStatusResponse { state }).into_response(),
         Err(ConnectionStatusError::NotFound) => ApiError::InvoiceNotFound.into_response(),
+        Err(ConnectionStatusError::Busy) => ApiError::DependencyUnavailable.into_response(),
         Err(ConnectionStatusError::Unavailable) => {
             crate::diagnostics::failure("connection_status", "application_service", "unavailable");
             ApiError::InternalError.into_response()

@@ -45,3 +45,10 @@ precedence over hints and remain the recovery path for restarts, missed hints,
 and work admitted through other stores. A successful targeted pass cannot clear
 aggregate health failures for unrelated Creators. Hints reduce idle polling waits
 without changing the meaning of Linked, handed-off, or delivered state.
+
+Enqueue scheduling admits at most `outbox.batch_size` concurrent Creators, with
+one task per Creator. Completion frees a slot without waiting for unrelated tasks.
+Discovery does not lease rows: each task takes the existing Creator mutation lock
+before claiming one due row, then rechecks its live fence before SDK effects.
+Shutdown stops new claims and drains admitted effects within the server deadline.
+Transport and reconciliation retain their own periodic worker scheduling.

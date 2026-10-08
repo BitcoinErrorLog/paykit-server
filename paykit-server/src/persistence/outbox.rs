@@ -243,6 +243,7 @@ impl OutboxStore {
             "SELECT NOT EXISTS ( \
                  SELECT 1 FROM outbox \
                  WHERE status IN ('retryable', 'handed_off', 'permanently_failed') \
+                    OR (status = 'leased' AND error_class IS NOT NULL) \
              )",
         )
         .fetch_one(&self.pool)
@@ -257,6 +258,61 @@ impl OutboxStore {
         limit: i64,
         lease: Duration,
     ) -> Result<Vec<ClaimedOutbox>, PersistenceError> {
+        self.claim_matching(owner, limit, lease, None).await
+    }
+
+    /// Discovers due Creators without leasing work. Excluded Creators already
+    /// have process-owned work; eligibility is checked again when claiming.
+    pub async fn due_creator_ids(
+        &self,
+        excluded: &[Uuid],
+        limit: i64,
+    ) -> Result<Vec<Uuid>, PersistenceError> {
+        sqlx::query_scalar(
+            "SELECT o.creator_id FROM outbox o \
+             WHERE NOT (o.creator_id = ANY($1)) AND ( \
+                 (o.status IN ('queued', 'retryable') AND o.next_attempt_at <= clock_timestamp()) \
+                 OR (o.status = 'leased' AND o.lease_expires_at <= clock_timestamp()) \
+             ) AND (o.intent_kind <> 'payment_request_proposal' OR ( \
+                 o.proposal_lookup_hash IS NOT NULL AND EXISTS ( \
+                     SELECT 1 FROM invoices invoice \
+                     JOIN lock_payment_generations generation \
+                       ON generation.creator_id = invoice.creator_id \
+                      AND generation.lock_resource_lookup_hash = invoice.lock_resource_lookup_hash \
+                     WHERE invoice.id = o.invoice_id \
+                       AND generation.current_generation = invoice.lock_resource_generation \
+                       AND generation.active_drain_id IS NULL \
+                 ))) \
+             GROUP BY o.creator_id ORDER BY MIN(o.next_attempt_at), o.creator_id LIMIT $2",
+        )
+        .bind(excluded)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)
+    }
+
+    /// Claims at most one due row after the caller has acquired Creator ownership.
+    /// Discovery is only a hint; the normal due-time and generation fences apply.
+    pub async fn claim_for_creator(
+        &self,
+        owner: Uuid,
+        creator_id: Uuid,
+        lease: Duration,
+    ) -> Result<Option<ClaimedOutbox>, PersistenceError> {
+        Ok(self
+            .claim_matching(owner, 1, lease, Some(creator_id))
+            .await?
+            .pop())
+    }
+
+    async fn claim_matching(
+        &self,
+        owner: Uuid,
+        limit: i64,
+        lease: Duration,
+        creator_id: Option<Uuid>,
+    ) -> Result<Vec<ClaimedOutbox>, PersistenceError> {
         let seconds = lease_seconds(lease)?;
         sqlx::query_as(
             "WITH candidates AS ( \
@@ -267,6 +323,7 @@ impl OutboxStore {
                      OR (o.status = 'leased' AND o.lease_expires_at <= clock_timestamp()) \
                      OR (o.status = 'retryable' AND o.next_attempt_at <= clock_timestamp()) \
                  ) \
+                 AND ($4::UUID IS NULL OR o.creator_id = $4) \
                  AND (o.intent_kind <> 'payment_request_proposal' OR ( \
                      o.proposal_lookup_hash IS NOT NULL AND EXISTS ( \
                      SELECT 1 \
@@ -298,6 +355,7 @@ impl OutboxStore {
         .bind(limit)
         .bind(owner)
         .bind(seconds)
+        .bind(creator_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)

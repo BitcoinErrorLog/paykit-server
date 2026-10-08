@@ -52,7 +52,7 @@ pub trait PeerConnectionStateRepository: Send + Sync {
         &self,
         creator: &CreatorPubky,
         binding: &ConnectionBinding,
-    ) -> Result<PaykitConnectionState, PersistenceError>;
+    ) -> Result<PaykitConnectionState, ConnectionStatusError>;
 }
 
 #[async_trait]
@@ -69,6 +69,7 @@ impl ConnectionBindingRepository for InvoiceStore {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectionStatusError {
     NotFound,
+    Busy,
     Unavailable,
 }
 
@@ -107,13 +108,16 @@ impl ConnectionStatusService {
         self.peers
             .connection_state(creator, &binding)
             .await
-            .map_err(|error| {
+            .inspect_err(|error| {
                 crate::diagnostics::failure(
                     "connection_status",
                     "peer_state_load",
-                    error.diagnostic_label(),
+                    match error {
+                        ConnectionStatusError::NotFound => "not_found",
+                        ConnectionStatusError::Busy => "shared_state_busy",
+                        ConnectionStatusError::Unavailable => "unavailable",
+                    },
                 );
-                ConnectionStatusError::Unavailable
             })
     }
 }
