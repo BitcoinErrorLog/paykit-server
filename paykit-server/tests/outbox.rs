@@ -8,7 +8,10 @@ use paykit_lib::{
 };
 use paykit_sdk::OutboundPrivateMessageStatus;
 use paykit_server::{
-    application::semantic_intent::{DeliveryIntentV1, PaymentTermsV1},
+    application::{
+        create_invoice::ReaderAuthorization,
+        semantic_intent::{DeliveryIntentV1, PaymentTermsV1},
+    },
     workers::outbox::{
         Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffCause,
         RetryableHandoffStage, handoff,
@@ -39,6 +42,7 @@ fn registry(capable: bool) -> PaykitAppRegistry {
 
 struct FakeAdapter {
     registry: PaykitAppRegistry,
+    authorization: Result<ReaderAuthorization, HandoffError>,
     recovery_marker_error: Option<HandoffError>,
     link_error: Option<HandoffError>,
     payment_request_calls: Mutex<usize>,
@@ -53,6 +57,14 @@ impl Adapter for FakeAdapter {
     ) -> Result<Option<PaykitAppRegistry>, HandoffError> {
         self.calls.lock().unwrap().push("fetch_registry");
         Ok(Some(self.registry.clone()))
+    }
+
+    async fn fetch_authorization(
+        &self,
+        _reader: &str,
+    ) -> Result<ReaderAuthorization, HandoffError> {
+        self.calls.lock().unwrap().push("fetch_authorization");
+        self.authorization
     }
 
     async fn observe_recovery_marker(&self, _reader: &str) -> Result<(), HandoffError> {
@@ -120,6 +132,7 @@ async fn incapable_registry_is_retryable_without_handoff() {
     let changed = registry(false);
     let adapter = FakeAdapter {
         registry: changed,
+        authorization: Ok(ReaderAuthorization::Verified),
         recovery_marker_error: None,
         link_error: None,
         payment_request_calls: Mutex::new(0),
@@ -140,6 +153,7 @@ async fn link_failure_has_one_durable_diagnostic_stage() {
     let selected = registry(true);
     let adapter = FakeAdapter {
         registry: selected.clone(),
+        authorization: Ok(ReaderAuthorization::Verified),
         recovery_marker_error: None,
         link_error: Some(HandoffError::Retryable(RetryableHandoffCause::Transport)),
         payment_request_calls: Mutex::new(0),
@@ -159,6 +173,7 @@ async fn retry_after_an_ambiguous_handoff_can_propose_twice() {
     let selected = registry(true);
     let adapter = Arc::new(FakeAdapter {
         registry: selected.clone(),
+        authorization: Ok(ReaderAuthorization::Verified),
         recovery_marker_error: None,
         link_error: None,
         payment_request_calls: Mutex::new(0),
@@ -186,6 +201,7 @@ async fn recovery_marker_observation_precedes_link_ensure_and_enqueue() {
     let selected = registry(true);
     let adapter = FakeAdapter {
         registry: selected,
+        authorization: Ok(ReaderAuthorization::Verified),
         recovery_marker_error: None,
         link_error: None,
         payment_request_calls: Mutex::new(0),
@@ -198,6 +214,7 @@ async fn recovery_marker_observation_precedes_link_ensure_and_enqueue() {
         *adapter.calls.lock().unwrap(),
         [
             "fetch_registry",
+            "fetch_authorization",
             "observe_recovery_marker",
             "ensure_link_with_peer",
             "propose_payment_request",
@@ -210,6 +227,7 @@ async fn recovery_marker_lookup_failure_never_ensures_or_enqueues() {
     let selected = registry(true);
     let adapter = FakeAdapter {
         registry: selected,
+        authorization: Ok(ReaderAuthorization::Verified),
         recovery_marker_error: Some(HandoffError::Retryable(RetryableHandoffCause::Transport)),
         link_error: None,
         payment_request_calls: Mutex::new(0),
@@ -224,7 +242,11 @@ async fn recovery_marker_lookup_failure_never_ensures_or_enqueues() {
     );
     assert_eq!(
         *adapter.calls.lock().unwrap(),
-        ["fetch_registry", "observe_recovery_marker"]
+        [
+            "fetch_registry",
+            "fetch_authorization",
+            "observe_recovery_marker"
+        ]
     );
     assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 0);
 }
@@ -234,6 +256,7 @@ async fn confirmed_absent_recovery_marker_continues_to_link_ensure() {
     let selected = registry(true);
     let adapter = FakeAdapter {
         registry: selected,
+        authorization: Ok(ReaderAuthorization::Verified),
         recovery_marker_error: None,
         link_error: None,
         payment_request_calls: Mutex::new(0),
@@ -251,4 +274,58 @@ async fn confirmed_absent_recovery_marker_continues_to_link_ensure() {
             .windows(2)
             .any(|calls| calls == ["observe_recovery_marker", "ensure_link_with_peer"])
     );
+}
+
+fn adapter_with_authorization(
+    authorization: Result<ReaderAuthorization, HandoffError>,
+) -> FakeAdapter {
+    FakeAdapter {
+        registry: registry(true),
+        authorization,
+        recovery_marker_error: None,
+        link_error: None,
+        payment_request_calls: Mutex::new(0),
+        calls: Mutex::new(Vec::new()),
+    }
+}
+
+#[tokio::test]
+async fn missing_or_invalid_reader_authorization_is_retryable_without_link_or_handoff() {
+    for (authorization, stage) in [
+        (
+            ReaderAuthorization::Missing,
+            RetryableHandoffStage::ReaderAuthorizationMissing,
+        ),
+        (
+            ReaderAuthorization::Invalid,
+            RetryableHandoffStage::ReaderAuthorizationInvalid,
+        ),
+    ] {
+        let adapter = adapter_with_authorization(Ok(authorization));
+
+        assert_eq!(
+            handoff(&adapter, &payment_intent()).await,
+            Err(HandoffFailure::Retryable(stage))
+        );
+        assert_eq!(
+            *adapter.calls.lock().unwrap(),
+            ["fetch_registry", "fetch_authorization"]
+        );
+        assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 0);
+    }
+}
+
+#[tokio::test]
+async fn reader_authorization_fetch_failure_keeps_its_own_stage() {
+    let adapter = adapter_with_authorization(Err(HandoffError::Retryable(
+        RetryableHandoffCause::Transport,
+    )));
+
+    assert_eq!(
+        handoff(&adapter, &payment_intent()).await,
+        Err(HandoffFailure::Retryable(
+            RetryableHandoffStage::ReaderAuthorizationFetch
+        ))
+    );
+    assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 0);
 }

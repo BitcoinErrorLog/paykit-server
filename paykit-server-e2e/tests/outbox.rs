@@ -108,6 +108,13 @@ impl Adapter for ReconciliationAdapter {
         Ok(None)
     }
 
+    async fn fetch_authorization(
+        &self,
+        _reader: &str,
+    ) -> Result<paykit_server::application::create_invoice::ReaderAuthorization, HandoffError> {
+        Err(HandoffError::Permanent)
+    }
+
     async fn observe_recovery_marker(&self, _reader: &str) -> Result<(), HandoffError> {
         Err(HandoffError::Permanent)
     }

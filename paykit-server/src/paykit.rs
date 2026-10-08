@@ -936,6 +936,20 @@ fn classify(error: PaykitSdkError) -> HandoffError {
     }
 }
 
+/// `Protocol` here only comes from a bad signature, another owner or an
+/// unreadable record; storage loading for the server's own SDK is infallible.
+fn handoff_reader_authorization<T>(
+    fetched: paykit_sdk::Result<T>,
+) -> Result<crate::application::create_invoice::ReaderAuthorization, HandoffError> {
+    use crate::application::create_invoice::ReaderAuthorization;
+    match fetched {
+        Ok(_) => Ok(ReaderAuthorization::Verified),
+        Err(PaykitSdkError::NotFound { .. }) => Ok(ReaderAuthorization::Missing),
+        Err(PaykitSdkError::Protocol { .. }) => Ok(ReaderAuthorization::Invalid),
+        Err(error) => Err(classify(error)),
+    }
+}
+
 fn retryable_recovery_observation(error: HandoffError) -> HandoffError {
     match error {
         HandoffError::Retryable(cause) => HandoffError::Retryable(cause),
@@ -975,6 +989,14 @@ impl Adapter for PaykitAdapter {
     ) -> Result<Option<paykit_lib::PaykitAppRegistry>, HandoffError> {
         let reader = parse_peer(reader)?;
         self.sdk.paykit_app_registry(reader).await.map_err(classify)
+    }
+
+    async fn fetch_authorization(
+        &self,
+        reader: &str,
+    ) -> Result<crate::application::create_invoice::ReaderAuthorization, HandoffError> {
+        let reader = parse_peer(reader)?;
+        handoff_reader_authorization(self.sdk.paykit_noise_key_authorization(reader).await)
     }
 
     async fn observe_recovery_marker(&self, reader: &str) -> Result<(), HandoffError> {
@@ -1134,6 +1156,43 @@ mod tests {
     use serde_json::Map;
 
     const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+    #[test]
+    fn handoff_reader_authorization_is_verified_only_for_a_fetched_record() {
+        use crate::application::create_invoice::ReaderAuthorization;
+        assert_eq!(
+            handoff_reader_authorization(Ok(())),
+            Ok(ReaderAuthorization::Verified)
+        );
+        assert_eq!(
+            handoff_reader_authorization::<()>(Err(PaykitSdkError::NotFound {
+                context: "no record".into(),
+                source: None,
+            })),
+            Ok(ReaderAuthorization::Missing)
+        );
+        assert_eq!(
+            handoff_reader_authorization::<()>(Err(PaykitSdkError::Protocol {
+                context: "bad signature".into(),
+                source: None,
+            })),
+            Ok(ReaderAuthorization::Invalid)
+        );
+        assert_eq!(
+            handoff_reader_authorization::<()>(Err(PaykitSdkError::Transport {
+                context: "read failed".into(),
+                source: None,
+            })),
+            Err(HandoffError::Retryable(RetryableHandoffCause::Transport))
+        );
+        assert_eq!(
+            handoff_reader_authorization::<()>(Err(PaykitSdkError::Identity {
+                context: "no storage".into(),
+                source: None,
+            })),
+            Err(HandoffError::Retryable(RetryableHandoffCause::Identity))
+        );
+    }
 
     fn server_app_id() -> PaykitAppId {
         PaykitAppId::new("paykit-server").unwrap()
