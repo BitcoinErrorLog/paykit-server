@@ -586,7 +586,17 @@ async fn wait_for_completion(
         }
         // Delivery can finish after this iteration's intake has already run.
         let received = peer.payment_requests().await.unwrap().len();
-        if delivered == 2 && statuses_confirmed && received == fixtures.len() {
+        let contacts_completed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM buyer_contacts WHERE completed_at IS NOT NULL",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if delivered == 2
+            && statuses_confirmed
+            && received == fixtures.len()
+            && contacts_completed == 2
+        {
             return;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -596,7 +606,7 @@ async fn wait_for_completion(
                     .await
                     .unwrap();
             panic!(
-                "composed workflow did not finish: delivered={delivered}, statuses_confirmed={statuses_confirmed}, received={received}, rows={rows:?}"
+                "composed workflow did not finish: delivered={delivered}, statuses_confirmed={statuses_confirmed}, received={received}, contacts_completed={contacts_completed}, rows={rows:?}"
             );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -611,6 +621,7 @@ async fn raw_database_bytes(pool: &PgPool) -> Vec<Vec<u8>> {
              UNION ALL SELECT convert_to(to_jsonb(i)::text, 'UTF8') FROM invoices i
              UNION ALL SELECT convert_to(to_jsonb(o)::text, 'UTF8') FROM outbox o
              UNION ALL SELECT convert_to(to_jsonb(b)::text, 'UTF8') FROM bitcoin_observations b
+             UNION ALL SELECT convert_to(to_jsonb(c)::text, 'UTF8') FROM buyer_contacts c
          ) protected_bytes",
     )
     .fetch_all(pool)
@@ -785,6 +796,17 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     let creators = CreatorStore::new(&first_pool, crypto.clone());
 
     let (reader, peer_key, peer_sdk) = create_peer(&bootstrap, &homeserver).await;
+    peer_sdk
+        .publish_paykit_profile(
+            paykit_sdk::PaykitProfile {
+                display_name: Some("Paid buyer".into()),
+                image_uri: None,
+                extra: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
     let creator_a = create_creator(
         &bootstrap,
         &homeserver,
@@ -825,7 +847,7 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         &creator_b.sdk,
         PubkyPublicKey::from_raw_or_app_key(creator_b.creator.to_string()).unwrap(),
         &peer_sdk,
-        peer_key,
+        peer_key.clone(),
     )
     .await;
 
@@ -1008,6 +1030,16 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     let state_a = creator_backup_state(&creator_a.sdk).await;
     let state_b = creator_backup_state(&creator_b.sdk).await;
     for state in [&state_a, &state_b] {
+        assert_eq!(state.contact_records.len(), 1);
+        assert_eq!(state.contact_records[0].public_key, peer_key);
+        assert_eq!(
+            state.contact_records[0].label.as_deref(),
+            Some("Paid buyer")
+        );
+        assert_eq!(
+            state.contact_records[0].public_contact_marker_status,
+            paykit_sdk::PublicationStatus::NotPublished
+        );
         assert_eq!(state.outbound_private_messages.len(), 1);
         assert!(
             state.outbound_private_messages[0].raw_json.len()
@@ -1032,6 +1064,7 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
         BUNDLE_B.into(),
         "0.00000100".into(),
         "0.00000200".into(),
+        "Paid buyer".into(),
         Txid::from_byte_array([11; 32]).to_string(),
         Txid::from_byte_array([12; 32]).to_string(),
         format!("{}:0", Txid::from_byte_array([11; 32])),

@@ -1,5 +1,7 @@
 //! Concrete per-Creator Paykit SDK boundary used by durable outbox workers.
 
+mod buyer_contacts;
+
 use std::{
     collections::HashMap,
     future::Future,

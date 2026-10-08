@@ -87,6 +87,89 @@ async fn invoice(store: &InvoiceStore) -> (uuid::Uuid, String) {
     invoice_for(store, b"bundle", b"request", "bitcoin-address-0").await
 }
 
+#[tokio::test]
+async fn verified_timely_payment_queues_one_contact_attempt_per_buyer() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let (id, address) = invoice(&store).await;
+    assert!(store.claim_buyer_contact().await.unwrap().is_none());
+    let outpoint = persisted_outpoint("buyer-contact");
+    for (amount, present) in [(99, true), (100, false)] {
+        store
+            .apply_bitcoin_observation(&address, &outpoint, amount, 1, present)
+            .await
+            .unwrap();
+        assert!(store.claim_buyer_contact().await.unwrap().is_none());
+    }
+    store
+        .apply_bitcoin_observation(&address, &outpoint, 100, 0, true)
+        .await
+        .unwrap();
+    let pending = store.claim_buyer_contact().await.unwrap().unwrap();
+    assert_eq!(pending.invoice_id, id);
+    assert_eq!(pending.reader, reader());
+    assert!(store.claim_buyer_contact().await.unwrap().is_none());
+
+    // An interrupted save is retryable after restart, without another chain observation.
+    sqlx::query("UPDATE buyer_contacts SET next_attempt_at = NOW() WHERE invoice_id = $1")
+        .bind(id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let restarted = InvoiceStore::new(database.pool(), crypto());
+    let retried = restarted.claim_buyer_contact().await.unwrap().unwrap();
+    assert_eq!(retried.invoice_id, id);
+    restarted.complete_buyer_contact(&retried).await.unwrap();
+    let (_, second_address) = invoice_for(
+        &store,
+        b"second-bundle",
+        b"second-request",
+        "bitcoin-address-1",
+    )
+    .await;
+    store
+        .apply_bitcoin_observation(
+            &second_address,
+            &persisted_outpoint("second-payment"),
+            100,
+            1,
+            true,
+        )
+        .await
+        .unwrap();
+    assert!(
+        store.claim_buyer_contact().await.unwrap().is_none(),
+        "repeat purchases must not recreate a deleted contact"
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn late_payment_does_not_queue_a_buyer_contact() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let (id, address) = invoice(&store).await;
+    let deadline: OffsetDateTime =
+        sqlx::query_scalar("SELECT payment_deadline FROM invoices WHERE id = $1")
+            .bind(id)
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    store
+        .apply_bitcoin_observation_at(
+            &address,
+            &persisted_outpoint("late-payment"),
+            100,
+            1,
+            true,
+            deadline + time::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+    assert!(store.claim_buyer_contact().await.unwrap().is_none());
+    database.cleanup().await;
+}
+
 async fn invoice_for(
     store: &InvoiceStore,
     bundle: &[u8],

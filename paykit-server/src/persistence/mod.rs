@@ -13,7 +13,7 @@ pub use deployment::{DeploymentStore, PersistenceError};
 pub(crate) use invoices::BitcoinObservationInput;
 pub use invoices::{
     AtomicInvoiceInput, AtomicInvoiceResult, InvoicePayloadFactory, InvoicePayloads,
-    InvoicePreflight, InvoiceStore,
+    InvoicePreflight, InvoiceStore, PendingBuyerContact,
 };
 pub use migrations::{MIGRATION_ADVISORY_LOCK_KEY, MigrationLock, run_migrations};
 pub use outbox::{ClaimedHandoff, ClaimedOutbox, HandoffResult, OutboxRetryClass, OutboxStore};

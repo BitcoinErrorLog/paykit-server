@@ -4,8 +4,11 @@
 //! repository persists those complete SDK inputs inside Creator-bound AEAD
 //! envelopes before reporting invoice success.
 
+mod buyer_contacts;
 mod settlement;
 mod usdt;
+
+pub use buyer_contacts::PendingBuyerContact;
 
 use std::sync::Arc;
 

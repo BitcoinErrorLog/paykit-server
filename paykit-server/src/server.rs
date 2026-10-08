@@ -426,8 +426,46 @@ fn spawn_owned_workers(workers: WorkerComponents, runtime: Arc<Runtime>) -> Join
     tasks.spawn(outbox_enqueue_loop(workers.clone(), runtime.clone()));
     tasks.spawn(outbox_reconciliation_loop(workers.clone(), runtime.clone()));
     tasks.spawn(shared_transport_loop(workers.clone(), runtime.clone()));
+    tasks.spawn(buyer_contacts_loop(workers.clone(), runtime.clone()));
     tasks.spawn(observer_loop(workers, runtime));
     tasks
+}
+
+async fn buyer_contacts_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
+    let mut interval = tokio::time::interval(workers.outbox_poll_interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = runtime.cancelled() => break,
+            _ = interval.tick() => {}
+        }
+        for _ in 0..workers.outbox_batch_size {
+            if !runtime.may_start_worker_claim() {
+                return;
+            }
+            let pending = match workers.invoices.claim_buyer_contact().await {
+                Ok(Some(pending)) => pending,
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::warn!(
+                        stage = "buyer_contact_claim",
+                        "Buyer contact work unavailable"
+                    );
+                    break;
+                }
+            };
+            let saved = match creator_adapter(&workers, pending.creator_id).await {
+                Ok(adapter) => adapter
+                    .save_buyer_contact(&workers.invoices, &pending)
+                    .await
+                    .is_ok(),
+                Err(_) => false,
+            };
+            if !saved {
+                tracing::warn!(stage = "buyer_contact_save", "Buyer contact save deferred");
+            }
+        }
+    }
 }
 
 async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
@@ -1457,10 +1495,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_spawn_path_owns_all_four_workers() {
+    async fn production_spawn_path_owns_all_workers() {
         let server = test_server().await;
         let mut tasks = spawn_owned_workers(server.workers, server.runtime);
-        assert_eq!(tasks.len(), 4);
+        assert_eq!(tasks.len(), 5);
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }

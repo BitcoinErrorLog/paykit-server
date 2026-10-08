@@ -72,6 +72,30 @@ A Bitcoin amount-matched output freezes at one confirmation and becomes final at
 USDT verification shares a bounded five-second chain-tip snapshot across Creator adapters. Each receipt and canonical block is read afresh. Persisted observation check times limit background refreshes of present transfers to once per minute; explicit status reads bypass this delay, and missing transfers remain eligible on every receive cycle.
 No spending, refunds, receipt issuance, or horizontal replicas are supported.
 
+### Buyer contacts
+
+A verified, full payment received within the invoice's payment window queues a
+private buyer-contact save. This uses Bitcoin output or USDT receipt verification,
+not a submitted Payment Proof or an Encrypted Link. It does not change Locks'
+confirmation/finality policy or grant access to content.
+
+A separate worker resolves the buyer's Paykit profile first, then Pubky.app when
+the Paykit profile is absent. If neither exists, it skips the contact. The worker
+inserts into the Creator's encrypted shared SDK contacts, visible to Bitkit on its
+next contact refresh. It never publishes a Public Contact Marker, edits an existing
+contact, or unblocks a peer. The existing Encrypted Link is unchanged.
+
+Contact work is recorded atomically with payment observation and retried after
+transient failures or worker restart, independently of payment delivery and status
+responses. Completed or skipped attempts are retained per Creator/buyer so later
+purchases do not recreate a contact the Creator removed. Profile resolution runs
+outside the shared-state lock. The worker rechecks completion under that lock and
+holds it through the contact write and database completion, fencing expired
+claims before they can modify shared contacts. These are two durable writes: a
+crash after the contact write but before database completion leaves a retryable
+attempt, not a completed one. Profile data stays in
+encrypted shared state; the queue reuses the encrypted invoice and keyed lookups.
+
 Upgrade policy and operational limits are in the [README](../README.md);
 validation commands are in [CONTRIBUTING](../CONTRIBUTING.md).
 

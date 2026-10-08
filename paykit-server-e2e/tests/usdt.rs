@@ -465,6 +465,16 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         assert_eq!(facts.amount_matched, amount >= 50_000);
         assert_eq!(facts.paid_on_time, offset == 0 && amount >= 50_000);
         assert!(!facts.finalized);
+        let contact = store.claim_buyer_contact().await.unwrap();
+        assert_eq!(
+            contact.is_some(),
+            matched,
+            "only a verified timely full receipt queues a contact"
+        );
+        if let Some(contact) = contact {
+            assert_eq!(contact.invoice_id, ids[0]);
+            store.complete_buyer_contact(&contact).await.unwrap();
+        }
         assert!(matches!(
             store.payment_status(&creator, &bundles[0]).await.unwrap(),
             Some(paykit_server::application::payment_status::PersistedPaymentStatus::Undetected)

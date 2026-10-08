@@ -92,6 +92,17 @@ impl InvoiceStore {
             .bind(invoice).bind(status).bind(bitcoin.confirmations).bind(bitcoin.matched)
             .bind(received_at).bind(eligible).bind(now)
             .execute(&mut **tx).await.map_err(|_| PersistenceError::Unavailable)?;
+        if eligible {
+            sqlx::query(
+                "INSERT INTO buyer_contacts (invoice_id, creator_id, reader_lookup_hash)
+                 SELECT id, creator_id, reader_lookup_hash FROM invoices WHERE id = $1
+                 ON CONFLICT (creator_id, reader_lookup_hash) DO NOTHING",
+            )
+            .bind(invoice)
+            .execute(&mut **tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        }
         Ok(())
     }
 }
