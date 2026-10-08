@@ -552,6 +552,23 @@ impl OutboxStore {
         Ok(changed.rows_affected() == 1)
     }
 
+    /// Checks for a committed SDK association after enqueue.
+    /// Leased, failed, and already delivered rows are not eligible for an initial send.
+    pub async fn handoff_is_committed(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<bool, PersistenceError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM outbox \
+             WHERE id = $1 AND creator_id = $2 AND status = 'handed_off')",
+        )
+        .bind(claim.id)
+        .bind(claim.creator_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)
+    }
+
     /// Marks delivery only while the separately acquired reconciliation fence is live.
     pub async fn mark_delivered(&self, claim: &ClaimedHandoff) -> Result<bool, PersistenceError> {
         self.reconciliation_transition(claim, "delivered", None, None)

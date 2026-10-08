@@ -834,6 +834,7 @@ async fn process_creator_outbox(
         claim.attempt_count(),
         claim.failure_count(),
     );
+    let mut ready_adapter = None;
     let result = with_claim_renewal(
         &workers.outbox,
         &claim,
@@ -841,8 +842,9 @@ async fn process_creator_outbox(
         async {
             match creator_adapter(&workers, creator).await {
                 Ok(adapter) => {
+                    let adapter = ready_adapter.insert(adapter);
                     process_claim_with(&workers.outbox, &claim, retry_schedule, |intent| {
-                        let adapter = &adapter;
+                        let adapter = &*adapter;
                         let guard = &guard;
                         let store = &workers.outbox;
                         let claim = &claim;
@@ -879,6 +881,18 @@ async fn process_creator_outbox(
     .await;
     if matches!(result, Ok((false, _))) {
         tracing::warn!("outbox handoff finished without a live claim transition");
+    }
+    if matches!(result, Ok((true, ProcessingHealth::Available)))
+        && runtime.may_start_worker_claim()
+        && let Some(adapter) = ready_adapter
+        && let Err(error) = adapter
+            .send_handed_off_with_guard(&guard, &workers.outbox, &claim)
+            .await
+    {
+        tracing::warn!(
+            ?error,
+            "handed-off delivery deferred to transport maintenance"
+        );
     }
     result.map(Some)
 }

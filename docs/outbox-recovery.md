@@ -17,6 +17,12 @@ Admission also requires the Reader's identity-signed Noise Key Authorization: mi
 
 Before link establishment or enqueue, the worker asks the SDK to observe the Reader's recovery marker under the Creator mutation lock. Confirmed absence continues normally. A fresh marker abandons the old link generation and starts recovery; lookup or prerequisite failures keep the exact outbox row retryable without SDK handoff identifiers. The server does not publish a marker on the Reader's behalf. This check covers handoffs beginning after marker publication, not SDK records already durably `Sent` before it.
 
+The SDK also checks recovery markers during link establishment. The separate
+observation remains necessary for error classification: the SDK's `Protocol`
+error covers both malformed remote markers and terminal protocol failures.
+Observation failures must remain retryable without treating all link protocol
+errors as recoverable.
+
 A successful proposal stores the returned SDK outbound, Event, and Payment Request IDs under the same live fence as `handed_off`. If the SDK transaction commits before this server transition, reclaimed work calls the public API again with the persisted terms and address. That accepted crash window is at-least-once and may create duplicate Payment Request proposals.
 
 An admitted enqueue task renews its database claim every third of the configured
@@ -68,3 +74,19 @@ Discovery does not lease rows: each task takes the existing Creator mutation loc
 before claiming one due row, then rechecks its live fence before SDK effects.
 Shutdown stops new claims and drains admitted effects within the server deadline.
 Transport and reconciliation retain their own periodic worker scheduling.
+
+After a successful handoff, the enqueue task attempts the associated Reader's
+queue while it still owns the Creator mutation lock. It reads the committed
+server association before sending. It does not receive from unrelated Readers
+or enqueue another proposal. The peer's FIFO order and SDK recovery checks still
+apply; the SDK may drain that peer's queue, including earlier messages.
+
+Each handoff gets one awaited peer send pass, not a fixed message-count limit,
+with no additional retry loop or operation deadline. It runs after enqueue lease
+renewal has finished and the association has committed, unless shutdown has begun.
+Admitted SDK operations run to completion under the Creator lock, preserving cancellation safety and
+existing SDK lease/retry waits. Releasing the guard after that pass lets queued
+lock waiters proceed in FIFO order. Failure leaves the server row `handed_off`,
+with no retry schedule or delivery-state mutation. Ordinary transport maintenance
+and fenced reconciliation remain responsible for eventual progress and `Sent`
+acknowledgement.

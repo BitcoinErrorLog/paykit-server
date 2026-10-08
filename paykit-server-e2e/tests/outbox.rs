@@ -995,6 +995,15 @@ async fn enqueue_retry_preserves_500ms_deadline_across_store_recreation() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_claim_associates() {
+    Box::pin(assert_public_sdk_handoff(true)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn responder_sdk_handoff_preserves_targeted_delivery() {
+    Box::pin(assert_public_sdk_handoff(false)).await;
+}
+
+async fn assert_public_sdk_handoff(creator_initiates: bool) {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let testnet = build_pubky_testnet().await;
@@ -1057,14 +1066,25 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         .unwrap();
     let peer_sdk = sdk_fixtures::hosted_sdk(peer_bootstrap.access.clone(), "bitkit", 0).await;
 
-    creator_sdk
-        .initiate_link_with_peer(peer_bootstrap.public_key.clone())
-        .await
-        .unwrap();
-    peer_sdk
-        .accept_link_with_peer(creator_bootstrap.public_key.clone())
-        .await
-        .unwrap();
+    if creator_initiates {
+        creator_sdk
+            .initiate_link_with_peer(peer_bootstrap.public_key.clone())
+            .await
+            .unwrap();
+        peer_sdk
+            .accept_link_with_peer(creator_bootstrap.public_key.clone())
+            .await
+            .unwrap();
+    } else {
+        peer_sdk
+            .initiate_link_with_peer(creator_bootstrap.public_key.clone())
+            .await
+            .unwrap();
+        creator_sdk
+            .accept_link_with_peer(peer_bootstrap.public_key.clone())
+            .await
+            .unwrap();
+    }
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut creator_link = LinkedPeerState::Linking;
     let mut peer_link = LinkedPeerState::Linking;
@@ -1324,7 +1344,7 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
     ));
     // Use the process-shared provider after it restores the stored grant.
     let creator_sdk = paykit_sdk::PaykitSdk::new(
-        storage,
+        storage.clone(),
         provider,
         sdk_fixtures::TestPaymentAdapter,
         paykit_sdk::PaykitSdkConfig::new("paykit-server").unwrap(),
@@ -1407,6 +1427,107 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
             second_request.clone(),
         )
     );
+
+    InvoiceStore::new(database.pool(), crypto.clone())
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"targeted-handoff",
+            lock_resource_binding: b"targeted-handoff",
+            payment_request_binding: b"targeted-handoff",
+            invoice_payloads: &Payloads {
+                reader: reader.clone(),
+            },
+            proposal_acceptance_seconds: 3600,
+            payment_window_seconds: 86400,
+        })
+        .await
+        .unwrap();
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let (outbound_id, request_count, before) =
+        with_claim_renewal(&outbox, &claim, Duration::from_secs(30), async {
+            let intent = outbox.delivery_intent(&claim).unwrap();
+            let result = adapter
+                .execute_claimed_handoff(&outbox, &claim, &intent)
+                .await
+                .unwrap();
+            let outbound_id = result.outbound_message_id();
+            adapter.send_handed_off(&outbox, &claim).await.unwrap();
+            let request_count = creator_sdk.payment_requests().await.unwrap().len();
+            let before = creator_sdk.export_backup_state().await.unwrap();
+            assert_eq!(
+                before
+                    .outbound_private_messages
+                    .iter()
+                    .find(|record| record.outbound_message_id == outbound_id)
+                    .unwrap()
+                    .status,
+                OutboundPrivateMessageStatus::Pending
+            );
+            assert!(outbox.mark_handed_off(&claim, &result).await.unwrap());
+            (outbound_id, request_count, before)
+        })
+        .await;
+    let lease = storage
+        .transaction(|tx| {
+            let now = sqlx::types::chrono::Utc::now();
+            Ok(tx
+                .claim_peer_link_operation(
+                    &peer_bootstrap.public_key,
+                    now,
+                    now + Duration::from_secs(60),
+                )?
+                .unwrap())
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        adapter.send_handed_off(&outbox, &claim).await,
+        Err(HandoffError::Retryable(_))
+    ));
+    assert!(outbox.handoff_is_committed(&claim).await.unwrap());
+    storage
+        .transaction(|tx| {
+            tx.release_peer_link_operation(&peer_bootstrap.public_key, lease.lease_id);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    // The unrelated Reader's failed intake cannot block this Reader's send.
+    // Repeated passes cannot create another proposal or outbound queue record.
+    for _ in 0..2 {
+        adapter.send_handed_off(&outbox, &claim).await.unwrap();
+    }
+    let after = creator_sdk.export_backup_state().await.unwrap();
+    assert_eq!(
+        creator_sdk.payment_requests().await.unwrap().len(),
+        request_count
+    );
+    assert_eq!(
+        after.outbound_private_messages.len(),
+        before.outbound_private_messages.len()
+    );
+    assert_eq!(
+        after
+            .outbound_private_messages
+            .iter()
+            .find(|record| record.outbound_message_id == outbound_id)
+            .unwrap()
+            .status,
+        OutboundPrivateMessageStatus::Sent
+    );
+    let status: String = sqlx::query_scalar("SELECT status FROM outbox WHERE id = $1")
+        .bind(claim.id())
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(status, "handed_off");
 
     drop(testnet);
     database.cleanup().await;

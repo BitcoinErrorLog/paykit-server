@@ -316,6 +316,50 @@ impl PaykitAdapter {
         claimed_handoff_steps(self, intent, store, claim).await
     }
 
+    /// Attempts one peer's queued sends after a durable server handoff.
+    /// Reconciliation still owns delivery acknowledgement; failures never enqueue
+    /// another proposal. SDK recovery and retry waits remain unchanged.
+    pub async fn send_handed_off(
+        &self,
+        store: &OutboxStore,
+        claim: &ClaimedOutbox,
+    ) -> Result<(), HandoffError> {
+        let guard = self.mutation_lock.clone().lock_owned().await;
+        self.send_handed_off_with_guard(&guard, store, claim).await
+    }
+
+    pub(crate) async fn send_handed_off_with_guard(
+        &self,
+        guard: &tokio::sync::OwnedMutexGuard<()>,
+        store: &OutboxStore,
+        claim: &ClaimedOutbox,
+    ) -> Result<(), HandoffError> {
+        assert!(Arc::ptr_eq(
+            &self.mutation_lock,
+            tokio::sync::OwnedMutexGuard::mutex(guard)
+        ));
+        if claim.creator_id() != self.creator_id {
+            return Err(HandoffError::Permanent);
+        }
+        if !store
+            .handoff_is_committed(claim)
+            .await
+            .map_err(|_| HandoffError::Retryable(RetryableHandoffCause::Storage))?
+        {
+            return Ok(());
+        }
+        let intent = store
+            .delivery_intent(claim)
+            .map_err(|_| HandoffError::Permanent)?;
+        // One peer pass preserves FIFO and SDK retry/recovery checks. Let admitted
+        // sends finish; cancellation can strand a prepared send until lease expiry.
+        self.sdk
+            .process_outbound_private_messages(parse_peer(intent.reader_pubky())?)
+            .await
+            .and_then(check_send_report)
+            .map_err(classify)
+    }
+
     /// Persists the mixed private stream before the SDK sends confirmations.
     /// No request is claimed, accepted, or executed by the server.
     /// Lock or revision contention is deferred to the next poll; other failures take precedence.
