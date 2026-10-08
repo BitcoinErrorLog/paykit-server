@@ -434,13 +434,22 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
     let mut interval = tokio::time::interval(workers.outbox_poll_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
-        tokio::select! {
+        let hinted_creators = tokio::select! {
+            biased;
             _ = runtime.cancelled() => break,
-            _ = interval.tick() => {}
-        }
-        let Ok(creators) = workers.creators.ready_ids().await else {
-            runtime.set_paykit_transport_available(false);
-            continue;
+            _ = interval.tick() => None,
+            creators = workers.outbox.wait_for_transport() => Some(creators),
+        };
+        let full_scan = hinted_creators.is_none();
+        let creators = match hinted_creators {
+            Some(creators) => creators,
+            None => match workers.creators.ready_ids().await {
+                Ok(creators) => creators,
+                Err(_) => {
+                    runtime.set_paykit_transport_available(false);
+                    continue;
+                }
+            },
         };
         let mut available = true;
         let mut deferred = false;
@@ -470,8 +479,8 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
                 );
             }
         }
-        // Contention is retried by the next poll, not evidence of recovery or failure.
-        if !available || !deferred {
+        // A targeted success cannot clear another Creator's failure or deferred work.
+        if !available || (full_scan && !deferred) {
             runtime.set_paykit_transport_available(available);
         }
     }
@@ -691,6 +700,7 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
     loop {
         tokio::select! {
             _ = runtime.cancelled() => break,
+            _ = workers.invoices.wait_for_admission() => {},
             _ = tokio::time::sleep(next_poll_delay) => {}
         }
         if !runtime.may_start_worker_claim() {
@@ -789,24 +799,29 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
     let mut interval = tokio::time::interval(workers.outbox_poll_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
-        tokio::select! {
+        let hinted_creators = tokio::select! {
+            biased;
             _ = runtime.cancelled() => break,
-            _ = interval.tick() => {}
-        }
+            _ = interval.tick() => None,
+            creators = workers.outbox.wait_for_reconciliation() => Some(creators),
+        };
         if !runtime.may_start_worker_claim() {
             break;
         }
         let claims = match workers
             .outbox
-            .claim_reconciliation(
+            .claim_reconciliation_for_creators(
                 owner,
                 workers.outbox_batch_size,
                 workers.outbox_lease_duration,
+                hinted_creators.as_deref(),
             )
             .await
         {
             Ok(claims) => {
-                runtime.set_outbox_reconciliation_available(true);
+                if hinted_creators.is_none() {
+                    runtime.set_outbox_reconciliation_available(true);
+                }
                 claims
             }
             Err(_) => {
@@ -865,16 +880,27 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
                 outbox_available = false;
             }
         }
-        delivery_available &= reconcile_payment_request_lifecycles(workers.clone()).await;
-        runtime.set_paykit_reconciliation_available(delivery_available);
-        runtime.set_outbox_reconciliation_available(outbox_available);
+        delivery_available &=
+            reconcile_payment_request_lifecycles(workers.clone(), hinted_creators.as_deref()).await;
+        if !delivery_available || hinted_creators.is_none() {
+            runtime.set_paykit_reconciliation_available(delivery_available);
+        }
+        if !outbox_available || hinted_creators.is_none() {
+            runtime.set_outbox_reconciliation_available(outbox_available);
+        }
     }
 }
 
-async fn reconcile_payment_request_lifecycles(workers: Arc<WorkerComponents>) -> bool {
-    let creator_ids = match workers.payment_request_lifecycles.creator_ids().await {
-        Ok(creator_ids) => creator_ids,
-        Err(_) => return false,
+async fn reconcile_payment_request_lifecycles(
+    workers: Arc<WorkerComponents>,
+    hinted_creators: Option<&[Uuid]>,
+) -> bool {
+    let creator_ids = match hinted_creators {
+        Some(creators) => creators.to_vec(),
+        None => match workers.payment_request_lifecycles.creator_ids().await {
+            Ok(creator_ids) => creator_ids,
+            Err(_) => return false,
+        },
     };
     let mut batch = JoinSet::new();
     for creator_id in creator_ids {

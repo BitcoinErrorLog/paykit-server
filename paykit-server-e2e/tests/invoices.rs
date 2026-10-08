@@ -128,6 +128,74 @@ fn input<'a>(
 }
 
 #[tokio::test]
+async fn committed_admissions_coalesce_and_failed_commits_do_not_wake() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let clone = store.clone();
+    let creator = creator();
+    let reader = reader();
+    for bundle in [b"wake-one".as_slice(), b"wake-two"] {
+        store
+            .create_atomic(input(&creator, &reader, bundle, bundle))
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::ZERO, clone.wait_for_admission())
+        .await
+        .expect("committed work retains a wakeup before the worker waits");
+    assert!(
+        tokio::time::timeout(std::time::Duration::ZERO, store.wait_for_admission())
+            .await
+            .is_err()
+    );
+    let restarted = InvoiceStore::new(database.pool(), crypto());
+    assert!(
+        tokio::time::timeout(std::time::Duration::ZERO, restarted.wait_for_admission())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        paykit_server::persistence::OutboxStore::new(database.pool(), crypto())
+            .claim(uuid::Uuid::new_v4(), 16, std::time::Duration::from_secs(30))
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "periodic claims recover durable work without a process-local hint"
+    );
+
+    // A deferred trigger fails COMMIT after the outbox INSERT succeeded.
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_admission() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'admission rejected'; END $$;
+         CREATE CONSTRAINT TRIGGER reject_admission AFTER INSERT ON outbox
+         DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION reject_admission();",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert!(
+        store
+            .create_atomic(input(&creator, &reader, b"wake-failed", b"wake-failed"))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM outbox")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(
+        tokio::time::timeout(std::time::Duration::ZERO, store.wait_for_admission())
+            .await
+            .is_err()
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn connection_binding_uses_persisted_reader_identity_without_mutating_business_rows() {
     let database = TestDatabase::create().await;
     let invoices = invoice_store(&database).await;

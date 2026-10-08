@@ -202,6 +202,108 @@ async fn assert_reconciliation_status(
 }
 
 #[tokio::test]
+async fn targeted_reconciliation_preserves_other_creators_due_times_and_leases() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creators = CreatorStore::new(database.pool(), crypto.clone());
+    let mut creator_ids = Vec::new();
+    for creator in [creator(), parse_creator(&reader().to_string()).unwrap()] {
+        let stored = creators
+            .create(&CreatorCredentials::new(
+                creator,
+                "session-secret".into(),
+                PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        creator_ids.push(stored.id());
+    }
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    let mut row_ids = Vec::new();
+    for creator_id in [
+        creator_ids[0],
+        creator_ids[0],
+        creator_ids[0],
+        creator_ids[1],
+    ] {
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO outbox \
+             (creator_id, intent_envelope, intent_kind, status, sdk_outbound_message_id) \
+             VALUES ($1, decode('00', 'hex'), 'endpoint_publication', 'handed_off', '1') \
+             RETURNING id",
+        )
+        .bind(creator_id)
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        row_ids.push(id);
+    }
+    sqlx::query("UPDATE outbox SET next_attempt_at = NOW() + INTERVAL '1 hour' WHERE id = $1")
+        .bind(row_ids[1])
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let claim_token = Uuid::new_v4();
+    sqlx::query(
+        "UPDATE outbox SET lease_owner = $2, claim_token = $3, \
+         lease_expires_at = NOW() + INTERVAL '1 hour' WHERE id = $1",
+    )
+    .bind(row_ids[2])
+    .bind(Uuid::new_v4())
+    .bind(claim_token)
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    let selected = outbox
+        .claim_reconciliation_for_creators(
+            Uuid::new_v4(),
+            10,
+            Duration::from_secs(30),
+            Some(&creator_ids[..1]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0].id(), row_ids[0]);
+    assert_eq!(selected[0].creator_id(), creator_ids[0]);
+    assert!(
+        outbox
+            .claim_reconciliation_for_creators(
+                Uuid::new_v4(),
+                10,
+                Duration::from_secs(30),
+                Some(&[]),
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // A fresh worker's periodic scan still recovers work without an in-memory hint.
+    let restarted = OutboxStore::new(
+        database.pool(),
+        Arc::new(Crypto::from_master_key(&[7; 32]).unwrap()),
+    );
+    let periodic = restarted
+        .claim_reconciliation(Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(periodic.len(), 1);
+    assert_eq!(periodic[0].id(), row_ids[3]);
+    let retained_token: Uuid = sqlx::query_scalar("SELECT claim_token FROM outbox WHERE id = $1")
+        .bind(row_ids[2])
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    assert_eq!(retained_token, claim_token);
+    database.cleanup().await;
+}
+
+#[tokio::test]
 async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
@@ -315,6 +417,16 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
         "an expired fence overwrote reclaimed work"
     );
     assert!(
+        tokio::time::timeout(Duration::ZERO, outbox.wait_for_transport())
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::ZERO, outbox.wait_for_reconciliation())
+            .await
+            .is_err()
+    );
+    assert!(
         outbox
             .mark_handed_off(
                 &reclaimed_request[0],
@@ -326,6 +438,19 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
             )
             .await
             .unwrap()
+    );
+    let worker_outbox = outbox.clone();
+    assert_eq!(
+        tokio::time::timeout(Duration::ZERO, worker_outbox.wait_for_transport())
+            .await
+            .unwrap(),
+        vec![reclaimed_request[0].creator_id()]
+    );
+    assert_eq!(
+        tokio::time::timeout(Duration::ZERO, worker_outbox.wait_for_reconciliation())
+            .await
+            .unwrap(),
+        vec![reclaimed_request[0].creator_id()]
     );
     assert!(
         outbox

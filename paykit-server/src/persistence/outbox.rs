@@ -6,7 +6,7 @@ use crate::{
     persistence::PersistenceError,
 };
 use sqlx::{PgPool, Postgres, Transaction};
-use std::time::Duration;
+use std::{collections::BTreeSet, sync::Mutex, time::Duration};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -182,6 +182,39 @@ impl ClaimedHandoff {
 pub struct OutboxStore {
     pool: PgPool,
     crypto: std::sync::Arc<Crypto>,
+    transport: std::sync::Arc<CreatorWakeup>,
+    reconciliation: std::sync::Arc<CreatorWakeup>,
+}
+
+#[derive(Default)]
+struct CreatorWakeup {
+    creators: Mutex<BTreeSet<Uuid>>,
+    notified: tokio::sync::Notify,
+}
+
+impl std::fmt::Debug for CreatorWakeup {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("CreatorWakeup { <redacted> }")
+    }
+}
+
+impl CreatorWakeup {
+    fn notify(&self, creator: Uuid) {
+        self.creators
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(creator);
+        self.notified.notify_one();
+    }
+
+    async fn wait(&self) -> Vec<Uuid> {
+        self.notified.notified().await;
+        let mut creators = self
+            .creators
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *creators).into_iter().collect()
+    }
 }
 
 impl OutboxStore {
@@ -189,7 +222,19 @@ impl OutboxStore {
         Self {
             pool: pool.clone(),
             crypto,
+            transport: std::sync::Arc::new(CreatorWakeup::default()),
+            reconciliation: std::sync::Arc::new(CreatorWakeup::default()),
         }
+    }
+
+    /// Waits for coalesced Creator hints to process durably handed-off SDK work.
+    pub async fn wait_for_transport(&self) -> Vec<Uuid> {
+        self.transport.wait().await
+    }
+
+    /// Waits for coalesced Creator hints to reconcile committed handoffs.
+    pub async fn wait_for_reconciliation(&self) -> Vec<Uuid> {
+        self.reconciliation.wait().await
     }
 
     /// Reports aggregate delivery availability without exposing row or Creator identifiers.
@@ -295,11 +340,24 @@ impl OutboxStore {
         limit: i64,
         lease: Duration,
     ) -> Result<Vec<ClaimedHandoff>, PersistenceError> {
+        self.claim_reconciliation_for_creators(owner, limit, lease, None)
+            .await
+    }
+
+    /// Claims due handoffs for selected Creators, or all Creators on a periodic scan.
+    pub async fn claim_reconciliation_for_creators(
+        &self,
+        owner: Uuid,
+        limit: i64,
+        lease: Duration,
+        creators: Option<&[Uuid]>,
+    ) -> Result<Vec<ClaimedHandoff>, PersistenceError> {
         let seconds = lease_seconds(lease)?;
         sqlx::query_as(
             "WITH candidates AS ( \
                  SELECT id FROM outbox \
                  WHERE status = 'handed_off' \
+                   AND ($4::UUID[] IS NULL OR creator_id = ANY($4)) \
                    AND sdk_outbound_message_id IS NOT NULL \
                    AND next_attempt_at <= clock_timestamp() \
                    AND (claim_token IS NULL OR lease_expires_at <= clock_timestamp()) \
@@ -318,6 +376,7 @@ impl OutboxStore {
         .bind(limit)
         .bind(owner)
         .bind(seconds)
+        .bind(creators)
         .fetch_all(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)
@@ -381,6 +440,11 @@ impl OutboxStore {
             .commit()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
+        if changed.rows_affected() == 1 {
+            // Hints never replace the durable row, due time, or claim fence.
+            self.transport.notify(claim.creator_id);
+            self.reconciliation.notify(claim.creator_id);
+        }
         Ok(changed.rows_affected() == 1)
     }
 
@@ -554,6 +618,36 @@ fn lookup_hash_from_storage(bytes: &[u8]) -> Result<LookupHash, PersistenceError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn creator_wakeups_coalesce_and_drain_without_losing_later_hints() {
+        let wakeup = CreatorWakeup::default();
+        let creators = BTreeSet::from([Uuid::new_v4(), Uuid::new_v4()]);
+        for creator in &creators {
+            wakeup.notify(*creator);
+            wakeup.notify(*creator);
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::ZERO, wakeup.wait())
+                .await
+                .unwrap(),
+            creators.into_iter().collect::<Vec<_>>()
+        );
+        assert!(
+            tokio::time::timeout(Duration::ZERO, wakeup.wait())
+                .await
+                .is_err()
+        );
+
+        let creator = Uuid::new_v4();
+        wakeup.notify(creator);
+        assert_eq!(
+            tokio::time::timeout(Duration::ZERO, wakeup.wait())
+                .await
+                .unwrap(),
+            vec![creator]
+        );
+    }
 
     #[test]
     fn retry_classes_are_closed_stage_only_diagnostics() {

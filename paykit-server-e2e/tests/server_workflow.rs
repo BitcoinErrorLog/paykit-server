@@ -839,6 +839,18 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     wait_until_listening(first_address).await;
     wait_until_ready(first_address).await;
 
+    // Keep the restart fixture queued through its persisted due time, including
+    // when admission wakes an already-running worker.
+    sqlx::raw_sql(
+        "CREATE FUNCTION defer_outbox() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN NEW.next_attempt_at = clock_timestamp() + INTERVAL '1 hour'; RETURN NEW; END $$;
+         CREATE TRIGGER defer_outbox BEFORE INSERT ON outbox
+         FOR EACH ROW EXECUTE FUNCTION defer_outbox();",
+    )
+    .execute(&first_pool)
+    .await
+    .unwrap();
+
     let (invoice_a, invoice_b) = tokio::join!(
         send_http(
             first_address,
@@ -908,6 +920,15 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
             .await
             .unwrap();
     assert_eq!(queued_after, queued_before);
+
+    sqlx::raw_sql(
+        "DROP TRIGGER defer_outbox ON outbox;
+         DROP FUNCTION defer_outbox();
+         UPDATE outbox SET next_attempt_at = clock_timestamp();",
+    )
+    .execute(&first_pool)
+    .await
+    .unwrap();
 
     let second_config = config(database.database_url(), &signing_key, "25ms");
     let second_pool = initialize_database(&second_config).await.unwrap();

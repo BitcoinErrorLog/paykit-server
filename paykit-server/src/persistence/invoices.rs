@@ -239,6 +239,7 @@ impl AtomicInvoiceResult {
 pub struct InvoiceStore {
     pool: PgPool,
     crypto: Arc<Crypto>,
+    admitted: Arc<tokio::sync::Notify>,
 }
 
 impl InvoiceStore {
@@ -246,7 +247,14 @@ impl InvoiceStore {
         Self {
             pool: pool.clone(),
             crypto,
+            admitted: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Waits for a coalesced hint that this store committed new outbox work.
+    /// Clones share the hint; periodic polling remains necessary after restart.
+    pub async fn wait_for_admission(&self) {
+        self.admitted.notified().await;
     }
 
     /// Authenticates encrypted payment records and observations against their keyed lookup hashes.
@@ -1546,6 +1554,7 @@ impl InvoiceStore {
         tx.commit()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
+        self.admitted.notify_one();
         Ok(AtomicInvoiceResult {
             invoice_id,
             payment_request_outbox_id,
