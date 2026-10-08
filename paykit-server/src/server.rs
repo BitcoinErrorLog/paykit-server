@@ -38,7 +38,8 @@ use crate::{
         creator_tasks::CreatorTasks,
         observer::{ElectrumAdapter, ElectrumPort, ObserverError, observe_once},
         outbox::{
-            ProcessingHealth, RetrySchedule, process_claim_with, process_reconciliation_with_health,
+            ProcessingHealth, RetrySchedule, process_claim_with,
+            process_reconciliation_with_health, with_claim_renewal,
         },
     },
 };
@@ -719,8 +720,9 @@ fn outbox_retry_schedule(
     rapid_link_retry_attempts: u32,
     rapid_link_retry_interval: Duration,
     attempt_count: i32,
+    failure_count: i32,
 ) -> RetrySchedule {
-    let default = retry_delay(initial, maximum, attempt_count);
+    let default = retry_delay(initial, maximum, failure_count.saturating_add(1));
     let rapid_link_retry_attempts = i32::try_from(rapid_link_retry_attempts)
         .expect("validated rapid link retry attempts fit i32");
     let link_establishment = if attempt_count <= rapid_link_retry_attempts {
@@ -830,42 +832,54 @@ async fn process_creator_outbox(
         workers.rapid_link_retry_attempts,
         workers.rapid_link_retry_interval,
         claim.attempt_count(),
+        claim.failure_count(),
     );
-    let result = match creator_adapter(&workers, creator).await {
-        Ok(adapter) => {
-            process_claim_with(&workers.outbox, &claim, retry_schedule, |intent| {
-                let adapter = &adapter;
-                let guard = &guard;
-                let store = &workers.outbox;
-                let claim = &claim;
-                async move {
-                    adapter
-                        .execute_claimed_handoff_with_guard(guard, store, claim, &intent)
-                        .await
+    let result = with_claim_renewal(
+        &workers.outbox,
+        &claim,
+        workers.outbox_lease_duration,
+        async {
+            match creator_adapter(&workers, creator).await {
+                Ok(adapter) => {
+                    process_claim_with(&workers.outbox, &claim, retry_schedule, |intent| {
+                        let adapter = &adapter;
+                        let guard = &guard;
+                        let store = &workers.outbox;
+                        let claim = &claim;
+                        async move {
+                            adapter
+                                .execute_claimed_handoff_with_guard(guard, store, claim, &intent)
+                                .await
+                        }
+                    })
+                    .await
                 }
-            })
-            .await
-        }
-        Err(AdapterBuildError::Permanent) => workers
-            .outbox
-            .mark_permanently_failed(&claim)
-            .await
-            .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
-        Err(AdapterBuildError::Unavailable) => workers
-            .outbox
-            .mark_retryable(
-                &claim,
-                retry_schedule.default_delay(),
-                OutboxRetryClass::AdapterUnavailable,
-            )
-            .await
-            .map(|transitioned| {
-                (
-                    transitioned,
-                    ProcessingHealth::Retryable(retry_schedule.default_delay()),
-                )
-            }),
-    };
+                Err(AdapterBuildError::Permanent) => workers
+                    .outbox
+                    .mark_permanently_failed(&claim)
+                    .await
+                    .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
+                Err(AdapterBuildError::Unavailable) => workers
+                    .outbox
+                    .mark_retryable(
+                        &claim,
+                        retry_schedule.default_delay(),
+                        OutboxRetryClass::AdapterUnavailable,
+                    )
+                    .await
+                    .map(|transitioned| {
+                        (
+                            transitioned,
+                            ProcessingHealth::Retryable(retry_schedule.default_delay()),
+                        )
+                    }),
+            }
+        },
+    )
+    .await;
+    if matches!(result, Ok((false, _))) {
+        tracing::warn!("outbox handoff finished without a live claim transition");
+    }
     result.map(Some)
 }
 
@@ -1457,7 +1471,7 @@ mod tests {
     }
 
     #[test]
-    fn link_establishment_retry_delay_is_capped_below_general_backoff() {
+    fn pending_links_do_not_inflate_failure_backoff() {
         let initial = Duration::from_secs(1);
         let maximum = Duration::from_secs(300);
         let rapid_attempts = 3;
@@ -1465,30 +1479,40 @@ mod tests {
 
         for attempt in 1_i32..=3 {
             let schedule =
-                outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, attempt);
+                outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, attempt, 0);
             assert_eq!(
-                schedule.delay_for(OutboxRetryClass::LinkEstablishment),
+                schedule.delay_for(OutboxRetryClass::LinkPending),
                 rapid_interval
             );
         }
 
         assert_eq!(
-            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 4)
-                .delay_for(OutboxRetryClass::LinkEstablishment),
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 4, 0)
+                .delay_for(OutboxRetryClass::LinkPending),
             Duration::from_secs(1)
         );
         assert_eq!(
-            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 5)
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 5, 0)
+                .delay_for(OutboxRetryClass::LinkPending),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 30, 0)
+                .delay_for(OutboxRetryClass::LinkPending),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 30, 0)
+                .default_delay(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 30, 1)
                 .delay_for(OutboxRetryClass::LinkEstablishment),
             Duration::from_secs(2)
         );
         assert_eq!(
-            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 13)
-                .delay_for(OutboxRetryClass::LinkEstablishment),
-            Duration::from_secs(5)
-        );
-        assert_eq!(
-            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 13)
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 30, 30)
                 .default_delay(),
             Duration::from_secs(300)
         );

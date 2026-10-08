@@ -72,6 +72,9 @@ pub enum HandoffFailure {
 
 fn at_stage(error: HandoffError, stage: RetryableHandoffStage) -> HandoffFailure {
     match error {
+        HandoffError::Retryable(RetryableHandoffCause::LinkPending) => {
+            HandoffFailure::Retryable(RetryableHandoffStage::LinkPending)
+        }
         HandoffError::Retryable(_) => HandoffFailure::Retryable(stage),
         HandoffError::Permanent => HandoffFailure::Permanent,
     }
@@ -103,7 +106,7 @@ impl RetrySchedule {
     }
 
     pub(crate) fn delay_for(self, stage: RetryableHandoffStage) -> Duration {
-        if stage == RetryableHandoffStage::LinkEstablishment {
+        if stage == RetryableHandoffStage::LinkPending {
             self.link_establishment
         } else {
             self.default
@@ -123,13 +126,8 @@ pub trait Adapter: Send + Sync {
         claim: &ClaimedOutbox,
         intent: &DeliveryIntentV1,
     ) -> Result<HandoffResult, HandoffFailure> {
-        match store.claim_handoff_eligible(claim).await {
-            Ok(true) => self.execute_handoff(intent).await,
-            Ok(false) => Err(HandoffFailure::Permanent),
-            Err(_) => Err(HandoffFailure::Retryable(
-                RetryableHandoffStage::AdapterUnavailable,
-            )),
-        }
+        check_claim(Some((store, claim))).await?;
+        self.execute_handoff(intent).await
     }
 
     /// Executes one complete semantic handoff. Concrete adapters may override
@@ -176,7 +174,40 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
     adapter: &A,
     intent: &DeliveryIntentV1,
 ) -> Result<HandoffResult, HandoffFailure> {
+    handoff_steps_with_claim(adapter, intent, None).await
+}
+
+pub(crate) async fn claimed_handoff_steps<A: Adapter + ?Sized>(
+    adapter: &A,
+    intent: &DeliveryIntentV1,
+    store: &OutboxStore,
+    claim: &ClaimedOutbox,
+) -> Result<HandoffResult, HandoffFailure> {
+    handoff_steps_with_claim(adapter, intent, Some((store, claim))).await
+}
+
+async fn check_claim(claim: Option<(&OutboxStore, &ClaimedOutbox)>) -> Result<(), HandoffFailure> {
+    if let Some((store, claim)) = claim {
+        match store.claim_handoff_eligible(claim).await {
+            Ok(true) => {}
+            Ok(false) => return Err(HandoffFailure::Permanent),
+            Err(_) => {
+                return Err(HandoffFailure::Retryable(
+                    RetryableHandoffStage::AdapterUnavailable,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handoff_steps_with_claim<A: Adapter + ?Sized>(
+    adapter: &A,
+    intent: &DeliveryIntentV1,
+    claim: Option<(&OutboxStore, &ClaimedOutbox)>,
+) -> Result<HandoffResult, HandoffFailure> {
     intent.validate().map_err(|_| HandoffFailure::Permanent)?;
+    check_claim(claim).await?;
     let registry = adapter
         .fetch_registry(intent.reader_pubky())
         .await
@@ -207,14 +238,17 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
             ));
         }
     }
+    check_claim(claim).await?;
     adapter
         .observe_recovery_marker(intent.reader_pubky())
         .await
         .map_err(|error| at_stage(error, RetryableHandoffStage::RecoveryMarkerObservation))?;
+    check_claim(claim).await?;
     adapter
         .ensure_link_with_peer(intent.reader_pubky())
         .await
         .map_err(|error| at_stage(error, RetryableHandoffStage::LinkEstablishment))?;
+    check_claim(claim).await?;
     match intent.operation() {
         DeliveryOperationV1::PaymentRequestProposal { terms } => adapter
             .propose_payment_request(intent.reader_pubky(), terms)
@@ -224,6 +258,33 @@ pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
             .cancel_payment_request(intent.reader_pubky(), payment_request_id)
             .await
             .map_err(|error| at_stage(error, RetryableHandoffStage::PaymentRequestCancellation)),
+    }
+}
+
+/// Renews an admitted handoff without cancelling its in-flight SDK work on lease loss.
+/// Subsequent SDK effects and the final database transition must revalidate the claim.
+pub async fn with_claim_renewal<F: std::future::Future>(
+    store: &OutboxStore,
+    claim: &ClaimedOutbox,
+    lease: Duration,
+    operation: F,
+) -> F::Output {
+    let renewal = async {
+        loop {
+            tokio::time::sleep((lease / 3).max(Duration::from_millis(1))).await;
+            if !store.renew_claim(claim, lease).await? {
+                return Ok::<(), PersistenceError>(());
+            }
+        }
+    };
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        result = &mut operation => result,
+        result = renewal => {
+            tracing::warn!(storage_error = result.is_err(), "outbox claim renewal stopped; draining admitted work");
+            operation.await
+        }
     }
 }
 

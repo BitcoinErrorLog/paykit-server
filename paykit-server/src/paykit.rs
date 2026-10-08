@@ -44,7 +44,7 @@ use crate::{
     },
     workers::outbox::{
         Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffCause,
-        RetryableHandoffStage, handoff_steps,
+        claimed_handoff_steps, handoff_steps,
     },
 };
 
@@ -313,13 +313,7 @@ impl PaykitAdapter {
             &self.mutation_lock,
             tokio::sync::OwnedMutexGuard::mutex(guard)
         ));
-        match store.claim_handoff_eligible(claim).await {
-            Ok(true) => handoff_steps(self, intent).await,
-            Ok(false) => Err(HandoffFailure::Permanent),
-            Err(_) => Err(HandoffFailure::Retryable(
-                RetryableHandoffStage::AdapterUnavailable,
-            )),
-        }
+        claimed_handoff_steps(self, intent, store, claim).await
     }
 
     /// Persists the mixed private stream before the SDK sends confirmations.

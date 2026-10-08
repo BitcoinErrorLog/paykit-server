@@ -19,13 +19,29 @@ Before link establishment or enqueue, the worker asks the SDK to observe the Rea
 
 A successful proposal stores the returned SDK outbound, Event, and Payment Request IDs under the same live fence as `handed_off`. If the SDK transaction commits before this server transition, reclaimed work calls the public API again with the persisted terms and address. That accepted crash window is at-least-once and may create duplicate Payment Request proposals.
 
+An admitted enqueue task renews its database claim every third of the configured
+lease duration while work is active. Renewal requires the same unexpired claim
+token and an eligible proposal generation with no active drain. An expired or
+replaced claim cannot be revived. Renewal failure does not cancel an in-flight
+SDK operation: it finishes, while subsequent SDK effects and the final database
+transition revalidate ownership. Shutdown drains admitted work within the existing
+server deadline. Renewal reduces expiry during slow work; it does not close the
+crash window between SDK persistence and the database association.
+
+Normal handshake progress or waiting uses the bounded link retry schedule and
+resets the consecutive failure counter. Actual dependency failures, including
+failed link operations, use exponential backoff from that counter instead of the
+total claim count. Failures at different stages do not reset one another's
+backoff. A first failure after repeated pending-link attempts therefore starts at
+the configured initial delay, while a continuing outage still reaches the cap.
+
 `handed_off` means durable shared SDK queue association, not remote delivery. A separately fenced reconciliation claim runs the SDK outbound processor and checks the exact stored outbound ID and app ownership in durable Creator SDK state. Only `OutboundPrivateMessageStatus::Sent` advances the row to `delivered`, meaning successful Encrypted Link send, not payer application acknowledgement. SDK `Pending`, `Sending`, and retry-backoff `Failed` records remain retryable. Missing records, `Invalid`, `RecoveryRequired`, and `Superseded` records are retained as `permanently_failed`; they never imply delivery or trigger a new proposal. Transport/storage errors remain retryable, and permanent errors retain only a non-secret error class.
 
-Encrypted Link establishment uses a rapid retry phase configured by
+Normal pending Encrypted Links use a rapid retry phase configured by
 `outbox.rapid_link_retry_attempts` (default `120`, range `1..=2147483647`) and
 `outbox.rapid_link_retry_interval_ms` (default `1000` milliseconds, range
 `1..=4294967295`; use `500` for half a second). After exactly that many outbox
-attempts, link-establishment retries resume the general `outbox.retry_initial`
+attempts, pending-link retries resume the general `outbox.retry_initial`
 to `outbox.retry_max` exponential schedule, still capped at five seconds. Other
 retry classes always use the general schedule. `outbox.poll_interval`,
 `outbox.retry_initial`, and `outbox.retry_max` remain duration strings; their

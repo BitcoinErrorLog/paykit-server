@@ -17,10 +17,12 @@ use paykit_server::{
     paykit::{CreatorSessions, PaykitAdapter},
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
-        InvoicePayloads, InvoiceStore, OutboxStore, PersistenceError, run_migrations,
+        InvoicePayloads, InvoiceStore, OutboxRetryClass, OutboxStore, PersistenceError,
+        run_migrations,
     },
     workers::outbox::{
         Adapter, HandoffError, HandoffResult, process_claim, process_reconciliation,
+        with_claim_renewal,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -32,6 +34,187 @@ mod common;
 mod sdk_fixtures;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+
+async fn queued_invoice(database: &TestDatabase) -> OutboxStore {
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creator = creator();
+    let reader = reader();
+    CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "session-secret".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: "xpub-secret".to_owned().into(),
+                account_index: 0,
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    InvoiceStore::new(database.pool(), crypto.clone())
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"outbox-bundle",
+            lock_resource_binding: b"outbox-lock",
+            payment_request_binding: b"outbox-payment-request",
+            invoice_payloads: &Payloads {
+                reader: reader.clone(),
+            },
+            proposal_acceptance_seconds: 3600,
+            payment_window_seconds: 86400,
+        })
+        .await
+        .unwrap();
+    OutboxStore::new(database.pool(), crypto)
+}
+
+fn handoff_result() -> HandoffResult {
+    HandoffResult::PaymentRequestProposal {
+        outbound_message_id: 42,
+        event_id: "event-42".into(),
+        payment_request_id: "request-42".into(),
+    }
+}
+
+#[tokio::test]
+async fn claim_renewal_keeps_slow_handoff_owned_until_transition() {
+    let database = TestDatabase::create().await;
+    let outbox = queued_invoice(&database).await;
+    let lease = Duration::from_secs(3);
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, lease)
+        .await
+        .unwrap()
+        .remove(0);
+    let transitioned = with_claim_renewal(&outbox, &claim, lease, async {
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            outbox
+                .claim(Uuid::new_v4(), 1, lease)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        outbox
+            .mark_handed_off(&claim, &handoff_result())
+            .await
+            .unwrap()
+    })
+    .await;
+    assert!(transitioned);
+    assert!(!outbox.renew_claim(&claim, lease).await.unwrap());
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn renewal_loss_finishes_admitted_work_without_reviving_an_old_claim() {
+    let database = TestDatabase::create().await;
+    let outbox = queued_invoice(&database).await;
+    let lease = Duration::from_secs(3);
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, lease)
+        .await
+        .unwrap()
+        .remove(0);
+    sqlx::query("UPDATE outbox SET lease_expires_at = clock_timestamp() - INTERVAL '1 second' WHERE id = $1")
+        .bind(claim.id()).execute(database.pool()).await.unwrap();
+    assert!(!outbox.renew_claim(&claim, lease).await.unwrap());
+    let replacement = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .remove(0);
+    assert_ne!(replacement.claim_token(), claim.claim_token());
+    let completed = with_claim_renewal(&outbox, &claim, lease, async {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !outbox
+                .mark_handed_off(&claim, &handoff_result())
+                .await
+                .unwrap()
+        );
+        true
+    })
+    .await;
+    assert!(completed);
+    assert!(outbox.claim_handoff_eligible(&replacement).await.unwrap());
+    assert!(
+        outbox
+            .mark_handed_off(&replacement, &handoff_result())
+            .await
+            .unwrap()
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn claim_renewal_respects_proposal_generation_fences() {
+    let database = TestDatabase::create().await;
+    let outbox = queued_invoice(&database).await;
+    let lease = Duration::from_secs(30);
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, lease)
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(outbox.renew_claim(&claim, lease).await.unwrap());
+    sqlx::query("UPDATE lock_payment_generations SET current_generation = current_generation + 1")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    assert!(!outbox.renew_claim(&claim, lease).await.unwrap());
+    assert!(!outbox.claim_handoff_eligible(&claim).await.unwrap());
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn pending_links_reset_failure_backoff_without_resetting_attempts() {
+    let database = TestDatabase::create().await;
+    let outbox = queued_invoice(&database).await;
+    let stages = [
+        (OutboxRetryClass::RegistryFetch, 1),
+        (OutboxRetryClass::ReaderAuthorizationFetch, 2),
+        (OutboxRetryClass::LinkPending, 0),
+        (OutboxRetryClass::LinkEstablishment, 1),
+        (OutboxRetryClass::PaymentRequestProposal, 2),
+    ];
+    for (index, (stage, expected)) in stages.into_iter().enumerate() {
+        let claim = outbox
+            .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(claim.attempt_count(), i32::try_from(index + 1).unwrap());
+        assert!(
+            outbox
+                .mark_retryable(&claim, Duration::ZERO, stage)
+                .await
+                .unwrap()
+        );
+        let count: i32 = sqlx::query_scalar("SELECT failure_count FROM outbox WHERE id = $1")
+            .bind(claim.id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, expected);
+    }
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .remove(0);
+    assert_eq!(claim.failure_count(), 2);
+    assert!(
+        outbox
+            .mark_handed_off(&claim, &handoff_result())
+            .await
+            .unwrap()
+    );
+    database.cleanup().await;
+}
 
 async fn build_pubky_testnet() -> EphemeralTestnet {
     let postgres = std::env::var("TEST_DATABASE_URL").unwrap();
@@ -728,6 +911,11 @@ async fn enqueue_retry_preserves_500ms_deadline_across_store_recreation() {
         })
         .await
         .unwrap();
+    sqlx::query("UPDATE outbox SET failure_count = 2 WHERE id = $1")
+        .bind(invoice.payment_request_outbox_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
     let outbox = OutboxStore::new(database.pool(), crypto.clone());
     let claim = outbox
         .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
@@ -736,19 +924,20 @@ async fn enqueue_retry_preserves_500ms_deadline_across_store_recreation() {
         .pop()
         .unwrap();
     assert_eq!(claim.id(), invoice.payment_request_outbox_id());
+    assert_eq!(claim.failure_count(), 2);
     assert!(
         outbox
             .mark_retryable(
                 &claim,
                 Duration::from_millis(500),
-                paykit_server::persistence::OutboxRetryClass::LinkEstablishment,
+                OutboxRetryClass::LinkPending,
             )
             .await
             .unwrap()
     );
 
-    let persisted_delay_ms: i64 = sqlx::query_scalar(
-        "SELECT ROUND(EXTRACT(EPOCH FROM (next_attempt_at - updated_at)) * 1000)::BIGINT \
+    let (persisted_delay_ms, failure_count): (i64, i32) = sqlx::query_as(
+        "SELECT ROUND(EXTRACT(EPOCH FROM (next_attempt_at - updated_at)) * 1000)::BIGINT, failure_count \
          FROM outbox WHERE id = $1",
     )
     .bind(claim.id())
@@ -756,6 +945,7 @@ async fn enqueue_retry_preserves_500ms_deadline_across_store_recreation() {
     .await
     .unwrap();
     assert_eq!(persisted_delay_ms, 500);
+    assert_eq!(failure_count, 0);
     sqlx::query(
         "UPDATE outbox \
          SET updated_at = updated_at + INTERVAL '1 minute', \
@@ -796,6 +986,8 @@ async fn enqueue_retry_preserves_500ms_deadline_across_store_recreation() {
         .unwrap();
     assert_eq!(retried.len(), 1);
     assert_eq!(retried[0].id(), claim.id());
+    assert_eq!(retried[0].failure_count(), 0);
+    assert_eq!(retried[0].attempt_count(), claim.attempt_count() + 1);
     drop(restarted_outbox);
     restarted_pool.close().await;
     database.cleanup().await;
@@ -944,15 +1136,32 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         .unwrap()
         .pop()
         .unwrap();
-    let second = creator_sdk
-        .propose_payment_request(peer_bootstrap.public_key.clone(), terms)
-        .await
-        .unwrap();
-    let second_result = HandoffResult::PaymentRequestProposal {
-        outbound_message_id: second.proposal_outbound_message_id.unwrap(),
-        event_id: second.proposal_event_id.unwrap(),
-        payment_request_id: second.payment_request_id,
-    };
+    let second_result =
+        with_claim_renewal(&outbox, &second_claim, Duration::from_secs(30), async {
+            let second = creator_sdk
+                .propose_payment_request(peer_bootstrap.public_key.clone(), terms)
+                .await
+                .unwrap();
+            let result = HandoffResult::PaymentRequestProposal {
+                outbound_message_id: second.proposal_outbound_message_id.unwrap(),
+                event_id: second.proposal_event_id.unwrap(),
+                payment_request_id: second.payment_request_id,
+            };
+            assert!(
+                !outbox
+                    .mark_handed_off(&first_claim, &first_result)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                outbox
+                    .mark_handed_off(&second_claim, &result)
+                    .await
+                    .unwrap()
+            );
+            result
+        })
+        .await;
 
     let HandoffResult::PaymentRequestProposal {
         outbound_message_id: first_outbound,
@@ -1182,18 +1391,6 @@ async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_
         );
     }
 
-    assert!(
-        !outbox
-            .mark_handed_off(&first_claim, &first_result)
-            .await
-            .unwrap()
-    );
-    assert!(
-        outbox
-            .mark_handed_off(&second_claim, &second_result)
-            .await
-            .unwrap()
-    );
     let associated: (String, String, String) = sqlx::query_as(
         "SELECT sdk_outbound_message_id, sdk_event_id, sdk_payment_request_id \
          FROM outbox WHERE id = $1",

@@ -21,6 +21,7 @@ pub enum OutboxRetryClass {
     ReaderAuthorizationInvalid,
     RecoveryMarkerObservation,
     LinkEstablishment,
+    LinkPending,
     PaymentRequestProposal,
     PaymentRequestCancellation,
     ReconciliationPending,
@@ -39,6 +40,7 @@ impl OutboxRetryClass {
             Self::ReaderAuthorizationInvalid => "reader_authorization_invalid",
             Self::RecoveryMarkerObservation => "recovery_marker_observation",
             Self::LinkEstablishment => "link_establishment",
+            Self::LinkPending => "link_pending",
             Self::PaymentRequestProposal => "payment_request_proposal",
             Self::PaymentRequestCancellation => "payment_request_cancellation",
             Self::ReconciliationPending => "reconciliation_pending",
@@ -105,6 +107,7 @@ pub struct ClaimedOutbox {
     creator_id: Uuid,
     invoice_id: Option<Uuid>,
     attempt_count: i32,
+    failure_count: i32,
     claim_token: Uuid,
     creator_lookup_hash: Vec<u8>,
     intent_envelope: Vec<u8>,
@@ -131,6 +134,11 @@ impl ClaimedOutbox {
 
     pub fn attempt_count(&self) -> i32 {
         self.attempt_count
+    }
+
+    /// Consecutive failures, excluding successful handshake progress or waiting.
+    pub fn failure_count(&self) -> i32 {
+        self.failure_count
     }
 
     pub fn claim_token(&self) -> Uuid {
@@ -348,7 +356,7 @@ impl OutboxStore {
                  updated_at = clock_timestamp() \
              FROM candidates \
              WHERE o.id = candidates.id \
-             RETURNING o.id, o.creator_id, o.invoice_id, o.attempt_count, o.claim_token, \
+             RETURNING o.id, o.creator_id, o.invoice_id, o.attempt_count, o.failure_count, o.claim_token, \
                  (SELECT creator_lookup_hash FROM creators WHERE id = o.creator_id) AS creator_lookup_hash, \
                  o.intent_envelope",
         )
@@ -389,6 +397,44 @@ impl OutboxStore {
         .fetch_one(&self.pool)
         .await
         .map_err(|_| PersistenceError::Unavailable)
+    }
+
+    /// Extends only a live claim whose proposal generation still permits handoff.
+    pub async fn renew_claim(
+        &self,
+        claim: &ClaimedOutbox,
+        lease: Duration,
+    ) -> Result<bool, PersistenceError> {
+        let Some((mut transaction, now)) = self.transition_fence(claim.id).await? else {
+            return Ok(false);
+        };
+        let changed = sqlx::query(
+            "UPDATE outbox o SET lease_expires_at = $3 + ($4 * INTERVAL '1 second') \
+             WHERE o.id = $1 AND o.status = 'leased' AND o.claim_token = $2 \
+               AND o.lease_expires_at > $3 \
+               AND (o.intent_kind <> 'payment_request_proposal' OR ( \
+                   o.proposal_lookup_hash IS NOT NULL AND EXISTS ( \
+                       SELECT 1 FROM invoices invoice \
+                       JOIN lock_payment_generations generation \
+                         ON generation.creator_id = invoice.creator_id \
+                        AND generation.lock_resource_lookup_hash = invoice.lock_resource_lookup_hash \
+                       WHERE invoice.id = o.invoice_id \
+                         AND generation.current_generation = invoice.lock_resource_generation \
+                         AND generation.active_drain_id IS NULL \
+                   )))",
+        )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .bind(now)
+        .bind(lease_seconds(lease)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(changed.rows_affected() == 1)
     }
 
     /// Claims attributable handed-off rows independently from enqueue work.
@@ -481,7 +527,7 @@ impl OutboxStore {
         };
         let changed = sqlx::query(
             "UPDATE outbox SET status = 'handed_off', sdk_outbound_message_id = $1, \
-                 sdk_event_id = $2, sdk_payment_request_id = $3, error_class = NULL, \
+                 sdk_event_id = $2, sdk_payment_request_id = $3, error_class = NULL, failure_count = 0, \
                  lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = $6 \
              WHERE id = $4 AND status = 'leased' AND claim_token = $5 AND lease_expires_at > $6",
         )
@@ -578,6 +624,9 @@ impl OutboxStore {
         let changed = sqlx::query(
             "UPDATE outbox \
              SET status = $1, error_class = $2, \
+                 failure_count = CASE WHEN $2 = 'link_pending' THEN 0 \
+                     WHEN $1 = 'retryable' THEN LEAST(failure_count::BIGINT + 1, 2147483647)::INTEGER \
+                     ELSE failure_count END, \
                  next_attempt_at = CASE WHEN $3::BIGINT IS NULL THEN next_attempt_at ELSE $6 + ($3 * INTERVAL '1 millisecond') END, \
                  lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = $6 \
              WHERE id = $4 AND status = 'leased' AND claim_token = $5 AND lease_expires_at > $6",
@@ -708,7 +757,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_classes_are_closed_stage_only_diagnostics() {
+    fn retry_classes_are_closed_diagnostics() {
         assert_eq!(
             [
                 OutboxRetryClass::AdapterUnavailable,
@@ -720,6 +769,7 @@ mod tests {
                 OutboxRetryClass::ReaderAuthorizationInvalid,
                 OutboxRetryClass::RecoveryMarkerObservation,
                 OutboxRetryClass::LinkEstablishment,
+                OutboxRetryClass::LinkPending,
                 OutboxRetryClass::PaymentRequestProposal,
                 OutboxRetryClass::PaymentRequestCancellation,
                 OutboxRetryClass::ReconciliationPending,
@@ -736,6 +786,7 @@ mod tests {
                 "reader_authorization_invalid",
                 "recovery_marker_observation",
                 "link_establishment",
+                "link_pending",
                 "payment_request_proposal",
                 "payment_request_cancellation",
                 "reconciliation_pending",
@@ -780,6 +831,7 @@ mod tests {
             creator_id,
             invoice_id: Some(Uuid::new_v4()),
             attempt_count: 7,
+            failure_count: 0,
             claim_token: Uuid::new_v4(),
             creator_lookup_hash: vec![3; 32],
             intent_envelope: vec![4; 64],

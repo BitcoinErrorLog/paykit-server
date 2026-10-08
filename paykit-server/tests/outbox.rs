@@ -149,26 +149,6 @@ async fn incapable_registry_is_retryable_without_handoff() {
 }
 
 #[tokio::test]
-async fn link_failure_has_one_durable_diagnostic_stage() {
-    let selected = registry(true);
-    let adapter = FakeAdapter {
-        registry: selected.clone(),
-        authorization: Ok(ReaderAuthorization::Verified),
-        recovery_marker_error: None,
-        link_error: Some(HandoffError::Retryable(RetryableHandoffCause::Transport)),
-        payment_request_calls: Mutex::new(0),
-        calls: Mutex::new(Vec::new()),
-    };
-
-    assert_eq!(
-        handoff(&adapter, &payment_intent()).await,
-        Err(HandoffFailure::Retryable(
-            RetryableHandoffStage::LinkEstablishment
-        ))
-    );
-}
-
-#[tokio::test]
 async fn retry_after_an_ambiguous_handoff_can_propose_twice() {
     let selected = registry(true);
     let adapter = Arc::new(FakeAdapter {
@@ -328,4 +308,30 @@ async fn reader_authorization_fetch_failure_keeps_its_own_stage() {
         ))
     );
     assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn pending_links_are_distinct_from_failed_link_operations() {
+    for (cause, expected) in [
+        (
+            RetryableHandoffCause::LinkPending,
+            RetryableHandoffStage::LinkPending,
+        ),
+        (
+            RetryableHandoffCause::Transport,
+            RetryableHandoffStage::LinkEstablishment,
+        ),
+        (
+            RetryableHandoffCause::Storage,
+            RetryableHandoffStage::LinkEstablishment,
+        ),
+    ] {
+        let mut adapter = adapter_with_authorization(Ok(ReaderAuthorization::Verified));
+        adapter.link_error = Some(HandoffError::Retryable(cause));
+        assert_eq!(
+            handoff(&adapter, &payment_intent()).await,
+            Err(HandoffFailure::Retryable(expected))
+        );
+        assert_eq!(*adapter.payment_request_calls.lock().unwrap(), 0);
+    }
 }
