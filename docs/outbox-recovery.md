@@ -21,6 +21,16 @@ A successful proposal stores the returned SDK outbound, Event, and Payment Reque
 
 `handed_off` means durable shared SDK queue association, not remote delivery. A separately fenced reconciliation claim runs the SDK outbound processor and checks the exact stored outbound ID and app ownership in durable Creator SDK state. Only `OutboundPrivateMessageStatus::Sent` advances the row to `delivered`, meaning successful Encrypted Link send, not payer application acknowledgement. SDK `Pending`, `Sending`, and retry-backoff `Failed` records remain retryable. Missing records, `Invalid`, `RecoveryRequired`, and `Superseded` records are retained as `permanently_failed`; they never imply delivery or trigger a new proposal. Transport/storage errors remain retryable, and permanent errors retain only a non-secret error class.
 
+Encrypted Link establishment uses a rapid retry phase configured by
+`outbox.rapid_link_retry_attempts` (default `120`, range `1..=2147483647`) and
+`outbox.rapid_link_retry_interval_ms` (default `1000` milliseconds, range
+`1..=4294967295`; use `500` for half a second). After exactly that many outbox
+attempts, link-establishment retries resume the general `outbox.retry_initial`
+to `outbox.retry_max` exponential schedule, still capped at five seconds. Other
+retry classes always use the general schedule. `outbox.poll_interval`,
+`outbox.retry_initial`, and `outbox.retry_max` remain duration strings; their
+units and behavior are unchanged.
+
 Payment Requests are retained Event Messages. The server neither publishes nor waits on invoice-specific Private Payment Lists, so their latest-state compaction cannot block request delivery or change an invoice's destination.
 
 The schema requires `handed_off` and `delivered` rows to carry a canonical numeric SDK outbound ID. See the [upgrade policy](../README.md#persistence-startup-and-upgrades) before replacing a database or binary.

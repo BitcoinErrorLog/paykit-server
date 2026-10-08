@@ -438,7 +438,7 @@ impl OutboxStore {
             claim,
             "retryable",
             Some(error_class.as_str()),
-            Some(lease_seconds(delay)?),
+            Some(duration_milliseconds(delay)?),
         )
         .await
     }
@@ -448,7 +448,7 @@ impl OutboxStore {
         claim: &ClaimedOutbox,
         status: &str,
         error_class: Option<&str>,
-        delay: Option<i64>,
+        delay_milliseconds: Option<i64>,
     ) -> Result<bool, PersistenceError> {
         let Some((mut transaction, now)) = self.transition_fence(claim.id).await? else {
             return Ok(false);
@@ -456,13 +456,13 @@ impl OutboxStore {
         let changed = sqlx::query(
             "UPDATE outbox \
              SET status = $1, error_class = $2, \
-                 next_attempt_at = CASE WHEN $3::BIGINT IS NULL THEN next_attempt_at ELSE $6 + ($3 * INTERVAL '1 second') END, \
+                 next_attempt_at = CASE WHEN $3::BIGINT IS NULL THEN next_attempt_at ELSE $6 + ($3 * INTERVAL '1 millisecond') END, \
                  lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL, updated_at = $6 \
              WHERE id = $4 AND status = 'leased' AND claim_token = $5 AND lease_expires_at > $6",
         )
         .bind(status)
         .bind(error_class)
-        .bind(delay)
+        .bind(delay_milliseconds)
         .bind(claim.id)
         .bind(claim.claim_token)
         .bind(now)
@@ -540,6 +540,10 @@ fn lease_seconds(duration: Duration) -> Result<i64, PersistenceError> {
     i64::try_from(duration.as_secs()).map_err(|_| PersistenceError::Unavailable)
 }
 
+fn duration_milliseconds(duration: Duration) -> Result<i64, PersistenceError> {
+    i64::try_from(duration.as_millis()).map_err(|_| PersistenceError::Unavailable)
+}
+
 fn lookup_hash_from_storage(bytes: &[u8]) -> Result<LookupHash, PersistenceError> {
     let bytes: [u8; 32] = bytes
         .try_into()
@@ -585,6 +589,18 @@ mod tests {
                 "reconciliation_pending",
                 "reconciliation",
             ]
+        );
+    }
+
+    #[test]
+    fn enqueue_retry_delay_preserves_milliseconds() {
+        assert_eq!(
+            duration_milliseconds(Duration::from_millis(500)).unwrap(),
+            500
+        );
+        assert_eq!(
+            duration_milliseconds(Duration::from_secs(5)).unwrap(),
+            5_000
         );
     }
 

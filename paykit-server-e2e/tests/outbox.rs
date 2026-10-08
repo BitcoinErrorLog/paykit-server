@@ -564,6 +564,114 @@ async fn invoice_request_is_claimable_directly_and_preserves_delivery_fences() {
     database.cleanup().await;
 }
 
+#[tokio::test]
+async fn enqueue_retry_preserves_500ms_deadline_across_store_recreation() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creator = creator();
+    let reader = reader();
+    CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "session-secret".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: "xpub-secret".to_owned().into(),
+                account_index: 0,
+            }),
+            None,
+        ))
+        .await
+        .unwrap();
+    let invoice = InvoiceStore::new(database.pool(), crypto.clone())
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: b"subsecond-retry-bundle",
+            lock_resource_binding: b"subsecond-retry-lock",
+            payment_request_binding: b"subsecond-retry-request",
+            invoice_payloads: &Payloads {
+                reader: reader.clone(),
+            },
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
+        })
+        .await
+        .unwrap();
+    let outbox = OutboxStore::new(database.pool(), crypto.clone());
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.id(), invoice.payment_request_outbox_id());
+    assert!(
+        outbox
+            .mark_retryable(
+                &claim,
+                Duration::from_millis(500),
+                paykit_server::persistence::OutboxRetryClass::LinkEstablishment,
+            )
+            .await
+            .unwrap()
+    );
+
+    let persisted_delay_ms: i64 = sqlx::query_scalar(
+        "SELECT ROUND(EXTRACT(EPOCH FROM (next_attempt_at - updated_at)) * 1000)::BIGINT \
+         FROM outbox WHERE id = $1",
+    )
+    .bind(claim.id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(persisted_delay_ms, 500);
+    sqlx::query(
+        "UPDATE outbox \
+         SET updated_at = updated_at + INTERVAL '1 minute', \
+             next_attempt_at = next_attempt_at + INTERVAL '1 minute' \
+         WHERE id = $1",
+    )
+    .bind(claim.id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    drop(outbox);
+    let restarted_pool = sqlx::PgPool::connect(database.database_url())
+        .await
+        .unwrap();
+    let restarted_outbox = OutboxStore::new(&restarted_pool, crypto);
+    assert!(
+        restarted_outbox
+            .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+            .await
+            .unwrap()
+            .is_empty(),
+        "persisted 500ms retry became immediately claimable after restart"
+    );
+    sqlx::query(
+        "UPDATE outbox \
+         SET updated_at = updated_at - INTERVAL '2 minutes', \
+             next_attempt_at = next_attempt_at - INTERVAL '2 minutes' \
+         WHERE id = $1",
+    )
+    .bind(claim.id())
+    .execute(&restarted_pool)
+    .await
+    .unwrap();
+    let retried = restarted_outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].id(), claim.id());
+    drop(restarted_outbox);
+    restarted_pool.close().await;
+    database.cleanup().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_claim_associates() {
     let database = TestDatabase::create().await;

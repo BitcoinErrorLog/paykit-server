@@ -515,6 +515,11 @@ fn parses_accepted_durations_and_uses_ledger_defaults() {
     assert_eq!(config.outbox.lease_duration, Duration::from_secs(30));
     assert_eq!(config.outbox.retry_initial, Duration::from_secs(1));
     assert_eq!(config.outbox.retry_max, Duration::from_secs(5 * 60));
+    assert_eq!(config.outbox.rapid_link_retry_attempts, 120);
+    assert_eq!(
+        config.outbox.rapid_link_retry_interval,
+        Duration::from_millis(1_000)
+    );
 
     assert_eq!(config.limits.request_body_bytes, 16 * 1024);
     assert_eq!(config.limits.lock_resource_bytes, 256 * 1024);
@@ -533,6 +538,41 @@ fn parses_accepted_durations_and_uses_ledger_defaults() {
     );
     let configured = Config::from_toml_and_environment(&input, environment()).unwrap();
     assert_eq!(configured.electrum.poll_interval, Duration::from_secs(30));
+}
+
+#[test]
+fn rapid_link_retry_policy_accepts_custom_attempts_and_millisecond_interval() {
+    let input = valid_toml().replace(
+        "poll_interval = \"5s\"",
+        "poll_interval = \"5s\"\nrapid_link_retry_attempts = 240\nrapid_link_retry_interval_ms = 500",
+    );
+    let config = Config::from_toml_and_environment(&input, environment()).unwrap();
+
+    assert_eq!(config.outbox.rapid_link_retry_attempts, 240);
+    assert_eq!(
+        config.outbox.rapid_link_retry_interval,
+        Duration::from_millis(500)
+    );
+}
+
+#[test]
+fn rapid_link_retry_policy_rejects_zero_and_out_of_range_values() {
+    for field in [
+        "rapid_link_retry_attempts = 0",
+        "rapid_link_retry_attempts = 2147483648",
+        "rapid_link_retry_interval_ms = 0",
+        "rapid_link_retry_interval_ms = 4294967296",
+    ] {
+        let input = valid_toml().replace(
+            "poll_interval = \"5s\"",
+            &format!("poll_interval = \"5s\"\n{field}"),
+        );
+
+        assert!(
+            Config::from_toml_and_environment(&input, environment()).is_err(),
+            "{field} should be rejected"
+        );
+    }
 }
 
 #[test]

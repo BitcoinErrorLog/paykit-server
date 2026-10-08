@@ -142,6 +142,10 @@ impl Config {
             ("outbox.lease_duration", self.outbox.lease_duration),
             ("outbox.retry_initial", self.outbox.retry_initial),
             ("outbox.retry_max", self.outbox.retry_max),
+            (
+                "outbox.rapid_link_retry_interval_ms",
+                self.outbox.rapid_link_retry_interval,
+            ),
             ("limits.lock_fetch_timeout", self.limits.lock_fetch_timeout),
             ("shutdown.drain_timeout", self.shutdown.drain_timeout),
         ] {
@@ -151,6 +155,10 @@ impl Config {
         }
         for (name, value) in [
             ("outbox.batch_size", u64::from(self.outbox.batch_size)),
+            (
+                "outbox.rapid_link_retry_attempts",
+                u64::from(self.outbox.rapid_link_retry_attempts),
+            ),
             ("limits.request_body_bytes", self.limits.request_body_bytes),
             (
                 "limits.lock_resource_bytes",
@@ -193,6 +201,11 @@ impl Config {
         }
         if self.outbox.retry_initial > self.outbox.retry_max {
             return Err(ConfigError::InconsistentRetries("outbox"));
+        }
+        if self.outbox.rapid_link_retry_attempts > i32::MAX as u32 {
+            return Err(ConfigError::ValueTooLarge(
+                "outbox.rapid_link_retry_attempts",
+            ));
         }
         if self.paykit.conversion_payment_window.as_secs() < 2
             || self.paykit.conversion_payment_window.subsec_nanos() != 0
@@ -465,6 +478,8 @@ pub struct OutboxConfig {
     pub lease_duration: Duration,
     pub retry_initial: Duration,
     pub retry_max: Duration,
+    pub rapid_link_retry_attempts: u32,
+    pub rapid_link_retry_interval: Duration,
 }
 
 #[derive(Debug)]
@@ -825,6 +840,10 @@ struct RawOutboxConfig {
     retry_initial: Duration,
     #[serde(default = "default_outbox_retry_max", with = "humantime_serde")]
     retry_max: Duration,
+    #[serde(default = "default_rapid_link_retry_attempts")]
+    rapid_link_retry_attempts: u32,
+    #[serde(default = "default_rapid_link_retry_interval_ms")]
+    rapid_link_retry_interval_ms: u32,
 }
 
 #[derive(Deserialize)]
@@ -901,6 +920,10 @@ impl From<RawOutboxConfig> for OutboxConfig {
             lease_duration: value.lease_duration,
             retry_initial: value.retry_initial,
             retry_max: value.retry_max,
+            rapid_link_retry_attempts: value.rapid_link_retry_attempts,
+            rapid_link_retry_interval: Duration::from_millis(u64::from(
+                value.rapid_link_retry_interval_ms,
+            )),
         }
     }
 }
@@ -947,6 +970,12 @@ const fn default_retry_initial() -> Duration {
 }
 const fn default_outbox_retry_max() -> Duration {
     Duration::from_secs(5 * 60)
+}
+const fn default_rapid_link_retry_attempts() -> u32 {
+    120
+}
+const fn default_rapid_link_retry_interval_ms() -> u32 {
+    1_000
 }
 
 const fn default_request_body_bytes() -> u64 {

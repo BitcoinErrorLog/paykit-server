@@ -212,7 +212,14 @@ The cryptographic envelope version, domain-separated KDF/AAD labels, and private
 
 ## Configuration and secrets
 
-Copy [`config/paykit-server.example.toml`](config/paykit-server.example.toml) to an operator-controlled path. The TOML schema is closed: unknown sections and keys are rejected. Durations are strings such as `"10s"` and `"5m"`.
+Copy [`config/paykit-server.example.toml`](config/paykit-server.example.toml) to an operator-controlled path. The TOML schema is closed: unknown sections and keys are rejected. Durations are strings such as `"10s"` and `"5m"`. The exception is `outbox.rapid_link_retry_interval_ms`, an integer millisecond count so operators can configure subsecond Encrypted Link retries.
+
+`outbox.rapid_link_retry_attempts` defaults to `120` and accepts integers from
+`1` through `2147483647`. `outbox.rapid_link_retry_interval_ms` defaults to
+`1000` and accepts integers from `1` through `4294967295`; `500` selects a
+half-second rapid interval. Omitting both keys preserves these defaults. General
+`outbox.retry_initial` and `outbox.retry_max` remain duration strings and still
+control later capped backoff and all non-link retry classes.
 
 Configuration rollout is explicit: replace legacy
 `locks.trusted_public_key = "pubky..."` with non-empty

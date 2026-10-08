@@ -108,6 +108,8 @@ struct WorkerComponents {
     outbox_lease_duration: Duration,
     outbox_retry_initial: Duration,
     outbox_retry_max: Duration,
+    rapid_link_retry_attempts: u32,
+    rapid_link_retry_interval: Duration,
     electrum_poll_interval: Duration,
 }
 
@@ -321,6 +323,8 @@ impl Server {
             outbox_lease_duration: config.outbox.lease_duration,
             outbox_retry_initial: config.outbox.retry_initial,
             outbox_retry_max: config.outbox.retry_max,
+            rapid_link_retry_attempts: config.outbox.rapid_link_retry_attempts,
+            rapid_link_retry_interval: config.outbox.rapid_link_retry_interval,
             electrum_poll_interval: config.electrum.poll_interval,
         };
 
@@ -660,25 +664,23 @@ fn retry_delay(initial: Duration, maximum: Duration, attempt_count: i32) -> Dura
     initial.saturating_mul(1_u32 << exponent).min(maximum)
 }
 
-const RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS: i32 = 20;
-const RAPID_LINK_ESTABLISHMENT_RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_LINK_ESTABLISHMENT_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 fn outbox_retry_schedule(
     initial: Duration,
     maximum: Duration,
+    rapid_link_retry_attempts: u32,
+    rapid_link_retry_interval: Duration,
     attempt_count: i32,
 ) -> RetrySchedule {
     let default = retry_delay(initial, maximum, attempt_count);
-    let link_establishment = if attempt_count <= RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS {
-        RAPID_LINK_ESTABLISHMENT_RETRY_DELAY
+    let rapid_link_retry_attempts = i32::try_from(rapid_link_retry_attempts)
+        .expect("validated rapid link retry attempts fit i32");
+    let link_establishment = if attempt_count <= rapid_link_retry_attempts {
+        rapid_link_retry_interval
     } else {
-        retry_delay(
-            initial,
-            maximum,
-            attempt_count - RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS,
-        )
-        .min(MAX_LINK_ESTABLISHMENT_RETRY_DELAY)
+        retry_delay(initial, maximum, attempt_count - rapid_link_retry_attempts)
+            .min(MAX_LINK_ESTABLISHMENT_RETRY_DELAY)
     };
     RetrySchedule::new(default, link_establishment)
 }
@@ -720,6 +722,8 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                 let retry_schedule = outbox_retry_schedule(
                     workers.outbox_retry_initial,
                     workers.outbox_retry_max,
+                    workers.rapid_link_retry_attempts,
+                    workers.rapid_link_retry_interval,
                     claim.attempt_count(),
                 );
                 match creator_adapter(&workers, claim.creator_id()).await {
@@ -1355,32 +1359,36 @@ mod tests {
     fn link_establishment_retry_delay_is_capped_below_general_backoff() {
         let initial = Duration::from_secs(1);
         let maximum = Duration::from_secs(300);
+        let rapid_attempts = 3;
+        let rapid_interval = Duration::from_millis(500);
 
-        for attempt in 1..=RAPID_LINK_ESTABLISHMENT_RETRY_ATTEMPTS {
-            let schedule = outbox_retry_schedule(initial, maximum, attempt);
+        for attempt in 1_i32..=3 {
+            let schedule =
+                outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, attempt);
             assert_eq!(
                 schedule.delay_for(OutboxRetryClass::LinkEstablishment),
-                Duration::from_secs(1)
+                rapid_interval
             );
         }
 
         assert_eq!(
-            outbox_retry_schedule(initial, maximum, 21)
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 4)
                 .delay_for(OutboxRetryClass::LinkEstablishment),
             Duration::from_secs(1)
         );
         assert_eq!(
-            outbox_retry_schedule(initial, maximum, 22)
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 5)
                 .delay_for(OutboxRetryClass::LinkEstablishment),
             Duration::from_secs(2)
         );
         assert_eq!(
-            outbox_retry_schedule(initial, maximum, 30)
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 13)
                 .delay_for(OutboxRetryClass::LinkEstablishment),
             Duration::from_secs(5)
         );
         assert_eq!(
-            outbox_retry_schedule(initial, maximum, 30).default_delay(),
+            outbox_retry_schedule(initial, maximum, rapid_attempts, rapid_interval, 13)
+                .default_delay(),
             Duration::from_secs(300)
         );
     }

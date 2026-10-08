@@ -59,6 +59,13 @@ batch_size = 16
 lease_duration = "30s"
 retry_initial = "1s"
 retry_max = "5m"
+# Keep Encrypted Link establishment retries fast for this many outbox attempts
+# before switching to retry_initial/retry_max backoff, capped at 5s for link
+# establishment failures. Integer range: 1..=2147483647; default: 120.
+rapid_link_retry_attempts = 120
+# Integer milliseconds between rapid link-establishment retries. Range:
+# 1..=4294967295; default: 1000. For example, 500 means 0.5 seconds.
+rapid_link_retry_interval_ms = 1000
 
 [limits]
 request_body_bytes = 16384
