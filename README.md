@@ -355,7 +355,9 @@ The later SDK handoff is not exactly once. Server delivery is at least once:
 The invoice API returns after durable intent commit. It does not wait for Encrypted Link establishment or remote delivery.
 
 Requests address the Reader identity, not a receiver folder. The Reader's App
-Registry must advertise a private-payment app capable of paying requests. New
+Registry must advertise a Noise key and at least one app with `payment_requests`
+and `outgoing_payments` enabled. Private Payment List sharing (`private_payments`)
+is not required: the invoice includes its payment destination. New
 invoice admission reads a cleanly missing registry at most three times, using
 full-jitter delays whose combined maximum is one second inside the existing
 15-second request deadline. Exhausted clean absence returns `503`

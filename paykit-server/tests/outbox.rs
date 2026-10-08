@@ -25,7 +25,7 @@ fn registry(capable: bool) -> PaykitAppRegistry {
             PaykitApp::new(
                 "Reader",
                 PaykitAppCapabilities {
-                    private_payments: true,
+                    private_payments: false,
                     payment_requests: true,
                     receipts: false,
                     outgoing_payments: capable,

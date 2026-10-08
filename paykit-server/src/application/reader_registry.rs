@@ -7,9 +7,7 @@ pub fn reader_is_capable(registry: &PaykitAppRegistry) -> bool {
     registry.noise_public_key().is_some()
         && registry.apps().values().any(|app| {
             let capabilities = app.capabilities();
-            capabilities.private_payments
-                && capabilities.payment_requests
-                && capabilities.outgoing_payments
+            capabilities.payment_requests && capabilities.outgoing_payments
         })
 }
 
@@ -22,6 +20,7 @@ mod tests {
     fn any_capable_app_is_sufficient_without_priority_or_default_selection() {
         let mut registry =
             PaykitAppRegistry::new(Some(paykit_lib::derive_paykit_noise_public_key(&[9; 32])));
+        assert!(!reader_is_capable(&registry));
         registry
             .register_app(
                 PaykitAppId::new("paykit-server").unwrap(),
@@ -31,11 +30,27 @@ mod tests {
         assert!(!reader_is_capable(&registry));
         registry
             .register_app(
+                PaykitAppId::new("outgoing-only").unwrap(),
+                PaykitApp::new(
+                    "Outgoing payments",
+                    PaykitAppCapabilities {
+                        private_payments: true,
+                        payment_requests: false,
+                        receipts: false,
+                        outgoing_payments: true,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(!reader_is_capable(&registry));
+        registry
+            .register_app(
                 PaykitAppId::new("another-wallet").unwrap(),
                 PaykitApp::new(
                     "Wallet",
                     PaykitAppCapabilities {
-                        private_payments: true,
+                        private_payments: false,
                         payment_requests: true,
                         receipts: false,
                         outgoing_payments: true,

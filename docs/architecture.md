@@ -59,8 +59,9 @@ A database transaction allocates one fresh BIP84 address per invoice and persist
 the complete Payment Request with that address in `payment_endpoints` and
 `required_app_id = "paykit-server"`. Exact replay returns the same invoice,
 assignment, terms, and outbox row. Invoices accepting Bitcoin cannot reuse its address. Invoices accepting USDT share the approved address and attribute individual transfers through verified request proofs. Both options may belong to one invoice; fixed conversion rates and per-option amounts are persisted with its immutable terms.
-Reader discovery checks that at least one registered app supports private payments,
-Payment Requests, and outgoing payments; it does not select a receiver path.
+Reader discovery requires a Noise key and at least one registered app supporting
+both Payment Requests and outgoing payments; Private Payment List sharing is not
+required. Discovery does not select a receiver path.
 
 SDK handoff is at least once. Reconciliation identifies the exact outbound ID and
 app; only SDK `Sent` means delivered, not payer acknowledgement. See

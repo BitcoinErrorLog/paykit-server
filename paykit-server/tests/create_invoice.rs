@@ -140,7 +140,7 @@ fn capable_registry() -> paykit_lib::PaykitAppRegistry {
             paykit_lib::PaykitApp::new(
                 "Bitkit",
                 paykit_lib::PaykitAppCapabilities {
-                    private_payments: true,
+                    private_payments: false,
                     payment_requests: true,
                     receipts: false,
                     outgoing_payments: true,
