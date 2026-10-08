@@ -569,8 +569,8 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         r#"
 [http]
 listen_addr = "127.0.0.1:0"
-[locks]
-trusted_public_key = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo"
+[signed_services]
+trusted_public_keys = ["pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo"]
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]

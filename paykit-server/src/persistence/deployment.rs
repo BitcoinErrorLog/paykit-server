@@ -35,17 +35,14 @@ impl DeploymentStore {
         .bind(invariants.bitcoin_network.as_str())
         .bind(invariants.paykit_client_id.as_str())
         .bind(invariants.app_id.as_str())
-        .bind(
-            invariants
-                .trusted_locks_key_fingerprint
-                .as_bytes()
-                .as_slice(),
-        )
+        // Legacy baseline column retained to preserve existing migration checksums.
+        // Trusted signing keys are rotatable credentials, not deployment invariants.
+        .bind(&[] as &[u8])
         .execute(&mut *transaction)
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         let existing = sqlx::query_as::<_, DeploymentMetadataRow>(
-            "SELECT bitcoin_network, paykit_client_id, app_id, locks_key_fingerprint \
+            "SELECT bitcoin_network, paykit_client_id, app_id \
              FROM deployment_metadata WHERE id = 1 FOR UPDATE",
         )
         .fetch_one(&mut *transaction)
@@ -55,7 +52,6 @@ impl DeploymentStore {
         if existing.bitcoin_network == invariants.bitcoin_network.as_str()
             && existing.paykit_client_id == invariants.paykit_client_id.as_str()
             && existing.app_id == invariants.app_id.as_str()
-            && existing.locks_key_fingerprint == invariants.trusted_locks_key_fingerprint.as_bytes()
         {
             transaction
                 .commit()
@@ -72,7 +68,6 @@ struct DeploymentMetadataRow {
     bitcoin_network: String,
     paykit_client_id: String,
     app_id: String,
-    locks_key_fingerprint: Vec<u8>,
 }
 
 /// Secret-free persistence failures suitable for startup and API boundaries.

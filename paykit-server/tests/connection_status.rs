@@ -15,7 +15,7 @@ use paykit_server::{
     },
     config::{Config, ConfigEnvironment},
     domain::locks::{BundleId, CreatorPubky, parse_bundle_id, parse_creator, parse_reader},
-    http::{auth::SignedLocksAuth, connection_status::connection_status_router},
+    http::{auth::SignedServiceAuth, connection_status::connection_status_router},
     persistence::PersistenceError,
 };
 use tower::ServiceExt;
@@ -127,8 +127,8 @@ fn config_for(key: &SigningKey) -> Config {
             r#"
 [http]
 listen_addr = "127.0.0.1:8080"
-[locks]
-trusted_public_key = "{key}"
+[signed_services]
+trusted_public_keys = ["{key}"]
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
@@ -195,7 +195,7 @@ async fn endpoint_returns_full_closed_connection_state_vocabulary() {
         let key = SigningKey::from_bytes(&[7; 32]);
         let (service, _) = service(Ok(Some(binding())), Ok(state));
         let router = connection_status_router(service).layer(Extension(Arc::new(
-            SignedLocksAuth::from_config(&config_for(&key)),
+            SignedServiceAuth::from_config(&config_for(&key)),
         )));
         let request_body =
             format!(r#"{{"bundle_id":"{BUNDLE}","creator":"{CREATOR}"}}"#).into_bytes();
@@ -217,7 +217,7 @@ async fn endpoint_preserves_not_found_storage_and_auth_failures_as_errors() {
 
     let (missing, _) = service(Ok(None), Ok(PaykitConnectionState::None));
     let missing = connection_status_router(missing).layer(Extension(Arc::new(
-        SignedLocksAuth::from_config(&config_for(&key)),
+        SignedServiceAuth::from_config(&config_for(&key)),
     )));
     assert_eq!(
         missing
@@ -233,7 +233,7 @@ async fn endpoint_preserves_not_found_storage_and_auth_failures_as_errors() {
         Ok(PaykitConnectionState::None),
     );
     let unavailable = connection_status_router(unavailable).layer(Extension(Arc::new(
-        SignedLocksAuth::from_config(&config_for(&key)),
+        SignedServiceAuth::from_config(&config_for(&key)),
     )));
     assert_eq!(
         unavailable
@@ -246,7 +246,7 @@ async fn endpoint_preserves_not_found_storage_and_auth_failures_as_errors() {
 
     let (service, _) = service(Ok(Some(binding())), Ok(PaykitConnectionState::None));
     let invalid_signature = connection_status_router(service).layer(Extension(Arc::new(
-        SignedLocksAuth::from_config(&config_for(&key)),
+        SignedServiceAuth::from_config(&config_for(&key)),
     )));
     let other_key = SigningKey::from_bytes(&[8; 32]);
     assert_eq!(
@@ -264,7 +264,7 @@ async fn endpoint_rejects_signed_unknown_request_fields() {
     let key = SigningKey::from_bytes(&[7; 32]);
     let (service, peers) = service(Ok(Some(binding())), Ok(PaykitConnectionState::None));
     let router = connection_status_router(service).layer(Extension(Arc::new(
-        SignedLocksAuth::from_config(&config_for(&key)),
+        SignedServiceAuth::from_config(&config_for(&key)),
     )));
     let request_body =
         format!(r#"{{"bundle_id":"{BUNDLE}","creator":"{CREATOR}","reader":"{READER}"}}"#)

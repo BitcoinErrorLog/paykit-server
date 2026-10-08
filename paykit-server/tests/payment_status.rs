@@ -15,7 +15,7 @@ use paykit_server::{
     application::payment_status::{PaymentStatusService, PersistedPaymentStatus, StatusRepository},
     config::{Config, ConfigEnvironment},
     domain::locks::{BundleId, CreatorPubky},
-    http::{auth::SignedLocksAuth, status::status_router},
+    http::{auth::SignedServiceAuth, status::status_router},
     persistence::PersistenceError,
 };
 use tower::ServiceExt;
@@ -63,8 +63,8 @@ fn config_for(key: &SigningKey) -> Config {
             r#"
 [http]
 listen_addr = "127.0.0.1:8080"
-[locks]
-trusted_public_key = "{key}"
+[signed_services]
+trusted_public_keys = ["{key}"]
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
@@ -94,7 +94,7 @@ signed_burst = 200
 
 fn router(key: &SigningKey, status: Option<PersistedPaymentStatus>) -> axum::Router {
     let (service, _) = service(status);
-    status_router(service).layer(Extension(Arc::new(SignedLocksAuth::from_config(
+    status_router(service).layer(Extension(Arc::new(SignedServiceAuth::from_config(
         &config_for(key),
     ))))
 }

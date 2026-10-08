@@ -43,25 +43,25 @@ impl Clock for SystemClock {
     }
 }
 
-pub struct SignedLocksAuth {
-    trusted_key: VerifyingKey,
+pub struct SignedServiceAuth {
+    trusted_keys: Vec<VerifyingKey>,
     request_body_bytes: usize,
     limiter: Mutex<TokenBucket>,
     clock: Arc<dyn Clock>,
     observer: Arc<dyn AuthProcessingObserver>,
 }
 
-impl fmt::Debug for SignedLocksAuth {
+impl fmt::Debug for SignedServiceAuth {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("SignedLocksAuth")
-            .field("trusted_key", &"<redacted>")
+            .debug_struct("SignedServiceAuth")
+            .field("trusted_keys", &"<redacted>")
             .field("request_body_bytes", &self.request_body_bytes)
             .finish_non_exhaustive()
     }
 }
 
-impl SignedLocksAuth {
+impl SignedServiceAuth {
     pub fn from_config(config: &Config) -> Self {
         Self::with_clock_and_observer(
             config,
@@ -86,7 +86,12 @@ impl SignedLocksAuth {
     ) -> Self {
         let now = clock.now();
         Self {
-            trusted_key: config.locks.trusted_public_key.verifying_key(),
+            trusted_keys: config
+                .signed_services
+                .trusted_public_keys
+                .iter()
+                .map(|key| key.verifying_key())
+                .collect(),
             request_body_bytes: usize::try_from(config.limits.request_body_bytes)
                 .expect("validated request body limit fits usize"),
             limiter: Mutex::new(TokenBucket::new(
@@ -166,7 +171,7 @@ where
     async fn from_request(request: Request, _: &S) -> Result<Self, Self::Rejection> {
         let auth = request
             .extensions()
-            .get::<Arc<SignedLocksAuth>>()
+            .get::<Arc<SignedServiceAuth>>()
             .cloned()
             .ok_or(ApiError::InvalidSignature)?;
         let (parts, body) = request.into_parts();
@@ -182,7 +187,7 @@ where
         }
         auth.observer.signature_verification_started();
         let preimage = signature_preimage(parts.method.as_str(), parts.uri.path(), &raw_body);
-        verify_signature(&auth.trusted_key, &parts.headers, &preimage)?;
+        verify_signature(&auth.trusted_keys, &parts.headers, &preimage)?;
 
         let value: serde_json::Value =
             serde_json::from_slice(&raw_body).map_err(|_| ApiError::InvalidRequest)?;
@@ -209,7 +214,7 @@ where
 }
 
 fn verify_signature(
-    trusted_key: &VerifyingKey,
+    trusted_keys: &[VerifyingKey],
     headers: &axum::http::HeaderMap,
     preimage: &[u8],
 ) -> Result<(), ApiError> {
@@ -231,9 +236,12 @@ fn verify_signature(
     if URL_SAFE_NO_PAD.encode(signature) != encoded {
         return Err(ApiError::InvalidSignature);
     }
-    trusted_key
-        .verify(preimage, &Signature::from_bytes(&signature))
-        .map_err(|_| ApiError::InvalidSignature)
+    let signature = Signature::from_bytes(&signature);
+    let mut verified = false;
+    for trusted_key in trusted_keys {
+        verified |= trusted_key.verify(preimage, &signature).is_ok();
+    }
+    verified.then_some(()).ok_or(ApiError::InvalidSignature)
 }
 
 /// Builds the versioned signed HTTP request preimage.

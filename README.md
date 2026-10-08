@@ -62,7 +62,11 @@ Business routes:
 - signed `POST /payment-request-drain-lookups`
 - signed `POST /payment-request-drain-cleanups`
 
-Business-route signatures use the configured trusted Locks Ed25519 key. Setup uses the Bitkit Pubky Auth companion-claim flow and an exact configured browser origin.
+Business-route signatures use one shared `signed_services.trusted_public_keys`
+authority domain. Every listed Locks or Marketplace Ed25519 key may call every
+signed route; there is no route-specific authorization. Shop/browser code must
+never receive a service signing secret. Setup uses the Bitkit Pubky Auth
+companion-claim flow and an exact configured browser origin.
 
 Successful invoice creation and exact replay return `200 OK` with only RFC 3339
 `invoice_created_at` and `payment_deadline` timestamps; they do not expose Noise
@@ -74,7 +78,7 @@ invoices return `404`; authentication, storage, malformed-state, and dependency
 failures remain typed errors. `connected` is the identity's shared Noise state,
 not payment or verification completion.
 
-`POST /setup/status` is the Locks-only readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination. Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
+`POST /setup/status` is the readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination. Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
 
 ### Setup iframe
 
@@ -192,10 +196,15 @@ Immutable deployment values are:
 
 - Bitcoin network;
 - Paykit Pubky client ID;
-- Paykit app ID (`paykit-server`);
-- trusted Locks public-key fingerprint.
+- Paykit app ID (`paykit-server`).
 
 Changing any of them after database initialization requires resetting the database.
+Trusted service keys are credentials rather than immutable deployment identity.
+Adding, removing, or replacing allowlisted keys does not alter persisted replay
+identity and does not require database reset. During rotation, deploy overlapping
+old and new public keys before removing old key. The allowlist is read at startup,
+so restart the server after each rotation step: add the new key, switch the signer,
+then remove the old key.
 
 Persisted application and schema compatibility across releases is intentionally unsupported during this pre-production phase. The `0.1.0-rc6` Paykit Server and `0.1.0-rc6` Locks rollout is coordinated: stop both services, deploy both versions, then start each service and let its one-time SQLx reset migration clear only its dedicated disposable prototype database while preserving `_sqlx_migrations`. Verify both migrations and services before allowing new invoice or verification work, then reacquire any required prototype state. Do not manually drop/recreate either database. Never run these reset migrations against production, staging, an unidentified database, or a database shared with unrelated applications.
 
@@ -204,6 +213,11 @@ The cryptographic envelope version, domain-separated KDF/AAD labels, and private
 ## Configuration and secrets
 
 Copy [`config/paykit-server.example.toml`](config/paykit-server.example.toml) to an operator-controlled path. The TOML schema is closed: unknown sections and keys are rejected. Durations are strings such as `"10s"` and `"5m"`.
+
+Configuration rollout is explicit: replace legacy
+`locks.trusted_public_key = "pubky..."` with non-empty
+`signed_services.trusted_public_keys = ["pubky..."]`. Legacy key is rejected;
+there is no compatibility alias that could create two authorities.
 
 Required environment variables:
 

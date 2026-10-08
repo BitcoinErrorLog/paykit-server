@@ -13,8 +13,9 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
 use paykit_server::{
+    Server,
     config::{Config, ConfigEnvironment},
-    http::auth::{AuthProcessingObserver, AuthenticatedJson, SignedLocksAuth},
+    http::auth::{AuthProcessingObserver, AuthenticatedJson, SignedServiceAuth},
     runtime::{DependencyCheck, Runtime, operational_router},
 };
 use serde::Deserialize;
@@ -51,18 +52,26 @@ impl AuthProcessingObserver for ProcessingCounter {
     }
 }
 
-fn config_for(key: &SigningKey, rate: u64, burst: u64, request_body_bytes: u64) -> Config {
-    let key = pubky::PublicKey::from(
+fn rendered_key(key: &SigningKey) -> String {
+    pubky::PublicKey::from(
         pubky::pkarr::PublicKey::try_from(key.verifying_key().as_bytes()).unwrap(),
     )
-    .to_string();
+    .to_string()
+}
+
+fn config_for_keys(keys: &[&SigningKey], rate: u64, burst: u64, request_body_bytes: u64) -> Config {
+    let keys = keys
+        .iter()
+        .map(|key| format!("\"{}\"", rendered_key(key)))
+        .collect::<Vec<_>>()
+        .join(", ");
     Config::from_toml_and_environment(
         &format!(
             r#"
 [http]
 listen_addr = "127.0.0.1:8080"
-[locks]
-trusted_public_key = "{key}"
+[signed_services]
+trusted_public_keys = [{keys}]
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
@@ -90,8 +99,12 @@ signed_burst = {burst}
     .unwrap()
 }
 
+fn config_for(key: &SigningKey, rate: u64, burst: u64, request_body_bytes: u64) -> Config {
+    config_for_keys(&[key], rate, burst, request_body_bytes)
+}
+
 fn router(key: &SigningKey, rate: u64, burst: u64) -> Router {
-    let auth = Arc::new(SignedLocksAuth::from_config(&config_for(
+    let auth = Arc::new(SignedServiceAuth::from_config(&config_for(
         key,
         rate,
         burst,
@@ -109,7 +122,7 @@ fn router_with_observer(
     observer: Arc<dyn AuthProcessingObserver>,
 ) -> Router {
     let config = config_for(key, rate, burst, 16 * 1024);
-    let auth = Arc::new(SignedLocksAuth::with_observer(&config, observer));
+    let auth = Arc::new(SignedServiceAuth::with_observer(&config, observer));
     Router::new()
         .route("/test", post(test_endpoint))
         .layer(Extension(auth))
@@ -119,6 +132,54 @@ async fn test_endpoint(
     AuthenticatedJson(payload): AuthenticatedJson<TestRequest>,
 ) -> Json<serde_json::Value> {
     Json(serde_json::json!({"value": payload.value}))
+}
+
+#[tokio::test]
+async fn every_signed_business_path_accepts_each_trusted_service_key() {
+    const SIGNED_PATHS: [&str; 8] = [
+        "/invoices",
+        "/connections/status",
+        "/transactions/status",
+        "/setup/status",
+        "/payment-requests/status",
+        "/payment-request-drains",
+        "/payment-request-drain-lookups",
+        "/payment-request-drain-cleanups",
+    ];
+    let first = SigningKey::from_bytes(&[7; 32]);
+    let second = SigningKey::from_bytes(&[8; 32]);
+    let unlisted = SigningKey::from_bytes(&[9; 32]);
+    let config = config_for_keys(&[&first, &second], 100, 200, 16 * 1024);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://127.0.0.1:1/paykit")
+        .unwrap();
+    let router = Server::build(config, pool).await.unwrap().router();
+
+    for path in SIGNED_PATHS {
+        for key in [&first, &second] {
+            let response = router
+                .clone()
+                .oneshot(signed_request_for_path(
+                    key,
+                    path,
+                    br#"{"value":1}"#.as_slice(),
+                ))
+                .await
+                .unwrap();
+            assert_ne!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            assert_ne!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        let response = router
+            .clone()
+            .oneshot(signed_request_for_path(
+                &unlisted,
+                path,
+                br#"{"value":1}"#.as_slice(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
 }
 
 fn signed_request(key: &SigningKey, body: impl Into<Vec<u8>>) -> Request<Body> {
@@ -203,7 +264,7 @@ async fn missing_malformed_and_invalid_signatures_have_the_same_safe_401_envelop
 #[tokio::test]
 async fn exact_path_prefix_is_part_of_the_signed_preimage() {
     let key = SigningKey::from_bytes(&[7; 32]);
-    let auth = Arc::new(SignedLocksAuth::from_config(&config_for(
+    let auth = Arc::new(SignedServiceAuth::from_config(&config_for(
         &key,
         100,
         200,
@@ -386,7 +447,9 @@ async fn raw_body_limit_precedes_signature_and_json_processing() {
 #[tokio::test]
 async fn configured_signed_body_limit_is_enforced() {
     let key = SigningKey::from_bytes(&[7; 32]);
-    let auth = Arc::new(SignedLocksAuth::from_config(&config_for(&key, 100, 200, 8)));
+    let auth = Arc::new(SignedServiceAuth::from_config(&config_for(
+        &key, 100, 200, 8,
+    )));
     let router = Router::new()
         .route("/test", post(test_endpoint))
         .layer(Extension(auth));
@@ -473,7 +536,7 @@ async fn operational_capacity_rejects_before_signature_verification() {
     let observer = Arc::new(ProcessingCounter::default());
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    let auth = Arc::new(SignedLocksAuth::with_observer(
+    let auth = Arc::new(SignedServiceAuth::with_observer(
         &config_for(&key, 100, 200, 16 * 1024),
         observer.clone(),
     ));
@@ -525,13 +588,13 @@ async fn operational_capacity_rejects_before_signature_verification() {
 }
 
 #[test]
-fn authentication_state_debug_redacts_the_trusted_public_key() {
-    let key = SigningKey::from_bytes(&[7; 32]);
-    let public_key = pubky::PublicKey::from(
-        pubky::pkarr::PublicKey::try_from(key.verifying_key().as_bytes()).unwrap(),
-    )
-    .to_string();
-    let auth = SignedLocksAuth::from_config(&config_for(&key, 100, 200, 16 * 1024));
+fn authentication_state_debug_redacts_every_trusted_public_key() {
+    let first = SigningKey::from_bytes(&[7; 32]);
+    let second = SigningKey::from_bytes(&[8; 32]);
+    let auth =
+        SignedServiceAuth::from_config(&config_for_keys(&[&first, &second], 100, 200, 16 * 1024));
+    let rendered = format!("{auth:?}");
 
-    assert!(!format!("{auth:?}").contains(&public_key));
+    assert!(!rendered.contains(&rendered_key(&first)));
+    assert!(!rendered.contains(&rendered_key(&second)));
 }

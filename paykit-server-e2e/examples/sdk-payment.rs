@@ -456,8 +456,8 @@ async fn main() -> Result<()> {
             r#"
 [http]
 listen_addr = "127.0.0.1:0"
-[locks]
-trusted_public_key = "{}"
+[signed_services]
+trusted_public_keys = ["{}"]
 [setup]
 allowed_origins = ["http://localhost:8080"]
 [paykit]

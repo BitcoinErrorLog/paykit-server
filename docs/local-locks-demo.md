@@ -76,8 +76,8 @@ Locks must generate `.local/paykit-config/config.toml` only after the local Lock
 [http]
 listen_addr = "0.0.0.0:3001"
 
-[locks]
-trusted_public_key = "<ACTUAL_CANONICAL_LOCK_SERVER_PUBKY>"
+[signed_services]
+trusted_public_keys = ["<ACTUAL_CANONICAL_LOCK_SERVER_PUBKY>"]
 
 [setup]
 allowed_origins = ["http://localhost:8080"]

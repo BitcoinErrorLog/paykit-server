@@ -344,8 +344,8 @@ fn config(database_url: &str, signing_key: &SigningKey, poll_interval: &str) -> 
             r#"
 [http]
 listen_addr = "127.0.0.1:0"
-[locks]
-trusted_public_key = "{trusted_key}"
+[signed_services]
+trusted_public_keys = ["{trusted_key}"]
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]

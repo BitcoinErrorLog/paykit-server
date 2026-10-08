@@ -29,8 +29,8 @@ fn config(database_url: &str, electrum_endpoint: &str, drain_timeout: &str) -> C
 [http]
 listen_addr = "127.0.0.1:0"
 
-[locks]
-trusted_public_key = "{TRUSTED_KEY}"
+[signed_services]
+trusted_public_keys = ["{TRUSTED_KEY}"]
 
 [setup]
 allowed_origins = ["https://app.example"]

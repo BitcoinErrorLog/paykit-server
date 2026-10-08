@@ -47,8 +47,8 @@ fn try_production_config_with_setup_logging(
         r#"
 [http]
 listen_addr = "127.0.0.1:0"
-[locks]
-trusted_public_key = "{CONFIG_KEY}"
+[signed_services]
+trusted_public_keys = ["{CONFIG_KEY}"]
 [setup]
 allowed_origins = ["https://app.example"]
 log_authorization_url = {log_authorization_url}

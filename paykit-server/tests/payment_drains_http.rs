@@ -14,7 +14,7 @@ use paykit_server::{
     },
     config::{Config, ConfigEnvironment},
     domain::locks::PubkyLockResource,
-    http::{auth::SignedLocksAuth, payment_drains::payment_drains_router},
+    http::{auth::SignedServiceAuth, payment_drains::payment_drains_router},
 };
 use tower::ServiceExt;
 
@@ -62,8 +62,8 @@ fn config_for(key: &SigningKey) -> Config {
             r#"
 [http]
 listen_addr = "127.0.0.1:8080"
-[locks]
-trusted_public_key = "{key}"
+[signed_services]
+trusted_public_keys = ["{key}"]
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
@@ -93,7 +93,7 @@ signed_burst = 200
 
 fn router(key: &SigningKey, drains: FakeDrains) -> axum::Router {
     payment_drains_router(Arc::new(drains)).layer(Extension(Arc::new(
-        SignedLocksAuth::from_config(&config_for(key)),
+        SignedServiceAuth::from_config(&config_for(key)),
     )))
 }
 

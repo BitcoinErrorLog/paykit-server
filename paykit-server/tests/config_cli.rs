@@ -12,8 +12,8 @@ fn config(client_id: bool) -> String {
     format!(
         r#"[http]
 listen_addr = "127.0.0.1:3001"
-[locks]
-trusted_public_key = "{KEY}"
+[signed_services]
+trusted_public_keys = ["{KEY}"]
 [setup]
 allowed_origins = ["http://127.0.0.1:8080"]
 [paykit]
@@ -70,8 +70,8 @@ fn check_config_validates_without_connecting_to_postgres() {
 #[test]
 fn checked_in_example_config_is_valid() {
     let source = include_str!("../../config/paykit-server.example.toml").replace(
-        "# trusted_public_key = \"pubky<pubky-key>\"",
-        &format!("trusted_public_key = \"{KEY}\""),
+        "# trusted_public_keys = [\"pubky<locks-key>\", \"pubky<marketplace-key>\"]",
+        &format!("trusted_public_keys = [\"{KEY}\"]"),
     );
     let output = run_check(&source, &[]);
     assert!(

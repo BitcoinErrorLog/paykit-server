@@ -34,7 +34,7 @@ use paykit_server::{
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     domain::locks::{CreatorPubky, parse_addressed_lock_resource, parse_bundle_id, parse_reader},
     http::{
-        auth::{SignedLocksAuth, signature_preimage},
+        auth::{SignedServiceAuth, signature_preimage},
         invoices::invoices_router,
     },
     persistence::{AtomicInvoiceInput, AtomicInvoiceResult, InvoicePreflight, PersistenceError},
@@ -724,7 +724,7 @@ async fn signed_router_distinguishes_session_and_lock_unavailability() {
     );
 }
 
-fn signed_auth(key: &SigningKey) -> Arc<SignedLocksAuth> {
+fn signed_auth(key: &SigningKey) -> Arc<SignedServiceAuth> {
     let key = pubky::PublicKey::from(
         pubky::pkarr::PublicKey::try_from(key.verifying_key().as_bytes()).unwrap(),
     )
@@ -734,8 +734,8 @@ fn signed_auth(key: &SigningKey) -> Arc<SignedLocksAuth> {
             r#"
 [http]
 listen_addr = "127.0.0.1:8080"
-[locks]
-trusted_public_key = "{key}"
+[signed_services]
+trusted_public_keys = ["{key}"]
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
@@ -761,7 +761,7 @@ signed_burst = 100
         },
     )
     .unwrap();
-    Arc::new(SignedLocksAuth::from_config(&config))
+    Arc::new(SignedServiceAuth::from_config(&config))
 }
 
 fn signed_invoice_request(key: &SigningKey, body: Vec<u8>) -> Request<Body> {

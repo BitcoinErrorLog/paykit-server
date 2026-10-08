@@ -18,7 +18,7 @@ use paykit_server::{
     },
     config::{Config, ConfigEnvironment},
     domain::locks::CreatorPubky,
-    http::{auth::SignedLocksAuth, setup_status::setup_status_router},
+    http::{auth::SignedServiceAuth, setup_status::setup_status_router},
 };
 use tower::ServiceExt;
 
@@ -54,8 +54,8 @@ fn config_for(key: &SigningKey) -> Config {
             r#"
 [http]
 listen_addr = "127.0.0.1:8080"
-[locks]
-trusted_public_key = "{key}"
+[signed_services]
+trusted_public_keys = ["{key}"]
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
@@ -84,7 +84,7 @@ signed_burst = 200
 }
 
 fn router(key: &SigningKey, result: Result<(), SessionValidationError>) -> axum::Router {
-    setup_status_router(service(result)).layer(Extension(Arc::new(SignedLocksAuth::from_config(
+    setup_status_router(service(result)).layer(Extension(Arc::new(SignedServiceAuth::from_config(
         &config_for(key),
     ))))
 }
@@ -158,7 +158,7 @@ async fn status_service_maps_validation_timeout_to_unavailable() {
 }
 
 #[tokio::test]
-async fn status_route_requires_pinned_locks_signature_and_closed_canonical_body() {
+async fn status_route_requires_trusted_service_signature_and_closed_canonical_body() {
     let key = SigningKey::from_bytes(&[7; 32]);
     let wrong_key = SigningKey::from_bytes(&[8; 32]);
     let invalid_signature = router(&key, Ok(()))

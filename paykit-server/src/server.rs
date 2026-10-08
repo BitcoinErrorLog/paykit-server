@@ -23,7 +23,7 @@ use crate::{
     config::{Config, OutboxConfig, PaykitConfig, PaykitNetwork},
     crypto::Crypto,
     domain::locks::{BundleId, CreatorPubky, PubkyLockResource, ReaderPubky},
-    http::{self, auth::SignedLocksAuth},
+    http::{self, auth::SignedServiceAuth},
     paykit::{CreatorSessions, PaykitAdapter},
     persistence::{
         CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PaymentDrainStore,
@@ -275,7 +275,7 @@ impl Server {
             SetupStatusService::new(session_validator)
                 .with_receiving(Arc::new(creators.clone()), usdt.is_some()),
         );
-        let signed_auth = Arc::new(SignedLocksAuth::from_config(&config));
+        let signed_auth = Arc::new(SignedServiceAuth::from_config(&config));
         let business_routes = http::setup::setup_router_with_trusted_proxy_hops(
             setup,
             config.http.trusted_proxy_hops(),
@@ -1331,8 +1331,8 @@ mod tests {
                 r#"
 [http]
 listen_addr = "127.0.0.1:0"
-[locks]
-trusted_public_key = "{CONFIG_KEY}"
+[signed_services]
+trusted_public_keys = ["{CONFIG_KEY}"]
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]

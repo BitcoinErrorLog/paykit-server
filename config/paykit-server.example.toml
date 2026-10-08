@@ -1,6 +1,6 @@
 # Paykit Server closed TOML schema.
-# This is a template, not a runnable configuration: add the required trusted
-# Locks public key locally and provide secrets only through the environment.
+# This is a template, not a runnable configuration: add every trusted service
+# public key locally and provide secrets only through the environment.
 # Only executable-consumed keys are shown. The retired [inbox] section is rejected.
 
 [http]
@@ -11,9 +11,10 @@ listen_addr = "127.0.0.1:8080"
 # limiter key. At most 8.
 trusted_proxy_hops = 0
 
-[locks]
-# Use the exact Pubky rendered by Locks as credentials.lock_server_public_key.
-# trusted_public_key = "pubky<pubky-key>"
+[signed_services]
+# Non-empty, duplicate-free allowlist. Use exact canonical Pubkys rendered by
+# Locks and Marketplace services. Overlap old and new keys during rotation.
+# trusted_public_keys = ["pubky<locks-key>", "pubky<marketplace-key>"]
 
 [setup]
 # Configure exact HTTP(S) origins, or use ["*"] alone to accept any valid

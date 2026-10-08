@@ -7,6 +7,21 @@ use paykit_server::config::{
 const KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 
+fn second_key() -> String {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[4; 32]);
+    pubky::PublicKey::from(
+        pubky::pkarr::PublicKey::try_from(signing_key.verifying_key().as_bytes()).unwrap(),
+    )
+    .to_string()
+}
+
+fn weak_key() -> String {
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&[0; 32]).unwrap();
+    assert!(verifying_key.is_weak());
+    pubky::PublicKey::from(pubky::pkarr::PublicKey::try_from(verifying_key.as_bytes()).unwrap())
+        .to_string()
+}
+
 fn environment() -> ConfigEnvironment {
     ConfigEnvironment {
         database_url: Some("postgres://paykit:secret@localhost/paykit".to_owned()),
@@ -20,8 +35,8 @@ fn valid_toml() -> String {
 [http]
 listen_addr = "127.0.0.1:8080"
 
-[locks]
-trusted_public_key = "{KEY}"
+[signed_services]
+trusted_public_keys = ["{KEY}"]
 
 [setup]
 allowed_origins = ["https://app.example"]
@@ -43,14 +58,76 @@ poll_interval = "5s"
     )
 }
 
+fn trusted_services_toml(keys: &str) -> String {
+    valid_toml().replace(
+        &format!("trusted_public_keys = [\"{KEY}\"]"),
+        &format!("trusted_public_keys = [{keys}]"),
+    )
+}
+
+#[test]
+fn trusted_service_allowlist_accepts_two_distinct_canonical_keys() {
+    let second = second_key();
+    let source = trusted_services_toml(&format!("\"{KEY}\", \"{second}\""));
+    let config = Config::from_toml_and_environment(&source, environment()).unwrap();
+    assert_eq!(config.signed_services.trusted_public_keys.len(), 2);
+}
+
+#[test]
+fn trusted_service_allowlist_rejects_empty_invalid_and_duplicate_keys() {
+    let duplicate = format!("\"{KEY}\", \"{KEY}\"");
+    let weak = format!("\"{}\"", weak_key());
+    let cases = [
+        ("", ConfigError::EmptyTrustedServicePublicKeys),
+        ("\"not-a-key\"", ConfigError::InvalidTrustedServicePublicKey),
+        (weak.as_str(), ConfigError::InvalidTrustedServicePublicKey),
+        (
+            duplicate.as_str(),
+            ConfigError::DuplicateTrustedServicePublicKey,
+        ),
+    ];
+
+    for (keys, expected) in cases {
+        let error = Config::from_toml_and_environment(&trusted_services_toml(keys), environment())
+            .unwrap_err();
+        assert_eq!(error, expected);
+    }
+}
+
+#[test]
+fn legacy_single_locks_key_is_rejected_after_explicit_allowlist_cutover() {
+    let legacy = valid_toml().replace(
+        &format!("[signed_services]\ntrusted_public_keys = [\"{KEY}\"]"),
+        &format!("[locks]\ntrusted_public_key = \"{KEY}\""),
+    );
+    let error = Config::from_toml_and_environment(&legacy, environment()).unwrap_err();
+    assert_eq!(error, ConfigError::LegacyLocksTrustedPublicKey);
+    assert_eq!(
+        error.to_string(),
+        "[locks] trusted_public_key was replaced by [signed_services] trusted_public_keys"
+    );
+}
+
+#[test]
+fn effective_config_redacts_every_trusted_service_key() {
+    let second = second_key();
+    let source = trusted_services_toml(&format!("\"{KEY}\", \"{second}\""));
+    let rendered = Config::from_toml_and_environment(&source, environment())
+        .unwrap()
+        .redacted_effective_config();
+    assert!(!rendered.contains(KEY));
+    assert!(!rendered.contains(&second));
+    assert!(rendered.contains("<redacted>"));
+}
+
 fn local_compose_toml() -> String {
     format!(
         r#"
 [http]
 listen_addr = "0.0.0.0:3001"
 
-[locks]
-trusted_public_key = "{KEY}"
+[signed_services]
+trusted_public_keys = ["{KEY}"]
 
 [setup]
 allowed_origins = ["http://localhost:8080"]
@@ -168,16 +245,7 @@ fn parses_exact_local_compose_config_contract() {
         config.deployment_invariants().bitcoin_network.as_str(),
         "regtest"
     );
-    assert_eq!(
-        config
-            .deployment_invariants()
-            .trusted_locks_key_fingerprint
-            .as_bytes(),
-        &[
-            182, 46, 134, 127, 162, 243, 58, 254, 98, 213, 214, 177, 100, 46, 22, 33, 213, 67, 48,
-            120, 70, 178, 165, 123, 137, 126, 113, 9, 25, 183, 103, 9,
-        ]
-    );
+
     assert_eq!(config.electrum.endpoint(), "tcp://fulcrum:50001");
     assert_eq!(config.electrum.poll_interval, Duration::from_secs(1));
     assert_eq!(config.outbox.poll_interval, Duration::from_millis(500));
@@ -349,7 +417,10 @@ fn rejects_invalid_network_origin_key_zero_values_and_inconsistent_retries() {
             "allowed_origins",
             "allowed_origins = [\"https://*.example\"]",
         ),
-        ("trusted_public_key", "trusted_public_key = \"not-a-key\""),
+        (
+            "trusted_public_keys",
+            "trusted_public_keys = [\"not-a-key\"]",
+        ),
         ("poll_interval", "poll_interval = \"0s\""),
         ("request_timeout", "request_timeout = \"0s\""),
         ("outbox_batch_size", "batch_size = 0"),
@@ -360,8 +431,8 @@ fn rejects_invalid_network_origin_key_zero_values_and_inconsistent_retries() {
             "allowed_origins" => {
                 valid_toml().replace("allowed_origins = [\"https://app.example\"]", replacement)
             }
-            "trusted_public_key" => {
-                valid_toml().replace(&format!("trusted_public_key = \"{KEY}\""), replacement)
+            "trusted_public_keys" => {
+                valid_toml().replace(&format!("trusted_public_keys = [\"{KEY}\"]"), replacement)
             }
             "poll_interval" => valid_toml().replace(
                 "endpoint = \"ssl://electrum.example:50002\"",
@@ -408,8 +479,8 @@ fn rejects_public_keys_without_the_pubky_prefix() {
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     ] {
         let input = valid_toml().replace(
-            &format!("trusted_public_key = \"{KEY}\""),
-            &format!("trusted_public_key = \"{unprefixed}\""),
+            &format!("trusted_public_keys = [\"{KEY}\"]"),
+            &format!("trusted_public_keys = [\"{unprefixed}\"]"),
         );
 
         assert!(Config::from_toml_and_environment(&input, environment()).is_err());
@@ -508,13 +579,7 @@ fn effective_config_is_redacted_and_exposes_typed_deployment_invariants() {
         config.deployment_invariants().app_id.as_str(),
         "paykit-server"
     );
-    assert_ne!(
-        config
-            .deployment_invariants()
-            .trusted_locks_key_fingerprint
-            .as_bytes(),
-        &[0; 32]
-    );
+    assert_eq!(config.signed_services.trusted_public_keys.len(), 1);
 }
 
 #[test]

@@ -18,7 +18,7 @@ use paykit_server::{
         locks::{BundleId, CreatorPubky},
         payment_request_lifecycle::PaymentRequestLifecycleState,
     },
-    http::{auth::SignedLocksAuth, payment_requests::payment_requests_router},
+    http::{auth::SignedServiceAuth, payment_requests::payment_requests_router},
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tower::ServiceExt;
@@ -52,8 +52,8 @@ fn config_for(key: &SigningKey) -> Config {
             r#"
 [http]
 listen_addr = "127.0.0.1:8080"
-[locks]
-trusted_public_key = "{key}"
+[signed_services]
+trusted_public_keys = ["{key}"]
 [setup]
 allowed_origins = ["https://app.example"]
 [paykit]
@@ -86,7 +86,7 @@ fn router(
     result: Result<Option<PaymentRequestStatusSummary>, PaymentRequestStatusError>,
 ) -> axum::Router {
     payment_requests_router(Arc::new(FakeStatus { result })).layer(Extension(Arc::new(
-        SignedLocksAuth::from_config(&config_for(key)),
+        SignedServiceAuth::from_config(&config_for(key)),
     )))
 }
 
