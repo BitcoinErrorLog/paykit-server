@@ -7,6 +7,7 @@ use paykit_sdk::{
     PrivatePaymentEndpointSelectionRequest, PrivatePaymentResolutionStatus, PubkyPublicKey,
 };
 use serde::Deserialize;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use super::{Failure, PAYKIT_APP_ID, ReceiveOutput};
 
@@ -88,6 +89,15 @@ pub(super) fn payment_instructions(
     resolution: &PrivateContactPaymentResolution,
     reader_pubky: &PubkyPublicKey,
 ) -> Result<ReceiveOutput, Failure> {
+    payment_instructions_at(request, resolution, reader_pubky, OffsetDateTime::now_utc())
+}
+
+fn payment_instructions_at(
+    request: &PaymentRequestRecord,
+    resolution: &PrivateContactPaymentResolution,
+    reader_pubky: &PubkyPublicKey,
+    now: OffsetDateTime,
+) -> Result<ReceiveOutput, Failure> {
     if request
         .proposal_app_id
         .as_ref()
@@ -102,7 +112,7 @@ pub(super) fn payment_instructions(
     if terms.amount.asset != "btc"
         || terms.required_app_id.as_ref().map(|id| id.as_str()) != Some(PAYKIT_APP_ID)
         || terms.recurrence.is_some()
-        || terms.proposal_expires_at.is_some()
+        || terms.conversion.is_some()
         || terms.accepted_payment_endpoint_identifiers != [BITCOIN_ENDPOINT.to_owned()]
         || terms
             .metadata
@@ -111,6 +121,13 @@ pub(super) fn payment_instructions(
             != Some(reader_pubky.to_app_key().as_str())
     {
         return Err(Failure::ProtocolFailed);
+    }
+    if let Some(proposal_expires_at) = &terms.proposal_expires_at {
+        let proposal_expires_at = OffsetDateTime::parse(proposal_expires_at, &Rfc3339)
+            .map_err(|_| Failure::ProtocolFailed)?;
+        if proposal_expires_at <= now {
+            return Err(Failure::ProtocolFailed);
+        }
     }
     let amount = Amount::from_str_in(&terms.amount.value, Denomination::Bitcoin)
         .map_err(|_| Failure::ProtocolFailed)?;
@@ -184,8 +201,11 @@ mod tests {
         ResolvedPrivatePaymentEndpoint,
     };
     use serde_json::{Map, json, to_value};
+    use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-    use super::{BITCOIN_ENDPOINT, payment_instructions, select_actionable_request};
+    use super::{
+        BITCOIN_ENDPOINT, payment_instructions, payment_instructions_at, select_actionable_request,
+    };
 
     fn reader() -> PubkyPublicKey {
         PubkyPublicKey::from_raw_or_app_key(
@@ -307,6 +327,60 @@ mod tests {
                 "optional_mining_command": "docker compose exec -T bitcoin sh -ec 'bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner generatetoaddress 6 \"$(bitcoin-cli -conf=\"$BITCOIN_DATA/bitcoin.conf\" -regtest -rpcwallet=miner getnewaddress)\"'"
             })
         );
+    }
+
+    #[test]
+    fn accepts_server_request_before_proposal_deadline() {
+        let now = OffsetDateTime::parse("2027-01-15T07:59:59Z", &Rfc3339).unwrap();
+        let mut request = request();
+        let terms = request.terms.as_mut().unwrap();
+        terms.proposal_expires_at = Some("2027-01-15T08:00:00Z".into());
+        terms.payment_deadline = Some(paykit_lib::PaymentDeadline::At {
+            timestamp: "2027-01-16T08:00:00Z".into(),
+        });
+
+        assert!(
+            payment_instructions_at(&request, &resolution(&regtest_p2wpkh()), &reader(), now,)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_server_request_at_or_after_proposal_deadline() {
+        let deadline = "2027-01-15T08:00:00Z";
+        let mut request = request();
+        request.terms.as_mut().unwrap().proposal_expires_at = Some(deadline.into());
+
+        for now in [
+            OffsetDateTime::parse(deadline, &Rfc3339).unwrap(),
+            OffsetDateTime::parse("2027-01-15T08:00:01Z", &Rfc3339).unwrap(),
+        ] {
+            assert!(
+                payment_instructions_at(&request, &resolution(&regtest_p2wpkh()), &reader(), now,)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_proposal_deadline() {
+        let now = OffsetDateTime::parse("2027-01-15T07:59:59Z", &Rfc3339).unwrap();
+        let mut request = request();
+        request.terms.as_mut().unwrap().proposal_expires_at = Some("not-rfc3339".into());
+
+        assert!(
+            payment_instructions_at(&request, &resolution(&regtest_p2wpkh()), &reader(), now,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_conversion_terms() {
+        let mut request = request();
+        request.terms.as_mut().unwrap().conversion =
+            Some(paykit_lib::PaymentConversion::Fixed { rates: Vec::new() });
+
+        assert!(payment_instructions(&request, &resolution(&regtest_p2wpkh()), &reader()).is_err());
     }
 
     #[test]
