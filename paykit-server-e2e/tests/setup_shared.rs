@@ -692,3 +692,428 @@ poll_interval = "1s"
     );
     database.cleanup().await;
 }
+
+/// `POST /setup/status` `accepted_asset` against sellers created by the real
+/// setup and reconnect routes, with the Shop iframe's USDT claim selection.
+mod setup_status_readiness {
+    use super::*;
+    use axum::{
+        Extension,
+        body::{Body, to_bytes},
+        http::{Method, Request, StatusCode},
+    };
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    use ed25519_dalek::{Signer, SigningKey};
+    use paykit_server::{
+        application::create_invoice::{SessionValidationError, SessionValidator},
+        application::setup_status::SetupStatusService,
+        domain::receiving::USDT_TOKEN,
+        http::{auth::SignedServiceAuth, setup_status::setup_status_router},
+    };
+    use tower::ServiceExt;
+
+    const USDT_ADDRESS: &str = "0x2222222222222222222222222222222222222222";
+    const READY: &str = r#"{"status":"ready"}"#;
+    const SETUP_REQUIRED: &str = r#"{"status":"setup_required"}"#;
+
+    struct StoredAuthority {
+        creators: CreatorStore,
+        sessions: CreatorSessions,
+    }
+
+    #[async_trait]
+    impl SessionValidator for StoredAuthority {
+        async fn validate(&self, creator: &CreatorPubky) -> Result<(), SessionValidationError> {
+            if !self
+                .creators
+                .setup_complete(creator)
+                .await
+                .map_err(|_| SessionValidationError::Unavailable)?
+            {
+                return Err(SessionValidationError::Invalid);
+            }
+            let access = self
+                .sessions
+                .provider(creator)
+                .load_session_access()
+                .await
+                .map_err(|_| SessionValidationError::Unavailable)?
+                .ok_or(SessionValidationError::Invalid)?;
+            access
+                .session
+                .revalidate()
+                .await
+                .map_err(|_| SessionValidationError::Unavailable)?
+                .ok_or(SessionValidationError::Invalid)?;
+            Ok(())
+        }
+    }
+
+    struct Seller {
+        root: PubkyLocalSecretKey,
+        creator: CreatorPubky,
+        key: PaykitIdentitySecretKey,
+        _wallet: sdk_fixtures::HostedSdk,
+    }
+
+    async fn enroll(bootstrap: &PubkySessionBootstrap, home: &PubkyPublicKey) -> Seller {
+        let root_keypair = pubky::Keypair::random();
+        let root = PubkyLocalSecretKey::new(root_keypair.secret_key());
+        let wallet_auth = bootstrap
+            .sign_up(
+                &root,
+                home,
+                None,
+                paykit_sdk::PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
+            )
+            .await
+            .unwrap();
+        let creator = parse_creator(&wallet_auth.public_key.to_app_key()).unwrap();
+        let wallet = sdk_fixtures::hosted_sdk(wallet_auth.access, "bitkit", 0).await;
+        let key = root.derive_paykit_identity_secret_key(1).unwrap();
+        Seller {
+            root,
+            creator,
+            key,
+            _wallet: wallet,
+        }
+    }
+
+    fn payload(seller: &Seller, bitcoin: bool, usdt: Option<&str>) -> Vec<u8> {
+        let mut value = serde_json::json!({
+            "paykit_access": {
+                "key_generation": seller.key.key_generation(),
+                "secret": URL_SAFE_NO_PAD.encode(seller.key.as_bytes()),
+            }
+        });
+        if bitcoin {
+            value["bitcoin_account"] = serde_json::json!({
+                "account_index": 0,
+                "address_type": "nativeSegwit",
+                "xpub": account(0).to_string(),
+            });
+        }
+        if let Some(address) = usdt {
+            value["usdt-arbitrum-address"] = serde_json::json!({
+                "value": address,
+                "chain_id": "42161",
+                "token": USDT_TOKEN,
+            });
+        }
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    async fn setup(
+        service: &SetupService,
+        bootstrap: &PubkySessionBootstrap,
+        seller: &Seller,
+        usdt: Option<&str>,
+    ) -> PollResult {
+        let flow = service
+            .begin("127.0.0.1".parse().unwrap(), "https://app.example", "setup")
+            .await
+            .unwrap();
+        assert!(flow.authorization_url.contains("usdt-address-v1"));
+        let payload = payload(seller, true, usdt);
+        approve_payload(service, bootstrap, &seller.root, flow, &payload, false).await
+    }
+
+    async fn reconnect_with_usdt(
+        service: &SetupService,
+        bootstrap: &PubkySessionBootstrap,
+        seller: &Seller,
+        usdt: Option<&str>,
+    ) -> PollResult {
+        let flow = service
+            .begin_reconnect(
+                "127.0.0.1".parse().unwrap(),
+                "https://app.example",
+                "reconnect",
+                &seller.creator,
+            )
+            .await
+            .unwrap();
+        assert!(flow.authorization_url.contains("usdt-address-v1"));
+        let payload = payload(seller, false, usdt);
+        approve_payload(service, bootstrap, &seller.root, flow, &payload, true).await
+    }
+
+    fn signing_config(key: &SigningKey) -> Config {
+        let key = pubky::PublicKey::from(
+            pubky::pkarr::PublicKey::try_from(key.verifying_key().as_bytes()).unwrap(),
+        )
+        .to_string();
+        Config::from_toml_and_environment(
+            &format!(
+                r#"
+[http]
+listen_addr = "127.0.0.1:8080"
+[signed_services]
+trusted_public_keys = ["{key}"]
+[setup]
+allowed_origins = ["https://app.example"]
+[paykit]
+client_id = "app.paykit.server"
+app_id = "paykit-server"
+network = "testnet"
+[bitcoin]
+network = "testnet"
+[electrum]
+endpoint = "ssl://electrum.example:50002"
+[outbox]
+poll_interval = "5s"
+[limits]
+request_body_bytes = 16384
+[rate_limits]
+signed_requests_per_second = 100
+signed_burst = 200
+"#
+            ),
+            ConfigEnvironment {
+                database_url: Some("postgres://paykit:secret@localhost/paykit".to_owned()),
+                master_key: Some("AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE".to_owned()),
+            },
+        )
+        .unwrap()
+    }
+
+    struct StatusRoute {
+        signer: SigningKey,
+        creators: CreatorStore,
+        sessions: CreatorSessions,
+        usdt_enabled: bool,
+    }
+
+    impl StatusRoute {
+        async fn ask(&self, body: String) -> (StatusCode, String) {
+            let service = SetupStatusService::new(Arc::new(StoredAuthority {
+                creators: self.creators.clone(),
+                sessions: self.sessions.clone(),
+            }))
+            .with_receiving(Arc::new(self.creators.clone()), self.usdt_enabled);
+            let router = setup_status_router(Arc::new(service)).layer(Extension(Arc::new(
+                SignedServiceAuth::from_config(&signing_config(&self.signer)),
+            )));
+            let body = body.into_bytes();
+            let preimage =
+                paykit_server::http::auth::signature_preimage("POST", "/setup/status", &body);
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/setup/status")
+                .header(
+                    "X-Paykit-Signature",
+                    URL_SAFE_NO_PAD.encode(self.signer.sign(&preimage).to_bytes()),
+                )
+                .body(Body::from(body))
+                .unwrap();
+            let response = router.oneshot(request).await.unwrap();
+            let status = response.status();
+            let body = String::from_utf8(
+                to_bytes(response.into_body(), 32 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            (status, body)
+        }
+
+        async fn accepted(&self, creator: &CreatorPubky, accepted: &str) -> String {
+            let (status, body) = self
+                .ask(format!(
+                    r#"{{"accepted_asset":"{accepted}","creator":"{creator}"}}"#
+                ))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            body
+        }
+
+        async fn denomination(&self, creator: &CreatorPubky, asset: &str) -> String {
+            let (status, body) = self
+                .ask(format!(r#"{{"asset":"{asset}","creator":"{creator}"}}"#))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            body
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn accepted_asset_follows_real_setup_and_reconnect() {
+        let database = TestDatabase::create().await;
+        run_migrations(database.pool()).await.unwrap();
+        let postgres = std::env::var("TEST_DATABASE_URL").unwrap();
+        let testnet = EphemeralTestnet::builder()
+            .postgres(pubky_testnet::pubky_homeserver::ConnectionString::new(&postgres).unwrap())
+            .build()
+            .await
+            .unwrap();
+        let relay = http_relay::HttpRelay::builder()
+            .http_port(0)
+            .run()
+            .await
+            .unwrap();
+        let client = testnet.sdk().unwrap();
+        let bootstrap = PubkySessionBootstrap::with_pubky(client.clone(), "app.paykit.server")
+            .unwrap()
+            .with_auth_relay(relay.local_url().join("inbox").unwrap().as_str())
+            .unwrap();
+        let home = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+        let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+        let creators = CreatorStore::new(database.pool(), crypto);
+        let sessions = CreatorSessions::new(
+            creators.clone(),
+            client.clone(),
+            paykit_server::config::PaykitConfig {
+                client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
+                app_id: paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+                network: paykit_server::config::PaykitNetwork::Testnet,
+                proposal_acceptance_window: Duration::from_secs(60 * 60),
+                payment_window: Duration::from_secs(24 * 60 * 60),
+                conversion_payment_window: Duration::from_secs(3600),
+                marketplace_prepare_ttl: Duration::from_secs(15 * 60),
+            },
+        );
+        let completer = RealSetupCompleter::new(
+            BitkitAuthStarter::new(bootstrap.clone()).with_usdt(),
+            Arc::new(PubkyCompanionRelay::new(
+                pubky::PubkyHttpClient::new().unwrap(),
+            )),
+            creators.clone(),
+            sessions.clone(),
+            BitcoinNetwork::Testnet,
+        );
+        let service = SetupService::new(
+            vec!["https://app.example".into()],
+            Arc::new(completer),
+            Arc::new(SystemClock::default()),
+            SetupLimits {
+                max_polls_per_flow: 2,
+                max_polls: 20,
+                setup_per_ip_per_minute: 20,
+                max_pending_setup_flows: 10,
+            },
+        );
+        let route = StatusRoute {
+            signer: SigningKey::from_bytes(&[7; 32]),
+            creators: creators.clone(),
+            sessions: sessions.clone(),
+            usdt_enabled: true,
+        };
+        let without_usdt_config = StatusRoute {
+            signer: SigningKey::from_bytes(&[7; 32]),
+            creators,
+            sessions,
+            usdt_enabled: false,
+        };
+
+        let never_set_up = enroll(&bootstrap, &home).await;
+        // Seller A approved a Bitcoin account and a USDT address.
+        let both = enroll(&bootstrap, &home).await;
+        assert_eq!(
+            setup(&service, &bootstrap, &both, Some(USDT_ADDRESS)).await,
+            PollResult::Complete
+        );
+        // Seller B approved a Bitcoin account and declined the USDT address.
+        let bitcoin_only = enroll(&bootstrap, &home).await;
+        assert_eq!(
+            setup(&service, &bootstrap, &bitcoin_only, None).await,
+            PollResult::Complete
+        );
+
+        assert_eq!(route.accepted(&both.creator, "USDT").await, READY);
+        assert_eq!(route.accepted(&both.creator, "BTC").await, READY);
+        assert_eq!(
+            route.accepted(&bitcoin_only.creator, "USDT").await,
+            SETUP_REQUIRED
+        );
+        assert_eq!(route.accepted(&bitcoin_only.creator, "BTC").await, READY);
+        assert_eq!(
+            route.accepted(&never_set_up.creator, "USDT").await,
+            SETUP_REQUIRED
+        );
+        assert_eq!(
+            route.accepted(&never_set_up.creator, "BTC").await,
+            SETUP_REQUIRED
+        );
+        // `[usdt]` not configured: even a seller with a USDT address is not ready.
+        assert_eq!(
+            without_usdt_config.accepted(&both.creator, "USDT").await,
+            SETUP_REQUIRED
+        );
+        assert_eq!(
+            without_usdt_config.accepted(&both.creator, "BTC").await,
+            READY
+        );
+
+        // The denomination semantics are untouched: the same Bitcoin-only seller
+        // is ready for every denomination, exactly as before `accepted_asset`.
+        for asset in ["BTC", "USD", "USDT"] {
+            assert_eq!(
+                route.denomination(&bitcoin_only.creator, asset).await,
+                READY
+            );
+            assert_eq!(route.denomination(&both.creator, asset).await, READY);
+            assert_eq!(
+                route.denomination(&never_set_up.creator, asset).await,
+                SETUP_REQUIRED
+            );
+        }
+        assert_eq!(
+            without_usdt_config
+                .denomination(&both.creator, "USDT")
+                .await,
+            SETUP_REQUIRED
+        );
+        assert_eq!(
+            without_usdt_config.denomination(&both.creator, "USD").await,
+            READY
+        );
+
+        // Both fields together.
+        let (status, body) = route
+            .ask(format!(
+                r#"{{"accepted_asset":"USDT","asset":"USDT","creator":"{}"}}"#,
+                bitcoin_only.creator
+            ))
+            .await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, SETUP_REQUIRED));
+        let (status, body) = route
+            .ask(format!(
+                r#"{{"accepted_asset":"BTC","asset":"USDT","creator":"{}"}}"#,
+                bitcoin_only.creator
+            ))
+            .await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, READY));
+        let (status, body) = route
+            .ask(format!(
+                r#"{{"accepted_asset":"USDT","asset":"USD","creator":"{}"}}"#,
+                both.creator
+            ))
+            .await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, READY));
+
+        // A reconnect that does not add the address leaves USDT unavailable.
+        assert_eq!(
+            reconnect_with_usdt(&service, &bootstrap, &bitcoin_only, None).await,
+            PollResult::Complete
+        );
+        assert_eq!(
+            route.accepted(&bitcoin_only.creator, "USDT").await,
+            SETUP_REQUIRED
+        );
+        // A reconnect that adds the address makes the seller USDT-ready.
+        assert_eq!(
+            reconnect_with_usdt(&service, &bootstrap, &bitcoin_only, Some(USDT_ADDRESS)).await,
+            PollResult::Complete
+        );
+        assert_eq!(route.accepted(&bitcoin_only.creator, "USDT").await, READY);
+        assert_eq!(route.accepted(&bitcoin_only.creator, "BTC").await, READY);
+        assert_eq!(
+            without_usdt_config
+                .accepted(&bitcoin_only.creator, "USDT")
+                .await,
+            SETUP_REQUIRED
+        );
+        database.cleanup().await;
+    }
+}
