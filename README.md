@@ -54,6 +54,7 @@ Business routes:
 - `GET /setup/reconnect`
 - `POST /setup/{flow_id}/complete`
 - signed `POST /invoices`
+- signed `POST /marketplace/payment-requests/prepare`
 - signed `POST /connections/status`
 - signed `POST /transactions/status`
 - signed `POST /setup/status`
@@ -86,6 +87,13 @@ share an in-flight SDK read. Each
 request still authenticates and loads its invoice binding; completed observations
 and errors are not cached. Payment authorization, handoff, and verification keep
 their own fresh checks.
+
+Marketplace preparation reserves invoice identity and private payment material but
+does not create an active invoice or enqueue publication. Its Creator-scoped
+`operation_id` exactly replays the stored preparation when the closed request is
+unchanged, conflicts on changed binding, and remains replayable after the
+preparation TTL. Activation, void, and business resolution are separate lifecycle
+operations and are not exposed by this preparation-only slice.
 
 `POST /setup/status` is the readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination. Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
 

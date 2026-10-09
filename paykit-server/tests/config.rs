@@ -158,7 +158,7 @@ fn setup_authorization_url_logging_defaults_to_disabled() {
 }
 
 #[test]
-fn invoice_windows_default_to_one_hour_acceptance_and_conversion_and_twenty_four_hour_payment() {
+fn invoice_windows_and_marketplace_prepare_ttl_have_closed_defaults() {
     let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
 
     assert_eq!(
@@ -173,6 +173,10 @@ fn invoice_windows_default_to_one_hour_acceptance_and_conversion_and_twenty_four
         config.paykit.payment_window,
         Duration::from_secs(24 * 60 * 60)
     );
+    assert_eq!(
+        config.paykit.marketplace_prepare_ttl,
+        Duration::from_secs(15 * 60)
+    );
 }
 
 #[test]
@@ -183,6 +187,8 @@ fn invoice_windows_require_positive_acceptance_strictly_before_payment() {
         "proposal_acceptance_window = \"0s\"\npayment_window = \"24h\"",
         "proposal_acceptance_window = \"24h\"\npayment_window = \"24h\"",
         "proposal_acceptance_window = \"25h\"\npayment_window = \"24h\"",
+        "marketplace_prepare_ttl = \"0s\"",
+        "marketplace_prepare_ttl = \"1500ms\"",
     ] {
         let input = valid_toml().replace(
             "network = \"testnet\"",

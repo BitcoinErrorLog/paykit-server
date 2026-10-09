@@ -1,6 +1,7 @@
 pub mod connection_status;
 pub mod create_invoice;
 pub mod invoice_pricing;
+pub mod marketplace_preparation;
 pub mod payment_drain;
 pub mod payment_request_status;
 pub mod payment_status;

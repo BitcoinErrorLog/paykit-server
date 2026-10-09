@@ -35,9 +35,9 @@ use crate::{
     },
 };
 
-const REQUEST_DEADLINE: Duration = Duration::from_secs(15);
-const REGISTRY_READ_ATTEMPTS: usize = 3;
-const REGISTRY_RETRY_DELAY_CAPS_MS: [u64; REGISTRY_READ_ATTEMPTS - 1] = [333, 667];
+pub(crate) const REQUEST_DEADLINE: Duration = Duration::from_secs(15);
+pub(crate) const REGISTRY_READ_ATTEMPTS: usize = 3;
+pub(crate) const REGISTRY_RETRY_DELAY_CAPS_MS: [u64; REGISTRY_READ_ATTEMPTS - 1] = [333, 667];
 
 #[derive(Clone, Debug)]
 pub struct CreateInvoiceRequest {
@@ -142,7 +142,7 @@ pub trait RegistryRetryDelay: Send + Sync {
 }
 
 #[derive(Default)]
-struct FullJitterRegistryRetryDelay;
+pub(crate) struct FullJitterRegistryRetryDelay;
 
 #[async_trait]
 impl RegistryRetryDelay for FullJitterRegistryRetryDelay {

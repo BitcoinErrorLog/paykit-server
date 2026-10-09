@@ -106,6 +106,12 @@ fn diagnosed_route(request: &Request<Body>) -> Option<DiagnosedRoute> {
             source_operation: "setup_status",
             frequent_poll: true,
         }),
+        "/marketplace/payment-requests/prepare" => Some(DiagnosedRoute {
+            event: "paykit_marketplace_prepare_outcome",
+            operation: None,
+            source_operation: "marketplace_prepare",
+            frequent_poll: false,
+        }),
         _ => None,
     }
 }

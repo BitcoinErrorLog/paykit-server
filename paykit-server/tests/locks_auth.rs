@@ -136,8 +136,9 @@ async fn test_endpoint(
 
 #[tokio::test]
 async fn every_signed_business_path_accepts_each_trusted_service_key() {
-    const SIGNED_PATHS: [&str; 8] = [
+    const SIGNED_PATHS: [&str; 9] = [
         "/invoices",
+        "/marketplace/payment-requests/prepare",
         "/connections/status",
         "/transactions/status",
         "/setup/status",

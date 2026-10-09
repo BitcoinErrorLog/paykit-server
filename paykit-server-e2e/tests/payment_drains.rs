@@ -800,6 +800,7 @@ async fn shared_foreign_app_records_do_not_poison_existing_invoice_refresh_or_ne
         proposal_acceptance_window: Duration::from_secs(60 * 60),
         payment_window: Duration::from_secs(24 * 60 * 60),
         conversion_payment_window: Duration::from_secs(3600),
+        marketplace_prepare_ttl: Duration::from_secs(15 * 60),
     };
     let sessions = CreatorSessionProvider::with_pubky(creators, creator.clone(), pubky, &paykit);
     let adapter = PaykitAdapter::new(creator_row.id(), sessions, &paykit).unwrap();

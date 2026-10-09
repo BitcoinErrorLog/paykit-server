@@ -94,6 +94,7 @@ impl Config {
                 proposal_acceptance_window: raw.paykit.proposal_acceptance_window,
                 payment_window: raw.paykit.payment_window,
                 conversion_payment_window: raw.paykit.conversion_payment_window,
+                marketplace_prepare_ttl: raw.paykit.marketplace_prepare_ttl,
             },
             electrum: ElectrumConfig {
                 endpoint: electrum_endpoint,
@@ -212,6 +213,8 @@ impl Config {
             || self.paykit.proposal_acceptance_window.is_zero()
             || self.paykit.proposal_acceptance_window.subsec_nanos() != 0
             || self.paykit.payment_window.subsec_nanos() != 0
+            || self.paykit.marketplace_prepare_ttl.is_zero()
+            || self.paykit.marketplace_prepare_ttl.subsec_nanos() != 0
             || self.paykit.proposal_acceptance_window >= self.paykit.payment_window
         {
             return Err(ConfigError::InvalidInvoiceWindows);
@@ -439,6 +442,7 @@ pub struct PaykitConfig {
     pub proposal_acceptance_window: Duration,
     pub payment_window: Duration,
     pub conversion_payment_window: Duration,
+    pub marketplace_prepare_ttl: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -645,7 +649,7 @@ pub enum ConfigError {
     #[error("paykit.receiver_path_priority must not contain duplicates")]
     DuplicateReceiverPathPriority,
     #[error(
-        "paykit windows must use whole seconds; acceptance must be positive and shorter than payment, and conversion must be at least two seconds"
+        "paykit windows must use whole seconds; acceptance and Marketplace prepare TTL must be positive, acceptance must be shorter than payment, and conversion must be at least two seconds"
     )]
     InvalidInvoiceWindows,
     #[error("{0} must be greater than zero")]
@@ -787,6 +791,8 @@ struct RawPaykitConfig {
         with = "humantime_serde"
     )]
     conversion_payment_window: Duration,
+    #[serde(default = "default_marketplace_prepare_ttl", with = "humantime_serde")]
+    marketplace_prepare_ttl: Duration,
 }
 
 const fn default_proposal_acceptance_window() -> Duration {
@@ -795,6 +801,10 @@ const fn default_proposal_acceptance_window() -> Duration {
 
 const fn default_payment_window() -> Duration {
     Duration::from_secs(24 * 60 * 60)
+}
+
+const fn default_marketplace_prepare_ttl() -> Duration {
+    Duration::from_secs(15 * 60)
 }
 
 #[derive(Deserialize)]

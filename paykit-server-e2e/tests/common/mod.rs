@@ -9,10 +9,20 @@ pub fn app_id() -> PaykitAppId {
     PaykitAppId::new("paykit-server").unwrap()
 }
 
+#[allow(dead_code)]
 pub fn payment_intent(reader: &ReaderPubky, address: String) -> DeliveryIntentV1 {
+    payment_intent_with_reference(reader, address, uuid::Uuid::new_v4().to_string())
+}
+
+#[allow(dead_code)]
+pub fn payment_intent_with_reference(
+    reader: &ReaderPubky,
+    address: String,
+    reference: String,
+) -> DeliveryIntentV1 {
     let terms = PaymentRequestTerms::builder(
         PaymentAmount::new("0.00000100", "btc").unwrap(),
-        PaymentReference::new(uuid::Uuid::new_v4().to_string()).unwrap(),
+        PaymentReference::new(reference).unwrap(),
         vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
     )
     .required_app_id(Some(app_id()))

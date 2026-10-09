@@ -93,6 +93,7 @@ impl Fixture {
             proposal_acceptance_window: Duration::from_secs(3600),
             payment_window: Duration::from_secs(86400),
             conversion_payment_window: Duration::from_secs(3600),
+            marketplace_prepare_ttl: Duration::from_secs(15 * 60),
         };
         let adapter = PaykitAdapter::new(
             creator_id,

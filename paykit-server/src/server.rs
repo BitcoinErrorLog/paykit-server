@@ -10,6 +10,7 @@ use crate::{
             PaykitIntentBuilder, ReaderAuthorization, RegistryDiscoveryError,
             SessionValidationError, SessionValidator,
         },
+        marketplace_preparation::PrepareMarketplaceService,
         payment_drain::{
             PaymentDrainCleanupToken, PaymentDrainError, PaymentDrainOperations,
             PaymentDrainSummary,
@@ -27,8 +28,8 @@ use crate::{
     http::{self, auth::SignedServiceAuth},
     paykit::{CreatorSessions, PaykitAdapter, creator_mutation_lock},
     persistence::{
-        CreatorStore, InvoiceStore, OutboxRetryClass, OutboxStore, PaymentDrainStore,
-        PaymentRequestLifecycleStore, PersistenceError,
+        CreatorStore, InvoiceStore, MarketplacePreparationStore, OutboxRetryClass, OutboxStore,
+        PaymentDrainStore, PaymentRequestLifecycleStore, PersistenceError,
     },
     real_setup::RealSetupCompleter,
     runtime::{PostgresDependency, Runtime, operational_router},
@@ -174,6 +175,7 @@ impl Server {
         let outbox = OutboxStore::new(&pool, crypto.clone());
         let payment_request_lifecycles = PaymentRequestLifecycleStore::new(&pool, crypto.clone());
         let payment_drains = PaymentDrainStore::new(&pool, crypto.clone());
+        let marketplace_preparations = MarketplacePreparationStore::new(&pool, crypto.clone());
 
         let bootstrap = setup_bootstrap(
             pubky.clone(),
@@ -252,6 +254,18 @@ impl Server {
                     .map_err(|_| ServerBuildError::ExchangeRates)?,
             )),
         );
+        let marketplace_preparation_service = Arc::new(PrepareMarketplaceService::new(
+            session_validator.clone(),
+            Arc::new(PubkyAppRegistryDiscovery {
+                storage: pubky.public_storage(),
+            }),
+            Arc::new(creators.clone()),
+            Arc::new(marketplace_preparations),
+            config.paykit.app_id.clone(),
+            config.deployment_invariants().bitcoin_network.clone(),
+            config.paykit.payment_window,
+            config.paykit.marketplace_prepare_ttl,
+        ));
         let connection_status_service = Arc::new(ConnectionStatusService::new(
             Arc::new(invoices.clone()),
             Arc::new(sessions.clone()),
@@ -291,6 +305,11 @@ impl Server {
                 .merge(http::connection_status::connection_status_router(
                     connection_status_service,
                 ))
+                .merge(
+                    http::marketplace_preparation::marketplace_preparation_router(
+                        marketplace_preparation_service,
+                    ),
+                )
                 .merge(http::status::status_router(status_service))
                 .merge(http::payment_drains::payment_drains_router(
                     payment_drain_operations,

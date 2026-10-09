@@ -196,6 +196,8 @@ pub enum EnvelopeType {
     OutboxSemanticIntent,
     /// Canonical addressed lock resource bound to one operational drain.
     PaymentDrain,
+    /// Durable unpublished Marketplace invoice preparation.
+    MarketplacePreparation,
 }
 
 impl EnvelopeType {
@@ -209,6 +211,7 @@ impl EnvelopeType {
             Self::UsdtObservation => b"usdt-observation",
             Self::OutboxSemanticIntent => b"outbox-semantic-intent",
             Self::PaymentDrain => b"payment-drain",
+            Self::MarketplacePreparation => b"marketplace-preparation",
         }
     }
 }
@@ -296,6 +299,15 @@ impl EnvelopeContext {
     /// Creates the binding context for one operational payment drain.
     pub fn payment_drain(creator_lookup_hash: LookupHash, row_id: Uuid) -> Self {
         Self::new(EnvelopeType::PaymentDrain, creator_lookup_hash, row_id)
+    }
+
+    /// Creates the binding context for one unpublished Marketplace preparation.
+    pub fn marketplace_preparation(creator_lookup_hash: LookupHash, row_id: Uuid) -> Self {
+        Self::new(
+            EnvelopeType::MarketplacePreparation,
+            creator_lookup_hash,
+            row_id,
+        )
     }
 
     fn new(envelope_type: EnvelopeType, creator_lookup_hash: LookupHash, row_id: Uuid) -> Self {
