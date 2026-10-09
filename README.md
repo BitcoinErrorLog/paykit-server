@@ -95,7 +95,7 @@ unchanged, conflicts on changed binding, and remains replayable after the
 preparation TTL. Activation, void, and business resolution are separate lifecycle
 operations and are not exposed by this preparation-only slice.
 
-`POST /setup/status` is the readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination. Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
+`POST /setup/status` is the readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination, and optional `accepted_asset: "BTC"` or `"USDT"` to check whether the Creator has approved receiving details for that payment asset (see [Direct USDT0 invoices](#direct-usdt0-invoices)). Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
 
 ### Setup iframe
 
@@ -550,10 +550,28 @@ the server. A standard Arbitrum JSON-RPC endpoint must support `eth_chainId`,
 Setup requests the existing Bitcoin account plus `usdt-address-v1`. The user can
 skip USDT without blocking Bitcoin. Reconnect can add a previously omitted USDT
 address but cannot change an already-approved address or Bitcoin account.
-Signed `POST /setup/status` accepts optional `asset: "BTC"`, `"USD"`, or `"USDT"`
-and returns the existing `{status}` response for that denomination. Omitting `asset`
-checks Pubky/Paykit authority only. Locks should check the selected asset before
-publishing a priced lock.
+Signed `POST /setup/status` accepts two optional fields that answer different
+questions and return the same `{status}` response:
+
+- `asset: "BTC"`, `"USD"`, or `"USDT"` is the price denomination. It is `ready`
+  when the Creator has any usable receiving detail (a Bitcoin account, or a USDT
+  address on a deployment with `[usdt]`), because Locks can convert the
+  denomination to whatever rail the Creator approved. `asset: "USDT"` additionally
+  requires `[usdt]` to be configured. Locks should check the selected asset
+  before publishing a priced lock.
+- `accepted_asset: "BTC"` or `"USDT"` is the payment asset. It is `ready` only when
+  the Creator has approved receiving details for that asset: `BTC` needs the
+  Bitcoin account and `USDT` needs the `usdt-address-v1` address, on a deployment
+  with `[usdt]` configured. A Bitcoin-only Creator who declined the USDT address
+  gets `setup_required` for `accepted_asset: "USDT"`, and a reconnect that adds
+  the address makes it `ready`. `USD` is a denomination, not a payment asset, and
+  any other value is `400 invalid_request`.
+
+When both fields are sent, the answer is `ready` only if both checks pass, and
+`setup_required` otherwise. A receiving-detail read that times out or fails is
+`unavailable`. Omitting both checks Pubky/Paykit
+authority only. Authority is always checked first, so a Creator whose authority is
+`setup_required` or `unavailable` gets that answer whatever the assets.
 
 Payment criteria use integer units: satoshis for `BTC`, cents for `USD`, and
 millionths for `USDT`. For example, `asset: "USD", amount: "500"` requests $5.
