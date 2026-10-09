@@ -375,11 +375,11 @@ On SIGTERM or SIGINT, readiness changes first, normal admission and new worker c
 
 A successful new invoice transaction atomically allocates an address and persists the Creator/reader assignment, invoice, and complete Payment Request intent. Its terms bind that invoice's address in `payment_endpoints` and require the `paykit-server` app. The request is immediately eligible for handoff without publishing a Private Payment List. Exact replay preserves the address and complete terms; conflicting replay is rejected. Concurrent invoices for the same Reader receive distinct addresses.
 
-The later SDK handoff is not exactly once. Server delivery is at least once:
+Payment Request proposal creation is idempotent; transport delivery remains at least once:
 
-- a crash before SDK-generated identifiers are durably associated may enqueue another Payment Request with new SDK Event, Payment Request, and outbound-message identifiers;
-- consumers must tolerate duplicate proposals and use stable server intent/Payment Reference values where applicable;
-- retries preserve the invoice's bound address and terms even when SDK identifiers change;
+- the durable outbox row UUID is the Payment Request ID, bound by the SDK to the Creator identity, app, Reader, and exact original terms;
+- a crash after SDK commit but before PostgreSQL association retries that ID and recovers the original Event and outbound-message IDs without enqueueing another proposal;
+- conflicting reuse of the ID is rejected; retries preserve the invoice's bound address and complete terms and still require current authorization and link readiness;
 - marking server work delivered means the exact SDK outbound record reached SDK `Sent`, not that the remote application acknowledged it.
 
 The invoice API returns after durable intent commit. It does not wait for Encrypted Link establishment or remote delivery.

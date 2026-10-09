@@ -993,6 +993,9 @@ fn parse_peer(reader: &str) -> Result<PubkyPublicKey, HandoffError> {
 fn classify(error: PaykitSdkError) -> HandoffError {
     match error {
         PaykitSdkError::Protocol { .. } => HandoffError::Permanent,
+        PaykitSdkError::LinkObservation { .. } => {
+            HandoffError::Retryable(RetryableHandoffCause::LinkObservation)
+        }
         PaykitSdkError::Policy { .. } => HandoffError::Retryable(RetryableHandoffCause::Policy),
         PaykitSdkError::Storage { .. } => HandoffError::Retryable(RetryableHandoffCause::Storage),
         PaykitSdkError::Identity { .. } => HandoffError::Retryable(RetryableHandoffCause::Identity),
@@ -1024,13 +1027,6 @@ fn handoff_reader_authorization<T>(
     }
 }
 
-fn retryable_recovery_observation(error: HandoffError) -> HandoffError {
-    match error {
-        HandoffError::Retryable(cause) => HandoffError::Retryable(cause),
-        HandoffError::Permanent => HandoffError::Retryable(RetryableHandoffCause::Other),
-    }
-}
-
 #[async_trait]
 impl Adapter for PaykitAdapter {
     async fn execute_claimed_handoff(
@@ -1046,10 +1042,11 @@ impl Adapter for PaykitAdapter {
 
     async fn execute_handoff(
         &self,
+        outbox_id: uuid::Uuid,
         intent: &DeliveryIntentV1,
     ) -> Result<HandoffResult, HandoffFailure> {
         let _guard = self.mutation_lock.lock().await;
-        handoff_steps(self, intent).await
+        handoff_steps(self, outbox_id, intent).await
     }
 
     async fn fetch_registry(
@@ -1066,16 +1063,6 @@ impl Adapter for PaykitAdapter {
     ) -> Result<crate::application::create_invoice::ReaderAuthorization, HandoffError> {
         let reader = parse_peer(reader)?;
         handoff_reader_authorization(self.sdk.paykit_noise_key_authorization(reader).await)
-    }
-
-    async fn observe_recovery_marker(&self, reader: &str) -> Result<(), HandoffError> {
-        let reader = parse_peer(reader)?;
-        self.sdk
-            .observe_encrypted_link_recovery_marker(reader)
-            .await
-            .map(|_| ())
-            .map_err(classify)
-            .map_err(retryable_recovery_observation)
     }
 
     async fn ensure_link_with_peer(&self, reader: &str) -> Result<(), HandoffError> {
@@ -1099,12 +1086,17 @@ impl Adapter for PaykitAdapter {
     async fn propose_payment_request(
         &self,
         reader: &str,
+        payment_request_id: PaymentRequestId,
         terms: &PaymentTermsV1,
     ) -> Result<HandoffResult, HandoffError> {
         let reader = parse_peer(reader)?;
         let record = self
             .sdk
-            .propose_payment_request(reader, terms.to_sdk().map_err(|_| HandoffError::Permanent)?)
+            .propose_payment_request_with_id(
+                reader,
+                payment_request_id,
+                terms.to_sdk().map_err(|_| HandoffError::Permanent)?,
+            )
             .await
             .map_err(classify)?;
         Ok(HandoffResult::PaymentRequestProposal {
@@ -1640,10 +1632,12 @@ mod tests {
     }
 
     #[test]
-    fn recovery_marker_observation_normalizes_permanent_sdk_errors_to_retryable() {
+    fn invalid_link_observation_is_retryable() {
         assert_eq!(
-            retryable_recovery_observation(HandoffError::Permanent),
-            HandoffError::Retryable(RetryableHandoffCause::Other)
+            classify(PaykitSdkError::LinkObservation {
+                context: "invalid recovery marker".into()
+            }),
+            HandoffError::Retryable(RetryableHandoffCause::LinkObservation)
         );
     }
 

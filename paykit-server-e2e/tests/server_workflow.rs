@@ -1581,13 +1581,13 @@ async fn malformed_recovery_marker_keeps_exact_handoff_retryable_until_repaired(
         );
         if payment.0 == "retryable"
             && payment.1 >= 2
-            && payment.2.as_deref() == Some("recovery_marker_observation")
+            && payment.2.as_deref() == Some("link_establishment")
         {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "handoff did not retry at recovery marker observation: {payment:?}"
+            "handoff did not retry link establishment: {payment:?}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

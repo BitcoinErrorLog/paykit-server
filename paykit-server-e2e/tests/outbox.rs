@@ -298,10 +298,6 @@ impl Adapter for ReconciliationAdapter {
         Err(HandoffError::Permanent)
     }
 
-    async fn observe_recovery_marker(&self, _reader: &str) -> Result<(), HandoffError> {
-        Err(HandoffError::Permanent)
-    }
-
     async fn ensure_link_with_peer(&self, _reader: &str) -> Result<(), HandoffError> {
         Err(HandoffError::Permanent)
     }
@@ -309,6 +305,7 @@ impl Adapter for ReconciliationAdapter {
     async fn propose_payment_request(
         &self,
         _reader: &str,
+        _payment_request_id: paykit_lib::PaymentRequestId,
         _terms: &paykit_server::application::semantic_intent::PaymentTermsV1,
     ) -> Result<HandoffResult, HandoffError> {
         Err(HandoffError::Permanent)
@@ -994,7 +991,7 @@ async fn enqueue_retry_preserves_500ms_deadline_across_store_recreation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn public_sdk_payment_request_retry_persists_distinct_ids_and_only_active_claim_associates() {
+async fn public_sdk_payment_request_retry_preserves_ids_and_only_active_claim_associates() {
     Box::pin(assert_public_sdk_handoff(true)).await;
 }
 
@@ -1133,17 +1130,36 @@ async fn assert_public_sdk_handoff(creator_initiates: bool) {
         .unwrap();
     assert_eq!(first_claim.id(), invoice.payment_request_outbox_id());
     let intent = outbox.delivery_intent(&first_claim).unwrap();
-    let terms = intent.terms().unwrap().to_sdk().unwrap();
-
-    let first = creator_sdk
-        .propose_payment_request(peer_bootstrap.public_key.clone(), terms.clone())
-        .await
-        .unwrap();
-    let first_result = HandoffResult::PaymentRequestProposal {
-        outbound_message_id: first.proposal_outbound_message_id.unwrap(),
-        event_id: first.proposal_event_id.unwrap(),
-        payment_request_id: first.payment_request_id,
+    let creators = CreatorStore::new(database.pool(), crypto.clone());
+    let config = PaykitConfig {
+        client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
+        app_id: common::app_id(),
+        network: PaykitNetwork::Testnet,
+        proposal_acceptance_window: Duration::from_secs(60 * 60),
+        payment_window: Duration::from_secs(24 * 60 * 60),
+        conversion_payment_window: std::time::Duration::from_secs(3600),
     };
+    let sessions = CreatorSessions::new(creators.clone(), testnet.sdk().unwrap(), config.clone());
+    let provider = sessions.provider(&creator);
+    let storage = paykit_sdk::PubkySharedStateStorage::new(provider.clone());
+    let adapter = PaykitAdapter::new(creator_record.id(), provider.clone(), &config).unwrap();
+    let first_result = with_claim_renewal(&outbox, &first_claim, Duration::from_secs(30), async {
+        adapter
+            .execute_claimed_handoff(&outbox, &first_claim, &intent)
+            .await
+            .unwrap()
+    })
+    .await;
+    let unassociated: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT sdk_outbound_message_id, sdk_event_id, sdk_payment_request_id FROM outbox WHERE id = $1",
+    )
+    .bind(first_claim.id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(unassociated, (None, None, None));
+    // Lose the adapter after the SDK commit, before recording its IDs in PostgreSQL.
+    drop(adapter);
 
     sqlx::query("UPDATE outbox SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
         .bind(first_claim.id())
@@ -1156,17 +1172,15 @@ async fn assert_public_sdk_handoff(creator_initiates: bool) {
         .unwrap()
         .pop()
         .unwrap();
+    assert_eq!(second_claim.id(), first_claim.id());
+    let adapter = PaykitAdapter::new(creator_record.id(), provider.clone(), &config).unwrap();
     let second_result =
         with_claim_renewal(&outbox, &second_claim, Duration::from_secs(30), async {
-            let second = creator_sdk
-                .propose_payment_request(peer_bootstrap.public_key.clone(), terms)
+            let retry_intent = outbox.delivery_intent(&second_claim).unwrap();
+            let result = adapter
+                .execute_claimed_handoff(&outbox, &second_claim, &retry_intent)
                 .await
                 .unwrap();
-            let result = HandoffResult::PaymentRequestProposal {
-                outbound_message_id: second.proposal_outbound_message_id.unwrap(),
-                event_id: second.proposal_event_id.unwrap(),
-                payment_request_id: second.payment_request_id,
-            };
             assert!(
                 !outbox
                     .mark_handed_off(&first_claim, &first_result)
@@ -1199,28 +1213,25 @@ async fn assert_public_sdk_handoff(creator_initiates: bool) {
     else {
         unreachable!()
     };
-    assert_ne!(first_outbound, second_outbound);
-    assert_ne!(first_event, second_event);
-    assert_ne!(first_request, second_request);
+    assert_eq!(first_outbound, second_outbound);
+    assert_eq!(first_event, second_event);
+    assert_eq!(first_request, second_request);
+    assert_eq!(first_request, &first_claim.id().to_string());
 
     let durable_state = creator_sdk.export_backup_state().await.unwrap();
-    for (outbound_id, event_id, request_id) in [
-        (first_outbound, first_event, first_request),
-        (second_outbound, second_event, second_request),
-    ] {
-        let outbound = durable_state
-            .outbound_private_messages
-            .iter()
-            .find(|record| record.outbound_message_id == *outbound_id)
-            .expect("SDK-generated outbound ID was not durable");
-        assert!(outbound.raw_json.contains(event_id));
-        assert!(outbound.raw_json.contains(request_id));
-        assert!(
-            outbound.raw_json.len() <= paykit_lib::pubky_noise::snow_crypto::PUBKY_NOISE_MSG_LEN
-        );
-        let wire: serde_json::Value = serde_json::from_str(&outbound.raw_json).unwrap();
-        assert!(wire.to_string().contains("payment_endpoints"));
-    }
+    let proposals = durable_state
+        .outbound_private_messages
+        .iter()
+        .filter(|record| record.kind == "paykit.payment_request")
+        .collect::<Vec<_>>();
+    assert_eq!(proposals.len(), 1);
+    let outbound = proposals[0];
+    assert_eq!(outbound.outbound_message_id, *first_outbound);
+    assert!(outbound.raw_json.len() <= paykit_lib::pubky_noise::snow_crypto::PUBKY_NOISE_MSG_LEN);
+    let wire: serde_json::Value = serde_json::from_str(&outbound.raw_json).unwrap();
+    assert_eq!(wire["event_id"], first_event.as_str());
+    assert_eq!(wire["payment_request_id"], first_request.as_str());
+    assert!(wire["request"]["payment_endpoints"].is_object());
 
     let old_list = creator_sdk
         .enqueue_private_payment_list_with_receiving_details(
@@ -1273,19 +1284,6 @@ async fn assert_public_sdk_handoff(creator_initiates: bool) {
             .unwrap()
             .is_none()
     );
-    let creators = CreatorStore::new(database.pool(), crypto.clone());
-    let config = PaykitConfig {
-        client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
-        app_id: common::app_id(),
-        network: PaykitNetwork::Testnet,
-        proposal_acceptance_window: Duration::from_secs(60 * 60),
-        payment_window: Duration::from_secs(24 * 60 * 60),
-        conversion_payment_window: std::time::Duration::from_secs(3600),
-    };
-    let sessions = CreatorSessions::new(creators.clone(), testnet.sdk().unwrap(), config.clone());
-    let provider = sessions.provider(&creator);
-    let storage = paykit_sdk::PubkySharedStateStorage::new(provider.clone());
-    let adapter = PaykitAdapter::new(creator_record.id(), provider.clone(), &config).unwrap();
     let lease = storage
         .transaction(|tx| {
             let now = sqlx::types::chrono::Utc::now();
@@ -1313,16 +1311,14 @@ async fn assert_public_sdk_handoff(creator_initiates: bool) {
                 Some(lease.clone())
             );
             let outbound = tx.outbound_private_messages(&peer_bootstrap.public_key);
-            for outbound_id in [first_outbound, second_outbound] {
-                assert_eq!(
-                    outbound
-                        .iter()
-                        .find(|record| record.outbound_message_id == *outbound_id)
-                        .unwrap()
-                        .status,
-                    OutboundPrivateMessageStatus::Pending
-                );
-            }
+            assert_eq!(
+                outbound
+                    .iter()
+                    .find(|record| record.outbound_message_id == *first_outbound)
+                    .unwrap()
+                    .status,
+                OutboundPrivateMessageStatus::Pending
+            );
             tx.release_peer_link_operation(&peer_bootstrap.public_key, lease.lease_id);
             Ok(())
         })
@@ -1356,15 +1352,13 @@ async fn assert_public_sdk_handoff(creator_initiates: bool) {
             .iter()
             .any(|record| record.outbound_message_id == old_list.outbound_message_id)
     );
-    for outbound_id in [first_outbound, second_outbound] {
-        assert!(
-            compacted
-                .outbound_private_messages
-                .iter()
-                .any(|record| record.outbound_message_id == *outbound_id
-                    && record.status == OutboundPrivateMessageStatus::Sent)
-        );
-    }
+    assert!(
+        compacted
+            .outbound_private_messages
+            .iter()
+            .any(|record| record.outbound_message_id == *first_outbound
+                && record.status == OutboundPrivateMessageStatus::Sent)
+    );
     peer_sdk
         .receive_private_messages(creator_bootstrap.public_key.clone())
         .await
@@ -1373,11 +1367,9 @@ async fn assert_public_sdk_handoff(creator_initiates: bool) {
         .actionable_received_payment_requests()
         .await
         .unwrap();
-    assert_eq!(received.len(), 2);
-    assert_eq!(
-        received[0].terms, received[1].terms,
-        "ambiguous replay preserves all terms"
-    );
+    assert_eq!(received.len(), 1);
+    assert_eq!(received[0].payment_request_id, *first_request);
+    assert_eq!(received[0].proposal_event_id.as_ref(), Some(first_event));
     for request in received {
         let resolution = peer_sdk
             .resolve_private_payment_request(

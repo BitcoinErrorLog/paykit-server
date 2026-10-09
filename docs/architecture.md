@@ -63,8 +63,10 @@ Reader discovery requires a Noise key and at least one registered app supporting
 both Payment Requests and outgoing payments; Private Payment List sharing is not
 required. Discovery does not select a receiver path.
 
-SDK handoff is at least once. Reconciliation identifies the exact outbound ID and
-app; only SDK `Sent` means delivered, not payer acknowledgement. See
+SDK proposal handoff uses the durable outbox UUID as its Payment Request ID, so
+retries recover one proposal and the same Event and outbound IDs. Transport
+remains at least once. Reconciliation identifies the exact outbound ID and app;
+only SDK `Sent` means delivered, not payer acknowledgement. See
 [outbox recovery](outbox-recovery.md) for leases and retry behavior.
 
 Bitcoin attribution uses direct observation of the invoice-specific address. USDT attribution combines an authenticated, request-bound ERC-20 account signature with independent Arbitrum receipt verification. Neither SDK lifecycle state nor a transaction hash alone proves settlement. One amount-matched output is required; split outputs are not aggregated.

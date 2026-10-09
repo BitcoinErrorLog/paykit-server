@@ -1,9 +1,9 @@
 //! Semantic outbox handoff policy.
 //!
 //! A call can commit to the SDK queue and the process can crash before the
-//! fenced database transition. Retrying therefore has **at-least-once**
-//! semantics: Payment Request proposals may be duplicated. The SDK owns its
-//! queue and encrypted-link retry state; this worker never claims exactly-once.
+//! fenced database transition. The durable outbox UUID binds every retry to one
+//! SDK Payment Request proposal with the original terms. Transport remains
+//! **at-least-once**; the SDK owns its queue and encrypted-link retry state.
 
 use async_trait::async_trait;
 use paykit_lib::PaykitAppRegistry;
@@ -43,6 +43,7 @@ pub enum RetryableHandoffCause {
     NotFound,
     PaymentAdapter,
     RecoveryRequired,
+    LinkObservation,
     Policy,
     LinkPending,
     Other,
@@ -57,6 +58,7 @@ impl RetryableHandoffCause {
             Self::NotFound => "not_found",
             Self::PaymentAdapter => "payment_adapter",
             Self::RecoveryRequired => "recovery_required",
+            Self::LinkObservation => "link_observation",
             Self::Policy => "policy",
             Self::LinkPending => "link_pending",
             Self::Other => "other",
@@ -127,16 +129,18 @@ pub trait Adapter: Send + Sync {
         intent: &DeliveryIntentV1,
     ) -> Result<HandoffResult, HandoffFailure> {
         check_claim(Some((store, claim))).await?;
-        self.execute_handoff(intent).await
+        self.execute_handoff(claim.id(), intent).await
     }
 
     /// Executes one complete semantic handoff. Concrete adapters may override
     /// this to serialize a multi-call SDK operation under one Creator lock.
+    /// `outbox_id` must be the persisted UUID-v4 row ID, unchanged on every retry.
     async fn execute_handoff(
         &self,
+        outbox_id: uuid::Uuid,
         intent: &DeliveryIntentV1,
     ) -> Result<HandoffResult, HandoffFailure> {
-        handoff_steps(self, intent).await
+        handoff_steps(self, outbox_id, intent).await
     }
 
     async fn fetch_registry(&self, reader: &str)
@@ -144,11 +148,13 @@ pub trait Adapter: Send + Sync {
     /// The Reader's signed Noise Key Authorization, checked before link setup,
     /// which verifies it again.
     async fn fetch_authorization(&self, reader: &str) -> Result<ReaderAuthorization, HandoffError>;
-    async fn observe_recovery_marker(&self, reader: &str) -> Result<(), HandoffError>;
     async fn ensure_link_with_peer(&self, reader: &str) -> Result<(), HandoffError>;
+    /// Creates or recovers the proposal bound to the durable outbox row ID.
+    /// Implementations must reject conflicting input and retain the original SDK IDs.
     async fn propose_payment_request(
         &self,
         reader: &str,
+        payment_request_id: paykit_lib::PaymentRequestId,
         terms: &crate::application::semantic_intent::PaymentTermsV1,
     ) -> Result<HandoffResult, HandoffError>;
     async fn cancel_payment_request(
@@ -163,18 +169,21 @@ pub trait Adapter: Send + Sync {
 }
 
 /// Recheck reader capabilities before handing off the persisted intent.
+/// The caller supplies the same durable UUID-v4 outbox row ID on every retry.
 pub async fn handoff(
     adapter: &dyn Adapter,
+    outbox_id: uuid::Uuid,
     intent: &DeliveryIntentV1,
 ) -> Result<HandoffResult, HandoffFailure> {
-    adapter.execute_handoff(intent).await
+    adapter.execute_handoff(outbox_id, intent).await
 }
 
 pub(crate) async fn handoff_steps<A: Adapter + ?Sized>(
     adapter: &A,
+    outbox_id: uuid::Uuid,
     intent: &DeliveryIntentV1,
 ) -> Result<HandoffResult, HandoffFailure> {
-    handoff_steps_with_claim(adapter, intent, None).await
+    handoff_steps_with_claim(adapter, outbox_id, intent, None).await
 }
 
 pub(crate) async fn claimed_handoff_steps<A: Adapter + ?Sized>(
@@ -183,7 +192,7 @@ pub(crate) async fn claimed_handoff_steps<A: Adapter + ?Sized>(
     store: &OutboxStore,
     claim: &ClaimedOutbox,
 ) -> Result<HandoffResult, HandoffFailure> {
-    handoff_steps_with_claim(adapter, intent, Some((store, claim))).await
+    handoff_steps_with_claim(adapter, claim.id(), intent, Some((store, claim))).await
 }
 
 async fn check_claim(claim: Option<(&OutboxStore, &ClaimedOutbox)>) -> Result<(), HandoffFailure> {
@@ -203,10 +212,13 @@ async fn check_claim(claim: Option<(&OutboxStore, &ClaimedOutbox)>) -> Result<()
 
 async fn handoff_steps_with_claim<A: Adapter + ?Sized>(
     adapter: &A,
+    outbox_id: uuid::Uuid,
     intent: &DeliveryIntentV1,
     claim: Option<(&OutboxStore, &ClaimedOutbox)>,
 ) -> Result<HandoffResult, HandoffFailure> {
     intent.validate().map_err(|_| HandoffFailure::Permanent)?;
+    let payment_request_id = paykit_lib::PaymentRequestId::new(outbox_id.to_string())
+        .map_err(|_| HandoffFailure::Permanent)?;
     check_claim(claim).await?;
     let registry = adapter
         .fetch_registry(intent.reader_pubky())
@@ -240,18 +252,13 @@ async fn handoff_steps_with_claim<A: Adapter + ?Sized>(
     }
     check_claim(claim).await?;
     adapter
-        .observe_recovery_marker(intent.reader_pubky())
-        .await
-        .map_err(|error| at_stage(error, RetryableHandoffStage::RecoveryMarkerObservation))?;
-    check_claim(claim).await?;
-    adapter
         .ensure_link_with_peer(intent.reader_pubky())
         .await
         .map_err(|error| at_stage(error, RetryableHandoffStage::LinkEstablishment))?;
     check_claim(claim).await?;
     match intent.operation() {
         DeliveryOperationV1::PaymentRequestProposal { terms } => adapter
-            .propose_payment_request(intent.reader_pubky(), terms)
+            .propose_payment_request(intent.reader_pubky(), payment_request_id, terms)
             .await
             .map_err(|error| at_stage(error, RetryableHandoffStage::PaymentRequestProposal)),
         DeliveryOperationV1::PaymentRequestCancellation { payment_request_id } => adapter
@@ -290,8 +297,8 @@ pub async fn with_claim_renewal<F: std::future::Future>(
 
 /// Executes one already-fenced claim. Enqueue is only `handed_off`; the SDK
 /// outbound record is reconciled separately before publication is acknowledged.
-/// A crash after enqueue but before this fenced transition is intentionally
-/// retried, so Payment Request proposals are at-least-once and may duplicate.
+/// A proposal retry after enqueue but before this fenced transition uses the
+/// same outbox UUID and terms, recovering the original proposal.
 pub async fn process_claim(
     store: &OutboxStore,
     adapter: &dyn Adapter,
