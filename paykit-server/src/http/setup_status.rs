@@ -9,7 +9,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    application::setup_status::SetupStatusService,
+    application::setup_status::{AcceptedAsset, SetupStatusService},
     domain::locks::parse_creator,
     http::{auth::AuthenticatedJson, error::ApiError},
 };
@@ -18,6 +18,7 @@ use crate::{
 struct SetupStatusBody {
     creator: String,
     asset: Option<String>,
+    accepted_asset: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -39,12 +40,29 @@ async fn status(
         Ok(creator) => creator,
         Err(_) => return ApiError::InvalidRequest.into_response(),
     };
-    let status = match body.asset {
+    let asset = match body.asset {
         Some(asset) => match crate::domain::invoice::CriterionAsset::parse(&asset) {
-            Ok(asset) => service.status_for_asset(&creator, asset).await,
+            Ok(asset) => Some(asset),
             Err(_) => return ApiError::InvalidRequest.into_response(),
         },
-        None => service.status(&creator).await,
+        None => None,
+    };
+    let accepted = match body.accepted_asset {
+        Some(accepted) => match AcceptedAsset::parse(&accepted) {
+            Ok(accepted) => Some(accepted),
+            Err(_) => return ApiError::InvalidRequest.into_response(),
+        },
+        None => None,
+    };
+    let status = match (asset, accepted) {
+        (Some(asset), Some(accepted)) => {
+            service
+                .status_for_asset_and_accepted_asset(&creator, asset, accepted)
+                .await
+        }
+        (Some(asset), None) => service.status_for_asset(&creator, asset).await,
+        (None, Some(accepted)) => service.status_for_accepted_asset(&creator, accepted).await,
+        (None, None) => service.status(&creator).await,
     };
     axum::Json(SetupStatusResponse {
         status: status.as_str(),
