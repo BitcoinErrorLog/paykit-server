@@ -34,8 +34,8 @@ Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report sec
 
 The [architecture contract](docs/architecture.md) describes shared identity,
 credential ownership, and immutable invoice attribution. Rust dependencies pin
-the Paykit `v0.1.0-rc71` release tag in `Cargo.toml`; `Cargo.lock` fixes its
-resolved commit at `e4e58d3ee6c6aa19d6262d4cd96a58890a65b6fa`.
+the Paykit `v0.1.0-rc72` release by exact revision in `Cargo.toml` and
+`Cargo.lock`: `ad3c72248d18587bb5b6ef3c99b063fa9bf31551`.
 Direct `pubky` and `pubky-testnet` dependencies are pinned to `0.15.0`.
 
 ## Executable boundary
@@ -80,6 +80,12 @@ not payment or verification completion.
 Shared-state lock contention returns `503 dependency_unavailable`; callers can
 retry the read. Other storage or state-validation failures remain errors, not
 connection-state responses.
+
+Overlapping polls in one Server process for the same Creator and persisted Reader
+share an in-flight SDK read. Each
+request still authenticates and loads its invoice binding; completed observations
+and errors are not cached. Payment authorization, handoff, and verification keep
+their own fresh checks.
 
 `POST /setup/status` is the readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination. Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
 
