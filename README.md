@@ -565,7 +565,9 @@ questions and return the same `{status}` response:
   with `[usdt]` configured. A Bitcoin-only Creator who declined the USDT address
   gets `setup_required` for `accepted_asset: "USDT"`, and a reconnect that adds
   the address makes it `ready`. `USD` is a denomination, not a payment asset, and
-  any other value is `400 invalid_request`.
+  any other value is `400 invalid_request`. An explicit `"accepted_asset": null`
+  is not an omission: it is also `400 invalid_request`, answered before any
+  authority or receiving check.
 
 When both fields are sent, the answer is `ready` only if both checks pass, and
 `setup_required` otherwise. A receiving-detail read that times out or fails is

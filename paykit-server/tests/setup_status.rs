@@ -551,9 +551,14 @@ mod receiving_readiness {
         assert_eq!(receiving.calls.load(Ordering::SeqCst), 1);
     }
 
-    fn router(key: &SigningKey, seller: Seller, usdt_enabled: bool) -> axum::Router {
+    fn router_with_authority(
+        key: &SigningKey,
+        authority: Result<(), SessionValidationError>,
+        seller: Seller,
+        usdt_enabled: bool,
+    ) -> axum::Router {
         setup_status_router(Arc::new(service(
-            Ok(()),
+            authority,
             Receiving::seller(seller),
             usdt_enabled,
         )))
@@ -562,17 +567,27 @@ mod receiving_readiness {
         ))))
     }
 
+    async fn post_with_authority(
+        key: &SigningKey,
+        authority: Result<(), SessionValidationError>,
+        seller: Seller,
+        usdt_enabled: bool,
+        body: String,
+    ) -> (StatusCode, String) {
+        let response = router_with_authority(key, authority, seller, usdt_enabled)
+            .oneshot(signed_request(key, body.into_bytes()))
+            .await
+            .unwrap();
+        (response.status(), response_body(response).await)
+    }
+
     async fn post(
         key: &SigningKey,
         seller: Seller,
         usdt_enabled: bool,
         body: String,
     ) -> (StatusCode, String) {
-        let response = router(key, seller, usdt_enabled)
-            .oneshot(signed_request(key, body.into_bytes()))
-            .await
-            .unwrap();
-        (response.status(), response_body(response).await)
+        post_with_authority(key, Ok(()), seller, usdt_enabled, body).await
     }
 
     const READY: &str = r#"{"status":"ready"}"#;
@@ -675,5 +690,69 @@ mod receiving_readiness {
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
             assert!(response.contains("invalid_request"), "{body}: {response}");
         }
+    }
+
+    #[tokio::test]
+    async fn route_rejects_explicit_null_accepted_asset_for_a_ready_authority() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let only_null = format!(r#"{{"accepted_asset":null,"creator":"{CREATOR}"}}"#);
+        let with_asset =
+            format!(r#"{{"accepted_asset":null,"asset":"BTC","creator":"{CREATOR}"}}"#);
+        for seller in [
+            Seller::Neither,
+            Seller::BitcoinOnly,
+            Seller::UsdtOnly,
+            Seller::Both,
+        ] {
+            for body in [&only_null, &with_asset] {
+                let (status, response) = post(&key, seller, true, body.clone()).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{seller:?} {body}");
+                assert!(
+                    response.contains("invalid_request"),
+                    "{seller:?} {body}: {response}"
+                );
+            }
+        }
+        assert_eq!(
+            post(
+                &key,
+                Seller::Neither,
+                true,
+                format!(r#"{{"creator":"{CREATOR}"}}"#)
+            )
+            .await,
+            (StatusCode::OK, READY.to_owned()),
+            "omitting accepted_asset keeps the authority-only answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_rejects_explicit_null_accepted_asset_before_authority_is_consulted() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let body = format!(r#"{{"accepted_asset":null,"creator":"{CREATOR}"}}"#);
+        for authority in [
+            Err(SessionValidationError::Invalid),
+            Err(SessionValidationError::Unavailable),
+        ] {
+            let (status, response) =
+                post_with_authority(&key, authority, Seller::Both, true, body.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{authority:?}");
+            assert!(
+                response.contains("invalid_request"),
+                "{authority:?}: {response}"
+            );
+        }
+        assert_eq!(
+            post_with_authority(
+                &key,
+                Err(SessionValidationError::Invalid),
+                Seller::Both,
+                true,
+                format!(r#"{{"creator":"{CREATOR}"}}"#)
+            )
+            .await,
+            (StatusCode::OK, SETUP_REQUIRED.to_owned()),
+            "an omitted accepted_asset still reports the unready authority"
+        );
     }
 }

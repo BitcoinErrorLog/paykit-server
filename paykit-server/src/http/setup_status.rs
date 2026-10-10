@@ -6,7 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     application::setup_status::{AcceptedAsset, SetupStatusService},
@@ -18,7 +18,21 @@ use crate::{
 struct SetupStatusBody {
     creator: String,
     asset: Option<String>,
+    #[serde(default, deserialize_with = "present_string")]
     accepted_asset: Option<String>,
+}
+
+/// Decodes a field that may be absent but, when present, must be a string.
+///
+/// `Option<String>` alone maps an explicit JSON `null` to `None`, which is
+/// indistinguishable from an omitted field. For `accepted_asset` that would turn
+/// a malformed request into an authority-only readiness answer, so a present
+/// `null` is rejected like any other non-string value.
+fn present_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Serialize)]
