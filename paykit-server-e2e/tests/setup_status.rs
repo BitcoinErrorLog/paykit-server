@@ -331,3 +331,43 @@ async fn both_fields_together_and_unknown_accepted_assets() {
     }
     database.cleanup().await;
 }
+
+#[tokio::test]
+async fn explicit_null_accepted_asset_is_an_invalid_request_not_an_omission() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let creators = CreatorStore::new(
+        database.pool(),
+        Arc::new(Crypto::from_master_key(&[1; 32]).unwrap()),
+    );
+    let no_rails = seller(&creators, false, false).await;
+    let bitcoin_only = seller(&creators, true, false).await;
+    let dual = seller(&creators, true, true).await;
+    let never_set_up = random_creator();
+    let route = Route::new(&creators, true);
+
+    // Omission stays the authority-only answer, so a null that decoded as an
+    // omission would have made these ready.
+    for creator in [&no_rails, &bitcoin_only, &dual] {
+        assert_eq!(
+            route.ok(format!(r#"{{"creator":"{creator}"}}"#)).await,
+            READY
+        );
+    }
+    assert_eq!(
+        route.ok(format!(r#"{{"creator":"{never_set_up}"}}"#)).await,
+        SETUP_REQUIRED
+    );
+
+    for creator in [&no_rails, &bitcoin_only, &dual, &never_set_up] {
+        for body in [
+            format!(r#"{{"accepted_asset":null,"creator":"{creator}"}}"#),
+            format!(r#"{{"accepted_asset":null,"asset":"USDT","creator":"{creator}"}}"#),
+        ] {
+            let (status, response) = route.ask(body.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(response.contains("invalid_request"), "{body}: {response}");
+        }
+    }
+    database.cleanup().await;
+}
