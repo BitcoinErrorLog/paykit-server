@@ -6,10 +6,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
-    application::setup_status::SetupStatusService,
+    application::setup_status::{AcceptedAsset, SetupStatusService},
     domain::locks::parse_creator,
     http::{auth::AuthenticatedJson, error::ApiError},
 };
@@ -18,6 +18,21 @@ use crate::{
 struct SetupStatusBody {
     creator: String,
     asset: Option<String>,
+    #[serde(default, deserialize_with = "present_string")]
+    accepted_asset: Option<String>,
+}
+
+/// Decodes a field that may be absent but, when present, must be a string.
+///
+/// `Option<String>` alone maps an explicit JSON `null` to `None`, which is
+/// indistinguishable from an omitted field. For `accepted_asset` that would turn
+/// a malformed request into an authority-only readiness answer, so a present
+/// `null` is rejected like any other non-string value.
+fn present_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Serialize)]
@@ -39,12 +54,29 @@ async fn status(
         Ok(creator) => creator,
         Err(_) => return ApiError::InvalidRequest.into_response(),
     };
-    let status = match body.asset {
+    let asset = match body.asset {
         Some(asset) => match crate::domain::invoice::CriterionAsset::parse(&asset) {
-            Ok(asset) => service.status_for_asset(&creator, asset).await,
+            Ok(asset) => Some(asset),
             Err(_) => return ApiError::InvalidRequest.into_response(),
         },
-        None => service.status(&creator).await,
+        None => None,
+    };
+    let accepted = match body.accepted_asset {
+        Some(accepted) => match AcceptedAsset::parse(&accepted) {
+            Ok(accepted) => Some(accepted),
+            Err(_) => return ApiError::InvalidRequest.into_response(),
+        },
+        None => None,
+    };
+    let status = match (asset, accepted) {
+        (Some(asset), Some(accepted)) => {
+            service
+                .status_for_asset_and_accepted_asset(&creator, asset, accepted)
+                .await
+        }
+        (Some(asset), None) => service.status_for_asset(&creator, asset).await,
+        (None, Some(accepted)) => service.status_for_accepted_asset(&creator, accepted).await,
+        (None, None) => service.status(&creator).await,
     };
     axum::Json(SetupStatusResponse {
         status: status.as_str(),
