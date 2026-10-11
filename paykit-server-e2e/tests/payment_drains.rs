@@ -99,9 +99,17 @@ fn proposal_intent_for_reference(
     endpoint_payload: &str,
 ) -> DeliveryIntentV1 {
     let _ = receiver_path;
+    proposal_intent_for_reader(READER, payment_reference, endpoint_payload)
+}
+
+fn proposal_intent_for_reader(
+    reader: &str,
+    payment_reference: &str,
+    endpoint_payload: &str,
+) -> DeliveryIntentV1 {
     let app_id = PaykitAppId::new("paykit-server").unwrap();
     DeliveryIntentV1::payment_request(
-        READER.into(),
+        reader.into(),
         app_id.clone(),
         &PaymentRequestTerms::builder(
             PaymentAmount::new("0.00001000", "BTC").unwrap(),
@@ -678,6 +686,156 @@ async fn shared_foreign_app_records_do_not_poison_existing_invoice_refresh_or_ne
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
+    let marketplace_reference = Uuid::new_v4().to_string();
+    let marketplace_endpoint_payload =
+        serde_json::json!({ "value": "marketplace-sdk-address" }).to_string();
+    let server_app_id = PaykitAppId::new("paykit-server").unwrap();
+    let marketplace_proposal = creator_sdk
+        .propose_payment_request(
+            payer_account.public_key.clone(),
+            PaymentRequestTerms::builder(
+                PaymentAmount::new("0.00001000", "BTC").unwrap(),
+                PaymentReference::new(marketplace_reference.clone()).unwrap(),
+                vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
+            )
+            .proposal_expires_at(Some("2027-01-15T08:00:00Z".into()))
+            .payment_deadline(Some(PaymentDeadline::At {
+                timestamp: "2027-01-16T08:00:00Z".into(),
+            }))
+            .required_app_id(Some(server_app_id))
+            .payment_endpoints(Some(HashMap::from([(
+                PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
+                PaymentEndpointPayload::new(&marketplace_endpoint_payload),
+            )])))
+            .build()
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    creator_sdk
+        .process_outbound_private_messages(payer_account.public_key.clone())
+        .await
+        .unwrap();
+    payer_sdk
+        .receive_private_messages_from_linked_peers()
+        .await
+        .unwrap();
+    let marketplace_proposal = creator_sdk
+        .payment_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|record| record.payment_request_id == marketplace_proposal.payment_request_id)
+        .unwrap();
+    assert!(marketplace_proposal.proposal_outbound_message_id.is_some());
+    assert!(marketplace_proposal.proposal_event_id.is_some());
+
+    let marketplace_preparation_id = Uuid::new_v4();
+    let outbox_id = Uuid::new_v4();
+    let marketplace_reader = format!("pubky{}", payer_account.public_key);
+    let marketplace_intent = proposal_intent_for_reader(
+        &marketplace_reader,
+        &marketplace_reference,
+        &marketplace_endpoint_payload,
+    );
+    let marketplace_intent_envelope = crypto
+        .encrypt(
+            &EnvelopeContext::outbox_semantic_intent(
+                crypto.lookup_hash(creator.to_string().as_bytes()),
+                outbox_id,
+            ),
+            &postcard::to_allocvec(&marketplace_intent).unwrap(),
+        )
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO marketplace_payment_preparations (
+             id, creator_id, operation_lookup_hash, request_lookup_hash,
+             reader_lookup_hash, preparation_envelope, state, prepared_at,
+             prepare_expires_at, activated_at, payment_deadline
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'active', NOW(),
+                   NOW() + INTERVAL '1 hour', NOW(), NOW() + INTERVAL '24 hours')",
+    )
+    .bind(marketplace_preparation_id)
+    .bind(creator_row.id())
+    .bind(
+        crypto
+            .lookup_hash(b"marketplace-sdk-operation")
+            .as_bytes()
+            .as_slice(),
+    )
+    .bind(
+        crypto
+            .lookup_hash(b"marketplace-sdk-request")
+            .as_bytes()
+            .as_slice(),
+    )
+    .bind(
+        crypto
+            .lookup_hash(marketplace_reader.as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
+    .bind(b"encrypted-preparation".as_slice())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO marketplace_settlements (
+             preparation_id, creator_id, payment_record_envelope,
+             bitcoin_address_lookup_hash, derivation_index_lookup_hash
+         ) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(marketplace_preparation_id)
+    .bind(creator_row.id())
+    .bind(b"encrypted-marketplace-payment".as_slice())
+    .bind(
+        crypto
+            .bitcoin_address_lookup_hash(b"marketplace-sdk-address")
+            .as_bytes()
+            .as_slice(),
+    )
+    .bind(
+        crypto
+            .bitcoin_derivation_index_lookup_hash(
+                crypto.lookup_hash(creator.to_string().as_bytes()),
+                500,
+            )
+            .as_bytes()
+            .as_slice(),
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO outbox (
+             id, creator_id, marketplace_preparation_id, intent_envelope,
+             intent_kind, status, sdk_outbound_message_id, sdk_event_id,
+             sdk_payment_request_id, proposal_lookup_hash
+         ) VALUES ($1, $2, $3, $4, 'payment_request_proposal', 'delivered',
+                   $5, $6, $7, $8)",
+    )
+    .bind(outbox_id)
+    .bind(creator_row.id())
+    .bind(marketplace_preparation_id)
+    .bind(marketplace_intent_envelope.as_bytes())
+    .bind(
+        marketplace_proposal
+            .proposal_outbound_message_id
+            .unwrap()
+            .to_string(),
+    )
+    .bind(marketplace_proposal.proposal_event_id.as_ref().unwrap())
+    .bind(&marketplace_proposal.payment_request_id)
+    .bind(
+        crypto
+            .payment_request_proposal_lookup_hash(marketplace_reference.as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+
     payer_sdk
         .propose_payment_request(
             creator_account.public_key.clone(),
@@ -821,12 +979,22 @@ async fn shared_foreign_app_records_do_not_poison_existing_invoice_refresh_or_ne
             PaymentRequestLifecycleState::Rejected
         );
     }
+    assert_eq!(
+        lifecycles
+            .load_marketplace(&creator, marketplace_preparation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .request_state,
+        PaymentRequestLifecycleState::Proposed,
+        "actual SDK-delivered Marketplace proposal must project to its own owner"
+    );
     let projected_lifecycle_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM payment_request_lifecycles")
             .fetch_one(database.pool())
             .await
             .unwrap();
-    assert_eq!(projected_lifecycle_count, 1);
+    assert_eq!(projected_lifecycle_count, 2);
 
     let drain = adapter
         .reconcile_and_create_payment_drain(

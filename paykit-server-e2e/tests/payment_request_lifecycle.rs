@@ -177,6 +177,84 @@ async fn attributable_invoice(
     (invoice_id, bundle_id, payment_request_id)
 }
 
+async fn attributable_marketplace(
+    database: &TestDatabase,
+    crypto: &Crypto,
+    creator_id: Uuid,
+    ordinal: u8,
+) -> (Uuid, String) {
+    let preparation_id = Uuid::new_v4();
+    let payment_request_id = Uuid::new_v4().to_string();
+    let outbox_id = Uuid::new_v4();
+    let intent_envelope = crypto
+        .encrypt(
+            &EnvelopeContext::outbox_semantic_intent(
+                crypto.lookup_hash(CREATOR.as_bytes()),
+                outbox_id,
+            ),
+            &postcard::to_allocvec(&proposal_intent(&payment_request_id)).unwrap(),
+        )
+        .unwrap();
+    let created_at = OffsetDateTime::from_unix_timestamp(1_800_001_000).unwrap();
+    let hash = |label: u8| vec![ordinal.wrapping_add(label); 32];
+    sqlx::query(
+        "INSERT INTO marketplace_payment_preparations (
+             id, creator_id, operation_lookup_hash, request_lookup_hash,
+             reader_lookup_hash, preparation_envelope, state, prepared_at,
+             prepare_expires_at, activated_at, payment_deadline
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'active', $7,
+                   $7 + INTERVAL '1 hour', $7, $7 + INTERVAL '24 hours')",
+    )
+    .bind(preparation_id)
+    .bind(creator_id)
+    .bind(hash(1))
+    .bind(hash(2))
+    .bind(hash(3))
+    .bind(b"encrypted-preparation".as_slice())
+    .bind(created_at)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO marketplace_settlements (
+             preparation_id, creator_id, payment_record_envelope,
+             bitcoin_address_lookup_hash, derivation_index_lookup_hash
+         ) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(preparation_id)
+    .bind(creator_id)
+    .bind(b"encrypted-payment".as_slice())
+    .bind(hash(4))
+    .bind(hash(5))
+    .execute(database.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO outbox (
+             id, creator_id, marketplace_preparation_id, intent_envelope,
+             intent_kind, status, sdk_outbound_message_id, sdk_event_id,
+             sdk_payment_request_id, proposal_lookup_hash
+         ) VALUES ($1, $2, $3, $4, 'payment_request_proposal', 'delivered',
+                   '1', $5, $6, $7)",
+    )
+    .bind(outbox_id)
+    .bind(creator_id)
+    .bind(preparation_id)
+    .bind(intent_envelope.as_bytes())
+    .bind(Uuid::new_v4().to_string())
+    .bind(&payment_request_id)
+    .bind(
+        crypto
+            .payment_request_proposal_lookup_hash(payment_request_id.as_bytes())
+            .as_bytes()
+            .as_slice(),
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    (preparation_id, payment_request_id)
+}
+
 fn projection(
     payment_request_id: String,
     request_state: PaymentRequestLifecycleState,
@@ -249,6 +327,69 @@ async fn all_canonical_lifecycle_states_are_durable_and_queryable_after_restart(
         assert_eq!(persisted.request_state, state);
         assert_eq!(persisted.last_event_at, recorded_at);
     }
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn marketplace_lifecycle_is_attributed_without_changing_locks_projection() {
+    let (database, crypto, store, creator_id) = setup().await;
+    let (_, bundle_id, locks_request_id) =
+        attributable_invoice(&database, &crypto, creator_id, 70).await;
+    let (preparation_id, marketplace_request_id) =
+        attributable_marketplace(&database, &crypto, creator_id, 80).await;
+    let recorded_at = OffsetDateTime::from_unix_timestamp(1_800_002_000).unwrap();
+
+    assert_eq!(
+        store
+            .apply(
+                creator_id,
+                &projection(
+                    marketplace_request_id,
+                    PaymentRequestLifecycleState::Accepted,
+                    1,
+                    recorded_at,
+                ),
+            )
+            .await
+            .unwrap(),
+        PaymentRequestLifecycleApply::Applied
+    );
+    assert_eq!(
+        store
+            .load_marketplace(&creator(), preparation_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .request_state,
+        PaymentRequestLifecycleState::Accepted
+    );
+    assert!(store.load(&creator(), bundle_id).await.unwrap().is_none());
+
+    assert_eq!(
+        store
+            .apply(
+                creator_id,
+                &projection(
+                    locks_request_id,
+                    PaymentRequestLifecycleState::Rejected,
+                    1,
+                    recorded_at,
+                ),
+            )
+            .await
+            .unwrap(),
+        PaymentRequestLifecycleApply::Applied
+    );
+    assert_eq!(
+        store
+            .load(&creator(), bundle_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .request_state,
+        PaymentRequestLifecycleState::Rejected
+    );
 
     database.cleanup().await;
 }

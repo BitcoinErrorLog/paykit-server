@@ -191,6 +191,8 @@ pub enum EnvelopeType {
     InvoicePaymentRecord,
     /// An encrypted Bitcoin outpoint and observed amount.
     BitcoinObservation,
+    /// Marketplace-owned encrypted Bitcoin outpoint and observed amount.
+    MarketplaceBitcoinObservation,
     UsdtObservation,
     /// Versioned server-owned semantic inputs for an outbound SDK handoff.
     OutboxSemanticIntent,
@@ -198,6 +200,8 @@ pub enum EnvelopeType {
     PaymentDrain,
     /// Durable unpublished Marketplace invoice preparation.
     MarketplacePreparation,
+    /// Encrypted Bitcoin settlement record for an activated Marketplace preparation.
+    MarketplaceSettlementPaymentRecord,
 }
 
 impl EnvelopeType {
@@ -208,10 +212,12 @@ impl EnvelopeType {
             Self::Invoice => b"invoice",
             Self::InvoicePaymentRecord => b"invoice-payment-record",
             Self::BitcoinObservation => b"bitcoin-observation",
+            Self::MarketplaceBitcoinObservation => b"marketplace-bitcoin-observation",
             Self::UsdtObservation => b"usdt-observation",
             Self::OutboxSemanticIntent => b"outbox-semantic-intent",
             Self::PaymentDrain => b"payment-drain",
             Self::MarketplacePreparation => b"marketplace-preparation",
+            Self::MarketplaceSettlementPaymentRecord => b"marketplace-settlement-payment-record",
         }
     }
 }
@@ -279,6 +285,20 @@ impl EnvelopeContext {
         context.parent_row_id = Some(invoice_id);
         context
     }
+    /// Binds one Bitcoin observation row to its owning Marketplace settlement.
+    pub fn bitcoin_observation_for_marketplace(
+        creator_lookup_hash: LookupHash,
+        row_id: Uuid,
+        marketplace_preparation_id: Uuid,
+    ) -> Self {
+        let mut context = Self::new(
+            EnvelopeType::MarketplaceBitcoinObservation,
+            creator_lookup_hash,
+            row_id,
+        );
+        context.parent_row_id = Some(marketplace_preparation_id);
+        context
+    }
     pub fn usdt_observation(
         creator_lookup_hash: LookupHash,
         row_id: Uuid,
@@ -307,6 +327,18 @@ impl EnvelopeContext {
             EnvelopeType::MarketplacePreparation,
             creator_lookup_hash,
             row_id,
+        )
+    }
+
+    /// Creates the binding context for one activated Marketplace settlement record.
+    pub fn marketplace_settlement_payment_record(
+        creator_lookup_hash: LookupHash,
+        preparation_id: Uuid,
+    ) -> Self {
+        Self::new(
+            EnvelopeType::MarketplaceSettlementPaymentRecord,
+            creator_lookup_hash,
+            preparation_id,
         )
     }
 

@@ -55,6 +55,10 @@ Business routes:
 - `POST /setup/{flow_id}/complete`
 - signed `POST /invoices`
 - signed `POST /marketplace/payment-requests/prepare`
+- signed `POST /marketplace/payment-requests/activate`
+- signed `POST /marketplace/payment-requests/void`
+- signed `POST /marketplace/payment-requests/resolve`
+- signed `POST /marketplace/payment-requests/status`
 - signed `POST /connections/status`
 - signed `POST /transactions/status`
 - signed `POST /setup/status`
@@ -93,7 +97,40 @@ does not create an active invoice or enqueue publication. Its Creator-scoped
 `operation_id` exactly replays the stored preparation when the closed request is
 unchanged, conflicts on changed binding, and remains replayable after the
 preparation TTL. Activation, void, and business resolution are separate lifecycle
-operations and are not exposed by this preparation-only slice.
+operations. Signed activation starts the bound payment window from the database
+clock and atomically enqueues one proposal; exact replay returns its stored result.
+Signed void wins only while prepared, never publishes, and never invokes SDK
+cancellation. Activate and void serialize on the preparation row. Signed resolution
+records one immutable `paid_manually`, `refunded`, or `abandoned` business outcome
+using database time. Exact outcome replay returns its stored timestamp; a different
+outcome conflicts. Resolution never changes payment-request or Bitcoin facts and
+never invokes SDK cancellation. Resolving a prepared invoice blocks activation but
+still permits void.
+
+Marketplace status uses closed `{"creator","invoice_id"}` input. Prepared and voided
+responses keep proposal and payment facts null; active responses project proposal
+delivery, canonical SDK request state, producer-owned payment state, business outcome,
+and active Bitcoin txid/amount/confirmations. A 0-confirmation replacement may change
+the active outpoint, while immutable per-outpoint amount and first-observation evidence
+continues to determine `amount_matched` and `paid_on_time`. When an active output is
+missing after a reorg, its Bitcoin object remains as evidence, but confirmations are
+zero and `amount_matched` and `paid_on_time` are false. `request_state: null` means no
+SDK lifecycle has been projected yet; `proposed` means proposal is projected but
+acceptance is not. Neither lag state means rejection or expiry. `payment_state` becomes
+`expired` after the inclusive payment deadline passes without the current active
+outpoint carrying durable timely amount-match evidence; a late match remains visible
+but does not restore eligibility. Exact route-emitted consumer and error fixtures live
+under `docs/fixtures/marketplace-payment-request-status/`. Unknown invoices and wrong
+Creators return the same `404`.
+
+Marketplace lifecycle conflicts use recovery-specific `409` codes. `prepare_expired`
+requires a new preparation attempt; `lifecycle_terminal` means activation lost to
+void or prepared-state resolution and must stop; `invoice_active` means void lost to
+activation, so the caller must keep observing the live invoice; `total_mismatch`
+means the caller total differs from Paykit Server's authoritative prepared total and
+requires operator attention. Exact activation and void replay still return their
+stored `200` response. Persisted-state and database-integrity faults fail with
+non-retryable `500 internal_error`, not `503 dependency_unavailable`.
 
 `POST /setup/status` is the readiness check for an authenticated Creator. Its closed body is `{"creator":"pubky..."}` with optional `asset: "BTC"`, `"USD"`, or `"USDT"` to check whether approved receiving details can accept that denomination, and optional `accepted_asset: "BTC"` or `"USDT"` to check whether the Creator has approved receiving details for that payment asset (see [Direct USDT0 invoices](#direct-usdt0-invoices)). Every signed route verifies Ed25519 over `b"paykit-http-signature-v1\0" + uppercase_method + b"\0" + exact_query_free_path + b"\0" + exact_raw_body`; there is no body-only fallback. It returns exactly one coarse state: `ready` when the persisted session, delegated key, App Registry entry, and hosted state are usable; `setup_required` when authority is absent or confirmed invalid; and `unavailable` for validation timeouts and storage, rate-limit, server, DNS, or transport failures. Untyped Pubky 401 responses are also `unavailable`: they cannot distinguish revoked grants from recoverable PoP failures. A revoked grant reported this way requires explicit reconnect. Callers must not convert `unavailable` into a new authorization flow.
 

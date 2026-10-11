@@ -8,7 +8,9 @@ use thiserror::Error;
 use crate::{
     config::Config,
     crypto::Crypto,
-    persistence::{CreatorStore, DeploymentStore, InvoiceStore, run_migrations},
+    persistence::{
+        CreatorStore, DeploymentStore, InvoiceStore, MarketplacePreparationStore, run_migrations,
+    },
 };
 
 /// Secret-free failures from database initialization before the listener binds.
@@ -32,6 +34,9 @@ pub enum StartupError {
     /// At least one encrypted Bitcoin payment record failed authentication.
     #[error("payment record integrity check failed")]
     PaymentRecordIntegrity,
+    /// At least one Marketplace settlement or Bitcoin evidence row failed authentication.
+    #[error("marketplace observation integrity check failed")]
+    MarketplaceObservationIntegrity,
 }
 
 /// Connects, migrates, validates deployment invariants, and authenticates every
@@ -57,10 +62,14 @@ pub async fn initialize_database(config: &Config) -> Result<PgPool, StartupError
         .scan_integrity()
         .await
         .map_err(|_| StartupError::CreatorIntegrity)?;
-    let invoices = InvoiceStore::new(&pool, crypto);
+    let invoices = InvoiceStore::new(&pool, crypto.clone());
     invoices
         .scan_payment_record_integrity()
         .await
         .map_err(|_| StartupError::PaymentRecordIntegrity)?;
+    MarketplacePreparationStore::new(&pool, crypto)
+        .scan_observation_integrity()
+        .await
+        .map_err(|_| StartupError::MarketplaceObservationIntegrity)?;
     Ok(pool)
 }

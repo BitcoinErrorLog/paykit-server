@@ -41,9 +41,14 @@ impl InvoiceStore {
         };
         if let Some(destination) = &payment.bitcoin {
             let observation: Option<BitcoinObservationRow> = sqlx::query_as(
-                "SELECT id, invoice_id, observation_envelope, outpoint_lookup_hash, confirmations, present
-                 FROM bitcoin_observations WHERE invoice_id = $1 AND active")
-                .bind(invoice).fetch_optional(&mut **tx).await.map_err(|_| PersistenceError::Unavailable)?;
+                "SELECT id, invoice_id, marketplace_preparation_id,
+                        observation_envelope, outpoint_lookup_hash, confirmations, present
+                 FROM bitcoin_observations WHERE invoice_id = $1 AND active",
+            )
+            .bind(invoice)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
             if let Some(observation) = observation {
                 let facts = self.decrypt_observation(creator_hash, &observation)?;
                 let matched =

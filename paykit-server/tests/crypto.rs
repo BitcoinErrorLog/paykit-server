@@ -170,6 +170,7 @@ fn supported_persistence_envelopes_bind_distinct_typed_contexts() {
         EnvelopeContext::reader_assignment(hash, row),
         EnvelopeContext::invoice(hash, row),
         EnvelopeContext::outbox_semantic_intent(hash, row),
+        EnvelopeContext::marketplace_settlement_payment_record(hash, row),
     ];
     for (index, context) in contexts.iter().enumerate() {
         let envelope = crypto.encrypt(context, b"task-seven-sentinel").unwrap();

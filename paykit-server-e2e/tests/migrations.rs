@@ -5,7 +5,7 @@ use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
 use uuid::Uuid;
 
-const REQUIRED_TABLES: [&str; 9] = [
+const REQUIRED_TABLES: [&str; 11] = [
     "deployment_metadata",
     "creators",
     "reader_assignments",
@@ -15,7 +15,31 @@ const REQUIRED_TABLES: [&str; 9] = [
     "usdt_observations",
     "buyer_contacts",
     "marketplace_payment_preparations",
+    "marketplace_settlements",
+    "bitcoin_address_owners",
 ];
+
+const PRE_SETTLEMENT_MIGRATIONS: [&str; 13] = [
+    include_str!("../../paykit-server/migrations/0001_initial.sql"),
+    include_str!("../../paykit-server/migrations/0002_invoice_deadlines.sql"),
+    include_str!("../../paykit-server/migrations/0003_invoice_observation_deadlines.sql"),
+    include_str!("../../paykit-server/migrations/0004_payment_request_lifecycles.sql"),
+    include_str!("../../paykit-server/migrations/0005_payment_drains.sql"),
+    include_str!("../../paykit-server/migrations/0006_payment_drain_cleanup_receipts.sql"),
+    include_str!("../../paykit-server/migrations/0007_payment_request_deadline_terms.sql"),
+    include_str!("../../paykit-server/migrations/0008_outbox_invoice_cardinality.sql"),
+    include_str!("../../paykit-server/migrations/0009_usdt_observations.sql"),
+    include_str!("../../paykit-server/migrations/0010_buyer_contacts.sql"),
+    include_str!("../../paykit-server/migrations/0011_outbox_failure_count.sql"),
+    include_str!("../../paykit-server/migrations/0012_marketplace_payment_preparations.sql"),
+    include_str!("../../paykit-server/migrations/0013_marketplace_activation_void.sql"),
+];
+const SETTLEMENT_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0014_marketplace_settlements.sql");
+const MARKETPLACE_OBSERVATION_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0015_marketplace_bitcoin_observations.sql");
+const RESOLUTION_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0016_marketplace_resolution_immutability.sql");
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
 /// migration tests deliberately use the production migration lock key, so
@@ -57,7 +81,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=12).collect::<Vec<_>>());
+    assert_eq!(applied_versions, (1..=16).collect::<Vec<_>>());
 
     let plaintext_creator_pubky_columns: Vec<String> = sqlx::query_scalar(
         "SELECT table_name \
@@ -114,6 +138,158 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
     .unwrap();
     assert_ne!(creator_id, Uuid::nil());
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn settlement_migration_backfills_invoice_owners_and_rejects_unbackfillable_active_rows() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    apply_pre_settlement_migrations(database.pool()).await;
+    let creator_id = insert_creator(database.pool()).await;
+    insert_invoice(
+        database.pool(),
+        creator_id,
+        b"upgrade-bundle",
+        b"upgrade-request",
+    )
+    .await;
+    let expected_owner: (Vec<u8>, Uuid) = sqlx::query_as(
+        "SELECT bitcoin_address_lookup_hash, id FROM invoices WHERE creator_id = $1",
+    )
+    .bind(creator_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+
+    let mut migration = database.pool().begin().await.unwrap();
+    sqlx::raw_sql(SETTLEMENT_MIGRATION)
+        .execute(&mut *migration)
+        .await
+        .unwrap();
+    migration.commit().await.unwrap();
+    let actual_owner: (Vec<u8>, Uuid) = sqlx::query_as(
+        "SELECT bitcoin_address_lookup_hash, invoice_id
+         FROM bitcoin_address_owners WHERE invoice_id = $1",
+    )
+    .bind(expected_owner.1)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(actual_owner, expected_owner);
+    database.cleanup().await;
+
+    let database = TestDatabase::create().await;
+    apply_pre_settlement_migrations(database.pool()).await;
+    let creator_id = insert_creator(database.pool()).await;
+    sqlx::query(
+        "INSERT INTO marketplace_payment_preparations (
+             id, creator_id, operation_lookup_hash, request_lookup_hash,
+             reader_lookup_hash, preparation_envelope, state, prepared_at,
+             prepare_expires_at, activated_at, payment_deadline
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'active', NOW(),
+                   NOW() + INTERVAL '1 hour', NOW(), NOW() + INTERVAL '24 hours')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(creator_id)
+    .bind(vec![1_u8; 32])
+    .bind(vec![2_u8; 32])
+    .bind(vec![3_u8; 32])
+    .bind(b"encrypted-preparation".as_slice())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let mut migration = database.pool().begin().await.unwrap();
+    let error = sqlx::raw_sql(SETTLEMENT_MIGRATION)
+        .execute(&mut *migration)
+        .await
+        .expect_err("active preparation without an application-owned record must block upgrade");
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some("P0001")
+    );
+    migration.rollback().await.unwrap();
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn resolution_migration_upgrades_settlement_schema_and_enforces_immutability() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_pre_settlement_migrations(pool).await;
+    let creator_id = insert_creator(pool).await;
+
+    let mut settlement = pool.begin().await.unwrap();
+    sqlx::raw_sql(SETTLEMENT_MIGRATION)
+        .execute(&mut *settlement)
+        .await
+        .unwrap();
+    settlement.commit().await.unwrap();
+
+    sqlx::raw_sql(MARKETPLACE_OBSERVATION_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let preparation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO marketplace_payment_preparations (
+             id, creator_id, operation_lookup_hash, request_lookup_hash,
+             reader_lookup_hash, preparation_envelope, state, prepared_at,
+             prepare_expires_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'prepared', NOW(), NOW() + INTERVAL '1 hour')",
+    )
+    .bind(preparation_id)
+    .bind(creator_id)
+    .bind(vec![1_u8; 32])
+    .bind(vec![2_u8; 32])
+    .bind(vec![3_u8; 32])
+    .bind(b"encrypted-preparation".as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let mut resolution = pool.begin().await.unwrap();
+    sqlx::raw_sql(RESOLUTION_MIGRATION)
+        .execute(&mut *resolution)
+        .await
+        .unwrap();
+    resolution.commit().await.unwrap();
+
+    sqlx::query(
+        "UPDATE marketplace_payment_preparations
+         SET business_outcome = 'refunded', resolved_at = clock_timestamp()
+         WHERE id = $1",
+    )
+    .bind(preparation_id)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_check_violation(
+        sqlx::query(
+            "UPDATE marketplace_payment_preparations
+             SET business_outcome = 'abandoned', resolved_at = clock_timestamp()
+             WHERE id = $1",
+        )
+        .bind(preparation_id)
+        .execute(pool)
+        .await,
+    );
+
+    let settlement_indexes: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_indexes
+         WHERE schemaname = 'public'
+           AND indexname IN (
+               'marketplace_settlements_pkey',
+               'marketplace_settlements_bitcoin_address_lookup_hash_key',
+               'payment_request_lifecycles_marketplace_index'
+           )",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(settlement_indexes, 3);
     database.cleanup().await;
 }
 
@@ -363,8 +539,8 @@ async fn schema_uniqueness_constraints_reject_duplicate_lookup_keys() {
     sqlx::query(
         "INSERT INTO bitcoin_observations
          (invoice_id, observation_envelope, outpoint_lookup_hash, active,
-          confirmations, present)
-         VALUES ($1, $2, $3, TRUE, 0, TRUE)",
+          confirmations, present, first_observed_at)
+         VALUES ($1, $2, $3, TRUE, 0, TRUE, clock_timestamp())",
     )
     .bind(first_invoice)
     .bind(b"encrypted-observation-a".as_slice())
@@ -376,14 +552,76 @@ async fn schema_uniqueness_constraints_reject_duplicate_lookup_keys() {
         sqlx::query(
             "INSERT INTO bitcoin_observations
              (invoice_id, observation_envelope, outpoint_lookup_hash, active,
-              confirmations, present)
-             VALUES ($1, $2, $3, TRUE, 0, TRUE)",
+              confirmations, present, first_observed_at)
+             VALUES ($1, $2, $3, TRUE, 0, TRUE, clock_timestamp())",
         )
         .bind(second_invoice)
         .bind(b"encrypted-observation-b".as_slice())
         .bind(outpoint_hash.as_bytes().as_slice())
         .execute(pool)
         .await,
+    );
+
+    let invoice_address_hash: Vec<u8> =
+        sqlx::query_scalar("SELECT bitcoin_address_lookup_hash FROM invoices WHERE id = $1")
+            .bind(first_invoice)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let marketplace_preparation_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO marketplace_payment_preparations (
+             id, creator_id, operation_lookup_hash, request_lookup_hash,
+             reader_lookup_hash, preparation_envelope, state, prepared_at,
+             prepare_expires_at, activated_at, payment_deadline
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'active', NOW(),
+                   NOW() + INTERVAL '1 hour', NOW(), NOW() + INTERVAL '24 hours')",
+    )
+    .bind(marketplace_preparation_id)
+    .bind(creator_id)
+    .bind(vec![41_u8; 32])
+    .bind(vec![42_u8; 32])
+    .bind(vec![43_u8; 32])
+    .bind(b"encrypted-preparation".as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_unique_violation(
+        sqlx::query(
+            "INSERT INTO marketplace_settlements (
+                 preparation_id, creator_id, payment_record_envelope,
+                 bitcoin_address_lookup_hash, derivation_index_lookup_hash
+             ) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(marketplace_preparation_id)
+        .bind(creator_id)
+        .bind(b"encrypted-marketplace-payment".as_slice())
+        .bind(&invoice_address_hash)
+        .bind(vec![44_u8; 32])
+        .execute(pool)
+        .await,
+    );
+    let marketplace_address_hash = vec![45_u8; 32];
+    sqlx::query(
+        "INSERT INTO marketplace_settlements (
+             preparation_id, creator_id, payment_record_envelope,
+             bitcoin_address_lookup_hash, derivation_index_lookup_hash
+         ) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(marketplace_preparation_id)
+    .bind(creator_id)
+    .bind(b"encrypted-marketplace-payment".as_slice())
+    .bind(&marketplace_address_hash)
+    .bind(vec![44_u8; 32])
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_unique_violation(
+        sqlx::query("UPDATE invoices SET bitcoin_address_lookup_hash = $1 WHERE id = $2")
+            .bind(marketplace_address_hash)
+            .bind(second_invoice)
+            .execute(pool)
+            .await,
     );
 
     database.cleanup().await;
@@ -460,6 +698,99 @@ async fn enum_like_status_columns_allow_unexpected_text_for_read_time_validation
     database.cleanup().await;
 }
 
+#[tokio::test]
+async fn observation_migration_upgrades_existing_locks_evidence_without_rewriting_it() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_pre_settlement_migrations(pool).await;
+    sqlx::raw_sql(SETTLEMENT_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(pool, creator_id, b"upgrade-bundle", b"upgrade-request").await;
+    let invoice_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM invoices WHERE payment_request_lookup_hash = $1")
+            .bind(b"upgrade-request".as_slice())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let outpoint_hash = vec![71_u8; 32];
+    let created_at: time::OffsetDateTime = sqlx::query_scalar(
+        "INSERT INTO bitcoin_observations
+         (invoice_id, observation_envelope, outpoint_lookup_hash, active,
+          confirmations, present)
+         VALUES ($1, $2, $3, TRUE, 0, TRUE)
+         RETURNING created_at",
+    )
+    .bind(invoice_id)
+    .bind(b"encrypted-upgrade-observation".as_slice())
+    .bind(&outpoint_hash)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(MARKETPLACE_OBSERVATION_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let upgraded: (Option<Uuid>, Option<Uuid>, time::OffsetDateTime, Vec<u8>) = sqlx::query_as(
+        "SELECT invoice_id, marketplace_preparation_id, first_observed_at,
+                observation_envelope
+         FROM bitcoin_observations WHERE outpoint_lookup_hash = $1",
+    )
+    .bind(&outpoint_hash)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        upgraded,
+        (
+            Some(invoice_id),
+            None,
+            created_at,
+            b"encrypted-upgrade-observation".to_vec(),
+        )
+    );
+    assert_check_violation(
+        sqlx::query(
+            "UPDATE bitcoin_observations SET invoice_id = NULL
+             WHERE outpoint_lookup_hash = $1",
+        )
+        .bind(&outpoint_hash)
+        .execute(pool)
+        .await,
+    );
+    assert_check_violation(
+        sqlx::query(
+            "UPDATE bitcoin_observations SET first_observed_at = first_observed_at + INTERVAL '1 second'
+             WHERE outpoint_lookup_hash = $1",
+        )
+        .bind(&outpoint_hash)
+        .execute(pool)
+        .await,
+    );
+    assert_check_violation(
+        sqlx::query("DELETE FROM bitcoin_observations WHERE outpoint_lookup_hash = $1")
+            .bind(&outpoint_hash)
+            .execute(pool)
+            .await,
+    );
+    database.cleanup().await;
+}
+
+async fn apply_pre_settlement_migrations(pool: &PgPool) {
+    let mut transaction = pool.begin().await.unwrap();
+    for migration in PRE_SETTLEMENT_MIGRATIONS {
+        sqlx::raw_sql(migration)
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+    }
+    transaction.commit().await.unwrap();
+}
+
 async fn insert_creator(pool: &PgPool) -> Uuid {
     sqlx::query_scalar(
         "INSERT INTO creators (creator_lookup_hash, credential_envelope) VALUES ($1, $2) RETURNING id",
@@ -493,8 +824,10 @@ async fn insert_invoice_result_with_reader(
     bundle_hash: &[u8],
     request_hash: &[u8],
 ) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
-    let address_hash = Uuid::new_v4();
-    let derivation_index_hash = Uuid::new_v4();
+    let mut address_hash = Uuid::new_v4().as_bytes().to_vec();
+    address_hash.extend_from_slice(Uuid::new_v4().as_bytes());
+    let mut derivation_index_hash = Uuid::new_v4().as_bytes().to_vec();
+    derivation_index_hash.extend_from_slice(Uuid::new_v4().as_bytes());
     let lock_resource_hash = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO invoices \
@@ -512,8 +845,8 @@ async fn insert_invoice_result_with_reader(
     .bind(request_hash)
     .bind(b"encrypted-invoice".as_slice())
     .bind(b"encrypted-payment-record".as_slice())
-    .bind(address_hash.as_bytes().as_slice())
-    .bind(derivation_index_hash.as_bytes().as_slice())
+    .bind(address_hash)
+    .bind(derivation_index_hash)
     .bind("undetected")
     .bind(lock_resource_hash.as_bytes().as_slice())
     .execute(pool)

@@ -10,7 +10,9 @@ use crate::{
             PaykitIntentBuilder, ReaderAuthorization, RegistryDiscoveryError,
             SessionValidationError, SessionValidator,
         },
+        marketplace_lifecycle::MarketplaceLifecycleService,
         marketplace_preparation::PrepareMarketplaceService,
+        marketplace_status::MarketplaceStatusService,
         payment_drain::{
             PaymentDrainCleanupToken, PaymentDrainError, PaymentDrainOperations,
             PaymentDrainSummary,
@@ -37,7 +39,9 @@ use crate::{
     setup_orchestration::PubkyCompanionRelay,
     workers::{
         creator_tasks::CreatorTasks,
-        observer::{ElectrumAdapter, ElectrumPort, ObserverError, observe_once},
+        observer::{
+            ElectrumAdapter, ElectrumPort, ObserverError, observe_marketplace_once, observe_once,
+        },
         outbox::{
             ProcessingHealth, RetrySchedule, process_claim_with,
             process_reconciliation_with_health, with_claim_renewal,
@@ -100,6 +104,7 @@ struct WorkerComponents {
     sessions: CreatorSessions,
     outbox: OutboxStore,
     invoices: InvoiceStore,
+    marketplace_preparations: Arc<MarketplacePreparationStore>,
     payment_request_lifecycles: PaymentRequestLifecycleStore,
     electrum: Arc<dyn ElectrumPort>,
     usdt: Option<crate::usdt::ArbitrumVerifier>,
@@ -175,7 +180,8 @@ impl Server {
         let outbox = OutboxStore::new(&pool, crypto.clone());
         let payment_request_lifecycles = PaymentRequestLifecycleStore::new(&pool, crypto.clone());
         let payment_drains = PaymentDrainStore::new(&pool, crypto.clone());
-        let marketplace_preparations = MarketplacePreparationStore::new(&pool, crypto.clone());
+        let marketplace_preparations =
+            Arc::new(MarketplacePreparationStore::new(&pool, crypto.clone()));
 
         let bootstrap = setup_bootstrap(
             pubky.clone(),
@@ -260,11 +266,18 @@ impl Server {
                 storage: pubky.public_storage(),
             }),
             Arc::new(creators.clone()),
-            Arc::new(marketplace_preparations),
+            marketplace_preparations.clone(),
             config.paykit.app_id.clone(),
             config.deployment_invariants().bitcoin_network.clone(),
             config.paykit.payment_window,
             config.paykit.marketplace_prepare_ttl,
+        ));
+        let marketplace_lifecycle_service = Arc::new(MarketplaceLifecycleService::new(
+            marketplace_preparations.clone(),
+            config.paykit.proposal_acceptance_window,
+        ));
+        let marketplace_status_service = Arc::new(MarketplaceStatusService::new(
+            marketplace_preparations.clone(),
         ));
         let connection_status_service = Arc::new(ConnectionStatusService::new(
             Arc::new(invoices.clone()),
@@ -310,6 +323,12 @@ impl Server {
                         marketplace_preparation_service,
                     ),
                 )
+                .merge(http::marketplace_lifecycle::marketplace_lifecycle_router(
+                    marketplace_lifecycle_service,
+                ))
+                .merge(http::marketplace_status::marketplace_status_router(
+                    marketplace_status_service,
+                ))
                 .merge(http::status::status_router(status_service))
                 .merge(http::payment_drains::payment_drains_router(
                     payment_drain_operations,
@@ -333,6 +352,7 @@ impl Server {
             sessions,
             outbox,
             invoices,
+            marketplace_preparations,
             payment_request_lifecycles,
             electrum,
             usdt,
@@ -1057,27 +1077,36 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
         if !runtime.may_start_worker_claim() {
             break;
         }
-        let targets = match workers.invoices.observation_targets().await {
-            Ok(targets) => targets,
-            Err(_) => {
-                runtime.set_electrum_available(false);
-                continue;
-            }
-        };
-        if targets.is_empty() {
-            runtime.set_electrum_available(true);
-            continue;
-        }
-        runtime.set_electrum_available(
-            observe_once(
+        let invoice_targets = workers.invoices.observation_targets().await;
+        let marketplace_targets = workers.marketplace_preparations.observation_targets().await;
+        let mut available = invoice_targets.is_ok() && marketplace_targets.is_ok();
+        if let Ok(targets) = invoice_targets
+            && !targets.is_empty()
+            && observe_once(
                 workers.electrum.as_ref(),
                 &workers.invoices,
                 &workers.bitcoin_network,
                 &targets,
             )
             .await
-            .is_ok(),
-        );
+            .is_err()
+        {
+            available = false;
+        }
+        if let Ok(targets) = marketplace_targets
+            && !targets.is_empty()
+            && observe_marketplace_once(
+                workers.electrum.as_ref(),
+                workers.marketplace_preparations.as_ref(),
+                &workers.bitcoin_network,
+                &targets,
+            )
+            .await
+            .is_err()
+        {
+            available = false;
+        }
+        runtime.set_electrum_available(available);
     }
 }
 

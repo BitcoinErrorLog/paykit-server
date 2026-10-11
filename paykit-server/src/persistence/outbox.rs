@@ -280,7 +280,7 @@ impl OutboxStore {
                  (o.status IN ('queued', 'retryable') AND o.next_attempt_at <= clock_timestamp()) \
                  OR (o.status = 'leased' AND o.lease_expires_at <= clock_timestamp()) \
              ) AND (o.intent_kind <> 'payment_request_proposal' OR ( \
-                 o.proposal_lookup_hash IS NOT NULL AND EXISTS ( \
+                 o.proposal_lookup_hash IS NOT NULL AND (EXISTS ( \
                      SELECT 1 FROM invoices invoice \
                      JOIN lock_payment_generations generation \
                        ON generation.creator_id = invoice.creator_id \
@@ -288,7 +288,11 @@ impl OutboxStore {
                      WHERE invoice.id = o.invoice_id \
                        AND generation.current_generation = invoice.lock_resource_generation \
                        AND generation.active_drain_id IS NULL \
-                 ))) \
+                 ) OR EXISTS ( \
+                     SELECT 1 FROM marketplace_payment_preparations preparation \
+                     WHERE preparation.id = o.marketplace_preparation_id \
+                       AND preparation.state = 'active' \
+                 )))) \
              GROUP BY o.creator_id ORDER BY MIN(o.next_attempt_at), o.creator_id LIMIT $2",
         )
         .bind(excluded)
@@ -331,7 +335,7 @@ impl OutboxStore {
                  ) \
                  AND ($4::UUID IS NULL OR o.creator_id = $4) \
                  AND (o.intent_kind <> 'payment_request_proposal' OR ( \
-                     o.proposal_lookup_hash IS NOT NULL AND EXISTS ( \
+                     o.proposal_lookup_hash IS NOT NULL AND (EXISTS ( \
                      SELECT 1 \
                      FROM invoices invoice \
                      JOIN lock_payment_generations generation \
@@ -340,7 +344,11 @@ impl OutboxStore {
                      WHERE invoice.id = o.invoice_id \
                        AND generation.current_generation = invoice.lock_resource_generation \
                        AND generation.active_drain_id IS NULL \
-                 ))) \
+                 ) OR EXISTS ( \
+                     SELECT 1 FROM marketplace_payment_preparations preparation \
+                     WHERE preparation.id = o.marketplace_preparation_id \
+                       AND preparation.state = 'active' \
+                 )))) \
                  ORDER BY o.next_attempt_at, o.id \
                  FOR UPDATE OF o SKIP LOCKED \
                  LIMIT $1 \
@@ -378,7 +386,7 @@ impl OutboxStore {
                  WHERE o.id = $1 AND o.status = 'leased' \
                    AND o.claim_token = $2 AND o.lease_expires_at > transaction_timestamp() \
                    AND (o.intent_kind <> 'payment_request_proposal' OR ( \
-                       o.proposal_lookup_hash IS NOT NULL AND EXISTS ( \
+                       o.proposal_lookup_hash IS NOT NULL AND (EXISTS ( \
                        SELECT 1 \
                        FROM invoices invoice \
                        JOIN lock_payment_generations generation \
@@ -387,7 +395,11 @@ impl OutboxStore {
                        WHERE invoice.id = o.invoice_id \
                          AND generation.current_generation = invoice.lock_resource_generation \
                          AND generation.active_drain_id IS NULL \
-                   ))) \
+                   ) OR EXISTS ( \
+                       SELECT 1 FROM marketplace_payment_preparations preparation \
+                       WHERE preparation.id = o.marketplace_preparation_id \
+                         AND preparation.state = 'active' \
+                   )))) \
              )",
         )
         .bind(claim.id)
@@ -411,7 +423,7 @@ impl OutboxStore {
              WHERE o.id = $1 AND o.status = 'leased' AND o.claim_token = $2 \
                AND o.lease_expires_at > $3 \
                AND (o.intent_kind <> 'payment_request_proposal' OR ( \
-                   o.proposal_lookup_hash IS NOT NULL AND EXISTS ( \
+                   o.proposal_lookup_hash IS NOT NULL AND (EXISTS ( \
                        SELECT 1 FROM invoices invoice \
                        JOIN lock_payment_generations generation \
                          ON generation.creator_id = invoice.creator_id \
@@ -419,7 +431,11 @@ impl OutboxStore {
                        WHERE invoice.id = o.invoice_id \
                          AND generation.current_generation = invoice.lock_resource_generation \
                          AND generation.active_drain_id IS NULL \
-                   )))",
+                   ) OR EXISTS ( \
+                       SELECT 1 FROM marketplace_payment_preparations preparation \
+                       WHERE preparation.id = o.marketplace_preparation_id \
+                         AND preparation.state = 'active' \
+                   ))))",
         )
         .bind(claim.id)
         .bind(claim.claim_token)

@@ -21,7 +21,9 @@ use crate::{
     bitcoin::{ObservationTarget, ObservedOutput},
     config::{BitcoinNetwork, validate_electrum_endpoint},
     domain::payment::BitcoinOutpoint,
-    persistence::{BitcoinObservationInput, InvoiceStore, PersistenceError},
+    persistence::{
+        BitcoinObservationInput, InvoiceStore, MarketplacePreparationStore, PersistenceError,
+    },
 };
 
 /// Production Electrum adapters are injected here. This boundary deliberately
@@ -247,6 +249,37 @@ pub async fn observe_once(
         .map_err(map_persistence)
 }
 
+/// Applies one fetched batch to Marketplace-owned settlements.
+pub async fn observe_marketplace_once(
+    port: &dyn ElectrumPort,
+    marketplace: &MarketplacePreparationStore,
+    network: &BitcoinNetwork,
+    targets: &[ObservationTarget],
+) -> Result<usize, ObserverError> {
+    let observations = port.observations(targets).await?;
+    let observations = validate_batch(observations, network, targets)?;
+    marketplace
+        .apply_bitcoin_observation_batch(&observations)
+        .await
+        .map_err(map_persistence)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn observe_marketplace_once_at(
+    port: &dyn ElectrumPort,
+    marketplace: &MarketplacePreparationStore,
+    network: &BitcoinNetwork,
+    targets: &[ObservationTarget],
+    observed_at: OffsetDateTime,
+) -> Result<usize, ObserverError> {
+    let observations = port.observations(targets).await?;
+    let observations = validate_batch(observations, network, targets)?;
+    marketplace
+        .apply_bitcoin_observation_batch_at(&observations, observed_at)
+        .await
+        .map_err(map_persistence)
+}
+
 #[cfg(any(test, feature = "test-utils"))]
 pub async fn observe_once_at(
     port: &dyn ElectrumPort,
@@ -330,12 +363,7 @@ fn validate_batch(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    validated.sort_by(|left, right| {
-        left.address
-            .cmp(&right.address)
-            .then_with(|| left.outpoint.txid().cmp(right.outpoint.txid()))
-            .then_with(|| left.outpoint.vout().cmp(&right.outpoint.vout()))
-    });
+    validated.sort_by(|left, right| left.cmp_for_batch(right));
     Ok(validated)
 }
 

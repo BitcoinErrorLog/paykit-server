@@ -678,8 +678,13 @@ async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
             .unwrap()
             .amount_matched
     );
+    let matched_outpoint =
+        paykit_server::domain::payment::BitcoinOutpoint::from_bitcoin(bitcoin::OutPoint::new(
+            bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros()),
+            1,
+        ));
     store
-        .apply_bitcoin_observation_at("quoted-btc-0", &outpoint, 50, 1, true, now)
+        .apply_bitcoin_observation_at("quoted-btc-0", &matched_outpoint, 50, 1, true, now)
         .await
         .unwrap();
     assert_eq!(
@@ -729,7 +734,7 @@ async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
     // Restart and independently reorg either chain; only losing both payments removes satisfaction.
     let restarted = InvoiceStore::new(database.pool(), crypto);
     restarted
-        .apply_bitcoin_observation_at("quoted-btc-0", &outpoint, 50, 0, false, now)
+        .apply_bitcoin_observation_at("quoted-btc-0", &matched_outpoint, 50, 0, false, now)
         .await
         .unwrap();
     assert_eq!(status(&restarted, &bundle).await, (true, 2));
@@ -746,7 +751,7 @@ async fn either_quoted_payment_can_settle_without_overwriting_the_other() {
         .unwrap();
     assert_eq!(status(&restarted, &bundle).await, (false, 0));
     restarted
-        .apply_bitcoin_observation_at("quoted-btc-0", &outpoint, 50, 6, true, now)
+        .apply_bitcoin_observation_at("quoted-btc-0", &matched_outpoint, 50, 6, true, now)
         .await
         .unwrap();
     assert_eq!(
