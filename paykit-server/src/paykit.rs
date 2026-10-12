@@ -1,6 +1,7 @@
 //! Concrete per-Creator Paykit SDK boundary used by durable outbox workers.
 
 mod buyer_contacts;
+mod payment_status;
 
 use std::{
     collections::HashMap,
@@ -56,6 +57,7 @@ pub struct CreatorSessionProvider {
     public_client: Pubky,
     client_id: String,
     cache: Arc<TokioMutex<Option<CachedSession>>>,
+    payment_request_refreshes: Arc<payment_status::PaymentRequestRefreshes>,
 }
 
 impl CreatorSessionProvider {
@@ -84,6 +86,7 @@ impl CreatorSessionProvider {
             public_client,
             client_id: config.client_id.to_string(),
             cache: Arc::new(TokioMutex::new(None)),
+            payment_request_refreshes: Arc::new(payment_status::PaymentRequestRefreshes::default()),
         }
     }
 }
@@ -283,6 +286,7 @@ pub struct PaykitAdapter {
     creator: CreatorPubky,
     app_id: PaykitAppId,
     mutation_lock: Arc<TokioMutex<()>>,
+    payment_request_refreshes: Arc<payment_status::PaymentRequestRefreshes>,
     usdt: Option<(InvoiceStore, crate::usdt::ArbitrumVerifier)>,
 }
 
@@ -364,13 +368,16 @@ impl PaykitAdapter {
     /// No request is claimed, accepted, or executed by the server.
     /// Lock or revision contention is deferred to the next poll; other failures take precedence.
     pub async fn maintain_transport(&self) -> paykit_sdk::Result<()> {
-        let _guard = self.mutation_lock.lock().await;
-        let peers = self.sdk.linked_peers().await?;
+        let peers = {
+            let _guard = self.mutation_lock.lock().await;
+            self.sdk.linked_peers().await?
+        };
         let mut results = Vec::new();
         for peer in peers
             .into_iter()
             .filter(|peer| peer.state == LinkedPeerState::Linked)
         {
+            let _guard = self.mutation_lock.lock().await;
             results.push(
                 self.sdk
                     .receive_private_messages(peer.counterparty)
@@ -379,9 +386,16 @@ impl PaykitAdapter {
             );
         }
         // A peer's receive failure must not prevent other peers' queued sends.
-        match self.sdk.pending_outbound_private_counterparties().await {
+        let pending = {
+            let _guard = self.mutation_lock.lock().await;
+            self.sdk.pending_outbound_private_counterparties().await
+        };
+        match pending {
             Ok(peers) => {
                 for peer in peers {
+                    // Finish an admitted peer operation before giving foreground
+                    // work the next turn on the Creator-local mutation fence.
+                    let _guard = self.mutation_lock.lock().await;
                     results.push(
                         self.sdk
                             .process_outbound_private_messages(peer)
@@ -401,6 +415,7 @@ impl PaykitAdapter {
         config: &PaykitConfig,
     ) -> Result<Self, PaykitSdkError> {
         let creator = sessions.creator.clone();
+        let payment_request_refreshes = sessions.payment_request_refreshes.clone();
         let storage = PubkySharedStateStorage::new(sessions.clone());
         let sdk = PaykitSdk::new(
             storage.clone(),
@@ -411,6 +426,7 @@ impl PaykitAdapter {
         Ok(Self {
             sdk,
             mutation_lock: creator_mutation_lock(creator_id),
+            payment_request_refreshes,
             storage,
             creator_id,
             creator,
@@ -435,7 +451,14 @@ impl PaykitAdapter {
         lifecycles: &PaymentRequestLifecycleStore,
     ) -> Result<(), LifecycleSyncError> {
         let _guard = self.mutation_lock.lock().await;
-        self.refresh_payment_requests_locked(lifecycles, None)
+        let reports = self.sdk.receive_private_messages_from_linked_peers().await;
+        let health = match reports {
+            Ok(reports) if reports.iter().all(|report| report.error.is_none()) => {
+                ReceiveHealth::Available
+            }
+            _ => ReceiveHealth::Unavailable,
+        };
+        self.project_payment_requests_locked(lifecycles, health)
             .await?;
         self.observe_usdt_requests(None).await
     }
@@ -443,11 +466,22 @@ impl PaykitAdapter {
     async fn refresh_payment_requests_locked(
         &self,
         lifecycles: &PaymentRequestLifecycleStore,
-        required_targets: Option<&[ReceiveTarget]>,
+        required_targets: &[ReceiveTarget],
     ) -> Result<(), LifecycleSyncError> {
-        let reports = self.sdk.receive_private_messages_from_linked_peers().await;
-        let receive_health =
-            receive_health_from_reports(reports.as_deref().map_err(|_| ()), required_targets);
+        let reports = receive_from_targets(required_targets, |peer| {
+            self.sdk.receive_private_messages(peer)
+        })
+        .await;
+        let receive_health = receive_health_for_required_targets(&reports, required_targets);
+        self.project_payment_requests_locked(lifecycles, receive_health)
+            .await
+    }
+
+    async fn project_payment_requests_locked(
+        &self,
+        lifecycles: &PaymentRequestLifecycleStore,
+        receive_health: ReceiveHealth,
+    ) -> Result<(), LifecycleSyncError> {
         let records = self
             .sdk
             .payment_requests()
@@ -490,15 +524,65 @@ impl PaykitAdapter {
         result
     }
 
-    /// Receives and projects fresh canonical state before returning status, all
-    /// under the same Creator-local mutation fence.
+    /// Coalesces overlapping receive for the same App and bundle.
+    /// Every caller projects current SDK state and transactionally revalidates targets
+    /// under the Creator-local mutation fence; payment status is never cached.
     pub async fn reconcile_and_lookup_payment_request_status(
         &self,
         lifecycles: &PaymentRequestLifecycleStore,
         statuses: &InvoiceStore,
         bundle_id: &BundleId,
     ) -> Result<Option<PaymentRequestStatusSummary>, PaymentRequestStatusError> {
+        let (required_targets, receive_health) = self
+            .payment_request_refreshes
+            .receive(
+                &self.app_id,
+                bundle_id,
+                Box::pin(async {
+                    let _guard = self.mutation_lock.lock().await;
+                    self.receive_payment_request_targets_locked(lifecycles, bundle_id)
+                        .await
+                }),
+            )
+            .await?;
         let _guard = self.mutation_lock.lock().await;
+        self.project_payment_requests_locked(lifecycles, receive_health)
+            .await
+            .map_err(|error| {
+                let mapped = map_lifecycle_status_error(error);
+                crate::diagnostics::failure(
+                    "payment_request_status",
+                    "paykit_reconciliation",
+                    mapped.diagnostic_label(),
+                );
+                mapped
+            })?;
+        self.observe_usdt_requests(Some(bundle_id))
+            .await
+            .map_err(map_lifecycle_status_error)?;
+        statuses
+            .payment_request_status_after_receive(
+                lifecycles,
+                &self.creator,
+                bundle_id,
+                &required_targets,
+            )
+            .await
+            .map_err(|error| {
+                crate::diagnostics::failure(
+                    "payment_request_status",
+                    "status_projection_load",
+                    error.diagnostic_label(),
+                );
+                PaymentRequestStatusError::Unavailable
+            })
+    }
+
+    async fn receive_payment_request_targets_locked(
+        &self,
+        lifecycles: &PaymentRequestLifecycleStore,
+        bundle_id: &BundleId,
+    ) -> Result<(Vec<RequiredReceiveTarget>, ReceiveHealth), PaymentRequestStatusError> {
         let required_targets = lifecycles
             .required_receive_targets_for_bundle(self.creator_id, bundle_id)
             .await
@@ -519,43 +603,12 @@ impl PaykitAdapter {
             );
             mapped
         })?;
-        refresh_then(
-            || async {
-                self.refresh_payment_requests_locked(lifecycles, Some(&parsed_targets))
-                    .await
-                    .map_err(|error| {
-                        let mapped = map_lifecycle_status_error(error);
-                        crate::diagnostics::failure(
-                            "payment_request_status",
-                            "paykit_reconciliation",
-                            mapped.diagnostic_label(),
-                        );
-                        mapped
-                    })
-            },
-            || async {
-                self.observe_usdt_requests(Some(bundle_id))
-                    .await
-                    .map_err(map_lifecycle_status_error)?;
-                statuses
-                    .payment_request_status_after_receive(
-                        lifecycles,
-                        &self.creator,
-                        bundle_id,
-                        &required_targets,
-                    )
-                    .await
-                    .map_err(|error| {
-                        crate::diagnostics::failure(
-                            "payment_request_status",
-                            "status_projection_load",
-                            error.diagnostic_label(),
-                        );
-                        PaymentRequestStatusError::Unavailable
-                    })
-            },
-        )
-        .await
+        let reports = receive_from_targets(&parsed_targets, |peer| {
+            self.sdk.receive_private_messages(peer)
+        })
+        .await;
+        let health = receive_health_for_required_targets(&reports, &parsed_targets);
+        Ok((required_targets, health))
     }
 
     /// Reconciles receive and the canonical SDK reducer before atomically
@@ -584,7 +637,7 @@ impl PaykitAdapter {
             .map_err(map_lifecycle_drain_error)?;
         let parsed_targets =
             parse_receive_targets(&required_targets).map_err(map_lifecycle_drain_error)?;
-        self.refresh_payment_requests_locked(lifecycles, Some(&parsed_targets))
+        self.refresh_payment_requests_locked(lifecycles, &parsed_targets)
             .await
             .map_err(map_lifecycle_drain_error)?;
         drains
@@ -638,23 +691,35 @@ fn receive_health_for_required_targets(
     }
 }
 
-fn receive_health_from_reports<E>(
-    reports: Result<&[PrivateStreamCounterpartyIntakeReport], E>,
-    required_targets: Option<&[ReceiveTarget]>,
-) -> ReceiveHealth {
-    match required_targets {
-        Some([]) => ReceiveHealth::Available,
-        Some(required) => reports.map_or(ReceiveHealth::Unavailable, |reports| {
-            receive_health_for_required_targets(reports, required)
-        }),
-        None => reports.map_or(ReceiveHealth::Unavailable, |reports| {
-            if reports.iter().all(|report| report.error.is_none()) {
-                ReceiveHealth::Available
-            } else {
-                ReceiveHealth::Unavailable
+async fn receive_from_targets<F, Fut>(
+    targets: &[ReceiveTarget],
+    mut receive: F,
+) -> Vec<PrivateStreamCounterpartyIntakeReport>
+where
+    F: FnMut(PubkyPublicKey) -> Fut,
+    Fut: Future<Output = paykit_sdk::Result<paykit_sdk::PrivateStreamIntakeReport>>,
+{
+    let mut reports = Vec::with_capacity(targets.len());
+    for target in targets {
+        let (report, error) = match receive(target.counterparty.clone()).await {
+            Ok(report) => (Some(report), None),
+            Err(error) => {
+                let text = error.to_string();
+                crate::diagnostics::failure(
+                    "payment_request_reconciliation",
+                    "peer_receive",
+                    classify(error).diagnostic_label(),
+                );
+                (None, Some(text))
             }
-        }),
+        };
+        reports.push(PrivateStreamCounterpartyIntakeReport {
+            counterparty: target.counterparty.clone(),
+            error,
+            report,
+        });
     }
+    reports
 }
 
 async fn project_lifecycles_after_receive<F, Fut>(
@@ -717,6 +782,7 @@ where
     refresh_then(refresh, operation).await
 }
 
+#[cfg(test)]
 async fn refresh_then<T, E, Refresh, RefreshFuture, Operation, OperationFuture>(
     refresh: Refresh,
     operation: Operation,
@@ -1438,6 +1504,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn targeted_receive_contacts_only_required_peers_and_preserves_failures() {
+        let required = [receive_target(CREATOR)];
+        for failed in [false, true] {
+            let mut calls = Vec::new();
+            let reports = receive_from_targets(&required, |peer| {
+                calls.push(peer.clone());
+                async move {
+                    if failed {
+                        Err(PaykitSdkError::Transport {
+                            context: "offline".into(),
+                            source: None,
+                        })
+                    } else {
+                        Ok(intake_report(CREATOR, None).report.unwrap())
+                    }
+                }
+            })
+            .await;
+            assert_eq!(calls, [required[0].counterparty.clone()]);
+            assert_eq!(
+                receive_health_for_required_targets(&reports, &required),
+                if failed {
+                    ReceiveHealth::Unavailable
+                } else {
+                    ReceiveHealth::Available
+                }
+            );
+        }
+    }
+
     #[test]
     fn no_required_receive_targets_ignore_unrelated_failures() {
         assert_eq!(
@@ -1446,10 +1543,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn no_required_receive_targets_ignore_top_level_receive_failure() {
+    #[tokio::test]
+    async fn no_required_receive_targets_do_not_receive() {
+        let reports = receive_from_targets(&[], |_| async {
+            panic!("empty targets must not contact peers")
+        })
+        .await;
         assert_eq!(
-            receive_health_from_reports(Err(()), Some(&[])),
+            receive_health_for_required_targets(&reports, &[]),
             ReceiveHealth::Available
         );
     }
@@ -1940,27 +2041,5 @@ mod tests {
 
         assert_eq!(result, Err(PaymentDrainError::Unavailable));
         assert_eq!(*calls.lock().unwrap(), vec!["replay", "refresh"]);
-    }
-
-    #[tokio::test]
-    async fn unavailable_required_intake_prevents_payment_request_status_lookup() {
-        let calls = Arc::new(StdMutex::new(Vec::new()));
-        let refresh_calls = calls.clone();
-        let lookup_calls = calls.clone();
-
-        let result = refresh_then(
-            move || {
-                refresh_calls.lock().unwrap().push("refresh");
-                std::future::ready(Err(PaymentRequestStatusError::Unavailable))
-            },
-            move || {
-                lookup_calls.lock().unwrap().push("lookup");
-                std::future::ready(Ok::<_, PaymentRequestStatusError>(Some(7_u8)))
-            },
-        )
-        .await;
-
-        assert_eq!(result, Err(PaymentRequestStatusError::Unavailable));
-        assert_eq!(*calls.lock().unwrap(), vec!["refresh"]);
     }
 }

@@ -56,6 +56,9 @@ mod sdk_fixtures;
 #[path = "server_workflow/connection_status.rs"]
 mod connection_status;
 
+#[path = "server_workflow/payment_status.rs"]
+mod payment_status;
+
 const MASTER_KEY: &str = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE";
 const BUNDLE_A: &str = "000G40R40M30E209185GR38E1W";
 const BUNDLE_B: &str = "000G40R40M30E209185GR38E2W";

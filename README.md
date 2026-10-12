@@ -502,10 +502,15 @@ finality. When both assets are paid, both observations remain available.
 
 Deploy this contract together with the matching Locks consumer.
 
-Before returning status, the server performs linked-peer
-receive, exact required-target freshness checks, Creator-local SDK mutation
-serialization, and transactional target revalidation. Missing, partial,
-unrelated, or failed required-peer intake returns unavailable. Exact terminal
+Before returning status, the server receives from the bundle's required
+counterparties, with exact required-target freshness checks, Creator-local SDK
+mutation serialization, and transactional target revalidation. Overlapping
+lookups for the same Creator, App, and bundle share receive work;
+each caller still projects current SDK state, looks up status, and revalidates its targets. Neither
+completed receive evidence nor payment status is cached. Missing or failed required-peer intake returns
+unavailable. Transport maintenance gives foreground work a turn between complete
+peer operations without interrupting admitted SDK work. Background lifecycle
+refresh retains bulk intake with bounded parallel inbox probes. Exact terminal
 response fixtures for Locks are published under
 `docs/fixtures/payment-request-status/`.
 
