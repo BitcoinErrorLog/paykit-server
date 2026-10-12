@@ -106,7 +106,10 @@ pub async fn hosted_sdk(access: PubkySessionAccess, app_id: &str, counter_seed: 
     sdk.publish_paykit_noise_key_authorization().await.unwrap();
     let mut backup = sdk.export_backup_state().await.unwrap();
     backup.next_outbound_private_message_id = counter_seed;
-    sdk.restore_backup_state(backup).await.unwrap();
+    // This fresh fixture has no links or private traffic after its immediate export.
+    sdk.restore_backup_state(backup, paykit_sdk::RestoredLinkPolicy::Resume)
+        .await
+        .unwrap();
     let app = if app_id == "paykit-server" {
         paykit_server::real_setup::server_app()
     } else {

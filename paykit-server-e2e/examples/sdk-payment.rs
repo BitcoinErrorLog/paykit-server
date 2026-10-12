@@ -309,6 +309,9 @@ async fn checkout(
         terms.required_app_id.as_ref().map(|id| id.as_str()) == Some("paykit-server"),
         "Unexpected payment app"
     );
+    let proposal_stream_item_id = request
+        .proposal_stream_item_id
+        .context("Request has no proposal stream item")?;
     let id = PaymentRequestId::new(request.payment_request_id.clone())?;
     let resolved = payer
         .resolve_private_payment_request(creator.clone(), &id, None)
@@ -337,7 +340,9 @@ async fn checkout(
     payer
         .claim_payment_request_for_execution(creator.clone(), &id)
         .await?;
-    payer.accept_payment_request(creator.clone(), &id).await?;
+    payer
+        .accept_payment_request(creator.clone(), &id, proposal_stream_item_id)
+        .await?;
     payer
         .process_outbound_private_messages(creator.clone())
         .await?;

@@ -6,13 +6,13 @@ lockfile=${2:-Cargo.lock}
 
 sed -i \
     -e 's#locks-core = { git = "https://github.com/pubky/locks.git", tag = "v0.1.0-rc9" }#locks-core = { path = "/build/locks/locks-core" }#' \
-    -e 's#paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", rev = "ad3c72248d18587bb5b6ef3c99b063fa9bf31551" }#paykit-lib = { path = "/build/paykit-rs/paykit-lib" }#' \
-    -e 's#paykit-sdk = { git = "https://github.com/pubky/paykit-rs.git", rev = "ad3c72248d18587bb5b6ef3c99b063fa9bf31551" }#paykit-sdk = { path = "/build/paykit-rs/paykit-sdk" }#' \
+    -e 's#paykit-lib = { git = "https://github.com/pubky/paykit-rs.git", rev = "03d4f05721e92d3944cb4d5af4b2c98c4390a5a8" }#paykit-lib = { path = "/build/paykit-rs/paykit-lib" }#' \
+    -e 's#paykit-sdk = { git = "https://github.com/pubky/paykit-rs.git", rev = "03d4f05721e92d3944cb4d5af4b2c98c4390a5a8" }#paykit-sdk = { path = "/build/paykit-rs/paykit-sdk" }#' \
     "$manifest"
 
 sed -i \
     -e '/source = "git+https:\/\/github.com\/pubky\/locks.git?tag=v0.1.0-rc9#8a954e425ebf4903c03dfc9939c21aeddf799f88"/d' \
-    -e '/source = "git+https:\/\/github.com\/pubky\/paykit-rs.git?rev=ad3c72248d18587bb5b6ef3c99b063fa9bf31551#ad3c72248d18587bb5b6ef3c99b063fa9bf31551"/d' \
+    -e '/source = "git+https:\/\/github.com\/pubky\/paykit-rs.git?rev=03d4f05721e92d3944cb4d5af4b2c98c4390a5a8#03d4f05721e92d3944cb4d5af4b2c98c4390a5a8"/d' \
     "$lockfile"
 
 grep -Fx 'locks-core = { path = "/build/locks/locks-core" }' "$manifest"
