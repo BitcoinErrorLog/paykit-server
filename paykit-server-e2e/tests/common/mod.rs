@@ -20,7 +20,16 @@ pub fn payment_intent_with_reference(
     address: String,
     reference: String,
 ) -> DeliveryIntentV1 {
-    let terms = PaymentRequestTerms::builder(
+    payment_intent_with_reference_and_note(reader, address, reference, None)
+}
+
+pub fn payment_intent_with_reference_and_note(
+    reader: &ReaderPubky,
+    address: String,
+    reference: String,
+    note: Option<&str>,
+) -> DeliveryIntentV1 {
+    let mut terms = PaymentRequestTerms::builder(
         PaymentAmount::new("0.00000100", "btc").unwrap(),
         PaymentReference::new(reference).unwrap(),
         vec![PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap()],
@@ -29,8 +38,13 @@ pub fn payment_intent_with_reference(
     .payment_endpoints(Some(HashMap::from([(
         PaymentEndpointIdentifier::new("btc-bitcoin-p2wpkh").unwrap(),
         PaymentEndpointPayload::new(serde_json::json!({"value": address}).to_string()),
-    )])))
-    .build()
-    .unwrap();
+    )])));
+    if let Some(note) = note {
+        terms = terms.metadata(serde_json::Map::from_iter([(
+            "note".into(),
+            serde_json::Value::String(note.into()),
+        )]));
+    }
+    let terms = terms.build().unwrap();
     DeliveryIntentV1::payment_request(reader.to_string(), app_id(), &terms).unwrap()
 }

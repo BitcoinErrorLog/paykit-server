@@ -102,6 +102,7 @@ fn request(window: u64) -> PrepareMarketplaceRequest {
         amount_sats: 50_000,
         operation_id: "marketplace-payment:order-1:attempt-1".into(),
         payment_window_seconds: window,
+        description: None,
     }
 }
 
@@ -267,6 +268,8 @@ struct FakeStore {
     preflight_calls: AtomicUsize,
     prepare_calls: AtomicUsize,
     captured_reference: Mutex<Option<String>>,
+    captured_metadata: Mutex<Option<serde_json::Map<String, serde_json::Value>>>,
+    captured_binding: Mutex<Option<Vec<u8>>>,
 }
 
 impl FakeStore {
@@ -277,6 +280,8 @@ impl FakeStore {
             preflight_calls: AtomicUsize::default(),
             prepare_calls: AtomicUsize::default(),
             captured_reference: Mutex::new(None),
+            captured_metadata: Mutex::new(None),
+            captured_binding: Mutex::new(None),
         }
     }
 
@@ -287,6 +292,8 @@ impl FakeStore {
             preflight_calls: AtomicUsize::default(),
             prepare_calls: AtomicUsize::default(),
             captured_reference: Mutex::new(None),
+            captured_metadata: Mutex::new(None),
+            captured_binding: Mutex::new(None),
         }
     }
 }
@@ -297,9 +304,10 @@ impl MarketplacePreparationPersistence for FakeStore {
         &self,
         _creator: &CreatorPubky,
         _operation_id: &str,
-        _request_binding: &[u8],
+        request_binding: &[u8],
     ) -> Result<MarketplacePreparationPreflight, PersistenceError> {
         self.preflight_calls.fetch_add(1, Ordering::SeqCst);
+        *self.captured_binding.lock().unwrap() = Some(request_binding.to_vec());
         Ok(self.preflight)
     }
 
@@ -319,6 +327,14 @@ impl MarketplacePreparationPersistence for FakeStore {
                     .terms()
                     .unwrap()
                     .payment_reference
+                    .clone(),
+            );
+            *self.captured_metadata.lock().unwrap() = Some(
+                payloads
+                    .payment_request_intent
+                    .terms()
+                    .unwrap()
+                    .metadata
                     .clone(),
             );
         }
@@ -480,6 +496,127 @@ async fn new_preparation_validates_dependencies_and_builds_caller_reference() {
         deps.store.captured_reference.lock().unwrap().as_deref(),
         Some(REFERENCE)
     );
+    assert_eq!(
+        deps.store.captured_metadata.lock().unwrap().as_ref(),
+        Some(&serde_json::Map::new())
+    );
+}
+
+#[tokio::test]
+async fn omitted_description_keeps_exact_legacy_binding() {
+    let deps = service(MarketplacePreparationPreflight::New);
+    deps.service.prepare(request(86_400)).await.unwrap();
+
+    let expected = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "amount_sats": 50_000,
+        "creator": CREATOR,
+        "operation_id": "marketplace-payment:order-1:attempt-1",
+        "payment_window_seconds": 86_400,
+        "reader": reader(),
+        "reference": REFERENCE,
+    }))
+    .unwrap();
+    assert_eq!(
+        deps.store.captured_binding.lock().unwrap().as_deref(),
+        Some(expected.as_slice())
+    );
+}
+
+#[tokio::test]
+async fn present_description_is_bound_and_copied_exactly_to_note_metadata() {
+    let deps = service(MarketplacePreparationPreflight::New);
+    let mut described = request(86_400);
+    described.description = Some("Café order 🛒".into());
+    deps.service.prepare(described).await.unwrap();
+
+    let binding: serde_json::Value = serde_json::from_slice(
+        deps.store
+            .captured_binding
+            .lock()
+            .unwrap()
+            .as_deref()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(binding["description"], "Café order 🛒");
+    assert_eq!(
+        deps.store.captured_metadata.lock().unwrap().as_ref(),
+        Some(&serde_json::Map::from_iter([(
+            "note".into(),
+            serde_json::Value::String("Café order 🛒".into()),
+        )]))
+    );
+
+    let replay = service(MarketplacePreparationPreflight::ExactReplay);
+    let mut same = request(86_400);
+    same.description = Some("Café order 🛒".into());
+    assert!(replay.service.prepare(same).await.unwrap().replayed());
+    assert_eq!(replay.session.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(replay.store.prepare_calls.load(Ordering::SeqCst), 1);
+    assert!(replay.store.captured_metadata.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn description_validation_uses_unicode_scalars_and_rejects_unsafe_text() {
+    let valid = ["é".repeat(140), "商品 42 🛒".into()];
+    for description in valid {
+        let deps = service(MarketplacePreparationPreflight::New);
+        let mut candidate = request(86_400);
+        candidate.description = Some(description.clone());
+        assert!(
+            deps.service.prepare(candidate).await.is_ok(),
+            "valid description rejected: {description:?}"
+        );
+    }
+
+    let invalid = [
+        String::new(),
+        " \t\n".into(),
+        "a".repeat(141),
+        "control\u{0000}".into(),
+        "direction\u{061c}".into(),
+        "direction\u{200e}".into(),
+        "direction\u{202a}".into(),
+        "direction\u{2066}".into(),
+        "line\u{2028}separator".into(),
+        "paragraph\u{2029}separator".into(),
+    ];
+    for description in invalid {
+        let deps = service(MarketplacePreparationPreflight::New);
+        let mut candidate = request(86_400);
+        candidate.description = Some(description);
+        assert_eq!(
+            deps.service.prepare(candidate).await,
+            Err(PrepareMarketplaceError::InvalidRequest)
+        );
+        assert_eq!(deps.store.prepare_calls.load(Ordering::SeqCst), 0);
+    }
+
+    let deps = service(MarketplacePreparationPreflight::New);
+    let mut oversized = request(86_400);
+    oversized.description = Some("🛒".repeat(140));
+    assert_eq!(
+        deps.service.prepare(oversized).await,
+        Err(PrepareMarketplaceError::InvalidRequest),
+        "scalar-valid descriptions must still fit the actual serialized Payment Request frame"
+    );
+    assert_eq!(deps.store.prepare_calls.load(Ordering::SeqCst), 1);
+    assert!(deps.store.captured_metadata.lock().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn changed_description_conflicts_before_mutable_dependencies() {
+    let deps = service(MarketplacePreparationPreflight::Conflict);
+    let mut changed = request(86_400);
+    changed.description = Some("changed".into());
+
+    assert_eq!(
+        deps.service.prepare(changed).await,
+        Err(PrepareMarketplaceError::Conflict)
+    );
+    assert_eq!(deps.session.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(deps.registries.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(deps.credentials.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -779,6 +916,15 @@ fn body(extra: bool) -> Vec<u8> {
     serde_json_canonicalizer::to_vec(&value).unwrap()
 }
 
+fn body_with_description(description: serde_json::Value) -> Vec<u8> {
+    let mut value: serde_json::Value = serde_json::from_slice(&body(false)).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("description".into(), description);
+    serde_json_canonicalizer::to_vec(&value).unwrap()
+}
+
 fn signed_request(key: &SigningKey, body: Vec<u8>) -> Request<Body> {
     let preimage = signature_preimage("POST", PATH, &body);
     Request::builder()
@@ -821,6 +967,39 @@ async fn signed_prepare_route_has_closed_request_and_response() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn signed_prepare_route_distinguishes_omitted_description_from_null_and_wrong_type() {
+    let key = SigningKey::from_bytes(&[11; 32]);
+    let deps = service(MarketplacePreparationPreflight::New);
+    let router = marketplace_preparation_router(deps.service).layer(Extension(signed_auth(&key)));
+
+    let valid = router
+        .clone()
+        .oneshot(signed_request(
+            &key,
+            body_with_description(serde_json::json!("Café order 🛒")),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(valid.status(), StatusCode::OK);
+
+    let omitted = router
+        .clone()
+        .oneshot(signed_request(&key, body(false)))
+        .await
+        .unwrap();
+    assert_eq!(omitted.status(), StatusCode::OK);
+
+    for invalid in [serde_json::Value::Null, serde_json::json!(42)] {
+        let response = router
+            .clone()
+            .oneshot(signed_request(&key, body_with_description(invalid)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }
 
 #[tokio::test]

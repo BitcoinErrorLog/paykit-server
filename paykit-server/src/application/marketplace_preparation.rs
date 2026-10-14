@@ -39,6 +39,7 @@ pub struct PrepareMarketplaceRequest {
     pub amount_sats: u64,
     pub operation_id: String,
     pub payment_window_seconds: u64,
+    pub description: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,6 +317,7 @@ impl PrepareMarketplaceService {
             reader: &request.reader,
             reference: &request.reference,
             amount_sats: request.amount_sats,
+            description: request.description.as_deref(),
             app_id: &self.app_id,
             bitcoin_network: &self.bitcoin_network,
             xpub: &bitcoin.xpub,
@@ -349,6 +351,9 @@ impl PrepareMarketplaceService {
 }
 
 type MarketplaceOperationLock = tokio::sync::Mutex<()>;
+
+const MAX_RFC3339_PROPOSAL_EXPIRES_AT: &str = "9999-12-31T23:59:59.999999998Z";
+const MAX_RFC3339_PAYMENT_DEADLINE: &str = "9999-12-31T23:59:59.999999999Z";
 
 fn marketplace_operation_lock(
     creator: &CreatorPubky,
@@ -386,6 +391,7 @@ struct MarketplacePayloads<'a> {
     reader: &'a ReaderPubky,
     reference: &'a str,
     amount_sats: u64,
+    description: Option<&'a str>,
     app_id: &'a PaykitAppId,
     bitcoin_network: &'a BitcoinNetwork,
     xpub: &'a str,
@@ -411,7 +417,7 @@ impl MarketplacePreparationPayloadFactory for MarketplacePayloads<'_> {
             self.amount_sats / 100_000_000,
             self.amount_sats % 100_000_000
         );
-        let terms = PaymentRequestTerms::builder(
+        let mut terms = PaymentRequestTerms::builder(
             PaymentAmount::new(amount, "btc").map_err(|_| PersistenceError::InvalidInput)?,
             PaymentReference::new(self.reference.to_owned())
                 .map_err(|_| PersistenceError::InvalidInput)?,
@@ -421,12 +427,27 @@ impl MarketplacePreparationPayloadFactory for MarketplacePayloads<'_> {
         .payment_endpoints(Some(HashMap::from([(
             endpoint,
             PaymentEndpointPayload::new(serde_json::json!({"value": address}).to_string()),
-        )])))
-        .build()
-        .map_err(|_| PersistenceError::InvalidInput)?;
+        )])));
+        if let Some(description) = self.description {
+            terms = terms.metadata(serde_json::Map::from_iter([(
+                "note".into(),
+                serde_json::Value::String(description.to_owned()),
+            )]));
+        }
+        let terms = terms.build().map_err(|_| PersistenceError::InvalidInput)?;
         let intent =
             DeliveryIntentV1::payment_request(self.reader.to_string(), self.app_id.clone(), &terms)
                 .map_err(|_| PersistenceError::InvalidInput)?;
+        // Activation owns real deadline selection. Check its largest possible RFC 3339
+        // shape now so no prepared invoice can later fail only because deadlines grow
+        // the outbound Payment Request past the Noise frame.
+        let mut final_shape = intent.clone();
+        final_shape
+            .set_deadlines(
+                MAX_RFC3339_PROPOSAL_EXPIRES_AT.into(),
+                MAX_RFC3339_PAYMENT_DEADLINE.into(),
+            )
+            .map_err(|_| PersistenceError::InvalidInput)?;
         Ok(MarketplacePreparationPayloads {
             payment_request_intent: intent,
         })
@@ -449,6 +470,15 @@ fn validate_request(
     {
         return Err(PrepareMarketplaceError::InvalidRequest);
     }
+    if request.description.as_deref().is_some_and(|description| {
+        description.trim().is_empty()
+            || description.chars().count() > 140
+            || description
+                .chars()
+                .any(|character| character.is_control() || is_direction_control(character))
+    }) {
+        return Err(PrepareMarketplaceError::InvalidRequest);
+    }
     PaymentReference::new(request.reference.clone())
         .map_err(|_| PrepareMarketplaceError::InvalidRequest)?;
     Ok(())
@@ -457,15 +487,35 @@ fn validate_request(
 fn request_binding(
     request: &PrepareMarketplaceRequest,
 ) -> Result<Vec<u8>, PrepareMarketplaceError> {
-    serde_json_canonicalizer::to_vec(&serde_json::json!({
+    let mut binding = serde_json::json!({
         "amount_sats": request.amount_sats,
         "creator": request.creator.to_string(),
         "operation_id": request.operation_id,
         "payment_window_seconds": request.payment_window_seconds,
         "reader": request.reader.to_string(),
         "reference": request.reference,
-    }))
-    .map_err(|_| PrepareMarketplaceError::InvalidRequest)
+    });
+    if let Some(description) = &request.description {
+        binding
+            .as_object_mut()
+            .expect("static request binding is an object")
+            .insert(
+                "description".into(),
+                serde_json::Value::String(description.clone()),
+            );
+    }
+    serde_json_canonicalizer::to_vec(&binding).map_err(|_| PrepareMarketplaceError::InvalidRequest)
+}
+
+fn is_direction_control(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 fn endpoint_identifier(network: &BitcoinNetwork) -> &'static str {

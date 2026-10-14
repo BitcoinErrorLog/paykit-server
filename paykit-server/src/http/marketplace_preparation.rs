@@ -7,7 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use time::format_description::well_known::Rfc3339;
 
 use crate::{
@@ -26,6 +26,15 @@ struct PrepareBody {
     amount_sats: u64,
     operation_id: String,
     payment_window_seconds: u64,
+    #[serde(default, deserialize_with = "deserialize_present_description")]
+    description: Option<String>,
+}
+
+fn deserialize_present_description<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Serialize)]
@@ -93,6 +102,7 @@ fn parse(body: PrepareBody) -> Result<PrepareMarketplaceRequest, ApiError> {
         amount_sats: body.amount_sats,
         operation_id: body.operation_id,
         payment_window_seconds: body.payment_window_seconds,
+        description: body.description,
     })
 }
 

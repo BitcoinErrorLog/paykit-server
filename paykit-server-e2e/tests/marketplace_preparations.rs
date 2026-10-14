@@ -1,8 +1,19 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use paykit_sdk::PaykitIdentitySecretKey;
 use paykit_server::{
-    application::semantic_intent::DeliveryIntentV1,
+    application::{
+        create_invoice::{
+            AppRegistryDiscovery, CreatorReceivingProvider, ReaderAuthorization,
+            RegistryDiscoveryError, SessionValidationError, SessionValidator,
+        },
+        marketplace_preparation::{
+            PrepareMarketplaceError, PrepareMarketplaceRequest, PrepareMarketplaceService,
+        },
+        semantic_intent::DeliveryIntentV1,
+    },
+    config::BitcoinNetwork,
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
     persistence::{
@@ -61,6 +72,73 @@ fn crypto() -> Arc<Crypto> {
     Arc::new(Crypto::from_master_key(&[7; 32]).unwrap())
 }
 
+struct ReadySession;
+
+#[async_trait]
+impl SessionValidator for ReadySession {
+    async fn validate(&self, _creator: &CreatorPubky) -> Result<(), SessionValidationError> {
+        Ok(())
+    }
+}
+
+struct ReadyRegistry;
+
+#[async_trait]
+impl AppRegistryDiscovery for ReadyRegistry {
+    async fn discover(
+        &self,
+        _reader: &ReaderPubky,
+    ) -> Result<Option<paykit_lib::PaykitAppRegistry>, RegistryDiscoveryError> {
+        let mut registry = paykit_lib::PaykitAppRegistry::new(Some(
+            paykit_lib::derive_paykit_noise_public_key(&[8; 32]),
+        ));
+        registry
+            .register_app(
+                paykit_lib::PaykitAppId::new("bitkit").unwrap(),
+                paykit_lib::PaykitApp::new(
+                    "Bitkit",
+                    paykit_lib::PaykitAppCapabilities {
+                        private_payments: false,
+                        payment_requests: true,
+                        receipts: false,
+                        outgoing_payments: true,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        Ok(Some(registry))
+    }
+
+    async fn authorization(
+        &self,
+        _reader: &ReaderPubky,
+    ) -> Result<ReaderAuthorization, RegistryDiscoveryError> {
+        Ok(ReaderAuthorization::Verified)
+    }
+}
+
+fn account_xpub() -> String {
+    use bitcoin::{
+        Network,
+        bip32::{ChildNumber, Xpriv, Xpub},
+        secp256k1::Secp256k1,
+    };
+    let secp = Secp256k1::new();
+    let account = Xpriv::new_master(Network::Bitcoin, &[42; 32])
+        .unwrap()
+        .derive_priv(
+            &secp,
+            &[
+                ChildNumber::from_hardened_idx(84).unwrap(),
+                ChildNumber::from_hardened_idx(0).unwrap(),
+                ChildNumber::from_hardened_idx(0).unwrap(),
+            ],
+        )
+        .unwrap();
+    Xpub::from_priv(&secp, &account).to_string()
+}
+
 fn parse_rfc3339(value: &str) -> OffsetDateTime {
     OffsetDateTime::parse(value, &Rfc3339).unwrap()
 }
@@ -74,6 +152,10 @@ fn rfc3339_timestamp_equality_preserves_fractional_instants() {
 }
 
 struct Payloads;
+
+struct DescribedPayloads {
+    note: Option<&'static str>,
+}
 
 #[derive(Serialize, Deserialize)]
 struct StoredPreparationEnvelopeV1 {
@@ -106,6 +188,22 @@ impl MarketplacePreparationPayloadFactory for Payloads {
     }
 }
 
+impl MarketplacePreparationPayloadFactory for DescribedPayloads {
+    fn for_child_index(
+        &self,
+        child_index: i64,
+    ) -> Result<MarketplacePreparationPayloads, PersistenceError> {
+        Ok(MarketplacePreparationPayloads {
+            payment_request_intent: common::payment_intent_with_reference_and_note(
+                &reader(),
+                format!("marketplace-address-{child_index}"),
+                "7cceb26d-9042-4ea6-bfcb-01bbd778d76e".into(),
+                self.note,
+            ),
+        })
+    }
+}
+
 async fn store(database: &TestDatabase) -> MarketplacePreparationStore {
     run_migrations(database.pool()).await.unwrap();
     create_creator(database, creator(), "session-secret", 9).await;
@@ -124,13 +222,96 @@ async fn create_creator(
             session_secret.into(),
             PaykitIdentitySecretKey::new([key_byte; 32], 1).unwrap(),
             Some(paykit_server::domain::receiving::BitcoinAccount {
-                xpub: "xpub-secret".to_owned().into(),
+                xpub: account_xpub().into(),
                 account_index: 0,
             }),
             None,
         ))
         .await
         .unwrap();
+}
+
+async fn preparation_service(database: &TestDatabase) -> PrepareMarketplaceService {
+    let store = Arc::new(store(database).await);
+    let credentials: Arc<dyn CreatorReceivingProvider> =
+        Arc::new(CreatorStore::new(database.pool(), crypto()));
+    PrepareMarketplaceService::new(
+        Arc::new(ReadySession),
+        Arc::new(ReadyRegistry),
+        credentials,
+        store,
+        paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        BitcoinNetwork::Mainnet,
+        std::time::Duration::from_secs(24 * 60 * 60),
+        std::time::Duration::from_secs(15 * 60),
+    )
+}
+
+fn application_request(description: String, operation_id: &str) -> PrepareMarketplaceRequest {
+    PrepareMarketplaceRequest {
+        creator: creator(),
+        reader: reader(),
+        reference: "7cceb26d-9042-4ea6-bfcb-01bbd778d76e".into(),
+        amount_sats: 100,
+        operation_id: operation_id.into(),
+        payment_window_seconds: 24 * 60 * 60,
+        description: Some(description),
+    }
+}
+
+#[tokio::test]
+async fn final_frame_capacity_is_checked_before_preparation_persists() {
+    let database = TestDatabase::create().await;
+    let service = preparation_service(&database).await;
+
+    assert_eq!(
+        service
+            .prepare(application_request(
+                "🛒".repeat(83),
+                "marketplace-payment:deadline-overflow:attempt-1",
+            ))
+            .await,
+        Err(PrepareMarketplaceError::InvalidRequest)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM marketplace_payment_preparations")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT next_child_index FROM creators")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        0
+    );
+
+    let prepared = service
+        .prepare(application_request(
+            "🛒".repeat(82),
+            "marketplace-payment:deadline-fit:attempt-1",
+        ))
+        .await
+        .unwrap();
+    let creator = creator();
+    let stored = stored_preparation_envelope(&database, &creator, prepared.invoice_id()).await;
+    let stored_terms = stored.payment_request_intent.terms().unwrap();
+    assert!(stored_terms.proposal_expires_at.is_none());
+    assert!(stored_terms.payment_deadline.is_none());
+    let activated = MarketplacePreparationStore::new(database.pool(), crypto())
+        .activate(MarketplaceActivationInput {
+            creator: &creator,
+            invoice_id: prepared.invoice_id(),
+            total_sats: 100,
+            proposal_acceptance_window: std::time::Duration::from_nanos(999_999_999),
+        })
+        .await
+        .unwrap();
+    assert!(activated.is_some());
+
+    database.cleanup().await;
 }
 
 async fn wait_for_lock_waiters(database: &TestDatabase, minimum: i64) {
@@ -198,6 +379,120 @@ fn input_with_ttl_and_window<'a>(
         prepare_ttl_seconds,
         payloads: &Payloads,
     }
+}
+
+fn input_with_payloads<'a>(
+    creator: &'a CreatorPubky,
+    reader: &'a ReaderPubky,
+    operation_id: &'a str,
+    request_binding: &'a [u8],
+    payloads: &'a dyn MarketplacePreparationPayloadFactory,
+) -> MarketplacePreparationInput<'a> {
+    MarketplacePreparationInput {
+        payloads,
+        ..input(creator, reader, operation_id, request_binding)
+    }
+}
+
+async fn stored_preparation_envelope(
+    database: &TestDatabase,
+    creator: &CreatorPubky,
+    invoice_id: uuid::Uuid,
+) -> StoredPreparationEnvelopeV1 {
+    let encrypted: Vec<u8> = sqlx::query_scalar(
+        "SELECT preparation_envelope FROM marketplace_payment_preparations WHERE id = $1",
+    )
+    .bind(invoice_id)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let crypto = crypto();
+    let context = EnvelopeContext::marketplace_preparation(
+        crypto.lookup_hash(creator.to_string().as_bytes()),
+        invoice_id,
+    );
+    let plaintext = crypto
+        .decrypt(&context, &EncryptedEnvelope::from_bytes(encrypted))
+        .unwrap();
+    postcard::from_bytes(&plaintext).unwrap()
+}
+
+#[tokio::test]
+async fn description_note_is_persisted_exactly_and_replay_keeps_original_intent() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let described = DescribedPayloads {
+        note: Some("Café order 🛒"),
+    };
+    let omitted = DescribedPayloads { note: None };
+
+    let first = store
+        .prepare(input_with_payloads(
+            &creator,
+            &reader,
+            "marketplace-payment:description:attempt-1",
+            b"described-request",
+            &described,
+        ))
+        .await
+        .unwrap();
+    let stored = stored_preparation_envelope(&database, &creator, first.invoice_id()).await;
+    assert_eq!(
+        stored.payment_request_intent.terms().unwrap().metadata,
+        serde_json::Map::from_iter([(
+            "note".into(),
+            serde_json::Value::String("Café order 🛒".into()),
+        )])
+    );
+
+    let replay = store
+        .prepare(input_with_payloads(
+            &creator,
+            &reader,
+            "marketplace-payment:description:attempt-1",
+            b"described-request",
+            &omitted,
+        ))
+        .await
+        .unwrap();
+    assert!(replay.replayed());
+    assert_eq!(replay.invoice_id(), first.invoice_id());
+    let replayed = stored_preparation_envelope(&database, &creator, replay.invoice_id()).await;
+    assert_eq!(
+        replayed.payment_request_intent,
+        stored.payment_request_intent
+    );
+
+    let legacy = store
+        .prepare(input_with_payloads(
+            &creator,
+            &reader,
+            "marketplace-payment:description:attempt-2",
+            b"legacy-request",
+            &omitted,
+        ))
+        .await
+        .unwrap();
+    let legacy = stored_preparation_envelope(&database, &creator, legacy.invoice_id()).await;
+    assert!(
+        legacy
+            .payment_request_intent
+            .terms()
+            .unwrap()
+            .metadata
+            .is_empty()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM marketplace_payment_preparations")
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        2
+    );
+
+    database.cleanup().await;
 }
 
 #[tokio::test]

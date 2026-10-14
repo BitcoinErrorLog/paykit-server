@@ -28,9 +28,12 @@ Request:
   "reference": "<payment reference>",
   "amount_sats": 1,
   "operation_id": "marketplace-payment:<payment_reference>:<bind_attempt>",
-  "payment_window_seconds": 86400
+  "payment_window_seconds": 86400,
+  "description": "Pubky Shop order 8F3A91"
 }
 ```
+
+`description` is optional. Omission preserves the original six-field request binding and Payment Request terms.
 
 Success `200`:
 
@@ -59,6 +62,8 @@ Accepted behavior:
 12. Retry only a cleanly missing Reader App Registry, with three total reads and the shared full-jitter delay policy. Exhausted absence remains `reader_setup_pending`; malformed and unavailable reads keep their distinct errors.
 13. A seller without Bitcoin receiving details returns `503 seller_setup_pending`, distinct from malformed buyer input and Reader setup.
 14. PostgreSQL Creator-row locking and the post-lock operation read serialize commits across processes. The process-local operation mutex only suppresses duplicate external reads within one server process; it is not a horizontal-replica persistence fence.
+15. An optional `description` is an immutable part of the request binding and is copied exactly to Payment Request `metadata.note`. It must contain 1–140 Unicode scalar values and cannot be blank, contain control or bidi direction-control characters, or contain Unicode line/paragraph separators. Explicit `null` and non-string values are invalid; accepted text is not trimmed, normalized, or truncated.
+16. A scalar-valid description must also fit in the actual complete serialized Payment Request under the pinned Pubky Noise frame. Oversized requests return `400 invalid_request` before persistence. There is no guessed fixed UTF-8 description limit or description-free retry.
 
 ## Activation and void contract — current implementation slice
 
