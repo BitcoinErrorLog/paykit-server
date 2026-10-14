@@ -1465,15 +1465,15 @@ async fn android_bitkit_button_targets_the_configured_bitkit_package() {
 
         // The plain link stays the default href; the intent URL is an escaped attribute value.
         assert!(markup.contains(&format!(
-            "<a class=\"bitkit-btn\" href=\"{plain_href}\" data-android-href=\"intent://signin_grant?secret=mock&amp;label=&#39;%22%3E%3C/script%3E;end&amp;x-bitkit-claim=watch-only-account-v1#Intent;scheme=pubkyauth;package={package};end\">Continue with Bitkit</a></main>"
+            "<a class=\"bitkit-btn\" href=\"{plain_href}\" data-android-href=\"intent://signin_grant?secret=mock&amp;label=&#39;%22%3E%3C/script%3E;end&amp;x-bitkit-claim=watch-only-account-v1#Intent;scheme=pubkyauth;package={package};end\" data-ios-href=\"bitkit://pubky-auth/setup?secret=mock&amp;label=&#39;%22%3E%3C/script%3E;end&amp;x-bitkit-claim=watch-only-account-v1\">Continue with Bitkit</a></main>"
         )));
         assert_eq!(qr_markup(&shell), qr_markup(&without_network));
         assert_eq!(shell.matches("<script>").count(), 1);
         assert_eq!(shell.matches("</script>").count(), 1);
         assert!(script.contains(
-            "if(bitkitButton.dataset.androidHref&&/Android/i.test(navigator.userAgent)){bitkitButton.href=bitkitButton.dataset.androidHref;}"
+            "if(bitkitButton.dataset.androidHref&&/Android/i.test(userAgent)){bitkitButton.href=bitkitButton.dataset.androidHref;}else if(bitkitButton.dataset.iosHref&&(/iPhone|iPad|iPod/i.test(userAgent)||(/Macintosh/i.test(userAgent)&&navigator.maxTouchPoints>1))){bitkitButton.href=bitkitButton.dataset.iosHref;}"
         ));
-        for forbidden in ["intent://", "pubkyauth", "secret=mock"] {
+        for forbidden in ["intent://", "bitkit://", "pubkyauth", "secret=mock"] {
             assert!(
                 !script.contains(forbidden),
                 "setup script contained forbidden value {forbidden}"
@@ -1501,22 +1501,23 @@ async fn android_reconnect_targets_bitkit_and_keeps_the_paykit_only_qr() {
     .await;
 
     assert!(with_network.contains(
-        "<a class=\"bitkit-btn\" href=\"pubkyauth://signin_grant?x-bitkit-claim=paykit-access-v1\" data-android-href=\"intent://signin_grant?x-bitkit-claim=paykit-access-v1#Intent;scheme=pubkyauth;package=to.bitkit.tnet;end\">Continue with Bitkit</a>"
+        "<a class=\"bitkit-btn\" href=\"pubkyauth://signin_grant?x-bitkit-claim=paykit-access-v1\" data-android-href=\"intent://signin_grant?x-bitkit-claim=paykit-access-v1#Intent;scheme=pubkyauth;package=to.bitkit.tnet;end\" data-ios-href=\"bitkit://pubky-auth/setup?x-bitkit-claim=paykit-access-v1\">Continue with Bitkit</a>"
     ));
     assert_eq!(
         with_network
             .matches("x-bitkit-claim=paykit-access-v1")
             .count(),
-        2
+        3
     );
     assert!(!with_network.contains("watch-only-account-v1"));
     assert_eq!(qr_markup(&with_network), qr_markup(&without_network));
 }
 
 #[tokio::test]
-async fn bitkit_button_keeps_only_the_plain_link_without_an_android_package() {
+async fn bitkit_button_has_no_android_link_without_an_android_package() {
     let grant_url = "pubkyauth://signin_grant?secret=mock&x-bitkit-claim=watch-only-account-v1";
-    let plain_anchor = "<a class=\"bitkit-btn\" href=\"pubkyauth://signin_grant?secret=mock&amp;x-bitkit-claim=watch-only-account-v1\">Continue with Bitkit</a>";
+    // The iOS handoff needs no package: Bitkit iOS registers `bitkit` on every network.
+    let plain_anchor = "<a class=\"bitkit-btn\" href=\"pubkyauth://signin_grant?secret=mock&amp;x-bitkit-claim=watch-only-account-v1\" data-ios-href=\"bitkit://pubky-auth/setup?secret=mock&amp;x-bitkit-claim=watch-only-account-v1\">Continue with Bitkit</a>";
     for service in [
         service_with_authorization_url(grant_url),
         service_with_authorization_url(grant_url).with_bitcoin_network(BitcoinNetwork::Signet),
@@ -1535,6 +1536,7 @@ async fn bitkit_button_keeps_only_the_plain_link_without_an_android_package() {
         "<a class=\"bitkit-btn\" href=\"pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;\">Continue with Bitkit</a>"
     ));
     assert!(!shell.contains("data-android-href"));
+    assert!(!shell.contains("data-ios-href"));
     assert!(!shell.contains("intent://"));
 }
 

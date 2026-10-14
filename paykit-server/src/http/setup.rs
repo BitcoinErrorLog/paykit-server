@@ -141,10 +141,13 @@ fn iframe_response(flow: StartedFlow, bitcoin_network: Option<&BitcoinNetwork>) 
         .and_then(|package| bitkit_android_intent_url(&flow.authorization_url, package))
         .map(|intent_url| format!(" data-android-href=\"{}\"", html_for_text(&intent_url)))
         .unwrap_or_default();
+    let ios_href = bitkit_ios_setup_url(&flow.authorization_url)
+        .map(|setup_url| format!(" data-ios-href=\"{}\"", html_for_text(&setup_url)))
+        .unwrap_or_default();
     let qr_svg = render_authorization_qr_svg(&flow.authorization_url);
     let css = SETUP_CSS;
     let shell = format!(
-        "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{css}</style><main><span class=\"qr\" data-testid=\"paykit-auth-qr\">{qr_svg}</span><a class=\"bitkit-btn\" href=\"{authorization_url}\"{android_href}>Continue with Bitkit</a></main><script>\nconst bitkitButton=document.querySelector('.bitkit-btn');if(bitkitButton.dataset.androidHref&&/Android/i.test(navigator.userAgent)){{bitkitButton.href=bitkitButton.dataset.androidHref;}}\nconst flowId={flow_id};const state={state};const targetOrigin={origin};\nconst retryable=new Set([408,425,429,502,503,504]);let delay=500;\nasync function poll(){{try{{const response=await fetch('/setup/'+flowId+'/complete',{{method:'POST'}});if(response.status===200){{window.parent.postMessage({{type:'paykit-setup-callback',state}},targetOrigin);return;}}if(!retryable.has(response.status)){{window.parent.postMessage({{type:'paykit-setup-callback',state,error:'setup-failed'}},targetOrigin);return;}}}}catch(_error){{}}setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script>"
+        "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{css}</style><main><span class=\"qr\" data-testid=\"paykit-auth-qr\">{qr_svg}</span><a class=\"bitkit-btn\" href=\"{authorization_url}\"{android_href}{ios_href}>Continue with Bitkit</a></main><script>\nconst bitkitButton=document.querySelector('.bitkit-btn');const userAgent=navigator.userAgent;if(bitkitButton.dataset.androidHref&&/Android/i.test(userAgent)){{bitkitButton.href=bitkitButton.dataset.androidHref;}}else if(bitkitButton.dataset.iosHref&&(/iPhone|iPad|iPod/i.test(userAgent)||(/Macintosh/i.test(userAgent)&&navigator.maxTouchPoints>1))){{bitkitButton.href=bitkitButton.dataset.iosHref;}}\nconst flowId={flow_id};const state={state};const targetOrigin={origin};\nconst retryable=new Set([408,425,429,502,503,504]);let delay=500;\nasync function poll(){{try{{const response=await fetch('/setup/'+flowId+'/complete',{{method:'POST'}});if(response.status===200){{window.parent.postMessage({{type:'paykit-setup-callback',state}},targetOrigin);return;}}if(!retryable.has(response.status)){{window.parent.postMessage({{type:'paykit-setup-callback',state,error:'setup-failed'}},targetOrigin);return;}}}}catch(_error){{}}setTimeout(poll,delay);delay=Math.min(delay*2,5000);}}setTimeout(poll,delay);\n</script>"
     );
     let mut response = Response::new(Body::from(shell));
     *response.status_mut() = StatusCode::OK;
@@ -236,6 +239,35 @@ fn bitkit_android_intent_url(authorization_url: &str, package: &str) -> Option<S
             .is_some_and(|host| BITKIT_PUBKYAUTH_HOSTS.contains(&host));
     canonical_grant
         .then(|| format!("intent://{rest}#Intent;scheme=pubkyauth;package={package};end"))
+}
+
+const BITKIT_SETUP_GRANT_PREFIX: &str = "pubkyauth://signin_grant?";
+
+/// Bitkit iOS's own setup handoff, `bitkit://pubky-auth/setup?<query>`, for a companion setup grant.
+///
+/// iOS hands a custom scheme registered by two apps to only one of them, and Pubky Ring registers
+/// `pubkyauth`, so Bitkit iOS takes setup on its own scheme. It turns the link back into
+/// `pubkyauth://signin_grant?<query>` and requires the `x-bitkit-claim` parameter. The query is kept
+/// byte for byte. Anything other than a canonical `signin_grant` URL with exactly one claim gets no
+/// handoff and keeps the plain link. (iPadOS reports a Mac user agent; the script checks touch too.)
+fn bitkit_ios_setup_url(authorization_url: &str) -> Option<String> {
+    let query = authorization_url.strip_prefix(BITKIT_SETUP_GRANT_PREFIX)?;
+    let url = Url::parse(authorization_url).ok()?;
+    let canonical_grant = url.as_str() == authorization_url
+        && url.fragment().is_none()
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url.host_str() == Some("signin_grant")
+        && url.path().is_empty()
+        && !query.is_empty()
+        && !query.starts_with('?')
+        && url
+            .query_pairs()
+            .filter(|(name, _)| name == crate::bitkit_claim::QUERY_PARAMETER)
+            .count()
+            == 1;
+    canonical_grant.then(|| format!("bitkit://pubky-auth/setup?{query}"))
 }
 
 fn html_for_text(value: &str) -> String {
@@ -361,6 +393,43 @@ mod tests {
                 "intent://signup_grant/path?a=%3B%23&b=;&c#Intent;scheme=pubkyauth;package=to.bitkit;end"
             )
         );
+    }
+
+    #[test]
+    fn ios_setup_url_keeps_the_claimed_grant_query_byte_for_byte() {
+        assert_eq!(
+            bitkit_ios_setup_url(GRANT_URL).as_deref(),
+            Some(
+                format!(
+                    "bitkit://pubky-auth/setup?{}",
+                    &GRANT_URL[BITKIT_SETUP_GRANT_PREFIX.len()..]
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn ios_setup_url_is_refused_for_anything_but_a_canonical_claimed_grant() {
+        for authorization_url in [
+            "",
+            "pubkyauth://signin_grant?caps=%2Fpub%2Fpaykit%2F%3Arw&secret=abc",
+            "pubkyauth://signin_grant?secret=abc&x-bitkit-claim=a&x-bitkit-claim=b",
+            "pubkyauth://signup_grant?secret=abc&x-bitkit-claim=watch-only-account-v1",
+            "pubkyauth://signin?secret=abc&x-bitkit-claim=watch-only-account-v1",
+            "pubkyauth://signin_grant/path?secret=abc&x-bitkit-claim=watch-only-account-v1",
+            "pubkyauth://signin_grant?",
+            "pubkyauth://signin_grant??secret=abc&x-bitkit-claim=watch-only-account-v1",
+            "pubkyauth://signin_grant?secret=abc&x-bitkit-claim=watch-only-account-v1#",
+            "pubkyauth://signin_grant?label=\"><script>&x-bitkit-claim=watch-only-account-v1",
+            "PUBKYAUTH://signin_grant?secret=abc&x-bitkit-claim=watch-only-account-v1",
+        ] {
+            assert_eq!(
+                bitkit_ios_setup_url(authorization_url),
+                None,
+                "{authorization_url}"
+            );
+        }
     }
 
     #[test]
