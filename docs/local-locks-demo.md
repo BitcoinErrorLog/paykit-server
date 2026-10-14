@@ -16,7 +16,7 @@ and exact Locks release selected in `Cargo.toml`:
 docker buildx build --load \
   --build-context paykit-lib='https://github.com/pubky/paykit-rs.git#03d4f05721e92d3944cb4d5af4b2c98c4390a5a8:paykit-lib' \
   --build-context paykit-sdk='https://github.com/pubky/paykit-rs.git#03d4f05721e92d3944cb4d5af4b2c98c4390a5a8:paykit-sdk' \
-  --build-context locks='https://github.com/pubky/locks.git#v0.1.0-rc9' \
+  --build-context locks='https://github.com/pubky/locks.git#v0.1.0-rc13' \
   -f Dockerfile.local \
   -t paykit-server:local .
 ```
