@@ -1471,7 +1471,7 @@ async fn android_bitkit_button_targets_the_configured_bitkit_package() {
         assert_eq!(shell.matches("<script>").count(), 1);
         assert_eq!(shell.matches("</script>").count(), 1);
         assert!(script.contains(
-            "if(bitkitButton.dataset.androidHref&&/Android/i.test(userAgent)){bitkitButton.href=bitkitButton.dataset.androidHref;}else if(bitkitButton.dataset.iosHref&&(/iPhone|iPad|iPod/i.test(userAgent)||(/Macintosh/i.test(userAgent)&&navigator.maxTouchPoints>1))){bitkitButton.href=bitkitButton.dataset.iosHref;}"
+            "if(bitkitButton.dataset.androidHref&&/Android/i.test(userAgent)){bitkitButton.href=bitkitButton.dataset.androidHref;}else if(bitkitButton.dataset.iosHref&&(/iPhone|iPad|iPod/i.test(userAgent)||(/Macintosh/i.test(userAgent)&&navigator.maxTouchPoints>1))){bitkitButton.href=bitkitButton.dataset.iosHref;bitkitButton.target='_top';}"
         ));
         for forbidden in ["intent://", "bitkit://", "pubkyauth", "secret=mock"] {
             assert!(
