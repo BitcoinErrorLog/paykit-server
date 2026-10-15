@@ -866,6 +866,13 @@ async fn process_creator_outbox(
     owner: Uuid,
     creator: Uuid,
 ) -> Result<Option<(bool, ProcessingHealth)>, PersistenceError> {
+    // Setup/rotation takes this PostgreSQL fence before the process-local SDK
+    // mutex. Keep the same ordering here to serialize external SDK effects with
+    // durable cutover across processes without lock inversion.
+    let mutation_fence = tokio::select! {
+        _ = runtime.cancelled() => return Ok(None),
+        fence = workers.creators.acquire_setup_lock_for_creator_id(creator) => fence?,
+    };
     let guard = tokio::select! {
         _ = runtime.cancelled() => return Ok(None),
         guard = creator_mutation_lock(creator).lock_owned() => guard,
@@ -969,7 +976,15 @@ async fn process_creator_outbox(
             "handed-off delivery deferred to transport maintenance"
         );
     }
-    result.map(Some)
+    let result = result.map(Some);
+    let unlocked = mutation_fence.release().await;
+    match result {
+        Err(error) => Err(error),
+        Ok(result) => {
+            unlocked?;
+            Ok(result)
+        }
+    }
 }
 
 async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {

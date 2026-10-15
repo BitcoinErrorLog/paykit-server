@@ -19,7 +19,7 @@ use crate::{
     bitkit_setup::{BitkitAuthStarter, StartedBitkitAuth},
     config::{BitcoinNetwork, PAYKIT_APP_ID, PaykitConfig},
     domain::locks::{CreatorPubky, parse_creator},
-    paykit::{CreatorSessions, ExplicitInputsPaymentAdapter, PaykitAdapter},
+    paykit::{CreatorSessions, ExplicitInputsPaymentAdapter, PaykitAdapter, creator_mutation_lock},
     persistence::{CreatorCredentials, CreatorStore, PaymentRequestLifecycleStore},
     setup::{Completion, SetupAttempt, SetupCompleter, StartedSetup},
     setup_diagnostics::{
@@ -505,8 +505,12 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                 let adapter = PaykitAdapter::new(creator_id, session, paykit)
                     .map_err(|_| ClaimError::InvalidEnvelope)?
                     .with_lifecycles(lifecycles.clone());
+                // Setup's cross-process advisory lock is already held. Take the
+                // process-local SDK fence in the same order as outbox workers and
+                // retain it through reconciliation plus durable cutover.
+                let mutation_guard = creator_mutation_lock(creator_id).lock_owned().await;
                 let evidence = adapter
-                    .reconcile_for_bitcoin_account_rotation(lifecycles)
+                    .reconcile_for_bitcoin_account_rotation(&mutation_guard, lifecycles)
                     .await
                     .map_err(|_| ClaimError::InvalidEnvelope)?;
                 self.creators

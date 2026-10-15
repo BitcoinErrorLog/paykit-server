@@ -186,8 +186,8 @@ pub struct CreatorStore {
     crypto: std::sync::Arc<Crypto>,
 }
 
-/// A creator-scoped PostgreSQL session advisory lock used to serialize setup
-/// publication and persistence across all server processes sharing the database.
+/// A creator-scoped PostgreSQL session advisory lock used to serialize setup,
+/// SDK outbox mutation, and rotation across all processes sharing the database.
 /// Its dedicated connection is detached from the pool, so cancellation drops
 /// the connection and releases PostgreSQL's session lock instead of returning a
 /// locked session to the pool.
@@ -208,6 +208,18 @@ impl CreatorSetupLock {
     }
 }
 
+fn creator_lock_key(lookup_hash: &[u8]) -> Result<i64, PersistenceError> {
+    if lookup_hash.len() != 32 {
+        return Err(PersistenceError::CorruptOrMissing);
+    }
+    let bytes: [u8; 8] = lookup_hash
+        .get(..8)
+        .ok_or(PersistenceError::CorruptOrMissing)?
+        .try_into()
+        .map_err(|_| PersistenceError::CorruptOrMissing)?;
+    Ok(i64::from_be_bytes(bytes))
+}
+
 impl CreatorStore {
     /// Creates a creator repository using a deployment-scoped crypto context.
     pub fn new(pool: &PgPool, crypto: std::sync::Arc<Crypto>) -> Self {
@@ -225,11 +237,29 @@ impl CreatorStore {
         creator: &CreatorPubky,
     ) -> Result<CreatorSetupLock, PersistenceError> {
         let lookup_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
-        let key = i64::from_be_bytes(
-            lookup_hash.as_bytes()[..8]
-                .try_into()
-                .expect("lookup hashes are 32 bytes"),
-        );
+        self.acquire_creator_lock(creator_lock_key(lookup_hash.as_bytes())?)
+            .await
+    }
+
+    /// Acquires the same cross-process Creator mutation fence from an internal
+    /// row identity. Workers take this before the process-local SDK mutex and
+    /// before claiming work, matching setup's advisory-lock-first ordering.
+    pub async fn acquire_setup_lock_for_creator_id(
+        &self,
+        creator_id: Uuid,
+    ) -> Result<CreatorSetupLock, PersistenceError> {
+        let lookup_hash: Vec<u8> =
+            sqlx::query_scalar("SELECT creator_lookup_hash FROM creators WHERE id = $1")
+                .bind(creator_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?
+                .ok_or(PersistenceError::CorruptOrMissing)?;
+        self.acquire_creator_lock(creator_lock_key(&lookup_hash)?)
+            .await
+    }
+
+    async fn acquire_creator_lock(&self, key: i64) -> Result<CreatorSetupLock, PersistenceError> {
         // A session advisory lock survives returning a connection to the pool.
         // Detach before acquiring it so cancellation closes the connection and
         // PostgreSQL releases the lock.

@@ -7,7 +7,7 @@ use paykit_server::{
     domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
-        InvoicePayloads, InvoiceStore, PaymentRequestLifecycleStore, PersistenceError,
+        InvoicePayloads, InvoiceStore, OutboxStore, PaymentRequestLifecycleStore, PersistenceError,
         run_migrations,
     },
 };
@@ -284,6 +284,217 @@ async fn rotation_cancels_proposed_preserves_accepted_and_exact_replays_old_bund
         .unwrap();
     assert_eq!(replay.invoice_id(), proposed.invoice_id());
     assert!(replay.replayed());
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn rotation_waits_for_admitted_proposal_then_cancels_it() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let created = store
+        .create_atomic(input(
+            &creator(),
+            &reader(),
+            b"rotation-worker-first-bundle",
+            b"rotation-worker-first-request",
+        ))
+        .await
+        .unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let outbox = OutboxStore::new(database.pool(), crypto());
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let creator_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM creators")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    let claim = outbox
+        .claim_for_creator(
+            uuid::Uuid::new_v4(),
+            creator_id,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let worker_fence = creators
+        .acquire_setup_lock_for_creator_id(claim.creator_id())
+        .await
+        .unwrap();
+    assert!(outbox.claim_handoff_eligible(&claim).await.unwrap());
+
+    let current = creators.load(&creator()).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator(),
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 7,
+        }),
+        None,
+    );
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator())
+        .await
+        .unwrap();
+    let rotation_started = Arc::new(tokio::sync::Notify::new());
+    let rotation = tokio::spawn({
+        let creators = creators.clone();
+        let lifecycles = lifecycles.clone();
+        let rotation_started = rotation_started.clone();
+        async move {
+            rotation_started.notify_one();
+            let fence = creators.acquire_setup_lock(&creator()).await.unwrap();
+            let result = creators
+                .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+                .await;
+            fence.release().await.unwrap();
+            result
+        }
+    });
+    rotation_started.notified().await;
+    tokio::task::yield_now().await;
+    assert!(
+        !rotation.is_finished(),
+        "cutover must wait for admitted worker"
+    );
+
+    let request_id = uuid::Uuid::new_v4().to_string();
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles
+         (invoice_id, sdk_payment_request_id, request_state, last_event_at, last_stream_item_id)
+         VALUES ($1, $2, 'proposed', NOW(), 1)",
+    )
+    .bind(created.invoice_id())
+    .bind(&request_id)
+    .execute(database.pool())
+    .await
+    .unwrap();
+    worker_fence.release().await.unwrap();
+
+    let result = rotation.await.unwrap().unwrap();
+    assert_eq!(result.cancellation_pending_count, 1);
+    let cancellation_target: String = sqlx::query_scalar(
+        "SELECT cancellation_target_payment_request_id FROM outbox
+         WHERE intent_kind = 'payment_request_cancellation'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(cancellation_target, request_id);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn admitted_proposal_rechecks_eligibility_after_rotation_wins() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let created = store
+        .create_atomic(input(
+            &creator(),
+            &reader(),
+            b"rotation-cutover-first-bundle",
+            b"rotation-cutover-first-request",
+        ))
+        .await
+        .unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let outbox = OutboxStore::new(database.pool(), crypto());
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let creator_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM creators")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    let claim = outbox
+        .claim_for_creator(
+            uuid::Uuid::new_v4(),
+            creator_id,
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let cutover_fence = creators.acquire_setup_lock(&creator()).await.unwrap();
+    let worker_started = Arc::new(tokio::sync::Notify::new());
+    let worker = tokio::spawn({
+        let creators = creators.clone();
+        let outbox = outbox.clone();
+        let worker_started = worker_started.clone();
+        async move {
+            worker_started.notify_one();
+            let fence = creators
+                .acquire_setup_lock_for_creator_id(claim.creator_id())
+                .await
+                .unwrap();
+            let eligible = outbox.claim_handoff_eligible(&claim).await.unwrap();
+            fence.release().await.unwrap();
+            eligible
+        }
+    });
+    worker_started.notified().await;
+    tokio::task::yield_now().await;
+    assert!(
+        !worker.is_finished(),
+        "worker must wait for durable cutover"
+    );
+
+    let current = creators.load(&creator()).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator(),
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 7,
+        }),
+        None,
+    );
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator())
+        .await
+        .unwrap();
+    let result = creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+        .await
+        .unwrap();
+    assert_eq!(result.cancellation_pending_count, 0);
+    cutover_fence.release().await.unwrap();
+
+    assert!(
+        !worker.await.unwrap(),
+        "suppressed proposal must not reach SDK"
+    );
+    let classification: String = sqlx::query_scalar(
+        "SELECT classification FROM creator_bitcoin_account_rotation_items
+         WHERE invoice_id = $1",
+    )
+    .bind(created.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(classification, "proposal_suppressed");
+    let suppressed: (
+        String,
+        Option<uuid::Uuid>,
+        Option<uuid::Uuid>,
+        Option<time::OffsetDateTime>,
+    ) = sqlx::query_as(
+        "SELECT status, lease_owner, claim_token, lease_expires_at
+             FROM outbox WHERE invoice_id = $1 AND intent_kind = 'payment_request_proposal'",
+    )
+    .bind(created.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(suppressed, ("permanently_failed".into(), None, None, None));
+    let lifecycle_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM payment_request_lifecycles WHERE invoice_id = $1")
+            .bind(created.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(lifecycle_count, 0);
     database.cleanup().await;
 }
 

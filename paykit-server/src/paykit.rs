@@ -521,9 +521,13 @@ impl PaykitAdapter {
     /// returning evidence for the subsequent serializable persistence snapshot.
     pub async fn reconcile_for_bitcoin_account_rotation(
         &self,
+        guard: &tokio::sync::OwnedMutexGuard<()>,
         lifecycles: &PaymentRequestLifecycleStore,
     ) -> Result<Vec<RequiredReceiveTarget>, LifecycleSyncError> {
-        let _guard = self.mutation_lock.lock().await;
+        assert!(Arc::ptr_eq(
+            &self.mutation_lock,
+            tokio::sync::OwnedMutexGuard::mutex(guard)
+        ));
         let required_targets = lifecycles
             .required_receive_targets_for_creator_rotation(&self.creator)
             .await
