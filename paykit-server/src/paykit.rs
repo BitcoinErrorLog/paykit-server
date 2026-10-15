@@ -40,8 +40,8 @@ use crate::{
         },
     },
     persistence::{
-        ClaimedOutbox, CreatorStore, InvoiceStore, OutboxStore, PaymentDrainStore,
-        PaymentRequestLifecycleStore, PersistenceError, RequiredReceiveTarget,
+        ClaimedOutbox, CreatorStore, InvoiceStore, MarketplacePreparationStore, OutboxStore,
+        PaymentDrainStore, PaymentRequestLifecycleStore, PersistenceError, RequiredReceiveTarget,
     },
     workers::outbox::{
         Adapter, HandoffError, HandoffFailure, HandoffResult, RetryableHandoffCause,
@@ -288,6 +288,7 @@ pub struct PaykitAdapter {
     mutation_lock: Arc<TokioMutex<()>>,
     payment_request_refreshes: Arc<payment_status::PaymentRequestRefreshes>,
     usdt: Option<(InvoiceStore, crate::usdt::ArbitrumVerifier)>,
+    marketplace: Option<Arc<MarketplacePreparationStore>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -432,6 +433,7 @@ impl PaykitAdapter {
             creator,
             app_id: config.app_id.clone(),
             usdt: None,
+            marketplace: None,
         })
     }
 
@@ -441,6 +443,13 @@ impl PaykitAdapter {
         verifier: Option<crate::usdt::ArbitrumVerifier>,
     ) -> Self {
         self.usdt = verifier.map(|verifier| (invoices, verifier));
+        self
+    }
+
+    /// Also attributes verified USDT evidence to active Marketplace settlements during
+    /// background reconciliation.
+    pub fn with_marketplace_usdt(mut self, store: Arc<MarketplacePreparationStore>) -> Self {
+        self.marketplace = Some(store);
         self
     }
 
@@ -517,6 +526,16 @@ impl PaykitAdapter {
             if let Err(error) = invoices
                 .observe_usdt_request(self.creator_id, &self.creator, record, verifier, bundle)
                 .await
+            {
+                result = Err(map_projection_persistence_error(error));
+            }
+            // Marketplace requests have no per-bundle status read; only the background
+            // reconciliation attributes their receipts.
+            if bundle.is_none()
+                && let Some(marketplace) = &self.marketplace
+                && let Err(error) = marketplace
+                    .observe_usdt_request(self.creator_id, &self.creator, record, verifier)
+                    .await
             {
                 result = Err(map_projection_persistence_error(error));
             }

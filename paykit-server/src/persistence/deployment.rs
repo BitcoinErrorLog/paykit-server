@@ -91,6 +91,9 @@ pub enum PersistenceError {
     /// A typed caller value cannot be represented by the persistence contract.
     #[error("persistence input is invalid")]
     InvalidInput,
+    /// A deadline the caller fixed had already passed when the operation could commit.
+    #[error("persistence deadline elapsed before the operation could commit")]
+    DeadlineElapsed,
 }
 
 impl PersistenceError {
@@ -102,6 +105,7 @@ impl PersistenceError {
             Self::Unavailable => "unavailable",
             Self::Conflict => "conflict",
             Self::InvalidInput => "invalid_input",
+            Self::DeadlineElapsed => "deadline_elapsed",
         }
     }
 }

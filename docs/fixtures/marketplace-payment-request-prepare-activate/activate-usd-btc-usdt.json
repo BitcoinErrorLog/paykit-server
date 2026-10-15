@@ -1,0 +1,1 @@
+{"invoice_id":"4c6e66c7-8a8b-4d54-b97b-340cedb3e1d0","state":"active","activated_at":"2026-10-23T09:05:00Z","payment_deadline":"2026-10-23T09:35:00Z","amount":"500","asset":"USD","accepted_assets":["BTC","USDT"],"payment_amounts":{"BTC":"6173","USDT":"5000000"}}

@@ -40,6 +40,14 @@ const MARKETPLACE_OBSERVATION_MIGRATION: &str =
     include_str!("../../paykit-server/migrations/0015_marketplace_bitcoin_observations.sql");
 const RESOLUTION_MIGRATION: &str =
     include_str!("../../paykit-server/migrations/0016_marketplace_resolution_immutability.sql");
+const OPTIONAL_RAIL_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0017_marketplace_optional_bitcoin_rail.sql");
+const USDT_OBSERVATION_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0018_marketplace_usdt_observations.sql");
+const USDT_VALIDATION_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0019_validate_marketplace_usdt_constraints.sql");
+const USDT_INDEX_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0020_marketplace_usdt_observation_index.sql");
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
 /// migration tests deliberately use the production migration lock key, so
@@ -81,7 +89,56 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=16).collect::<Vec<_>>());
+    assert_eq!(applied_versions, (1..=20).collect::<Vec<_>>());
+
+    let settlement_address_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'marketplace_settlements'
+           AND column_name = 'bitcoin_address_lookup_hash'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(settlement_address_nullable, "YES");
+    let usdt_owner_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'public' AND table_name = 'usdt_observations'
+           AND column_name = 'invoice_id'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(usdt_owner_nullable, "YES");
+    let usdt_owner_guards: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM pg_constraint
+                 WHERE conname = 'usdt_observation_exactly_one_owner')
+              + (SELECT count(*) FROM pg_trigger
+                 WHERE tgname = 'usdt_observation_owner_immutable')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(usdt_owner_guards, 2);
+    assert_usdt_constraints_validated(pool, true).await;
+    let index_valid: bool = sqlx::query_scalar(
+        "SELECT indisvalid FROM pg_index
+         WHERE indexrelid = 'usdt_observations_marketplace_settlement_index'::regclass",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(index_valid);
+    let claim_trigger: String = sqlx::query_scalar(
+        "SELECT pg_get_triggerdef(oid) FROM pg_trigger
+         WHERE tgname = 'marketplace_settlements_claim_global_bitcoin_address'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(
+        claim_trigger.contains("WHEN ((new.bitcoin_address_lookup_hash IS NOT NULL))"),
+        "{claim_trigger}"
+    );
 
     let plaintext_creator_pubky_columns: Vec<String> = sqlx::query_scalar(
         "SELECT table_name \
@@ -780,6 +837,259 @@ async fn observation_migration_upgrades_existing_locks_evidence_without_rewritin
     database.cleanup().await;
 }
 
+#[tokio::test]
+async fn usdt_migration_keeps_locks_receipts_and_pins_one_immutable_owner() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_pre_settlement_migrations(pool).await;
+    for migration in [
+        SETTLEMENT_MIGRATION,
+        MARKETPLACE_OBSERVATION_MIGRATION,
+        RESOLUTION_MIGRATION,
+        OPTIONAL_RAIL_MIGRATION,
+    ] {
+        sqlx::raw_sql(migration).execute(pool).await.unwrap();
+    }
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(pool, creator_id, b"usdt-bundle", b"usdt-request").await;
+    let invoice_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM invoices WHERE payment_request_lookup_hash = $1")
+            .bind(b"usdt-request".as_slice())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let transfer_hash = vec![81_u8; 32];
+    sqlx::query(
+        "INSERT INTO usdt_observations
+         (id, invoice_id, transfer_lookup_hash, observation_envelope, confirmations,
+          present, finalized)
+         VALUES ($1, $2, $3, $4, 3, TRUE, FALSE)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(invoice_id)
+    .bind(&transfer_hash)
+    .bind(b"encrypted-usdt-observation".as_slice())
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(USDT_OBSERVATION_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    // The live table is only touched briefly: constraints start NOT VALID but are
+    // already enforced for every new or changed row.
+    assert_usdt_constraints_validated(pool, false).await;
+    let upgraded: (Option<Uuid>, Option<Uuid>, Vec<u8>, i32) = sqlx::query_as(
+        "SELECT invoice_id, marketplace_preparation_id, observation_envelope, confirmations
+         FROM usdt_observations WHERE transfer_lookup_hash = $1",
+    )
+    .bind(&transfer_hash)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        upgraded,
+        (
+            Some(invoice_id),
+            None,
+            b"encrypted-usdt-observation".to_vec(),
+            3
+        )
+    );
+    assert_check_violation(
+        sqlx::query(
+            "UPDATE usdt_observations SET invoice_id = NULL WHERE transfer_lookup_hash = $1",
+        )
+        .bind(&transfer_hash)
+        .execute(pool)
+        .await,
+    );
+    assert_check_violation(
+        sqlx::query(
+            "UPDATE usdt_observations SET transfer_lookup_hash = $2 WHERE transfer_lookup_hash = $1",
+        )
+        .bind(&transfer_hash)
+        .bind(vec![82_u8; 32])
+        .execute(pool)
+        .await,
+    );
+    assert_check_violation(
+        sqlx::query(
+            "INSERT INTO usdt_observations
+             (id, transfer_lookup_hash, observation_envelope, confirmations, present, finalized)
+             VALUES ($1, $2, $3, 0, TRUE, FALSE)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(vec![83_u8; 32])
+        .bind(b"ownerless".as_slice())
+        .execute(pool)
+        .await,
+    );
+    sqlx::query("UPDATE usdt_observations SET confirmations = 9 WHERE transfer_lookup_hash = $1")
+        .bind(&transfer_hash)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    sqlx::raw_sql(USDT_VALIDATION_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_usdt_constraints_validated(pool, true).await;
+    sqlx::raw_sql(USDT_INDEX_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let index: (bool, String) = sqlx::query_as(
+        "SELECT index.indisvalid, pg_get_indexdef(index.indexrelid)
+         FROM pg_index index
+         WHERE index.indexrelid = 'usdt_observations_marketplace_settlement_index'::regclass",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(index.0);
+    assert!(
+        index
+            .1
+            .contains("WHERE (marketplace_preparation_id IS NOT NULL)")
+    );
+    database.cleanup().await;
+}
+
+async fn assert_usdt_constraints_validated(pool: &PgPool, validated: bool) {
+    let states: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT conname::text, convalidated FROM pg_constraint
+         WHERE conrelid = 'usdt_observations'::regclass
+           AND conname IN ('usdt_observations_marketplace_preparation_id_fkey',
+                           'usdt_observation_exactly_one_owner')
+         ORDER BY conname",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        states,
+        vec![
+            ("usdt_observation_exactly_one_owner".to_owned(), validated),
+            (
+                "usdt_observations_marketplace_preparation_id_fkey".to_owned(),
+                validated
+            ),
+        ]
+    );
+}
+
+async fn insert_usdt_receipt(
+    executor: impl sqlx::PgExecutor<'_>,
+    invoice_id: Uuid,
+    transfer_byte: u8,
+) -> Result<sqlx::postgres::PgQueryResult, sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO usdt_observations
+         (id, invoice_id, transfer_lookup_hash, observation_envelope, confirmations,
+          present, finalized)
+         VALUES ($1, $2, $3, $4, 1, TRUE, FALSE)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(invoice_id)
+    .bind(vec![transfer_byte; 32])
+    .bind(b"encrypted-usdt-observation".as_slice())
+    .execute(executor)
+    .await
+}
+
+/// A live Locks table: everything through `0018` applied, one receipt present.
+async fn live_usdt_table_through_0018(pool: &PgPool) -> Uuid {
+    apply_pre_settlement_migrations(pool).await;
+    for migration in [
+        SETTLEMENT_MIGRATION,
+        MARKETPLACE_OBSERVATION_MIGRATION,
+        RESOLUTION_MIGRATION,
+        OPTIONAL_RAIL_MIGRATION,
+        USDT_OBSERVATION_MIGRATION,
+    ] {
+        sqlx::raw_sql(migration).execute(pool).await.unwrap();
+    }
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(pool, creator_id, b"live-bundle", b"live-request").await;
+    let invoice_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM invoices WHERE payment_request_lookup_hash = $1")
+            .bind(b"live-request".as_slice())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    insert_usdt_receipt(pool, invoice_id, 1).await.unwrap();
+    invoice_id
+}
+
+/// The index build waits for older transactions but must never stall Locks, and the
+/// validation must not wait for them at all.
+#[tokio::test]
+async fn usdt_validation_and_index_migrations_do_not_block_locks_writers() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    let invoice_id = live_usdt_table_through_0018(pool).await;
+
+    // A Locks writer is mid-transaction while the migrations run.
+    let mut open_writer = pool.begin().await.unwrap();
+    insert_usdt_receipt(&mut *open_writer, invoice_id, 2)
+        .await
+        .unwrap();
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        sqlx::raw_sql(USDT_VALIDATION_MIGRATION).execute(pool),
+    )
+    .await
+    .expect("validation must not wait for an open writer")
+    .unwrap();
+    assert_usdt_constraints_validated(pool, true).await;
+
+    let index_pool = pool.clone();
+    let index = tokio::spawn(async move {
+        sqlx::raw_sql(USDT_INDEX_MIGRATION)
+            .execute(&index_pool)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !index.is_finished(),
+        "a concurrent build waits for the older writer"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        insert_usdt_receipt(pool, invoice_id, 3).await.unwrap();
+        sqlx::query(
+            "UPDATE usdt_observations SET confirmations = 5 WHERE transfer_lookup_hash = $1",
+        )
+        .bind(vec![1_u8; 32])
+        .execute(pool)
+        .await
+        .unwrap();
+    })
+    .await
+    .expect("Locks writes must not be blocked by the index build");
+
+    open_writer.commit().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(20), index)
+        .await
+        .expect("index build finishes once the older writer commits")
+        .unwrap();
+    let valid: bool = sqlx::query_scalar(
+        "SELECT indisvalid FROM pg_index
+         WHERE indexrelid = 'usdt_observations_marketplace_settlement_index'::regclass",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(valid);
+    database.cleanup().await;
+}
+
 async fn apply_pre_settlement_migrations(pool: &PgPool) {
     let mut transaction = pool.begin().await.unwrap();
     for migration in PRE_SETTLEMENT_MIGRATIONS {
@@ -913,4 +1223,70 @@ async fn acquire_and_release_advisory_lock(connection: &mut PgConnection) {
     })
     .await
     .expect("cancelled migration left the advisory lock held");
+}
+
+/// An interrupted concurrent build leaves the named index invalid. The rerun must fail
+/// visibly rather than accept the unusable relation and record the migration.
+#[tokio::test]
+async fn interrupted_index_build_makes_the_rerun_fail_visibly() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    let invoice_id = live_usdt_table_through_0018(pool).await;
+    sqlx::raw_sql(USDT_VALIDATION_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    // The build waits for the open writer, and is cancelled while it waits.
+    let mut open_writer = pool.begin().await.unwrap();
+    insert_usdt_receipt(&mut *open_writer, invoice_id, 2)
+        .await
+        .unwrap();
+    let mut interrupted = database.acquire_connection().await;
+    sqlx::query("SET statement_timeout = '500ms'")
+        .execute(&mut *interrupted)
+        .await
+        .unwrap();
+    sqlx::raw_sql(USDT_INDEX_MIGRATION)
+        .execute(&mut *interrupted)
+        .await
+        .expect_err("the build is cancelled while it waits for the older writer");
+    sqlx::query("RESET statement_timeout")
+        .execute(&mut *interrupted)
+        .await
+        .unwrap();
+    drop(interrupted);
+    open_writer.commit().await.unwrap();
+
+    let index_valid = || async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT indisvalid FROM pg_index
+             WHERE indexrelid = 'usdt_observations_marketplace_settlement_index'::regclass",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    };
+    assert!(!index_valid().await, "the cancelled build left it invalid");
+
+    let rerun = sqlx::raw_sql(USDT_INDEX_MIGRATION).execute(pool).await;
+    let error = rerun.expect_err("the rerun must not accept the invalid index");
+    assert!(
+        error.to_string().contains("already exists"),
+        "unexpected error: {error}"
+    );
+    assert!(!index_valid().await);
+
+    // The documented recovery: drop it concurrently, then rerun.
+    sqlx::raw_sql("DROP INDEX CONCURRENTLY usdt_observations_marketplace_settlement_index")
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(USDT_INDEX_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    assert!(index_valid().await);
+    database.cleanup().await;
 }

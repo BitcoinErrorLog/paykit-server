@@ -158,8 +158,8 @@ impl InvoiceStore {
         for (identity, proofs) in candidates {
             let identity_hash = self.crypto.usdt_transfer_lookup_hash(identity.as_bytes());
             let skip: Option<bool> = sqlx::query_scalar(
-                "SELECT finalized OR ($2 AND invoice_id = $3 AND present
-                    AND checked_at <= NOW() AND checked_at > NOW() - INTERVAL '1 minute')
+                "SELECT COALESCE(finalized OR ($2 AND invoice_id = $3 AND present
+                    AND checked_at <= NOW() AND checked_at > NOW() - INTERVAL '1 minute'), FALSE)
                  FROM usdt_observations WHERE transfer_lookup_hash = $1",
             )
             .bind(identity_hash.as_bytes().as_slice())
@@ -240,12 +240,12 @@ impl InvoiceStore {
             .execute(&mut *tx)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
-        let existing: Option<(Uuid, Uuid, bool)> = sqlx::query_as(
+        let existing: Option<(Uuid, Option<Uuid>, bool)> = sqlx::query_as(
             "SELECT id, invoice_id, finalized FROM usdt_observations WHERE transfer_lookup_hash = $1 FOR UPDATE")
             .bind(transfer_hash.as_bytes().as_slice()).fetch_optional(&mut *tx).await
             .map_err(|_| PersistenceError::Unavailable)?;
         if let Some((_, invoice_id, finalized)) = existing {
-            if invoice_id != row.id {
+            if invoice_id != Some(row.id) {
                 return Ok(());
             }
             if finalized {
@@ -268,7 +268,7 @@ impl InvoiceStore {
         let confirmations =
             i32::try_from(transfer.confirmations).map_err(|_| PersistenceError::InvalidInput)?;
         // The unique transfer identity also fences simultaneous proofs for different invoices.
-        let owner: Uuid = sqlx::query_scalar(
+        let owner: Option<Uuid> = sqlx::query_scalar(
             "INSERT INTO usdt_observations (id, invoice_id, transfer_lookup_hash, observation_envelope, confirmations, present, finalized)
              VALUES ($1,$2,$3,$4,$5,TRUE,$6)
              ON CONFLICT (transfer_lookup_hash) DO UPDATE SET
@@ -280,7 +280,7 @@ impl InvoiceStore {
              RETURNING invoice_id")
             .bind(id).bind(row.id).bind(transfer_hash.as_bytes().as_slice()).bind(envelope.as_bytes())
             .bind(confirmations).bind(transfer.finalized).fetch_one(&mut *tx).await.map_err(|_| PersistenceError::Unavailable)?;
-        if owner != row.id {
+        if owner != Some(row.id) {
             return Ok(());
         }
         self.project_payments(

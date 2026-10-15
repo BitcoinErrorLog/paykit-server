@@ -194,6 +194,8 @@ pub enum EnvelopeType {
     /// Marketplace-owned encrypted Bitcoin outpoint and observed amount.
     MarketplaceBitcoinObservation,
     UsdtObservation,
+    /// Marketplace-owned encrypted USDT receipt facts.
+    MarketplaceUsdtObservation,
     /// Versioned server-owned semantic inputs for an outbound SDK handoff.
     OutboxSemanticIntent,
     /// Canonical addressed lock resource bound to one operational drain.
@@ -214,6 +216,7 @@ impl EnvelopeType {
             Self::BitcoinObservation => b"bitcoin-observation",
             Self::MarketplaceBitcoinObservation => b"marketplace-bitcoin-observation",
             Self::UsdtObservation => b"usdt-observation",
+            Self::MarketplaceUsdtObservation => b"marketplace-usdt-observation",
             Self::OutboxSemanticIntent => b"outbox-semantic-intent",
             Self::PaymentDrain => b"payment-drain",
             Self::MarketplacePreparation => b"marketplace-preparation",
@@ -306,6 +309,20 @@ impl EnvelopeContext {
     ) -> Self {
         let mut context = Self::new(EnvelopeType::UsdtObservation, creator_lookup_hash, row_id);
         context.parent_row_id = Some(invoice_id);
+        context
+    }
+    /// Binds one USDT receipt row to its owning Marketplace settlement.
+    pub fn usdt_observation_for_marketplace(
+        creator_lookup_hash: LookupHash,
+        row_id: Uuid,
+        marketplace_preparation_id: Uuid,
+    ) -> Self {
+        let mut context = Self::new(
+            EnvelopeType::MarketplaceUsdtObservation,
+            creator_lookup_hash,
+            row_id,
+        );
+        context.parent_row_id = Some(marketplace_preparation_id);
         context
     }
     /// Creates the binding context for an outbox semantic intent.

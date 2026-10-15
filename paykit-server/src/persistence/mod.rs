@@ -11,11 +11,11 @@ mod payment_request_lifecycles;
 
 pub use creators::{CreatorCredentials, CreatorSetupLock, CreatorStore, PersistedCreator};
 pub use deployment::{DeploymentStore, PersistenceError};
-pub(crate) use invoices::BitcoinObservationInput;
 pub use invoices::{
     AtomicInvoiceInput, AtomicInvoiceResult, InvoicePayloadFactory, InvoicePayloads,
     InvoicePreflight, InvoiceStore, PendingBuyerContact,
 };
+pub(crate) use invoices::{BitcoinObservationInput, InvoicePaymentRecordV1};
 pub use marketplace_preparations::{
     MarketplaceActivationInput, MarketplaceActivationResult, MarketplaceLifecyclePersistenceError,
     MarketplacePreparationInput, MarketplacePreparationPayloadFactory,

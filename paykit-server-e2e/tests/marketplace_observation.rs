@@ -7,7 +7,10 @@ use paykit_server::{
     bitcoin::{ObservationTarget, ObservedOutput, TrackedOutput},
     config::BitcoinNetwork,
     crypto::Crypto,
-    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    domain::{
+        invoice::CriterionAsset,
+        locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    },
     persistence::{
         CreatorCredentials, CreatorStore, MarketplaceActivationInput, MarketplacePreparationInput,
         MarketplacePreparationPayloadFactory, MarketplacePreparationPayloads,
@@ -92,9 +95,11 @@ async fn prepare(
             reference: REFERENCE,
             operation_id,
             request_binding: operation_id.as_bytes(),
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             payment_window_seconds,
             prepare_ttl_seconds: 15 * 60,
+            prepare_deadline: common::deadline_after(15 * 60),
             payloads: &Payloads,
         })
         .await
@@ -109,7 +114,8 @@ async fn activate(
         .activate(MarketplaceActivationInput {
             creator: &creator(),
             invoice_id,
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: std::time::Duration::from_secs(1),
         })
         .await

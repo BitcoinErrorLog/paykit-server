@@ -17,7 +17,11 @@ use crate::{
         ResolveMarketplaceRequest, VoidMarketplaceRequest,
     },
     domain::locks::parse_creator,
-    http::{auth::AuthenticatedJson, error::ApiError},
+    http::{
+        auth::AuthenticatedJson,
+        error::ApiError,
+        marketplace_terms::{TermsResponse, parse_amount, parse_asset},
+    },
     persistence::MarketplaceResolutionOutcome,
 };
 
@@ -25,7 +29,8 @@ use crate::{
 struct ActivateBody {
     creator: String,
     invoice_id: String,
-    total_sats: u64,
+    amount: String,
+    asset: String,
 }
 
 #[derive(Deserialize)]
@@ -47,7 +52,8 @@ struct ActivateResponse {
     state: &'static str,
     activated_at: String,
     payment_deadline: String,
-    total_sats: u64,
+    #[serde(flatten)]
+    terms: TermsResponse,
 }
 
 #[derive(Serialize)]
@@ -97,7 +103,7 @@ async fn activate(
                     state: "active",
                     activated_at,
                     payment_deadline,
-                    total_sats: result.total_sats(),
+                    terms: TermsResponse::new(result.terms(), result.quote()),
                 }),
             )
                 .into_response()
@@ -166,7 +172,8 @@ fn parse_activate(body: ActivateBody) -> Result<ActivateMarketplaceRequest, ApiE
     Ok(ActivateMarketplaceRequest {
         creator: parse_creator(&body.creator).map_err(|_| ApiError::InvalidRequest)?,
         invoice_id: parse_uuid(&body.invoice_id)?,
-        total_sats: body.total_sats,
+        amount: parse_amount(&body.amount)?,
+        asset: parse_asset(&body.asset)?,
     })
 }
 

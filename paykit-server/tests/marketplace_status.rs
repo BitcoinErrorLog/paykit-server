@@ -9,9 +9,12 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use ed25519_dalek::{Signer, SigningKey};
 use paykit_server::{
-    application::marketplace_status::{
-        MarketplaceBitcoinStatus, MarketplaceInvoiceStatus, MarketplaceStatusError,
-        MarketplaceStatusPersistence, MarketplaceStatusService,
+    application::{
+        marketplace_status::{
+            MarketplaceBitcoinStatus, MarketplaceInvoiceStatus, MarketplaceStatusError,
+            MarketplaceStatusPersistence, MarketplaceStatusService, MarketplaceUsdtStatus,
+        },
+        setup_status::AcceptedAsset,
     },
     config::{Config, ConfigEnvironment},
     domain::locks::CreatorPubky,
@@ -32,6 +35,35 @@ const CONSUMER_STATUS_BODY: &str = r#"{"creator":"pubkygy1wnkhfwezwdnawnur1bc3kw
 const CONSUMER_STATUS_SIGNATURE: &str =
     "wis1mgbBnXe1u13cnM9-CUbS4EoT2q39_SlAnyQUgErHnQflpbEwyoM6AkP6wlD5sN-rQx14BVw7CUGSaznUAQ";
 
+/// Checks a route-emitted body against its checked-in fixture; with
+/// `PAYKIT_CAPTURE_FIXTURES` set, rewrites the fixture from the emitted body instead.
+fn assert_fixture(name: &str, emitted: &str) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../docs/fixtures/marketplace-payment-request-status")
+        .join(format!("{name}.json"));
+    if std::env::var_os("PAYKIT_CAPTURE_FIXTURES").is_some() {
+        std::fs::write(&path, format!("{emitted}\n")).unwrap();
+        return;
+    }
+    assert_eq!(
+        emitted,
+        std::fs::read_to_string(&path).unwrap().trim_end(),
+        "fixture {name}"
+    );
+}
+
+fn btc_offer(
+    status: MarketplaceInvoiceStatus,
+    bitcoin: Option<&MarketplaceBitcoinStatus>,
+) -> MarketplaceInvoiceStatus {
+    let paid = bitcoin
+        .is_some_and(MarketplaceBitcoinStatus::paid_on_time)
+        .then_some(AcceptedAsset::Btc);
+    status
+        .with_offer(vec![AcceptedAsset::Btc], vec![(AcceptedAsset::Btc, 50_000)])
+        .with_usdt(None, paid)
+}
+
 struct FakeStore {
     result: Result<Option<MarketplaceInvoiceStatus>, MarketplaceStatusError>,
 }
@@ -48,25 +80,29 @@ impl MarketplaceStatusPersistence for FakeStore {
 }
 
 fn active_status() -> MarketplaceInvoiceStatus {
-    MarketplaceInvoiceStatus::active(
-        INVOICE_ID,
-        "delivered",
-        Some("accepted"),
-        "confirmed",
-        OffsetDateTime::UNIX_EPOCH,
-        OffsetDateTime::UNIX_EPOCH + time::Duration::days(1),
-        Some(MarketplaceBitcoinStatus::new(
-            "0000000000000000000000000000000000000000000000000000000000000001".into(),
-            2,
-            50_000,
-            OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
-            3,
-            true,
-            true,
-            true,
-        )),
-        Some("paid_manually"),
-        Some(OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2)),
+    let bitcoin = MarketplaceBitcoinStatus::new(
+        "0000000000000000000000000000000000000000000000000000000000000001".into(),
+        2,
+        50_000,
+        OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+        3,
+        true,
+        true,
+        true,
+    );
+    btc_offer(
+        MarketplaceInvoiceStatus::active(
+            INVOICE_ID,
+            "delivered",
+            Some("accepted"),
+            "confirmed",
+            OffsetDateTime::UNIX_EPOCH,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::days(1),
+            Some(bitcoin.clone()),
+            Some("paid_manually"),
+            Some(OffsetDateTime::UNIX_EPOCH + time::Duration::hours(2)),
+        ),
+        Some(&bitcoin),
     )
 }
 
@@ -75,16 +111,20 @@ fn active_status_with(
     payment_state: &'static str,
     bitcoin: Option<MarketplaceBitcoinStatus>,
 ) -> MarketplaceInvoiceStatus {
-    MarketplaceInvoiceStatus::active(
-        INVOICE_ID,
-        "delivered",
-        request_state,
-        payment_state,
-        OffsetDateTime::UNIX_EPOCH,
-        OffsetDateTime::UNIX_EPOCH + time::Duration::days(1),
-        bitcoin,
-        None,
-        None,
+    let paid_on_time = bitcoin.clone();
+    btc_offer(
+        MarketplaceInvoiceStatus::active(
+            INVOICE_ID,
+            "delivered",
+            request_state,
+            payment_state,
+            OffsetDateTime::UNIX_EPOCH,
+            OffsetDateTime::UNIX_EPOCH + time::Duration::days(1),
+            bitcoin,
+            None,
+            None,
+        ),
+        paid_on_time.as_ref(),
     )
 }
 
@@ -208,6 +248,7 @@ async fn signed_status_has_exact_closed_active_fixture() {
     assert_eq!(
         body(response).await,
         serde_json::json!({
+            "accepted_assets":["BTC"],
             "activated_at":"1970-01-01T00:00:00Z",
             "bitcoin":{
                 "amount_matched":true,
@@ -218,12 +259,15 @@ async fn signed_status_has_exact_closed_active_fixture() {
             },
             "invoice_id":INVOICE_ID,
             "outcome":"paid_manually",
+            "paid_asset":"BTC",
+            "payment_amounts":{"BTC":"50000"},
             "payment_deadline":"1970-01-02T00:00:00Z",
             "payment_state":"confirmed",
             "proposal_delivery_state":"delivered",
             "request_state":"accepted",
             "resolved_at":"1970-01-01T02:00:00Z",
-            "state":"active"
+            "state":"active",
+            "usdt_arbitrum":null
         })
     );
 }
@@ -233,20 +277,19 @@ async fn marketplace_consumer_fixtures_are_emitted_by_the_signed_route() {
     let key = SigningKey::from_bytes(&[7; 32]);
     let success_cases = [
         (
-            MarketplaceInvoiceStatus::inactive(INVOICE_ID, "prepared", None, None),
-            include_str!("../../docs/fixtures/marketplace-payment-request-status/prepared.json"),
+            btc_offer(
+                MarketplaceInvoiceStatus::inactive(INVOICE_ID, "prepared", None, None),
+                None,
+            ),
+            "prepared",
         ),
         (
             active_status_with(None, "undetected", None),
-            include_str!(
-                "../../docs/fixtures/marketplace-payment-request-status/active-unprojected.json"
-            ),
+            "active-unprojected",
         ),
         (
             active_status_with(Some("proposed"), "undetected", None),
-            include_str!(
-                "../../docs/fixtures/marketplace-payment-request-status/proposed-undetected.json"
-            ),
+            "proposed-undetected",
         ),
         (
             active_status_with(
@@ -254,7 +297,7 @@ async fn marketplace_consumer_fixtures_are_emitted_by_the_signed_route() {
                 "detected",
                 Some(bitcoin_status(50_000, 0, true, true, true)),
             ),
-            include_str!("../../docs/fixtures/marketplace-payment-request-status/detected.json"),
+            "detected",
         ),
         (
             active_status_with(
@@ -262,9 +305,7 @@ async fn marketplace_consumer_fixtures_are_emitted_by_the_signed_route() {
                 "confirmed",
                 Some(bitcoin_status(50_000, 3, true, true, true)),
             ),
-            include_str!(
-                "../../docs/fixtures/marketplace-payment-request-status/confirmed-matched.json"
-            ),
+            "confirmed-matched",
         ),
         (
             active_status_with(
@@ -272,9 +313,7 @@ async fn marketplace_consumer_fixtures_are_emitted_by_the_signed_route() {
                 "confirmed",
                 Some(bitcoin_status(49_999, 3, true, false, false)),
             ),
-            include_str!(
-                "../../docs/fixtures/marketplace-payment-request-status/confirmed-unmatched.json"
-            ),
+            "confirmed-unmatched",
         ),
         (
             active_status_with(
@@ -282,9 +321,7 @@ async fn marketplace_consumer_fixtures_are_emitted_by_the_signed_route() {
                 "expired",
                 Some(bitcoin_status(50_000, 3, true, true, false)),
             ),
-            include_str!(
-                "../../docs/fixtures/marketplace-payment-request-status/expired-late-match.json"
-            ),
+            "expired-late-match",
         ),
         (
             active_status_with(
@@ -292,7 +329,7 @@ async fn marketplace_consumer_fixtures_are_emitted_by_the_signed_route() {
                 "undetected",
                 Some(bitcoin_status(50_000, 0, false, false, false)),
             ),
-            include_str!("../../docs/fixtures/marketplace-payment-request-status/reorged.json"),
+            "reorged",
         ),
     ];
     for (status, fixture) in success_cases {
@@ -309,24 +346,20 @@ async fn marketplace_consumer_fixtures_are_emitted_by_the_signed_route() {
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response_body(response).await, fixture.trim_end());
+        assert_fixture(fixture, &response_body(response).await);
     }
 
     for (result, expected_status, fixture) in [
-        (
-            Ok(None),
-            StatusCode::NOT_FOUND,
-            include_str!("../../docs/fixtures/marketplace-payment-request-status/not-found.json"),
-        ),
+        (Ok(None), StatusCode::NOT_FOUND, "not-found"),
         (
             Err(MarketplaceStatusError::Conflict),
             StatusCode::CONFLICT,
-            include_str!("../../docs/fixtures/marketplace-payment-request-status/conflict.json"),
+            "conflict",
         ),
         (
             Err(MarketplaceStatusError::Unavailable),
             StatusCode::SERVICE_UNAVAILABLE,
-            include_str!("../../docs/fixtures/marketplace-payment-request-status/unavailable.json"),
+            "unavailable",
         ),
         (
             Ok(Some(active_status_with(
@@ -335,9 +368,7 @@ async fn marketplace_consumer_fixtures_are_emitted_by_the_signed_route() {
                 None,
             ))),
             StatusCode::SERVICE_UNAVAILABLE,
-            include_str!(
-                "../../docs/fixtures/marketplace-payment-request-status/recovery-required.json"
-            ),
+            "recovery-required",
         ),
         (
             Ok(Some(active_status_with(
@@ -346,9 +377,7 @@ async fn marketplace_consumer_fixtures_are_emitted_by_the_signed_route() {
                 None,
             ))),
             StatusCode::CONFLICT,
-            include_str!(
-                "../../docs/fixtures/marketplace-payment-request-status/invalid-conflict.json"
-            ),
+            "invalid-conflict",
         ),
     ] {
         let response = marketplace_status_router(Arc::new(MarketplaceStatusService::new(
@@ -362,7 +391,7 @@ async fn marketplace_consumer_fixtures_are_emitted_by_the_signed_route() {
         .await
         .unwrap();
         assert_eq!(response.status(), expected_status);
-        assert_eq!(response_body(response).await, fixture.trim_end());
+        assert_fixture(fixture, &response_body(response).await);
     }
 }
 
@@ -501,4 +530,69 @@ async fn status_rejects_unknown_fields_and_maps_closed_errors() {
         assert_eq!(response.status(), status);
         assert_eq!(body(response).await["error"]["code"], code);
     }
+}
+
+#[tokio::test]
+async fn status_reports_the_usdt_receipt_and_the_paid_asset_next_to_bitcoin() {
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let usdt = MarketplaceUsdtStatus::new(
+        "0x1111111111111111111111111111111111111111111111111111111111111111".into(),
+        5_000_000,
+        OffsetDateTime::UNIX_EPOCH + time::Duration::hours(1),
+        2,
+        true,
+        true,
+        false,
+    );
+    let status = MarketplaceInvoiceStatus::active(
+        INVOICE_ID,
+        "delivered",
+        Some("proof_submitted"),
+        "confirmed",
+        OffsetDateTime::UNIX_EPOCH,
+        OffsetDateTime::UNIX_EPOCH + time::Duration::days(1),
+        None,
+        None,
+        None,
+    )
+    .with_offer(
+        vec![AcceptedAsset::Btc, AcceptedAsset::Usdt],
+        vec![
+            (AcceptedAsset::Btc, 6_173),
+            (AcceptedAsset::Usdt, 5_000_000),
+        ],
+    )
+    .with_usdt(Some(usdt), Some(AcceptedAsset::Usdt));
+    let response = marketplace_status_router(Arc::new(MarketplaceStatusService::new(Arc::new(
+        FakeStore {
+            result: Ok(Some(status)),
+        },
+    ))))
+    .layer(Extension(signed_auth(&key)))
+    .oneshot(request(
+        &key,
+        serde_json::json!({"creator":CREATOR,"invoice_id":INVOICE_ID}),
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body(response).await;
+    assert_eq!(
+        body["usdt_arbitrum"],
+        serde_json::json!({
+            "tx_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "observed_amount": "5000000",
+            "confirmations": 2,
+            "amount_matched": true,
+            "paid_on_time": true,
+            "finalized": false
+        })
+    );
+    assert_eq!(body["paid_asset"], "USDT");
+    assert_eq!(body["accepted_assets"], serde_json::json!(["BTC", "USDT"]));
+    assert_eq!(
+        body["payment_amounts"],
+        serde_json::json!({"BTC": "6173", "USDT": "5000000"})
+    );
+    assert!(body["bitcoin"].is_null());
 }

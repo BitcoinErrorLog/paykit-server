@@ -8,9 +8,10 @@ use std::{
 
 use async_trait::async_trait;
 use paykit_lib::{
-    PaykitAppId, PaymentAmount, PaymentEndpointIdentifier, PaymentEndpointPayload,
-    PaymentReference, PaymentRequestTerms,
+    ConversionRate, PaykitAppId, PaymentAmount, PaymentConversion, PaymentEndpointIdentifier,
+    PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
 };
+use time::OffsetDateTime;
 
 use crate::{
     application::{
@@ -20,11 +21,18 @@ use crate::{
             RegistryRetryDelay, SessionValidationError, SessionValidator,
             derive_bip84_p2wpkh_address,
         },
+        invoice_pricing::{ExchangeRates, conversion_rates},
+        marketplace_terms::MarketplaceTerms,
         reader_registry::reader_is_capable,
         semantic_intent::DeliveryIntentV1,
+        setup_status::AcceptedAsset,
     },
     config::BitcoinNetwork,
-    domain::locks::{CreatorPubky, ReaderPubky},
+    domain::{
+        invoice::CriterionAsset,
+        locks::{CreatorPubky, ReaderPubky},
+        receiving::{BitcoinAccount, USDT_ENDPOINT, UsdtAddress},
+    },
     persistence::{
         MarketplacePreparationInput, MarketplacePreparationPayloadFactory,
         MarketplacePreparationPayloads, MarketplacePreparationPreflight,
@@ -36,10 +44,25 @@ pub struct PrepareMarketplaceRequest {
     pub creator: CreatorPubky,
     pub reader: ReaderPubky,
     pub reference: String,
-    pub amount_sats: u64,
+    /// Exact amount in `asset`'s base units: sats, cents or millionths.
+    pub amount: u64,
+    /// Denomination of `amount`.
+    pub asset: CriterionAsset,
+    /// Optional narrowing of the seller's enabled receiving options. When omitted,
+    /// the request offers every asset the seller has set up. When present it is a
+    /// non-empty, unique subset filter that never adds a rail.
+    pub accepted_assets: Option<Vec<AcceptedAsset>>,
     pub operation_id: String,
     pub payment_window_seconds: u64,
     pub description: Option<String>,
+}
+
+/// Receiving rails a seller still has to set up for the accepted assets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MissingSellerRails {
+    Bitcoin,
+    Usdt,
+    BitcoinAndUsdt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,7 +75,11 @@ pub enum PrepareMarketplaceError {
     ReaderNotPayable,
     ReaderRegistryUnavailable,
     ReaderRegistryMalformed,
-    SellerSetupPending,
+    SellerSetupPending(MissingSellerRails),
+    /// An accepted asset needs a rail this deployment is not configured for.
+    AssetUnsupported,
+    /// The payment window is over the cap that applies to this request's conversion.
+    PaymentWindowExceedsCap,
     DeadlineExceeded,
     Unavailable,
 }
@@ -68,7 +95,9 @@ impl PrepareMarketplaceError {
             Self::ReaderNotPayable => "reader_not_payable",
             Self::ReaderRegistryUnavailable => "reader_registry_unavailable",
             Self::ReaderRegistryMalformed => "reader_registry_malformed",
-            Self::SellerSetupPending => "seller_setup_pending",
+            Self::SellerSetupPending(_) => "seller_setup_pending",
+            Self::AssetUnsupported => "asset_unsupported",
+            Self::PaymentWindowExceedsCap => "payment_window_exceeds_cap",
             Self::DeadlineExceeded => "deadline_exceeded",
             Self::Unavailable => "unavailable",
         }
@@ -88,6 +117,9 @@ pub trait MarketplacePreparationPersistence: Send + Sync {
         &self,
         input: MarketplacePreparationInput<'_>,
     ) -> Result<MarketplacePreparationResult, PersistenceError>;
+
+    /// The database clock, the one clock a preparation's expiry is fixed and judged on.
+    async fn database_time(&self) -> Result<OffsetDateTime, PersistenceError>;
 }
 
 #[async_trait]
@@ -107,6 +139,10 @@ impl MarketplacePreparationPersistence for MarketplacePreparationStore {
     ) -> Result<MarketplacePreparationResult, PersistenceError> {
         MarketplacePreparationStore::prepare(self, input).await
     }
+
+    async fn database_time(&self) -> Result<OffsetDateTime, PersistenceError> {
+        MarketplacePreparationStore::database_time(self).await
+    }
 }
 
 pub struct PrepareMarketplaceService {
@@ -117,7 +153,10 @@ pub struct PrepareMarketplaceService {
     app_id: PaykitAppId,
     bitcoin_network: BitcoinNetwork,
     payment_window_cap: Duration,
+    conversion_payment_window: Duration,
     prepare_ttl: Duration,
+    usdt_enabled: bool,
+    rates: Option<Arc<dyn ExchangeRates>>,
     registry_retry_delay: Arc<dyn RegistryRetryDelay>,
     request_deadline: Duration,
 }
@@ -142,10 +181,31 @@ impl PrepareMarketplaceService {
             app_id,
             bitcoin_network,
             payment_window_cap,
+            conversion_payment_window: Duration::from_secs(3600),
             prepare_ttl,
+            usdt_enabled: false,
+            rates: None,
             registry_retry_delay: Arc::new(FullJitterRegistryRetryDelay),
             request_deadline: REQUEST_DEADLINE,
         }
+    }
+
+    /// Enables USDT as an accepted payment asset on this deployment.
+    pub fn with_usdt(mut self, enabled: bool) -> Self {
+        self.usdt_enabled = enabled;
+        self
+    }
+
+    /// Cap for requests whose conversion crosses Bitcoin; never clamped, only refused.
+    pub fn with_conversion_payment_window(mut self, window: Duration) -> Self {
+        self.conversion_payment_window = window;
+        self
+    }
+
+    /// BTC/USD feed read once at prepare for requests that cross Bitcoin.
+    pub fn with_exchange_rates(mut self, rates: Arc<dyn ExchangeRates>) -> Self {
+        self.rates = Some(rates);
+        self
     }
 
     pub fn with_registry_retry_delay(
@@ -166,9 +226,18 @@ impl PrepareMarketplaceService {
         request: PrepareMarketplaceRequest,
     ) -> Result<MarketplacePreparationResult, PrepareMarketplaceError> {
         let started = Instant::now();
-        let request_binding = request_binding(&request).inspect_err(|&error| {
-            diagnose("request_binding", error);
-        })?;
+        let filter =
+            normalized_filter(request.accepted_assets.as_deref()).inspect_err(|&error| {
+                diagnose("request_terms", error);
+            })?;
+        if request.amount == 0 {
+            diagnose("request_terms", PrepareMarketplaceError::InvalidRequest);
+            return Err(PrepareMarketplaceError::InvalidRequest);
+        }
+        let request_binding =
+            request_binding(&request, filter.as_deref()).inspect_err(|&error| {
+                diagnose("request_binding", error);
+            })?;
         // PostgreSQL creator-row locking serializes commits across processes. This
         // process-local lock only prevents duplicate mutable external reads here.
         let operation_lock = marketplace_operation_lock(&request.creator, &request.operation_id);
@@ -196,9 +265,11 @@ impl PrepareMarketplaceService {
                         reference: &request.reference,
                         operation_id: &request.operation_id,
                         request_binding: &request_binding,
-                        total_sats: request.amount_sats,
+                        amount: request.amount,
+                        asset: request.asset,
                         payment_window_seconds: request.payment_window_seconds,
                         prepare_ttl_seconds: self.prepare_ttl.as_secs(),
+                        prepare_deadline: None,
                         payloads: &ReplayOnlyPayloads,
                     }),
                 )
@@ -213,7 +284,7 @@ impl PrepareMarketplaceService {
             MarketplacePreparationPreflight::New => {}
         }
 
-        validate_request(&request, self.payment_window_cap).inspect_err(|&error| {
+        self.validate_request(&request).inspect_err(|&error| {
             diagnose("request_validation", error);
         })?;
 
@@ -306,23 +377,97 @@ impl PrepareMarketplaceService {
         .await
         .map_err(|_| deadline("seller_receiving_details"))?
         .map_err(|error| store_failure("seller_receiving_details", error))?;
-        let bitcoin = receiving.bitcoin.ok_or_else(|| {
+        // The seller's setup decides what can be offered, exactly as for Locks
+        // invoices; a filter only narrows that set and never adds a rail.
+        let allowed = |asset: AcceptedAsset| filter.as_ref().is_none_or(|set| set.contains(&asset));
+        let bitcoin = receiving.bitcoin.filter(|_| allowed(AcceptedAsset::Btc));
+        let usdt = receiving
+            .usdt
+            .filter(|_| self.usdt_enabled && allowed(AcceptedAsset::Usdt));
+        let offered: Vec<_> = [
+            bitcoin.as_ref().map(|_| AcceptedAsset::Btc),
+            usdt.as_ref().map(|_| AcceptedAsset::Usdt),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let Ok(terms) = MarketplaceTerms::new(request.amount, request.asset, offered) else {
+            let error = refusal_without_rails(filter.as_deref(), self.usdt_enabled);
+            diagnose("seller_receiving_details_check", error);
+            return Err(error);
+        };
+        let cap = if terms.crosses_bitcoin_rate() {
+            self.payment_window_cap.min(self.conversion_payment_window)
+        } else {
+            self.payment_window_cap
+        };
+        if request.payment_window_seconds > cap.as_secs() {
             diagnose(
-                "seller_receiving_details_check",
-                PrepareMarketplaceError::SellerSetupPending,
+                "payment_window_cap",
+                PrepareMarketplaceError::PaymentWindowExceedsCap,
             );
-            PrepareMarketplaceError::SellerSetupPending
+            return Err(PrepareMarketplaceError::PaymentWindowExceedsCap);
+        }
+        // One feed read, fixed here for the life of the preparation: activation never
+        // refetches, so the buyer's quote cannot move after the order is shown.
+        let price = if terms.crosses_bitcoin_rate() {
+            let provider = self.rates.as_ref().ok_or_else(|| {
+                diagnose("exchange_rate", PrepareMarketplaceError::Unavailable);
+                PrepareMarketplaceError::Unavailable
+            })?;
+            Some(
+                tokio::time::timeout(
+                    remaining_at(started, self.request_deadline, "exchange_rate")?,
+                    provider.usd_per_btc(),
+                )
+                .await
+                .map_err(|_| deadline("exchange_rate"))?
+                .map_err(|_| {
+                    diagnose("exchange_rate", PrepareMarketplaceError::Unavailable);
+                    PrepareMarketplaceError::Unavailable
+                })?,
+            )
+        } else {
+            None
+        };
+        let rates = conversion_rates(
+            terms.asset(),
+            terms.accepts(AcceptedAsset::Btc),
+            terms.accepts(AcceptedAsset::Usdt),
+            price.as_deref(),
+        )
+        .map_err(|_| {
+            diagnose("exchange_rate", PrepareMarketplaceError::Unavailable);
+            PrepareMarketplaceError::Unavailable
         })?;
         let payloads = MarketplacePayloads {
             reader: &request.reader,
             reference: &request.reference,
-            amount_sats: request.amount_sats,
+            terms: &terms,
+            rates,
             description: request.description.as_deref(),
             app_id: &self.app_id,
             bitcoin_network: &self.bitcoin_network,
-            xpub: &bitcoin.xpub,
-            account_index: bitcoin.account_index,
+            bitcoin,
+            usdt,
         };
+        // The preparation's whole life is fixed here, on the database clock, when the
+        // quote is accepted. A wait for the Creator row can only use up that life: the
+        // store refuses once the deadline has passed and never starts a new TTL.
+        let accepted_at = tokio::time::timeout(
+            remaining_at(started, self.request_deadline, "quote_clock")?,
+            self.store.database_time(),
+        )
+        .await
+        .map_err(|_| deadline("quote_clock"))?
+        .map_err(|error| store_failure("quote_clock", error))?;
+        let prepare_deadline = time::Duration::try_from(self.prepare_ttl)
+            .ok()
+            .and_then(|ttl| accepted_at.checked_add(ttl))
+            .ok_or_else(|| {
+                diagnose("quote_clock", PrepareMarketplaceError::Unavailable);
+                PrepareMarketplaceError::Unavailable
+            })?;
         remaining_at(started, self.request_deadline, "prepare_store")?;
         // Do not cancel a PostgreSQL mutation at the HTTP deadline: COMMIT may
         // otherwise win while this request reports timeout. Await one factual
@@ -336,9 +481,11 @@ impl PrepareMarketplaceService {
                 reference: &request.reference,
                 operation_id: &request.operation_id,
                 request_binding: &request_binding,
-                total_sats: request.amount_sats,
+                amount: request.amount,
+                asset: request.asset,
                 payment_window_seconds: request.payment_window_seconds,
                 prepare_ttl_seconds: self.prepare_ttl.as_secs(),
+                prepare_deadline: Some(prepare_deadline),
                 payloads: &payloads,
             })
             .await
@@ -390,12 +537,13 @@ impl MarketplacePreparationPayloadFactory for ReplayOnlyPayloads {
 struct MarketplacePayloads<'a> {
     reader: &'a ReaderPubky,
     reference: &'a str,
-    amount_sats: u64,
+    terms: &'a MarketplaceTerms,
+    rates: Vec<ConversionRate>,
     description: Option<&'a str>,
     app_id: &'a PaykitAppId,
     bitcoin_network: &'a BitcoinNetwork,
-    xpub: &'a str,
-    account_index: u32,
+    bitcoin: Option<BitcoinAccount>,
+    usdt: Option<UsdtAddress>,
 }
 
 impl MarketplacePreparationPayloadFactory for MarketplacePayloads<'_> {
@@ -403,31 +551,46 @@ impl MarketplacePreparationPayloadFactory for MarketplacePayloads<'_> {
         &self,
         child_index: i64,
     ) -> Result<MarketplacePreparationPayloads, PersistenceError> {
-        let address = derive_bip84_p2wpkh_address(
-            self.xpub,
-            self.account_index,
-            self.bitcoin_network,
-            child_index,
-        )
-        .map_err(|_| PersistenceError::InvalidInput)?;
-        let endpoint = PaymentEndpointIdentifier::new(endpoint_identifier(self.bitcoin_network))
+        let mut endpoints = HashMap::new();
+        if let Some(bitcoin) = &self.bitcoin {
+            let address = derive_bip84_p2wpkh_address(
+                &bitcoin.xpub,
+                bitcoin.account_index,
+                self.bitcoin_network,
+                child_index,
+            )
             .map_err(|_| PersistenceError::InvalidInput)?;
-        let amount = format!(
-            "{}.{:08}",
-            self.amount_sats / 100_000_000,
-            self.amount_sats % 100_000_000
-        );
+            endpoints.insert(
+                PaymentEndpointIdentifier::new(endpoint_identifier(self.bitcoin_network))
+                    .map_err(|_| PersistenceError::InvalidInput)?,
+                PaymentEndpointPayload::new(serde_json::json!({"value": address}).to_string()),
+            );
+        }
+        if let Some(address) = &self.usdt {
+            endpoints.insert(
+                PaymentEndpointIdentifier::new(USDT_ENDPOINT)
+                    .map_err(|_| PersistenceError::InvalidInput)?,
+                PaymentEndpointPayload::new(address.endpoint().to_string()),
+            );
+        }
+        let mut identifiers: Vec<_> = endpoints.keys().cloned().collect();
+        identifiers.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        let asset = self.terms.asset();
         let mut terms = PaymentRequestTerms::builder(
-            PaymentAmount::new(amount, "btc").map_err(|_| PersistenceError::InvalidInput)?,
+            PaymentAmount::new(
+                asset.decimal_amount(self.terms.amount()),
+                asset.as_str().to_ascii_lowercase(),
+            )
+            .map_err(|_| PersistenceError::InvalidInput)?,
             PaymentReference::new(self.reference.to_owned())
                 .map_err(|_| PersistenceError::InvalidInput)?,
-            vec![endpoint.clone()],
+            identifiers,
         )
         .required_app_id(Some(self.app_id.clone()))
-        .payment_endpoints(Some(HashMap::from([(
-            endpoint,
-            PaymentEndpointPayload::new(serde_json::json!({"value": address}).to_string()),
-        )])));
+        .payment_endpoints(Some(endpoints))
+        .conversion((!self.rates.is_empty()).then(|| PaymentConversion::Fixed {
+            rates: self.rates.clone(),
+        }));
         if let Some(description) = self.description {
             terms = terms.metadata(serde_json::Map::from_iter([(
                 "note".into(),
@@ -454,55 +617,103 @@ impl MarketplacePreparationPayloadFactory for MarketplacePayloads<'_> {
     }
 }
 
-fn validate_request(
-    request: &PrepareMarketplaceRequest,
-    payment_window_cap: Duration,
-) -> Result<(), PrepareMarketplaceError> {
-    let reference = uuid::Uuid::parse_str(&request.reference)
-        .map_err(|_| PrepareMarketplaceError::InvalidRequest)?;
-    if request.operation_id.is_empty()
-        || request.amount_sats == 0
-        || request.payment_window_seconds == 0
-        || request.payment_window_seconds > payment_window_cap.as_secs()
-        || reference.get_version_num() != 4
-        || reference.get_variant() != uuid::Variant::RFC4122
-        || reference.hyphenated().to_string() != request.reference
-    {
+impl PrepareMarketplaceService {
+    /// Pure checks that need no seller, reader or feed read.
+    fn validate_request(
+        &self,
+        request: &PrepareMarketplaceRequest,
+    ) -> Result<(), PrepareMarketplaceError> {
+        let reference = uuid::Uuid::parse_str(&request.reference)
+            .map_err(|_| PrepareMarketplaceError::InvalidRequest)?;
+        if request.operation_id.is_empty()
+            || request.payment_window_seconds == 0
+            || reference.get_version_num() != 4
+            || reference.get_variant() != uuid::Variant::RFC4122
+            || reference.hyphenated().to_string() != request.reference
+        {
+            return Err(PrepareMarketplaceError::InvalidRequest);
+        }
+        if request.description.as_deref().is_some_and(|description| {
+            description.trim().is_empty()
+                || description.chars().count() > 140
+                || description
+                    .chars()
+                    .any(|character| character.is_control() || is_direction_control(character))
+        }) {
+            return Err(PrepareMarketplaceError::InvalidRequest);
+        }
+        PaymentReference::new(request.reference.clone())
+            .map_err(|_| PrepareMarketplaceError::InvalidRequest)?;
+        if request.payment_window_seconds > self.payment_window_cap.as_secs() {
+            return Err(PrepareMarketplaceError::PaymentWindowExceedsCap);
+        }
+        Ok(())
+    }
+}
+
+/// A present filter must be non-empty and unique; it is kept in canonical order.
+fn normalized_filter(
+    filter: Option<&[AcceptedAsset]>,
+) -> Result<Option<Vec<AcceptedAsset>>, PrepareMarketplaceError> {
+    let Some(filter) = filter else {
+        return Ok(None);
+    };
+    let mut set = filter.to_vec();
+    set.sort();
+    if set.is_empty() || set.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(PrepareMarketplaceError::InvalidRequest);
     }
-    if request.description.as_deref().is_some_and(|description| {
-        description.trim().is_empty()
-            || description.chars().count() > 140
-            || description
-                .chars()
-                .any(|character| character.is_control() || is_direction_control(character))
-    }) {
-        return Err(PrepareMarketplaceError::InvalidRequest);
+    Ok(Some(set))
+}
+
+/// Why nothing could be offered: the deployment cannot do the only asset asked for,
+/// or the seller has not set up any asset the request allows. The refusal names only
+/// rails this deployment could offer.
+fn refusal_without_rails(
+    filter: Option<&[AcceptedAsset]>,
+    usdt_enabled: bool,
+) -> PrepareMarketplaceError {
+    use AcceptedAsset::{Btc, Usdt};
+    match filter {
+        None => PrepareMarketplaceError::SellerSetupPending(MissingSellerRails::Bitcoin),
+        Some([Usdt]) if !usdt_enabled => PrepareMarketplaceError::AssetUnsupported,
+        Some(set) => PrepareMarketplaceError::SellerSetupPending(
+            match (set.contains(&Btc), set.contains(&Usdt) && usdt_enabled) {
+                (true, true) => MissingSellerRails::BitcoinAndUsdt,
+                (false, true) => MissingSellerRails::Usdt,
+                _ => MissingSellerRails::Bitcoin,
+            },
+        ),
     }
-    PaymentReference::new(request.reference.clone())
-        .map_err(|_| PrepareMarketplaceError::InvalidRequest)?;
-    Ok(())
 }
 
 fn request_binding(
     request: &PrepareMarketplaceRequest,
+    filter: Option<&[AcceptedAsset]>,
 ) -> Result<Vec<u8>, PrepareMarketplaceError> {
     let mut binding = serde_json::json!({
-        "amount_sats": request.amount_sats,
+        "amount": request.amount.to_string(),
+        "asset": request.asset.as_str(),
         "creator": request.creator.to_string(),
         "operation_id": request.operation_id,
         "payment_window_seconds": request.payment_window_seconds,
         "reader": request.reader.to_string(),
         "reference": request.reference,
     });
+    let fields = binding
+        .as_object_mut()
+        .expect("static request binding is an object");
+    if let Some(filter) = filter {
+        fields.insert(
+            "accepted_assets".into(),
+            filter.iter().map(|asset| asset.as_str()).collect(),
+        );
+    }
     if let Some(description) = &request.description {
-        binding
-            .as_object_mut()
-            .expect("static request binding is an object")
-            .insert(
-                "description".into(),
-                serde_json::Value::String(description.clone()),
-            );
+        fields.insert(
+            "description".into(),
+            serde_json::Value::String(description.clone()),
+        );
     }
     serde_json_canonicalizer::to_vec(&binding).map_err(|_| PrepareMarketplaceError::InvalidRequest)
 }
@@ -540,6 +751,7 @@ fn registry_failure(stage: &'static str, error: RegistryDiscoveryError) -> Prepa
 fn map_store(error: PersistenceError) -> PrepareMarketplaceError {
     match error {
         PersistenceError::Conflict => PrepareMarketplaceError::Conflict,
+        PersistenceError::DeadlineElapsed => PrepareMarketplaceError::DeadlineExceeded,
         PersistenceError::InvalidInput => PrepareMarketplaceError::InvalidRequest,
         PersistenceError::DeploymentMismatch
         | PersistenceError::CorruptOrMissing

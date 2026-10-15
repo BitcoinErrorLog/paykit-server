@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use axum::{
     Router,
@@ -12,10 +12,17 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::{
     application::marketplace_preparation::{
-        PrepareMarketplaceError, PrepareMarketplaceRequest, PrepareMarketplaceService,
+        MissingSellerRails, PrepareMarketplaceError, PrepareMarketplaceRequest,
+        PrepareMarketplaceService,
     },
     domain::locks::{parse_creator, parse_reader},
-    http::{auth::AuthenticatedJson, error::ApiError},
+    http::{
+        auth::AuthenticatedJson,
+        error::ApiError,
+        marketplace_terms::{
+            TermsResponse, parse_accepted_assets, parse_amount, parse_asset, rates,
+        },
+    },
 };
 
 #[derive(Deserialize)]
@@ -23,11 +30,21 @@ struct PrepareBody {
     creator: String,
     reader: String,
     reference: String,
-    amount_sats: u64,
+    amount: String,
+    asset: String,
+    #[serde(default, deserialize_with = "deserialize_present_assets")]
+    accepted_assets: Option<Vec<String>>,
     operation_id: String,
     payment_window_seconds: u64,
     #[serde(default, deserialize_with = "deserialize_present_description")]
     description: Option<String>,
+}
+
+fn deserialize_present_assets<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<String>::deserialize(deserializer).map(Some)
 }
 
 fn deserialize_present_description<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -41,7 +58,9 @@ where
 struct PrepareResponse {
     invoice_id: String,
     state: &'static str,
-    total_sats: u64,
+    #[serde(flatten)]
+    terms: TermsResponse,
+    rates: BTreeMap<&'static str, String>,
     prepare_expires_at: String,
 }
 
@@ -77,7 +96,8 @@ async fn prepare(
                 axum::Json(PrepareResponse {
                     invoice_id: result.invoice_id().hyphenated().to_string(),
                     state: "prepared",
-                    total_sats: result.total_sats(),
+                    terms: TermsResponse::new(result.terms(), result.quote()),
+                    rates: rates(result.quote()),
                     prepare_expires_at,
                 }),
             )
@@ -99,7 +119,13 @@ fn parse(body: PrepareBody) -> Result<PrepareMarketplaceRequest, ApiError> {
         creator: parse_creator(&body.creator).map_err(|_| ApiError::InvalidRequest)?,
         reader: parse_reader(&body.reader).map_err(|_| ApiError::InvalidRequest)?,
         reference: body.reference,
-        amount_sats: body.amount_sats,
+        amount: parse_amount(&body.amount)?,
+        asset: parse_asset(&body.asset)?,
+        accepted_assets: body
+            .accepted_assets
+            .as_deref()
+            .map(parse_accepted_assets)
+            .transpose()?,
         operation_id: body.operation_id,
         payment_window_seconds: body.payment_window_seconds,
         description: body.description,
@@ -116,7 +142,17 @@ fn map_error(error: PrepareMarketplaceError) -> ApiError {
         PrepareMarketplaceError::ReaderNotPayable => ApiError::ReaderNotPayable,
         PrepareMarketplaceError::ReaderRegistryUnavailable => ApiError::ReaderRegistryUnavailable,
         PrepareMarketplaceError::ReaderRegistryMalformed => ApiError::ReaderRegistryMalformed,
-        PrepareMarketplaceError::SellerSetupPending => ApiError::SellerSetupPending,
+        PrepareMarketplaceError::SellerSetupPending(MissingSellerRails::Bitcoin) => {
+            ApiError::SellerSetupPending
+        }
+        PrepareMarketplaceError::SellerSetupPending(MissingSellerRails::Usdt) => {
+            ApiError::SellerUsdtSetupPending
+        }
+        PrepareMarketplaceError::SellerSetupPending(MissingSellerRails::BitcoinAndUsdt) => {
+            ApiError::SellerBitcoinAndUsdtSetupPending
+        }
+        PrepareMarketplaceError::AssetUnsupported => ApiError::AssetUnsupported,
+        PrepareMarketplaceError::PaymentWindowExceedsCap => ApiError::PaymentWindowExceedsCap,
         PrepareMarketplaceError::DeadlineExceeded => ApiError::DependencyTimeout,
         PrepareMarketplaceError::Unavailable => ApiError::DependencyUnavailable,
     }

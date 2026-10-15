@@ -1,11 +1,10 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use axum::{Json, Router, extract::State, routing::post};
 use paykit_lib::{
     PaykitAppId, PaymentAmount, PaymentEndpointIdentifier, PaymentEndpointPayload,
     PaymentReference, PaymentRequestTerms,
 };
-use paykit_sdk::{PaykitIdentitySecretKey, PaymentProofRecord, PaymentRequestRecord};
+use paykit_sdk::PaykitIdentitySecretKey;
 use paykit_server::{
     application::{
         payment_request_status::{PaymentRequestStatusOperations, PaymentRequestStatusSummary},
@@ -13,153 +12,30 @@ use paykit_server::{
     },
     crypto::Crypto,
     domain::{
+        invoice::CriterionAsset,
         locks::{
             BundleId, parse_addressed_lock_resource, parse_bundle_id, parse_creator, parse_reader,
         },
-        receiving::{USDT_ENDPOINT, USDT_TOKEN, UsdtAddress},
+        receiving::{USDT_ENDPOINT, UsdtAddress},
     },
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
-        InvoicePayloads, InvoiceStore, PaymentDrainStore, PersistenceError, run_migrations,
+        InvoicePayloads, InvoiceStore, MarketplaceActivationInput, MarketplacePreparationInput,
+        MarketplacePreparationPayloadFactory, MarketplacePreparationPayloads,
+        MarketplacePreparationStore, PaymentDrainStore, PersistenceError, run_migrations,
     },
     usdt::{ArbitrumVerifier, PaymentContext, VerificationError},
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
-use uuid::Uuid;
 
-const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+mod common;
+
+use common::arbitrum::{BLOCK, CREATOR, RECIPIENT, Rpc, fixture, proof, record};
+
 const BUNDLES: [&str; 2] = ["000G40R40M30E209185GR38E1W", "000G40R40M30E209185GR38E2W"];
-const RECIPIENT: &str = "0x2222222222222222222222222222222222222222";
 const LOCK_RESOURCE: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json";
-const BLOCK: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-fn fixture(index: usize) -> Value {
-    serde_json::from_str::<Value>(include_str!("fixtures/usdt-proofs.json")).unwrap()["proofs"]
-        [index]
-        .clone()
-}
-
-fn proof(index: usize) -> PaymentProofRecord {
-    let fixture = fixture(index);
-    serde_json::from_value(json!({
-        "event_id": Uuid::new_v4().to_string(), "stream_item_id":1,
-        "payment_reference": fixture["binding"]["paymentReference"],
-        "payment_app_id":"paykit-server", "payment_endpoint_identifier":USDT_ENDPOINT,
-        "proof":fixture["proof"], "recorded_at":"2026-10-07T00:00:00Z"
-    }))
-    .unwrap()
-}
-
-fn record(index: usize) -> PaymentRequestRecord {
-    serde_json::from_value(json!({
-        "counterparty":CREATOR.trim_start_matches("pubky"),
-        "payment_request_id":fixture(index)["binding"]["paymentRequestId"],
-        "local_role":"Payee", "state":"ProofSubmitted", "conversion_quotes":[],
-        "payment_proofs":[proof(index)],
-    }))
-    .unwrap()
-}
-
-#[derive(Clone)]
-struct Chain {
-    receipt: Value,
-    chain_id: u64,
-    head: u64,
-    timestamp: i64,
-    finalized: bool,
-    reorg: bool,
-    unavailable: bool,
-}
-
-impl Chain {
-    fn new() -> Self {
-        let hash = fixture(0)["proof"]["transaction_hash"].clone();
-        let sender = "0x0000000000000000000000007e5f4552091a69125d5dfcb7b8c2659029395bdf";
-        let topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-        let recipient = format!("0x{}{}", "0".repeat(24), &RECIPIENT[2..]);
-        Self {
-            receipt: json!({"transactionHash":hash,"status":"0x1","blockNumber":"0x64","blockHash":BLOCK,
-            "logs":[{}, {"address":USDT_TOKEN,"transactionHash":hash,"blockHash":BLOCK,"removed":false,
-                "logIndex":"0xf", "topics":[topic,sender,recipient],"data":format!("0x{:064x}",50_000)}]}),
-            chain_id: 42161,
-            head: 101,
-            timestamp: OffsetDateTime::now_utc().unix_timestamp(),
-            finalized: false,
-            reorg: false,
-            unavailable: false,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct RpcState {
-    chain: Arc<Mutex<Chain>>,
-    requests: Arc<Mutex<Vec<(String, Value)>>>,
-}
-
-struct Rpc {
-    chain: Arc<Mutex<Chain>>,
-    verifier: ArbitrumVerifier,
-    url: url::Url,
-    requests: Arc<Mutex<Vec<(String, Value)>>>,
-    task: tokio::task::JoinHandle<()>,
-}
-impl Drop for Rpc {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-impl Rpc {
-    async fn start() -> Self {
-        async fn handle(State(state): State<RpcState>, Json(request): Json<Value>) -> Json<Value> {
-            state.requests.lock().unwrap().push((
-                request["method"].as_str().unwrap().to_owned(),
-                request["params"].clone(),
-            ));
-            let chain = state.chain.lock().unwrap();
-            if chain.unavailable {
-                return Json(
-                    json!({"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"unavailable"}}),
-                );
-            }
-            let result = match request["method"].as_str().unwrap() {
-                "eth_chainId" => json!(format!("0x{:x}", chain.chain_id)),
-                "eth_getTransactionReceipt" => chain.receipt.clone(),
-                "eth_blockNumber" => json!(format!("0x{:x}", chain.head)),
-                "eth_getBlockByNumber" if request["params"][0] == "finalized" => {
-                    json!({"number":if chain.finalized {"0x64"}else{"0x63"}})
-                }
-                "eth_getBlockByNumber" => {
-                    json!({"number":request["params"][0],"hash":if chain.reorg {"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}else{BLOCK},"timestamp":format!("0x{:x}",chain.timestamp)})
-                }
-                _ => panic!("unexpected RPC"),
-            };
-            Json(json!({"jsonrpc":"2.0","id":1,"result":result}))
-        }
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url: url::Url = format!("http://{}", listener.local_addr().unwrap())
-            .parse()
-            .unwrap();
-        let chain = Arc::new(Mutex::new(Chain::new()));
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let app = Router::new().route("/", post(handle)).with_state(RpcState {
-            chain: chain.clone(),
-            requests: requests.clone(),
-        });
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        Self {
-            chain,
-            verifier: ArbitrumVerifier::new(url.clone()).unwrap(),
-            url,
-            requests,
-            task,
-        }
-    }
-}
 
 #[tokio::test]
 async fn account_attestation_and_canonical_receipt_are_both_required() {
@@ -903,4 +779,123 @@ async fn timely_usdt_payment_remains_verifiable_after_drain_cleanup() {
             .finalized
     );
     database.cleanup().await;
+}
+
+struct MarketplacePayload;
+
+impl MarketplacePreparationPayloadFactory for MarketplacePayload {
+    fn for_child_index(
+        &self,
+        _index: i64,
+    ) -> Result<MarketplacePreparationPayloads, PersistenceError> {
+        Ok(MarketplacePreparationPayloads {
+            payment_request_intent: invoice_payload(2, None)?.payment_request_intent,
+        })
+    }
+}
+
+#[tokio::test]
+async fn locks_ignores_a_transfer_a_marketplace_request_already_owns() {
+    let bundle = parse_bundle_id(BUNDLES[0]).unwrap();
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(&[7; 32]).unwrap());
+    let creator = parse_creator(CREATOR).unwrap();
+    let creator_id = CreatorStore::new(database.pool(), crypto.clone())
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "test-session".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            None,
+            Some(UsdtAddress::try_from(RECIPIENT.to_owned()).unwrap()),
+        ))
+        .await
+        .unwrap()
+        .id();
+
+    let invoices = InvoiceStore::new(database.pool(), crypto.clone());
+    let locks_invoice = invoices
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &parse_reader(CREATOR).unwrap(),
+            bundle_binding: BUNDLES[0].as_bytes(),
+            lock_resource_binding: b"lock",
+            payment_request_binding: BUNDLES[0].as_bytes(),
+            invoice_payloads: &Payload { index: 0 },
+            proposal_acceptance_seconds: 3600,
+            payment_window_seconds: 86400,
+        })
+        .await
+        .unwrap()
+        .invoice_id();
+    sqlx::query("INSERT INTO payment_request_lifecycles (invoice_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id) VALUES ($1,$2,'proof_submitted',NOW(),1)")
+        .bind(locks_invoice)
+        .bind(record(0).payment_request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    let marketplace = MarketplacePreparationStore::new(database.pool(), crypto.clone());
+    let prepared = marketplace
+        .prepare(MarketplacePreparationInput {
+            creator: &creator,
+            reader: &parse_reader(CREATOR).unwrap(),
+            reference: fixture(2)["binding"]["paymentReference"].as_str().unwrap(),
+            operation_id: "marketplace-usdt",
+            request_binding: b"marketplace-usdt",
+            amount: 50_000,
+            asset: CriterionAsset::Usdt,
+            payment_window_seconds: 86_400,
+            prepare_ttl_seconds: 900,
+            prepare_deadline: common::deadline_after(900),
+            payloads: &MarketplacePayload,
+        })
+        .await
+        .unwrap();
+    marketplace
+        .activate(MarketplaceActivationInput {
+            creator: &creator,
+            invoice_id: prepared.invoice_id(),
+            amount: 50_000,
+            asset: CriterionAsset::Usdt,
+            proposal_acceptance_window: std::time::Duration::from_secs(1_800),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query("INSERT INTO payment_request_lifecycles (marketplace_preparation_id,sdk_payment_request_id,request_state,last_event_at,last_stream_item_id,state_event_id) VALUES ($1,$2,'proof_submitted',NOW(),1,'event')")
+        .bind(prepared.invoice_id())
+        .bind(record(2).payment_request_id)
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    let rpc = Rpc::start().await;
+    marketplace
+        .observe_usdt_request(creator_id, &creator, &record(2), &rpc.verifier)
+        .await
+        .unwrap();
+    // The same on-chain transfer, attested for a Locks invoice, cannot take the receipt.
+    invoices
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &record(0),
+            &rpc.verifier,
+            Some(&bundle),
+        )
+        .await
+        .unwrap();
+    invoices
+        .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
+        .await
+        .unwrap();
+    assert_eq!(status(&invoices, &bundle).await, (false, 0));
+    let owners: (i64, i64) = sqlx::query_as(
+        "SELECT count(invoice_id), count(marketplace_preparation_id) FROM usdt_observations",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(owners, (0, 1));
 }

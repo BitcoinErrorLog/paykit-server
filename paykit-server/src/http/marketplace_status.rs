@@ -6,14 +6,19 @@ use axum::{
     response::{IntoResponse, Response},
     routing::post,
 };
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::{
-    application::marketplace_status::{
-        MarketplaceBitcoinStatus, MarketplaceInvoiceStatus, MarketplaceStatusError,
-        MarketplaceStatusService,
+    application::{
+        marketplace_status::{
+            MarketplaceBitcoinStatus, MarketplaceInvoiceStatus, MarketplaceStatusError,
+            MarketplaceStatusService, MarketplaceUsdtStatus,
+        },
+        setup_status::AcceptedAsset,
     },
     domain::locks::parse_creator,
     http::{auth::AuthenticatedJson, error::ApiError},
@@ -36,6 +41,16 @@ struct BitcoinResponse {
 }
 
 #[derive(Serialize)]
+struct UsdtResponse {
+    tx_hash: String,
+    observed_amount: String,
+    confirmations: u32,
+    amount_matched: bool,
+    paid_on_time: bool,
+    finalized: bool,
+}
+
+#[derive(Serialize)]
 struct StatusResponse {
     invoice_id: String,
     state: &'static str,
@@ -44,7 +59,11 @@ struct StatusResponse {
     payment_state: Option<&'static str>,
     activated_at: Option<String>,
     payment_deadline: Option<String>,
+    accepted_assets: Vec<&'static str>,
+    payment_amounts: BTreeMap<&'static str, String>,
     bitcoin: Option<BitcoinResponse>,
+    usdt_arbitrum: Option<UsdtResponse>,
+    paid_asset: Option<&'static str>,
     outcome: Option<&'static str>,
     resolved_at: Option<String>,
 }
@@ -93,7 +112,20 @@ fn response(status: MarketplaceInvoiceStatus) -> Result<StatusResponse, ApiError
         payment_state: status.payment_state,
         activated_at: format_optional(status.activated_at)?,
         payment_deadline: format_optional(status.payment_deadline)?,
+        accepted_assets: status
+            .accepted_assets
+            .iter()
+            .copied()
+            .map(AcceptedAsset::as_str)
+            .collect(),
+        payment_amounts: status
+            .payment_amounts
+            .iter()
+            .map(|(asset, amount)| (asset.as_str(), amount.to_string()))
+            .collect(),
         bitcoin: status.bitcoin.map(bitcoin_response),
+        usdt_arbitrum: status.usdt_arbitrum.map(usdt_response),
+        paid_asset: status.paid_asset.map(AcceptedAsset::as_str),
         outcome: status.outcome,
         resolved_at: format_optional(status.resolved_at)?,
     })
@@ -106,6 +138,17 @@ fn bitcoin_response(status: MarketplaceBitcoinStatus) -> BitcoinResponse {
         confirmations: status.confirmations,
         amount_matched: status.amount_matched,
         paid_on_time: status.paid_on_time,
+    }
+}
+
+fn usdt_response(status: MarketplaceUsdtStatus) -> UsdtResponse {
+    UsdtResponse {
+        tx_hash: status.tx_hash,
+        observed_amount: status.observed_amount.to_string(),
+        confirmations: status.confirmations,
+        amount_matched: status.amount_matched,
+        paid_on_time: status.paid_on_time,
+        finalized: status.finalized,
     }
 }
 

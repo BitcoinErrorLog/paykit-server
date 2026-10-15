@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use crate::{
-    domain::locks::CreatorPubky,
+    domain::{invoice::CriterionAsset, locks::CreatorPubky},
     persistence::{
         MarketplaceActivationInput, MarketplaceActivationResult,
         MarketplaceLifecyclePersistenceError, MarketplacePreparationStore,
@@ -18,7 +18,10 @@ use crate::{
 pub struct ActivateMarketplaceRequest {
     pub creator: CreatorPubky,
     pub invoice_id: Uuid,
-    pub total_sats: u64,
+    /// Exact amount in `asset`'s base units, as prepared.
+    pub amount: u64,
+    /// Denomination of `amount`, as prepared.
+    pub asset: CriterionAsset,
 }
 
 pub struct VoidMarketplaceRequest {
@@ -113,14 +116,15 @@ impl MarketplaceLifecycleService {
         &self,
         request: ActivateMarketplaceRequest,
     ) -> Result<MarketplaceActivationResult, MarketplaceLifecycleError> {
-        if request.total_sats == 0 || self.proposal_acceptance_window.is_zero() {
+        if request.amount == 0 || self.proposal_acceptance_window.is_zero() {
             return Err(MarketplaceLifecycleError::InvalidRequest);
         }
         self.store
             .activate(MarketplaceActivationInput {
                 creator: &request.creator,
                 invoice_id: request.invoice_id,
-                total_sats: request.total_sats,
+                amount: request.amount,
+                asset: request.asset,
                 proposal_acceptance_window: self.proposal_acceptance_window,
             })
             .await
@@ -171,9 +175,9 @@ fn map_store(error: MarketplaceLifecyclePersistenceError) -> MarketplaceLifecycl
         MarketplaceLifecyclePersistenceError::Persistence(PersistenceError::InvalidInput) => {
             MarketplaceLifecycleError::InvalidRequest
         }
-        MarketplaceLifecyclePersistenceError::Persistence(PersistenceError::Unavailable) => {
-            MarketplaceLifecycleError::Unavailable
-        }
+        MarketplaceLifecyclePersistenceError::Persistence(
+            PersistenceError::Unavailable | PersistenceError::DeadlineElapsed,
+        ) => MarketplaceLifecycleError::Unavailable,
         MarketplaceLifecyclePersistenceError::Persistence(
             PersistenceError::DeploymentMismatch
             | PersistenceError::CorruptOrMissing

@@ -7,6 +7,7 @@ pub mod invoices;
 pub mod marketplace_lifecycle;
 pub mod marketplace_preparation;
 pub mod marketplace_status;
+mod marketplace_terms;
 pub mod payment_drains;
 pub mod payment_requests;
 pub(crate) mod request_diagnostics;

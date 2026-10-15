@@ -31,7 +31,9 @@ impl SetupStatus {
 ///
 /// This is not a price denomination: `USD` is a `CriterionAsset` but never an
 /// accepted payment asset.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum AcceptedAsset {
     Btc,
     Usdt,
@@ -43,6 +45,20 @@ impl AcceptedAsset {
             "BTC" => Ok(Self::Btc),
             "USDT" => Ok(Self::Usdt),
             _ => Err(AcceptedAssetError::Unsupported),
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Btc => "BTC",
+            Self::Usdt => "USDT",
+        }
+    }
+
+    pub const fn criterion_asset(self) -> crate::domain::invoice::CriterionAsset {
+        match self {
+            Self::Btc => crate::domain::invoice::CriterionAsset::Btc,
+            Self::Usdt => crate::domain::invoice::CriterionAsset::Usdt,
         }
     }
 }

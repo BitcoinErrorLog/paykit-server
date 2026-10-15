@@ -8,10 +8,14 @@ use paykit_server::{
         MarketplaceBitcoinStatus, MarketplaceInvoiceStatus, MarketplaceStatusError,
         MarketplaceStatusPersistence, MarketplaceStatusService,
     },
+    application::setup_status::AcceptedAsset,
     bitcoin::{ObservationTarget, ObservedOutput},
     config::BitcoinNetwork,
     crypto::Crypto,
-    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    domain::{
+        invoice::CriterionAsset,
+        locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    },
     persistence::{
         CreatorCredentials, CreatorStore, MarketplaceActivationInput, MarketplacePreparationInput,
         MarketplacePreparationPayloadFactory, MarketplacePreparationPayloads,
@@ -112,9 +116,11 @@ async fn prepare_with_window(
             reference: REFERENCE,
             operation_id: "marketplace-payment:order-1:attempt-1",
             request_binding: b"request-one",
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             payment_window_seconds,
             prepare_ttl_seconds: 15 * 60,
+            prepare_deadline: common::deadline_after(15 * 60),
             payloads: &Payloads,
         })
         .await
@@ -165,9 +171,10 @@ async fn status_scopes_owner_and_projects_publication_and_resolution() {
 
     assert_eq!(
         store.status(&creator(), invoice_id).await.unwrap(),
-        Some(MarketplaceInvoiceStatus::inactive(
-            invoice_id, "prepared", None, None,
-        ))
+        Some(
+            MarketplaceInvoiceStatus::inactive(invoice_id, "prepared", None, None,)
+                .with_offer(vec![AcceptedAsset::Btc], vec![(AcceptedAsset::Btc, 100)],)
+        )
     );
     assert_eq!(
         store.status(&other_creator(), invoice_id).await.unwrap(),
@@ -185,7 +192,8 @@ async fn status_scopes_owner_and_projects_publication_and_resolution() {
         .activate(MarketplaceActivationInput {
             creator: &creator(),
             invoice_id,
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
@@ -193,17 +201,20 @@ async fn status_scopes_owner_and_projects_publication_and_resolution() {
         .unwrap();
     assert_eq!(
         store.status(&creator(), invoice_id).await.unwrap(),
-        Some(MarketplaceInvoiceStatus::active(
-            invoice_id,
-            "pending",
-            None,
-            "undetected",
-            activated.activated_at(),
-            activated.payment_deadline(),
-            None,
-            None,
-            None,
-        ))
+        Some(
+            MarketplaceInvoiceStatus::active(
+                invoice_id,
+                "pending",
+                None,
+                "undetected",
+                activated.activated_at(),
+                activated.payment_deadline(),
+                None,
+                None,
+                None,
+            )
+            .with_offer(vec![AcceptedAsset::Btc], vec![(AcceptedAsset::Btc, 100)],)
+        )
     );
 
     for (stored, projected) in [
@@ -234,7 +245,8 @@ async fn status_scopes_owner_and_projects_publication_and_resolution() {
             None,
             None,
             None,
-        );
+        )
+        .with_offer(vec![AcceptedAsset::Btc], vec![(AcceptedAsset::Btc, 100)]);
         assert_eq!(
             store.status(&creator(), invoice_id).await.unwrap(),
             Some(expected)
@@ -258,17 +270,20 @@ async fn status_scopes_owner_and_projects_publication_and_resolution() {
     .unwrap();
     assert_eq!(
         store.status(&creator(), invoice_id).await.unwrap(),
-        Some(MarketplaceInvoiceStatus::active(
-            invoice_id,
-            "failed",
-            None,
-            "undetected",
-            activated.activated_at(),
-            activated.payment_deadline(),
-            None,
-            Some("refunded"),
-            Some(resolved_at),
-        ))
+        Some(
+            MarketplaceInvoiceStatus::active(
+                invoice_id,
+                "failed",
+                None,
+                "undetected",
+                activated.activated_at(),
+                activated.payment_deadline(),
+                None,
+                Some("refunded"),
+                Some(resolved_at),
+            )
+            .with_offer(vec![AcceptedAsset::Btc], vec![(AcceptedAsset::Btc, 100)],)
+        )
     );
 
     database.cleanup().await;
@@ -284,7 +299,8 @@ async fn bitcoin_evidence_keeps_identity_amount_and_first_observation_immutable(
         .activate(MarketplaceActivationInput {
             creator: &creator(),
             invoice_id,
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
@@ -314,26 +330,30 @@ async fn bitcoin_evidence_keeps_identity_amount_and_first_observation_immutable(
     );
     assert_eq!(
         store.status(&creator(), invoice_id).await.unwrap(),
-        Some(MarketplaceInvoiceStatus::active(
-            invoice_id,
-            "pending",
-            None,
-            "detected",
-            activated.activated_at(),
-            activated.payment_deadline(),
-            Some(MarketplaceBitcoinStatus::new(
-                first_outpoint.txid.to_string(),
-                first_outpoint.vout,
-                100,
-                first_at,
-                0,
-                true,
-                true,
-                true,
-            )),
-            None,
-            None,
-        ))
+        Some(
+            MarketplaceInvoiceStatus::active(
+                invoice_id,
+                "pending",
+                None,
+                "detected",
+                activated.activated_at(),
+                activated.payment_deadline(),
+                Some(MarketplaceBitcoinStatus::new(
+                    first_outpoint.txid.to_string(),
+                    first_outpoint.vout,
+                    100,
+                    first_at,
+                    0,
+                    true,
+                    true,
+                    true,
+                )),
+                None,
+                None,
+            )
+            .with_offer(vec![AcceptedAsset::Btc], vec![(AcceptedAsset::Btc, 100)],)
+            .with_usdt(None, Some(AcceptedAsset::Btc))
+        )
     );
 
     let targets = store.observation_targets().await.unwrap();
@@ -414,26 +434,29 @@ async fn bitcoin_evidence_keeps_identity_amount_and_first_observation_immutable(
     .unwrap();
     assert_eq!(
         store.status(&creator(), invoice_id).await.unwrap(),
-        Some(MarketplaceInvoiceStatus::active(
-            invoice_id,
-            "pending",
-            None,
-            "undetected",
-            activated.activated_at(),
-            activated.payment_deadline(),
-            Some(MarketplaceBitcoinStatus::new(
-                first_outpoint.txid.to_string(),
-                first_outpoint.vout,
-                100,
-                first_at,
-                0,
-                false,
-                false,
-                false,
-            )),
-            None,
-            None,
-        ))
+        Some(
+            MarketplaceInvoiceStatus::active(
+                invoice_id,
+                "pending",
+                None,
+                "undetected",
+                activated.activated_at(),
+                activated.payment_deadline(),
+                Some(MarketplaceBitcoinStatus::new(
+                    first_outpoint.txid.to_string(),
+                    first_outpoint.vout,
+                    100,
+                    first_at,
+                    0,
+                    false,
+                    false,
+                    false,
+                )),
+                None,
+                None,
+            )
+            .with_offer(vec![AcceptedAsset::Btc], vec![(AcceptedAsset::Btc, 100)],)
+        )
     );
 
     // A late replacement owns its own immutable first-observation evidence. It must
@@ -459,26 +482,29 @@ async fn bitcoin_evidence_keeps_identity_amount_and_first_observation_immutable(
     .unwrap();
     assert_eq!(
         store.status(&creator(), invoice_id).await.unwrap(),
-        Some(MarketplaceInvoiceStatus::active(
-            invoice_id,
-            "pending",
-            None,
-            "expired",
-            activated.activated_at(),
-            activated.payment_deadline(),
-            Some(MarketplaceBitcoinStatus::new(
-                replacement.txid.to_string(),
-                replacement.vout,
-                100,
-                replacement_at,
-                1,
-                true,
-                true,
-                false,
-            )),
-            None,
-            None,
-        ))
+        Some(
+            MarketplaceInvoiceStatus::active(
+                invoice_id,
+                "pending",
+                None,
+                "expired",
+                activated.activated_at(),
+                activated.payment_deadline(),
+                Some(MarketplaceBitcoinStatus::new(
+                    replacement.txid.to_string(),
+                    replacement.vout,
+                    100,
+                    replacement_at,
+                    1,
+                    true,
+                    true,
+                    false,
+                )),
+                None,
+                None,
+            )
+            .with_offer(vec![AcceptedAsset::Btc], vec![(AcceptedAsset::Btc, 100)],)
+        )
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -569,7 +595,8 @@ async fn malformed_active_relations_fail_closed() {
         .activate(MarketplaceActivationInput {
             creator: &creator(),
             invoice_id,
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
@@ -606,7 +633,8 @@ async fn lifecycle_states_project_and_exception_states_fail_closed() {
             .activate(MarketplaceActivationInput {
                 creator: &creator(),
                 invoice_id,
-                total_sats: 100,
+                amount: 100,
+                asset: CriterionAsset::Btc,
                 proposal_acceptance_window: Duration::from_secs(30 * 60),
             })
             .await
@@ -616,17 +644,20 @@ async fn lifecycle_states_project_and_exception_states_fail_closed() {
 
         assert_eq!(
             store.status(&creator(), invoice_id).await.unwrap(),
-            Some(MarketplaceInvoiceStatus::active(
-                invoice_id,
-                "pending",
-                Some(state),
-                "undetected",
-                activated.activated_at(),
-                activated.payment_deadline(),
-                None,
-                None,
-                None,
-            ))
+            Some(
+                MarketplaceInvoiceStatus::active(
+                    invoice_id,
+                    "pending",
+                    Some(state),
+                    "undetected",
+                    activated.activated_at(),
+                    activated.payment_deadline(),
+                    None,
+                    None,
+                    None,
+                )
+                .with_offer(vec![AcceptedAsset::Btc], vec![(AcceptedAsset::Btc, 100)],)
+            )
         );
         database.cleanup().await;
     }
@@ -645,7 +676,8 @@ async fn lifecycle_states_project_and_exception_states_fail_closed() {
             .activate(MarketplaceActivationInput {
                 creator: &creator(),
                 invoice_id,
-                total_sats: 100,
+                amount: 100,
+                asset: CriterionAsset::Btc,
                 proposal_acceptance_window: Duration::from_secs(30 * 60),
             })
             .await
@@ -676,23 +708,29 @@ async fn inactive_resolution_is_projected_without_payment_fields() {
         .unwrap();
     assert_eq!(
         store.status(&creator(), invoice_id).await.unwrap(),
-        Some(MarketplaceInvoiceStatus::inactive(
-            invoice_id,
-            "prepared",
-            Some("abandoned"),
-            Some(resolution.resolved_at()),
-        ))
+        Some(
+            MarketplaceInvoiceStatus::inactive(
+                invoice_id,
+                "prepared",
+                Some("abandoned"),
+                Some(resolution.resolved_at()),
+            )
+            .with_offer(vec![AcceptedAsset::Btc], vec![(AcceptedAsset::Btc, 100)],)
+        )
     );
 
     store.void(&creator(), invoice_id).await.unwrap().unwrap();
     assert_eq!(
         store.status(&creator(), invoice_id).await.unwrap(),
-        Some(MarketplaceInvoiceStatus::inactive(
-            invoice_id,
-            "voided",
-            Some("abandoned"),
-            Some(resolution.resolved_at()),
-        ))
+        Some(
+            MarketplaceInvoiceStatus::inactive(
+                invoice_id,
+                "voided",
+                Some("abandoned"),
+                Some(resolution.resolved_at()),
+            )
+            .with_offer(vec![AcceptedAsset::Btc], vec![(AcceptedAsset::Btc, 100)],)
+        )
     );
 
     database.cleanup().await;
@@ -707,7 +745,8 @@ async fn deadline_expiry_underpayment_and_late_match_are_projected() {
         .activate(MarketplaceActivationInput {
             creator: &creator(),
             invoice_id,
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
@@ -735,51 +774,57 @@ async fn deadline_expiry_underpayment_and_late_match_are_projected() {
     .unwrap();
     assert_eq!(
         store.status(&creator(), invoice_id).await.unwrap(),
-        Some(MarketplaceInvoiceStatus::active(
-            invoice_id,
-            "pending",
-            None,
-            "confirmed",
-            activated.activated_at(),
-            deadline,
-            Some(MarketplaceBitcoinStatus::new(
-                underpaid.txid.to_string(),
-                underpaid.vout,
-                99,
-                activated.activated_at() + time::Duration::milliseconds(500),
-                1,
-                true,
-                false,
-                false,
-            )),
-            None,
-            None,
-        ))
+        Some(
+            MarketplaceInvoiceStatus::active(
+                invoice_id,
+                "pending",
+                None,
+                "confirmed",
+                activated.activated_at(),
+                deadline,
+                Some(MarketplaceBitcoinStatus::new(
+                    underpaid.txid.to_string(),
+                    underpaid.vout,
+                    99,
+                    activated.activated_at() + time::Duration::milliseconds(500),
+                    1,
+                    true,
+                    false,
+                    false,
+                )),
+                None,
+                None,
+            )
+            .with_offer(vec![AcceptedAsset::Btc], vec![(AcceptedAsset::Btc, 100)],)
+        )
     );
 
     tokio::time::sleep(std::time::Duration::from_millis(2_100)).await;
     assert_eq!(
         store.status(&creator(), invoice_id).await.unwrap(),
-        Some(MarketplaceInvoiceStatus::active(
-            invoice_id,
-            "pending",
-            None,
-            "expired",
-            activated.activated_at(),
-            deadline,
-            Some(MarketplaceBitcoinStatus::new(
-                underpaid.txid.to_string(),
-                underpaid.vout,
-                99,
-                activated.activated_at() + time::Duration::milliseconds(500),
-                1,
-                true,
-                false,
-                false,
-            )),
-            None,
-            None,
-        ))
+        Some(
+            MarketplaceInvoiceStatus::active(
+                invoice_id,
+                "pending",
+                None,
+                "expired",
+                activated.activated_at(),
+                deadline,
+                Some(MarketplaceBitcoinStatus::new(
+                    underpaid.txid.to_string(),
+                    underpaid.vout,
+                    99,
+                    activated.activated_at() + time::Duration::milliseconds(500),
+                    1,
+                    true,
+                    false,
+                    false,
+                )),
+                None,
+                None,
+            )
+            .with_offer(vec![AcceptedAsset::Btc], vec![(AcceptedAsset::Btc, 100)],)
+        )
     );
 
     let late = outpoint(21);
@@ -802,26 +847,29 @@ async fn deadline_expiry_underpayment_and_late_match_are_projected() {
     .unwrap();
     assert_eq!(
         store.status(&creator(), invoice_id).await.unwrap(),
-        Some(MarketplaceInvoiceStatus::active(
-            invoice_id,
-            "pending",
-            None,
-            "expired",
-            activated.activated_at(),
-            deadline,
-            Some(MarketplaceBitcoinStatus::new(
-                late.txid.to_string(),
-                late.vout,
-                100,
-                deadline + time::Duration::seconds(1),
-                1,
-                true,
-                true,
-                false,
-            )),
-            None,
-            None,
-        ))
+        Some(
+            MarketplaceInvoiceStatus::active(
+                invoice_id,
+                "pending",
+                None,
+                "expired",
+                activated.activated_at(),
+                deadline,
+                Some(MarketplaceBitcoinStatus::new(
+                    late.txid.to_string(),
+                    late.vout,
+                    100,
+                    deadline + time::Duration::seconds(1),
+                    1,
+                    true,
+                    true,
+                    false,
+                )),
+                None,
+                None,
+            )
+            .with_offer(vec![AcceptedAsset::Btc], vec![(AcceptedAsset::Btc, 100)],)
+        )
     );
 
     database.cleanup().await;
@@ -836,7 +884,8 @@ async fn observation_waits_for_creator_before_locking_preparation() {
         .activate(MarketplaceActivationInput {
             creator: &creator(),
             invoice_id,
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await
@@ -896,7 +945,8 @@ async fn observation_evidence_rejects_direct_rewrite_and_delete() {
         .activate(MarketplaceActivationInput {
             creator: &creator(),
             invoice_id,
-            total_sats: 100,
+            amount: 100,
+            asset: CriterionAsset::Btc,
             proposal_acceptance_window: Duration::from_secs(30 * 60),
         })
         .await

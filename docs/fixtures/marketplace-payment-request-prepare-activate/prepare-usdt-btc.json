@@ -1,0 +1,1 @@
+{"invoice_id":"4c6e66c7-8a8b-4d54-b97b-340cedb3e1d0","state":"prepared","amount":"5000000","asset":"USDT","accepted_assets":["BTC"],"payment_amounts":{"BTC":"6173"},"rates":{"BTC":"0.000012345679012346"},"prepare_expires_at":"2026-10-23T09:15:00Z"}

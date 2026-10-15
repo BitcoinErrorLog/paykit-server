@@ -1,0 +1,1 @@
+{"invoice_id":"4c6e66c7-8a8b-4d54-b97b-340cedb3e1d0","state":"prepared","amount":"500","asset":"USD","accepted_assets":["USDT"],"payment_amounts":{"USDT":"5000000"},"rates":{"USDT":"1"},"prepare_expires_at":"2026-10-23T09:15:00Z"}

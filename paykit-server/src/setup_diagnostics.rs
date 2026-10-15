@@ -148,6 +148,7 @@ pub(crate) fn persistence_failure_class(error: &PersistenceError) -> SetupFailur
         PersistenceError::Unavailable => SetupFailureClass::Storage,
         PersistenceError::Conflict => SetupFailureClass::Conflict,
         PersistenceError::InvalidInput => SetupFailureClass::InvalidRequest,
+        PersistenceError::DeadlineElapsed => SetupFailureClass::Storage,
     }
 }
 

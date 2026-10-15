@@ -35,6 +35,10 @@ pub enum ApiError {
     ReaderRegistryUnavailable,
     ReaderRegistryMalformed,
     SellerSetupPending,
+    SellerUsdtSetupPending,
+    SellerBitcoinAndUsdtSetupPending,
+    AssetUnsupported,
+    PaymentWindowExceedsCap,
 }
 
 #[derive(Serialize)]
@@ -194,6 +198,26 @@ impl ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "seller_setup_pending",
                 "seller Bitcoin receiving setup is needed",
+            ),
+            Self::SellerUsdtSetupPending => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "seller_setup_pending",
+                "seller USDT receiving setup is needed",
+            ),
+            Self::SellerBitcoinAndUsdtSetupPending => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "seller_setup_pending",
+                "seller Bitcoin and USDT receiving setup is needed",
+            ),
+            Self::AssetUnsupported => (
+                StatusCode::CONFLICT,
+                "asset_unsupported",
+                "requested payment asset is not supported by this deployment",
+            ),
+            Self::PaymentWindowExceedsCap => (
+                StatusCode::BAD_REQUEST,
+                "payment_window_exceeds_cap",
+                "payment window exceeds the cap for this request",
             ),
         }
     }
