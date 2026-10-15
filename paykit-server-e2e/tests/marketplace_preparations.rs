@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use paykit_sdk::PaykitIdentitySecretKey;
+use paykit_sdk::{OutboundPrivateMessageStatus, PaykitIdentitySecretKey};
 use paykit_server::{
     application::{
         create_invoice::{
@@ -26,6 +26,7 @@ use paykit_server::{
         MarketplacePreparationStore, MarketplaceResolutionOutcome, OutboxStore, PersistenceError,
         run_migrations,
     },
+    workers::outbox::{Adapter, HandoffError, HandoffResult, process_reconciliation},
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use serde::{Deserialize, Serialize};
@@ -85,6 +86,61 @@ impl SessionValidator for ReadySession {
 }
 
 struct ReadyRegistry;
+
+struct MarketplaceReconciliationAdapter {
+    sent: bool,
+}
+
+#[async_trait]
+impl Adapter for MarketplaceReconciliationAdapter {
+    async fn fetch_registry(
+        &self,
+        _reader: &str,
+    ) -> Result<Option<paykit_lib::PaykitAppRegistry>, HandoffError> {
+        unreachable!()
+    }
+
+    async fn fetch_authorization(
+        &self,
+        _reader: &str,
+    ) -> Result<ReaderAuthorization, HandoffError> {
+        unreachable!()
+    }
+
+    async fn ensure_link_with_peer(&self, _reader: &str) -> Result<(), HandoffError> {
+        unreachable!()
+    }
+
+    async fn propose_payment_request(
+        &self,
+        _reader: &str,
+        _payment_request_id: paykit_lib::PaymentRequestId,
+        _terms: &paykit_server::application::semantic_intent::PaymentTermsV1,
+    ) -> Result<HandoffResult, HandoffError> {
+        unreachable!()
+    }
+
+    async fn cancel_payment_request(
+        &self,
+        _reader: &str,
+        _payment_request_id: &str,
+    ) -> Result<HandoffResult, HandoffError> {
+        unreachable!()
+    }
+
+    async fn outbound_status(
+        &self,
+        _outbound_message_id: u64,
+    ) -> Result<Option<OutboundPrivateMessageStatus>, HandoffError> {
+        if self.sent {
+            Ok(Some(OutboundPrivateMessageStatus::Sent))
+        } else {
+            Err(HandoffError::Retryable(
+                paykit_server::workers::outbox::RetryableHandoffCause::Transport,
+            ))
+        }
+    }
+}
 
 #[async_trait]
 impl AppRegistryDiscovery for ReadyRegistry {
@@ -423,6 +479,120 @@ async fn stored_preparation_envelope(
         .decrypt(&context, &EncryptedEnvelope::from_bytes(encrypted))
         .unwrap();
     postcard::from_bytes(&plaintext).unwrap()
+}
+
+#[tokio::test]
+async fn marketplace_post_deadline_reconciliation_remains_deliverable_without_degrading_health() {
+    let database = TestDatabase::create().await;
+    let preparations = store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let prepared = preparations
+        .prepare(input(
+            &creator,
+            &reader,
+            "marketplace-payment:reconciliation:attempt-1",
+            b"marketplace-reconciliation",
+        ))
+        .await
+        .unwrap();
+    preparations
+        .activate(MarketplaceActivationInput {
+            creator: &creator,
+            invoice_id: prepared.invoice_id(),
+            amount: 100,
+            asset: CriterionAsset::Btc,
+            proposal_acceptance_window: Duration::from_secs(1),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+    let outbox = OutboxStore::new(database.pool(), crypto());
+    let claim = outbox
+        .claim(uuid::Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .remove(0);
+    let deadline = outbox
+        .delivery_intent(&claim)
+        .unwrap()
+        .proposal_expires_at()
+        .unwrap()
+        .unwrap();
+    assert!(
+        outbox
+            .mark_handed_off(
+                &claim,
+                &HandoffResult::PaymentRequestProposal {
+                    outbound_message_id: 91,
+                    event_id: "marketplace-event".into(),
+                    payment_request_id: uuid::Uuid::new_v4().to_string(),
+                },
+            )
+            .await
+            .unwrap()
+    );
+    let wait_seconds: f64 = sqlx::query_scalar(
+        "SELECT GREATEST(EXTRACT(EPOCH FROM ($1 - clock_timestamp())), 0)::DOUBLE PRECISION",
+    )
+    .bind(deadline)
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs_f64(wait_seconds + 0.05)).await;
+
+    let retry = outbox
+        .claim_reconciliation(uuid::Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(
+        process_reconciliation(
+            &outbox,
+            &MarketplaceReconciliationAdapter { sent: false },
+            &retry,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap()
+    );
+    let state: (String, Option<String>) =
+        sqlx::query_as("SELECT status, error_class FROM outbox WHERE id = $1")
+            .bind(retry.id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        state,
+        ("handed_off".into(), Some("reconciliation_pending".into()))
+    );
+    assert!(outbox.delivery_available().await.unwrap());
+
+    let sent = outbox
+        .claim_reconciliation(uuid::Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .remove(0);
+    assert!(
+        process_reconciliation(
+            &outbox,
+            &MarketplaceReconciliationAdapter { sent: true },
+            &sent,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM outbox WHERE id = $1")
+            .bind(sent.id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap(),
+        "delivered"
+    );
+    database.cleanup().await;
 }
 
 #[tokio::test]

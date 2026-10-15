@@ -460,6 +460,7 @@ Build command, image contract, source-rewrite behavior, and generated config con
 - `GET /health/live` returns `200` with `{ "status": "live" }` while the process serves; it performs no dependency check.
 - `GET /health/ready` reports `postgres`, `electrum`, `paykit_delivery`, and `outbox` states. Overall `ready` and `degraded` return `200`; `not_ready` returns `503`.
 - PostgreSQL loss is `not_ready`. Electrum or Paykit delivery trouble is `degraded`.
+- Individual Reader setup/link progress, handed-off queue progress, expired proposals, and retained terminal delivery failures do not degrade global `paykit_delivery`; systemic adapter, dependency-read, SDK execution, link dependency, reconciliation, and transport failures do.
 - Shared transport contention retries on the next poll and preserves prior transport health. Actual failures still degrade health, and outstanding undelivered invoices remain unavailable; only a clean pass clears transport failures.
 - `GET /metrics` exports identifier-free Prometheus/OpenMetrics data.
 

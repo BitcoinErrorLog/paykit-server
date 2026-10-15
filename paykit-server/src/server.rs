@@ -891,6 +891,26 @@ async fn process_creator_outbox(
         &claim,
         workers.outbox_lease_duration,
         async {
+            let intent =
+                match workers.outbox.delivery_intent(&claim) {
+                    Ok(intent) => intent,
+                    Err(_) => {
+                        return workers.outbox.mark_permanently_failed(&claim).await.map(
+                            |transitioned| (transitioned, ProcessingHealth::PermanentFailure),
+                        );
+                    }
+                };
+            if let Some(deadline) = intent
+                .proposal_expires_at()
+                .map_err(|_| PersistenceError::CorruptOrMissing)?
+                && workers.outbox.proposal_expired(deadline).await?
+            {
+                return workers
+                    .outbox
+                    .mark_proposal_expired(&claim)
+                    .await
+                    .map(|transitioned| (transitioned, ProcessingHealth::Available));
+            }
             match creator_adapter(&workers, creator).await {
                 Ok(adapter) => {
                     let adapter = ready_adapter.insert(adapter);
@@ -1014,14 +1034,11 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
         let mut outbox_available = true;
         while let Some(result) = batch.join_next().await {
             match result {
-                Ok(Ok((_, ProcessingHealth::Available))) => {}
-                Ok(Ok((
-                    _,
-                    ProcessingHealth::Retryable(_) | ProcessingHealth::PermanentFailure,
-                ))) => {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => {
                     delivery_available = false;
+                    outbox_available = false;
                 }
-                Ok(Err(_)) => outbox_available = false,
                 Err(_) => panic!("owned outbox reconciliation task exited unexpectedly"),
             }
         }

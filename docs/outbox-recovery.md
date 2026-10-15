@@ -52,6 +52,16 @@ total claim count. Failures at different stages do not reset one another's
 backoff. A first failure after repeated pending-link attempts therefore starts at
 the configured initial delay, while a continuing outage still reaches the cap.
 
+Before every claimed handoff and again before each external proposal effect, the
+worker compares the intent's immutable `proposal_expires_at` with PostgreSQL
+`clock_timestamp()`. Equality is expired. An expired proposal is retained as
+`permanently_failed` with the closed `proposal_expired` diagnostic; it is never
+claimed again and no Reader or SDK operation is retried. This check also runs
+after restart, so a retry deadline cannot be extended by downtime or process
+clock drift. Cancellation intents retry until the canceled request's immutable
+payment deadline. At or after that boundary, undelivered cancellation work is
+retained as `cancellation_expired` without another Reader or SDK call.
+
 `handed_off` means durable shared SDK queue association, not remote delivery. A separately fenced reconciliation claim runs the SDK outbound processor and checks the exact stored outbound ID and app ownership in durable Creator SDK state. Only `OutboundPrivateMessageStatus::Sent` advances the row to `delivered`, meaning successful Encrypted Link send, not payer application acknowledgement. SDK `Pending`, `Sending`, and retry-backoff `Failed` records remain retryable. Missing records, `Invalid`, `RecoveryRequired`, and `Superseded` records are retained as `permanently_failed`; they never imply delivery or trigger a new proposal. Transport/storage errors remain retryable, and permanent errors retain only a non-secret error class.
 
 Normal pending Encrypted Links use a rapid retry phase configured by
@@ -78,6 +88,18 @@ precedence over hints and remain the recovery path for restarts, missed hints,
 and work admitted through other stores. A successful targeted pass cannot clear
 aggregate health failures for unrelated Creators. Hints reduce idle polling waits
 without changing the meaning of Linked, handed-off, or delivered state.
+
+Global `paykit_delivery` readiness reports worker and systemic dependency health,
+not one Reader's progress. Pending/missing Reader setup, link establishment or
+waiting, normal handed-off reconciliation, proposal expiry, and retained permanent
+failure stay visible in durable row state without degrading every Creator.
+Adapter construction, dependency reads, SDK proposal/cancellation execution,
+systemic link storage/identity/transport failures, and reconciliation failures
+for still-actionable work degrade delivery readiness. Proposal reconciliation
+continues after its acceptance deadline so a later durable `Sent` state can
+still promote the row to `delivered`, but one buyer's post-deadline retry does
+not degrade global readiness. PostgreSQL worker failures independently degrade
+`outbox` readiness.
 
 Enqueue scheduling admits at most `outbox.batch_size` concurrent Creators, with
 one task per Creator. Completion frees a slot without waiting for unrelated tasks.

@@ -240,6 +240,20 @@ impl DeliveryIntentV1 {
         }
     }
 
+    pub fn proposal_expires_at(&self) -> Result<Option<OffsetDateTime>, DeliveryIntentError> {
+        match &self.operation {
+            DeliveryOperationV1::PaymentRequestProposal { terms } => terms
+                .proposal_expires_at
+                .as_deref()
+                .map(|deadline| {
+                    OffsetDateTime::parse(deadline, &Rfc3339)
+                        .map_err(|_| DeliveryIntentError::Invalid)
+                })
+                .transpose(),
+            DeliveryOperationV1::PaymentRequestCancellation { .. } => Ok(None),
+        }
+    }
+
     pub fn matches_proposal(
         &self,
         reader_pubky: &str,

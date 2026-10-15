@@ -296,11 +296,11 @@ async fn pending_links_are_distinct_from_failed_link_operations() {
         ),
         (
             RetryableHandoffCause::Transport,
-            RetryableHandoffStage::LinkEstablishment,
+            RetryableHandoffStage::LinkDependency,
         ),
         (
             RetryableHandoffCause::Storage,
-            RetryableHandoffStage::LinkEstablishment,
+            RetryableHandoffStage::LinkDependency,
         ),
     ] {
         let mut adapter = adapter_with_authorization(Ok(ReaderAuthorization::Verified));

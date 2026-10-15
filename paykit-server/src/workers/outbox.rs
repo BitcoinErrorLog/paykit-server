@@ -69,7 +69,30 @@ impl RetryableHandoffCause {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HandoffFailure {
     Retryable(RetryableHandoffStage),
+    ProposalExpired,
+    CancellationExpired,
     Permanent,
+}
+
+#[derive(Clone, Copy)]
+enum DeliveryExpiration {
+    Proposal(time::OffsetDateTime),
+    Cancellation(time::OffsetDateTime),
+}
+
+impl DeliveryExpiration {
+    const fn deadline(self) -> time::OffsetDateTime {
+        match self {
+            Self::Proposal(deadline) | Self::Cancellation(deadline) => deadline,
+        }
+    }
+
+    const fn failure(self) -> HandoffFailure {
+        match self {
+            Self::Proposal(_) => HandoffFailure::ProposalExpired,
+            Self::Cancellation(_) => HandoffFailure::CancellationExpired,
+        }
+    }
 }
 
 fn at_stage(error: HandoffError, stage: RetryableHandoffStage) -> HandoffFailure {
@@ -78,6 +101,25 @@ fn at_stage(error: HandoffError, stage: RetryableHandoffStage) -> HandoffFailure
             HandoffFailure::Retryable(RetryableHandoffStage::LinkPending)
         }
         HandoffError::Retryable(_) => HandoffFailure::Retryable(stage),
+        HandoffError::Permanent => HandoffFailure::Permanent,
+    }
+}
+
+fn at_link_stage(error: HandoffError) -> HandoffFailure {
+    match error {
+        HandoffError::Retryable(RetryableHandoffCause::LinkPending) => {
+            HandoffFailure::Retryable(RetryableHandoffStage::LinkPending)
+        }
+        HandoffError::Retryable(
+            RetryableHandoffCause::Storage
+            | RetryableHandoffCause::Identity
+            | RetryableHandoffCause::Transport
+            | RetryableHandoffCause::PaymentAdapter
+            | RetryableHandoffCause::Other,
+        ) => HandoffFailure::Retryable(RetryableHandoffStage::LinkDependency),
+        HandoffError::Retryable(_) => {
+            HandoffFailure::Retryable(RetryableHandoffStage::LinkEstablishment)
+        }
         HandoffError::Permanent => HandoffFailure::Permanent,
     }
 }
@@ -128,8 +170,7 @@ pub trait Adapter: Send + Sync {
         claim: &ClaimedOutbox,
         intent: &DeliveryIntentV1,
     ) -> Result<HandoffResult, HandoffFailure> {
-        check_claim(Some((store, claim))).await?;
-        self.execute_handoff(claim.id(), intent).await
+        claimed_handoff_steps(self, intent, store, claim).await
     }
 
     /// Executes one complete semantic handoff. Concrete adapters may override
@@ -195,8 +236,22 @@ pub(crate) async fn claimed_handoff_steps<A: Adapter + ?Sized>(
     handoff_steps_with_claim(adapter, claim.id(), intent, Some((store, claim))).await
 }
 
-async fn check_claim(claim: Option<(&OutboxStore, &ClaimedOutbox)>) -> Result<(), HandoffFailure> {
+async fn check_claim(
+    claim: Option<(&OutboxStore, &ClaimedOutbox)>,
+    expiration: Option<DeliveryExpiration>,
+) -> Result<(), HandoffFailure> {
     if let Some((store, claim)) = claim {
+        if let Some(expiration) = expiration {
+            match store.proposal_expired(expiration.deadline()).await {
+                Ok(true) => return Err(expiration.failure()),
+                Ok(false) => {}
+                Err(_) => {
+                    return Err(HandoffFailure::Retryable(
+                        RetryableHandoffStage::AdapterUnavailable,
+                    ));
+                }
+            }
+        }
         match store.claim_handoff_eligible(claim).await {
             Ok(true) => {}
             Ok(false) => return Err(HandoffFailure::Permanent),
@@ -217,9 +272,23 @@ async fn handoff_steps_with_claim<A: Adapter + ?Sized>(
     claim: Option<(&OutboxStore, &ClaimedOutbox)>,
 ) -> Result<HandoffResult, HandoffFailure> {
     intent.validate().map_err(|_| HandoffFailure::Permanent)?;
+    let expiration = match intent.operation() {
+        DeliveryOperationV1::PaymentRequestProposal { .. } => intent
+            .proposal_expires_at()
+            .map_err(|_| HandoffFailure::Permanent)?
+            .map(DeliveryExpiration::Proposal),
+        DeliveryOperationV1::PaymentRequestCancellation { .. } => match claim {
+            Some((_, claim)) => Some(DeliveryExpiration::Cancellation(
+                claim
+                    .invoice_payment_deadline()
+                    .ok_or(HandoffFailure::Permanent)?,
+            )),
+            None => None,
+        },
+    };
     let payment_request_id = paykit_lib::PaymentRequestId::new(outbox_id.to_string())
         .map_err(|_| HandoffFailure::Permanent)?;
-    check_claim(claim).await?;
+    check_claim(claim, expiration).await?;
     let registry = adapter
         .fetch_registry(intent.reader_pubky())
         .await
@@ -232,6 +301,7 @@ async fn handoff_steps_with_claim<A: Adapter + ?Sized>(
             RetryableHandoffStage::RegistryIncapable,
         ));
     }
+    check_claim(claim, expiration).await?;
     // Retryable like an incapable registry: the Reader can still publish or fix it.
     match adapter
         .fetch_authorization(intent.reader_pubky())
@@ -250,12 +320,12 @@ async fn handoff_steps_with_claim<A: Adapter + ?Sized>(
             ));
         }
     }
-    check_claim(claim).await?;
+    check_claim(claim, expiration).await?;
     adapter
         .ensure_link_with_peer(intent.reader_pubky())
         .await
-        .map_err(|error| at_stage(error, RetryableHandoffStage::LinkEstablishment))?;
-    check_claim(claim).await?;
+        .map_err(at_link_stage)?;
+    check_claim(claim, expiration).await?;
     match intent.operation() {
         DeliveryOperationV1::PaymentRequestProposal { terms } => adapter
             .propose_payment_request(intent.reader_pubky(), payment_request_id, terms)
@@ -345,6 +415,28 @@ where
                 .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
         }
     };
+    let expiration = match intent.operation() {
+        DeliveryOperationV1::PaymentRequestProposal { .. } => intent
+            .proposal_expires_at()
+            .map_err(|_| PersistenceError::CorruptOrMissing)?
+            .map(DeliveryExpiration::Proposal),
+        DeliveryOperationV1::PaymentRequestCancellation { .. } => {
+            Some(DeliveryExpiration::Cancellation(
+                claim
+                    .invoice_payment_deadline()
+                    .ok_or(PersistenceError::CorruptOrMissing)?,
+            ))
+        }
+    };
+    if let Some(expiration) = expiration
+        && store.proposal_expired(expiration.deadline()).await?
+    {
+        let transitioned = match expiration {
+            DeliveryExpiration::Proposal(_) => store.mark_proposal_expired(claim).await?,
+            DeliveryExpiration::Cancellation(_) => store.mark_cancellation_expired(claim).await?,
+        };
+        return Ok((transitioned, ProcessingHealth::Available));
+    }
     match execute(intent).await {
         Ok(result) => store
             .mark_handed_off(claim, &result)
@@ -357,6 +449,14 @@ where
                 .await
                 .map(|transitioned| (transitioned, ProcessingHealth::Retryable(delay)))
         }
+        Err(HandoffFailure::ProposalExpired) => store
+            .mark_proposal_expired(claim)
+            .await
+            .map(|transitioned| (transitioned, ProcessingHealth::Available)),
+        Err(HandoffFailure::CancellationExpired) => store
+            .mark_cancellation_expired(claim)
+            .await
+            .map(|transitioned| (transitioned, ProcessingHealth::Available)),
         Err(HandoffFailure::Permanent) => store
             .mark_permanently_failed(claim)
             .await
@@ -385,6 +485,23 @@ pub async fn process_reconciliation_with_health(
     claim: &ClaimedHandoff,
     retry_delay: Duration,
 ) -> Result<(bool, ProcessingHealth), PersistenceError> {
+    let expiration = match reconciliation_expiration(store, claim) {
+        Ok(expiration) => expiration,
+        Err(_) => {
+            return store
+                .mark_reconciliation_permanently_failed(claim)
+                .await
+                .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
+        }
+    };
+    if let Some(DeliveryExpiration::Cancellation(deadline)) = expiration
+        && store.proposal_expired(deadline).await?
+    {
+        return store
+            .mark_handed_off_cancellation_expired(claim)
+            .await
+            .map(|transitioned| (transitioned, ProcessingHealth::Available));
+    }
     let outbound_message_id = match claim.sdk_outbound_message_id() {
         Ok(value) => value,
         Err(_) => {
@@ -408,21 +525,94 @@ pub async fn process_reconciliation_with_health(
             .mark_reconciliation_permanently_failed(claim)
             .await
             .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
-        Ok(_) => store
-            .retry_reconciliation(
+        Ok(_) => {
+            retry_reconciliation_after_failure(
+                store,
                 claim,
                 retry_delay,
+                expiration,
                 RetryableHandoffStage::ReconciliationPending,
             )
             .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Retryable(retry_delay))),
-        Err(HandoffError::Retryable(_)) => store
-            .retry_reconciliation(claim, retry_delay, RetryableHandoffStage::Reconciliation)
+        }
+        Err(HandoffError::Retryable(_)) => {
+            retry_reconciliation_after_failure(
+                store,
+                claim,
+                retry_delay,
+                expiration,
+                RetryableHandoffStage::Reconciliation,
+            )
             .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Retryable(retry_delay))),
+        }
         Err(HandoffError::Permanent) => store
             .mark_reconciliation_permanently_failed(claim)
             .await
             .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure)),
     }
+}
+
+fn reconciliation_expiration(
+    store: &OutboxStore,
+    claim: &ClaimedHandoff,
+) -> Result<Option<DeliveryExpiration>, PersistenceError> {
+    Ok(match claim.intent_kind() {
+        "endpoint_publication" => None,
+        "payment_request_proposal" => {
+            let intent = store.handed_off_delivery_intent(claim)?;
+            if !matches!(
+                intent.operation(),
+                DeliveryOperationV1::PaymentRequestProposal { .. }
+            ) {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+            intent
+                .proposal_expires_at()
+                .map_err(|_| PersistenceError::CorruptOrMissing)?
+                .map(DeliveryExpiration::Proposal)
+        }
+        "payment_request_cancellation" => {
+            let intent = store.handed_off_delivery_intent(claim)?;
+            if !matches!(
+                intent.operation(),
+                DeliveryOperationV1::PaymentRequestCancellation { .. }
+            ) {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+            Some(DeliveryExpiration::Cancellation(
+                claim
+                    .invoice_payment_deadline()
+                    .ok_or(PersistenceError::CorruptOrMissing)?,
+            ))
+        }
+        _ => return Err(PersistenceError::CorruptOrMissing),
+    })
+}
+
+async fn retry_reconciliation_after_failure(
+    store: &OutboxStore,
+    claim: &ClaimedHandoff,
+    retry_delay: Duration,
+    expiration: Option<DeliveryExpiration>,
+    mut stage: RetryableHandoffStage,
+) -> Result<(bool, ProcessingHealth), PersistenceError> {
+    if let Some(expiration) = expiration
+        && store.proposal_expired(expiration.deadline()).await?
+    {
+        match expiration {
+            DeliveryExpiration::Proposal(_) => {
+                stage = RetryableHandoffStage::ReconciliationPending;
+            }
+            DeliveryExpiration::Cancellation(_) => {
+                return store
+                    .mark_handed_off_cancellation_expired(claim)
+                    .await
+                    .map(|transitioned| (transitioned, ProcessingHealth::Available));
+            }
+        }
+    }
+    store
+        .retry_reconciliation(claim, retry_delay, stage)
+        .await
+        .map(|transitioned| (transitioned, ProcessingHealth::Retryable(retry_delay)))
 }

@@ -20,6 +20,7 @@ pub enum OutboxRetryClass {
     ReaderAuthorizationMissing,
     ReaderAuthorizationInvalid,
     LinkEstablishment,
+    LinkDependency,
     LinkPending,
     PaymentRequestProposal,
     PaymentRequestCancellation,
@@ -38,6 +39,7 @@ impl OutboxRetryClass {
             Self::ReaderAuthorizationMissing => "reader_authorization_missing",
             Self::ReaderAuthorizationInvalid => "reader_authorization_invalid",
             Self::LinkEstablishment => "link_establishment",
+            Self::LinkDependency => "link_dependency",
             Self::LinkPending => "link_pending",
             Self::PaymentRequestProposal => "payment_request_proposal",
             Self::PaymentRequestCancellation => "payment_request_cancellation",
@@ -109,6 +111,7 @@ pub struct ClaimedOutbox {
     claim_token: Uuid,
     creator_lookup_hash: Vec<u8>,
     intent_envelope: Vec<u8>,
+    invoice_payment_deadline: Option<OffsetDateTime>,
 }
 
 impl std::fmt::Debug for ClaimedOutbox {
@@ -142,6 +145,10 @@ impl ClaimedOutbox {
     pub fn claim_token(&self) -> Uuid {
         self.claim_token
     }
+
+    pub fn invoice_payment_deadline(&self) -> Option<OffsetDateTime> {
+        self.invoice_payment_deadline
+    }
 }
 
 /// A separately fenced claim over an attributable `handed_off` row.
@@ -152,6 +159,10 @@ pub struct ClaimedHandoff {
     attempt_count: i32,
     claim_token: Uuid,
     sdk_outbound_message_id: String,
+    intent_kind: String,
+    creator_lookup_hash: Vec<u8>,
+    intent_envelope: Vec<u8>,
+    invoice_payment_deadline: Option<OffsetDateTime>,
 }
 
 impl std::fmt::Debug for ClaimedHandoff {
@@ -181,6 +192,14 @@ impl ClaimedHandoff {
         self.sdk_outbound_message_id
             .parse()
             .map_err(|_| PersistenceError::CorruptOrMissing)
+    }
+
+    pub fn invoice_payment_deadline(&self) -> Option<OffsetDateTime> {
+        self.invoice_payment_deadline
+    }
+
+    pub fn intent_kind(&self) -> &str {
+        &self.intent_kind
     }
 }
 
@@ -243,13 +262,33 @@ impl OutboxStore {
         self.reconciliation.wait().await
     }
 
-    /// Reports aggregate delivery availability without exposing row or Creator identifiers.
+    /// Reports durable systemic delivery failures without treating individual
+    /// Reader progress or retained terminal history as a global outage.
     pub async fn delivery_available(&self) -> Result<bool, PersistenceError> {
         sqlx::query_scalar(
             "SELECT NOT EXISTS ( \
-                 SELECT 1 FROM outbox \
-                 WHERE status IN ('retryable', 'handed_off', 'permanently_failed') \
-                    OR (status = 'leased' AND error_class IS NOT NULL) \
+                 SELECT 1 FROM outbox o \
+                 WHERE o.status IN ('retryable', 'leased', 'handed_off') \
+                   AND o.error_class IN ( \
+                     'adapter_unavailable', 'registry_fetch', \
+                     'reader_authorization_fetch', 'link_dependency', \
+                     'payment_request_proposal', \
+                     'payment_request_cancellation', 'reconciliation' \
+                   ) \
+                   AND (o.intent_kind <> 'payment_request_proposal' OR ( \
+                       o.proposal_lookup_hash IS NOT NULL AND (EXISTS ( \
+                           SELECT 1 FROM invoices invoice \
+                           JOIN lock_payment_generations generation \
+                             ON generation.creator_id = invoice.creator_id \
+                            AND generation.lock_resource_lookup_hash = invoice.lock_resource_lookup_hash \
+                           WHERE invoice.id = o.invoice_id \
+                             AND generation.current_generation = invoice.lock_resource_generation \
+                             AND generation.active_drain_id IS NULL \
+                       ) OR EXISTS ( \
+                           SELECT 1 FROM marketplace_payment_preparations preparation \
+                           WHERE preparation.id = o.marketplace_preparation_id \
+                             AND preparation.state = 'active' \
+                       )))) \
              )",
         )
         .fetch_one(&self.pool)
@@ -364,7 +403,8 @@ impl OutboxStore {
              WHERE o.id = candidates.id \
              RETURNING o.id, o.creator_id, o.invoice_id, o.attempt_count, o.failure_count, o.claim_token, \
                  (SELECT creator_lookup_hash FROM creators WHERE id = o.creator_id) AS creator_lookup_hash, \
-                 o.intent_envelope",
+                 o.intent_envelope, \
+                 (SELECT payment_deadline FROM invoices WHERE id = o.invoice_id) AS invoice_payment_deadline",
         )
         .bind(limit)
         .bind(owner)
@@ -489,7 +529,10 @@ impl OutboxStore {
                  attempt_count = o.attempt_count + 1, updated_at = clock_timestamp() \
              FROM candidates WHERE o.id = candidates.id \
              RETURNING o.id, o.creator_id, o.attempt_count, o.claim_token, \
-                 o.sdk_outbound_message_id",
+                 o.sdk_outbound_message_id, o.intent_kind, \
+                 (SELECT creator_lookup_hash FROM creators WHERE id = o.creator_id) AS creator_lookup_hash, \
+                 o.intent_envelope, \
+                 (SELECT payment_deadline FROM invoices WHERE id = o.invoice_id) AS invoice_payment_deadline",
         )
         .bind(limit)
         .bind(owner)
@@ -505,15 +548,43 @@ impl OutboxStore {
         &self,
         claim: &ClaimedOutbox,
     ) -> Result<DeliveryIntentV1, PersistenceError> {
-        let creator_hash = lookup_hash_from_storage(&claim.creator_lookup_hash)?;
+        self.decrypt_delivery_intent(claim.id, &claim.creator_lookup_hash, &claim.intent_envelope)
+    }
+
+    pub fn handed_off_delivery_intent(
+        &self,
+        claim: &ClaimedHandoff,
+    ) -> Result<DeliveryIntentV1, PersistenceError> {
+        self.decrypt_delivery_intent(claim.id, &claim.creator_lookup_hash, &claim.intent_envelope)
+    }
+
+    fn decrypt_delivery_intent(
+        &self,
+        id: Uuid,
+        creator_lookup_hash: &[u8],
+        intent_envelope: &[u8],
+    ) -> Result<DeliveryIntentV1, PersistenceError> {
+        let creator_hash = lookup_hash_from_storage(creator_lookup_hash)?;
         let plaintext = self
             .crypto
             .decrypt(
-                &EnvelopeContext::outbox_semantic_intent(creator_hash, claim.id),
-                &EncryptedEnvelope::from_bytes(claim.intent_envelope.clone()),
+                &EnvelopeContext::outbox_semantic_intent(creator_hash, id),
+                &EncryptedEnvelope::from_bytes(intent_envelope.to_vec()),
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         DeliveryIntentV1::decode(&plaintext).map_err(|_| PersistenceError::CorruptOrMissing)
+    }
+
+    /// Compares a proposal deadline with authoritative database time.
+    pub async fn proposal_expired(
+        &self,
+        deadline: OffsetDateTime,
+    ) -> Result<bool, PersistenceError> {
+        sqlx::query_scalar("SELECT $1 <= clock_timestamp()")
+            .bind(deadline)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)
     }
 
     /// Records the exact SDK enqueue result while the enqueue fence is live.
@@ -625,6 +696,40 @@ impl OutboxStore {
     ) -> Result<bool, PersistenceError> {
         self.transition(claim, "permanently_failed", Some("permanent"), None)
             .await
+    }
+
+    pub async fn mark_proposal_expired(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<bool, PersistenceError> {
+        self.transition(claim, "permanently_failed", Some("proposal_expired"), None)
+            .await
+    }
+
+    pub async fn mark_cancellation_expired(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<bool, PersistenceError> {
+        self.transition(
+            claim,
+            "permanently_failed",
+            Some("cancellation_expired"),
+            None,
+        )
+        .await
+    }
+
+    pub async fn mark_handed_off_cancellation_expired(
+        &self,
+        claim: &ClaimedHandoff,
+    ) -> Result<bool, PersistenceError> {
+        self.reconciliation_transition(
+            claim,
+            "permanently_failed",
+            Some("cancellation_expired"),
+            None,
+        )
+        .await
     }
 
     pub async fn mark_retryable(
@@ -799,6 +904,7 @@ mod tests {
                 OutboxRetryClass::ReaderAuthorizationMissing,
                 OutboxRetryClass::ReaderAuthorizationInvalid,
                 OutboxRetryClass::LinkEstablishment,
+                OutboxRetryClass::LinkDependency,
                 OutboxRetryClass::LinkPending,
                 OutboxRetryClass::PaymentRequestProposal,
                 OutboxRetryClass::PaymentRequestCancellation,
@@ -815,6 +921,7 @@ mod tests {
                 "reader_authorization_missing",
                 "reader_authorization_invalid",
                 "link_establishment",
+                "link_dependency",
                 "link_pending",
                 "payment_request_proposal",
                 "payment_request_cancellation",
@@ -854,6 +961,10 @@ mod tests {
             attempt_count: 8,
             claim_token: Uuid::new_v4(),
             sdk_outbound_message_id: outbound_id.into(),
+            intent_kind: "payment_request_proposal".into(),
+            creator_lookup_hash: vec![1; 32],
+            intent_envelope: vec![2; 64],
+            invoice_payment_deadline: Some(OffsetDateTime::UNIX_EPOCH),
         };
         let outbox_claim = ClaimedOutbox {
             id: claim_id,
@@ -864,6 +975,7 @@ mod tests {
             claim_token: Uuid::new_v4(),
             creator_lookup_hash: vec![3; 32],
             intent_envelope: vec![4; 64],
+            invoice_payment_deadline: Some(OffsetDateTime::UNIX_EPOCH),
         };
 
         let result_debug = format!("{result:?}");
