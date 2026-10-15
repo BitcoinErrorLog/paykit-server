@@ -231,6 +231,7 @@ impl CreatorReceivingProvider for FakeCredentials {
                 account_index: 0,
             }),
             usdt: None,
+            bitcoin_account_generation: 0,
         })
     }
 }
@@ -246,6 +247,7 @@ impl CreatorReceivingProvider for MissingBitcoinCredentials {
         Ok(ReceivingDetails {
             bitcoin: None,
             usdt: None,
+            bitcoin_account_generation: 0,
         })
     }
 }
@@ -1199,6 +1201,7 @@ impl CreatorReceivingProvider for RailCredentials {
             usdt: self
                 .usdt
                 .then(|| USDT_ADDRESS.to_owned().try_into().unwrap()),
+            bitcoin_account_generation: 0,
         })
     }
 }

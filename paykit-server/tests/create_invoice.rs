@@ -383,6 +383,7 @@ impl CreatorReceivingProvider for FakeCredentials {
                     account_index: 0,
                 }),
                 usdt: None,
+                bitcoin_account_generation: 0,
             },
         )
     }

@@ -200,13 +200,16 @@ impl Server {
         if config.usdt.is_some() {
             auth_starter = auth_starter.with_usdt();
         }
-        let setup_completer = Arc::new(RealSetupCompleter::new(
-            auth_starter,
-            relay,
-            creators.clone(),
-            sessions.clone(),
-            config.deployment_invariants().bitcoin_network.clone(),
-        ));
+        let setup_completer = Arc::new(
+            RealSetupCompleter::new(
+                auth_starter,
+                relay,
+                creators.clone(),
+                sessions.clone(),
+                config.deployment_invariants().bitcoin_network.clone(),
+            )
+            .with_bitcoin_rotation(payment_request_lifecycles.clone(), config.paykit.clone()),
+        );
         let setup = SetupService::new_with_authorization_url_logging(
             config.setup.allowed_origins.clone(),
             setup_completer,
@@ -750,6 +753,7 @@ async fn creator_adapter(
     PaykitAdapter::new(creator_id, sessions, &workers.paykit)
         .map(|adapter| {
             adapter
+                .with_lifecycles(workers.payment_request_lifecycles.clone())
                 .with_usdt(workers.invoices.clone(), workers.usdt.clone())
                 .with_marketplace_usdt(workers.marketplace_preparations.clone())
         })

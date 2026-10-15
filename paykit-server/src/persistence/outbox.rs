@@ -449,6 +449,35 @@ impl OutboxStore {
         .map_err(|_| PersistenceError::Unavailable)
     }
 
+    /// Canonical acceptance makes a queued cancellation obsolete. Call only
+    /// after receiving and projecting target peer under Creator-local SDK fence.
+    pub async fn cancellation_target_is_accepted(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<bool, PersistenceError> {
+        sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM outbox cancellation
+                 JOIN payment_request_lifecycles lifecycle
+                   ON lifecycle.sdk_payment_request_id =
+                      cancellation.cancellation_target_payment_request_id
+                  AND lifecycle.invoice_id IS NOT DISTINCT FROM cancellation.invoice_id
+                  AND lifecycle.marketplace_preparation_id IS NOT DISTINCT FROM
+                      cancellation.marketplace_preparation_id
+                 WHERE cancellation.id = $1
+                   AND cancellation.intent_kind = 'payment_request_cancellation'
+                   AND lifecycle.request_state IN (
+                       'accepted', 'proof_submitted', 'active_recurring'
+                   )
+             )",
+        )
+        .bind(claim.id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)
+    }
+
     /// Extends only a live claim whose proposal generation still permits handoff.
     pub async fn renew_claim(
         &self,
@@ -714,6 +743,19 @@ impl OutboxStore {
             claim,
             "permanently_failed",
             Some("cancellation_expired"),
+            None,
+        )
+        .await
+    }
+
+    pub async fn mark_cancellation_obsolete(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<bool, PersistenceError> {
+        self.transition(
+            claim,
+            "permanently_failed",
+            Some("cancellation_obsolete"),
             None,
         )
         .await

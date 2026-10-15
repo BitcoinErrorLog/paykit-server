@@ -89,7 +89,20 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=20).collect::<Vec<_>>());
+    assert_eq!(applied_versions, (1..=21).collect::<Vec<_>>());
+
+    let rotation_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND (table_name, column_name) IN
+               (('creators', 'bitcoin_account_generation'),
+                ('invoices', 'bitcoin_account_generation'),
+                ('marketplace_payment_preparations', 'bitcoin_account_generation'))",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(rotation_columns, 3);
 
     let settlement_address_nullable: String = sqlx::query_scalar(
         "SELECT is_nullable FROM information_schema.columns

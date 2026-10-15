@@ -17,10 +17,10 @@ use crate::{
     application::create_invoice::derive_bip84_p2wpkh_address,
     bitkit_claim::{ClaimError, VerifiedCompanionClaim},
     bitkit_setup::{BitkitAuthStarter, StartedBitkitAuth},
-    config::{BitcoinNetwork, PAYKIT_APP_ID},
+    config::{BitcoinNetwork, PAYKIT_APP_ID, PaykitConfig},
     domain::locks::{CreatorPubky, parse_creator},
-    paykit::{CreatorSessions, ExplicitInputsPaymentAdapter},
-    persistence::{CreatorCredentials, CreatorStore},
+    paykit::{CreatorSessions, ExplicitInputsPaymentAdapter, PaykitAdapter},
+    persistence::{CreatorCredentials, CreatorStore, PaymentRequestLifecycleStore},
     setup::{Completion, SetupAttempt, SetupCompleter, StartedSetup},
     setup_diagnostics::{
         SetupFailureClass, SetupOutcome, SetupStage, claim_failure_class, emit_setup_stage,
@@ -193,6 +193,7 @@ pub struct RealSetupCompleter {
     sessions: CreatorSessions,
     bitcoin_network: BitcoinNetwork,
     relay_deadline: Duration,
+    bitcoin_rotation: Option<(PaymentRequestLifecycleStore, PaykitConfig)>,
 }
 
 impl RealSetupCompleter {
@@ -230,7 +231,17 @@ impl RealSetupCompleter {
             sessions,
             bitcoin_network,
             relay_deadline: Duration::from_secs(30),
+            bitcoin_rotation: None,
         }
+    }
+
+    pub fn with_bitcoin_rotation(
+        mut self,
+        lifecycles: PaymentRequestLifecycleStore,
+        paykit: PaykitConfig,
+    ) -> Self {
+        self.bitcoin_rotation = Some((lifecycles, paykit));
+        self
     }
 }
 
@@ -333,6 +344,7 @@ impl SetupCompleter for RealSetupCompleter {
             publisher: self.publisher.clone(),
             bitcoin_network: self.bitcoin_network.clone(),
             reconnect: expected_creator.is_some(),
+            bitcoin_rotation: self.bitcoin_rotation.clone(),
         };
         match receive_verify_commit(
             self.relay.as_ref(),
@@ -358,6 +370,7 @@ struct CreatorSetupCommit {
     publisher: Arc<dyn AppPublisher>,
     bitcoin_network: BitcoinNetwork,
     reconnect: bool,
+    bitcoin_rotation: Option<(PaymentRequestLifecycleStore, PaykitConfig)>,
 }
 
 #[async_trait]
@@ -377,8 +390,9 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                 self.creators.load_optional(&self.creator).await,
                 persistence_failure_class,
             )?;
-            // Reconnect preserves Bitcoin derivation and can add an optional USDT address.
-            let (bitcoin_account, usdt_address, key) =
+            // Omitted reconnect Bitcoin data preserves derivation. Explicit changed
+            // valid account data enters the atomic rotation path below.
+            let (bitcoin_account, usdt_address, key, bitcoin_rotation_requested) =
                 match (self.reconnect, claim, existing.as_ref()) {
                     (false, VerifiedCompanionClaim::Setup(claim), None) => {
                         let account = claim
@@ -403,6 +417,7 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                             account,
                             claim.usdt_address,
                             claim.paykit_identity_secret_key,
+                            false,
                         )
                     }
                     (true, VerifiedCompanionClaim::Setup(claim), Some(existing))
@@ -414,12 +429,43 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                                 .usdt_address
                                 .or_else(|| existing.usdt_address().cloned()),
                             claim.paykit_identity_secret_key,
+                            false,
+                        )
+                    }
+                    (true, VerifiedCompanionClaim::Setup(claim), Some(existing)) => {
+                        let account = claim
+                            .bitcoin_account
+                            .ok_or(ClaimError::InvalidPayload)
+                            .and_then(|account| {
+                                let xpub = stage_result(
+                                    SetupStage::XpubValidate,
+                                    validate_xpub(
+                                        &account.serialized_xpub,
+                                        account.account_index,
+                                        &self.bitcoin_network,
+                                    ),
+                                    claim_failure_class,
+                                )?;
+                                Ok(crate::domain::receiving::BitcoinAccount {
+                                    xpub: Zeroizing::new(xpub),
+                                    account_index: account.account_index,
+                                })
+                            })?;
+                        let changed = existing.bitcoin_account() != Some(&account);
+                        (
+                            Some(account),
+                            claim
+                                .usdt_address
+                                .or_else(|| existing.usdt_address().cloned()),
+                            claim.paykit_identity_secret_key,
+                            changed,
                         )
                     }
                     (true, VerifiedCompanionClaim::Reconnect(key), Some(existing)) => (
                         existing.bitcoin_account().cloned(),
                         existing.usdt_address().cloned(),
                         key,
+                        false,
                     ),
                     _ => return Err(ClaimError::InvalidPayload),
                 };
@@ -442,7 +488,32 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
             }
             // Key authorization is verified before either credential or shared-state writes.
             self.publisher.verify_key(&access).await?;
-            let persisted = if existing.is_some() {
+            let persisted = if bitcoin_rotation_requested {
+                let (lifecycles, paykit) = self
+                    .bitcoin_rotation
+                    .as_ref()
+                    .ok_or(ClaimError::InvalidEnvelope)?;
+                let (creator_id, _) = self
+                    .creators
+                    .load_with_id(&self.creator)
+                    .await
+                    .map_err(|_| ClaimError::InvalidEnvelope)?;
+                let session = self.sessions.provider(&self.creator);
+                session
+                    .seed_verified_reconnect(&self.session_secret, access.clone())
+                    .await;
+                let adapter = PaykitAdapter::new(creator_id, session, paykit)
+                    .map_err(|_| ClaimError::InvalidEnvelope)?
+                    .with_lifecycles(lifecycles.clone());
+                let evidence = adapter
+                    .reconcile_for_bitcoin_account_rotation(lifecycles)
+                    .await
+                    .map_err(|_| ClaimError::InvalidEnvelope)?;
+                self.creators
+                    .rotate_bitcoin_account_after_receive(lifecycles, &credentials, &evidence)
+                    .await
+                    .map(|_| ())
+            } else if existing.is_some() {
                 self.creators.reauthenticate(&credentials).await
             } else {
                 self.creators.create(&credentials).await.map(|_| ())

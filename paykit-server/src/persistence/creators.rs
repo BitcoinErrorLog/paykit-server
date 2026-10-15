@@ -11,10 +11,27 @@ use zeroize::Zeroizing;
 use crate::domain::receiving::{BitcoinAccount, UsdtAddress};
 
 use crate::{
+    application::semantic_intent::DeliveryIntentV1,
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext, LookupHash},
-    domain::locks::{CreatorPubky, parse_creator},
-    persistence::PersistenceError,
+    domain::{
+        locks::{CreatorPubky, parse_creator},
+        payment_request_lifecycle::PaymentRequestLifecycleState,
+    },
+    persistence::{PaymentRequestLifecycleStore, PersistenceError, RequiredReceiveTarget},
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BitcoinAccountRotation {
+    pub generation: i64,
+    pub cancellation_pending_count: u64,
+    pub voided_preparation_count: u64,
+}
+
+#[derive(Clone, Copy)]
+enum RotationOwner {
+    Invoice(Uuid),
+    Marketplace(Uuid),
+}
 
 /// Secret-bearing creator authority accepted by the persistence boundary.
 pub struct CreatorCredentials {
@@ -69,12 +86,13 @@ impl CreatorCredentials {
         self.usdt_address.as_ref()
     }
 
-    /// Rejects account changes, key rollback, and key substitution within a generation.
+    /// Rejects account removal, key rollback, and key substitution within a generation.
+    /// A changed non-empty Bitcoin account is handled only by the atomic rotation path.
     pub fn validate_reauthentication(&self, replacement: &Self) -> Result<(), PersistenceError> {
         let current = &self.paykit_identity_secret;
         let next = &replacement.paykit_identity_secret;
         if self.creator != replacement.creator
-            || self.bitcoin_account != replacement.bitcoin_account
+            || (self.bitcoin_account.is_some() && replacement.bitcoin_account.is_none())
             || (self.usdt_address.is_some() && self.usdt_address != replacement.usdt_address)
             || next.key_generation() < current.key_generation()
             || (next.key_generation() == current.key_generation() && next != current)
@@ -82,6 +100,10 @@ impl CreatorCredentials {
             return Err(PersistenceError::ReauthenticationMismatch);
         }
         Ok(())
+    }
+
+    pub fn bitcoin_account_changed(&self, replacement: &Self) -> bool {
+        self.bitcoin_account != replacement.bitcoin_account
     }
 
     fn encode(&self) -> Result<Zeroizing<Vec<u8>>, PersistenceError> {
@@ -309,6 +331,34 @@ impl CreatorStore {
             .map(|credentials| (id, credentials))
     }
 
+    /// Loads credentials with the durable Bitcoin generation used to fence
+    /// address derivation after account rotation.
+    pub async fn load_with_bitcoin_account_generation(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<(CreatorCredentials, i64), PersistenceError> {
+        let hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        let row = sqlx::query_as::<_, CreatorGenerationRow>(
+            "SELECT id, creator_lookup_hash, credential_envelope, bitcoin_account_generation
+             FROM creators WHERE creator_lookup_hash = $1",
+        )
+        .bind(hash.as_bytes().as_slice())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?
+        .ok_or(PersistenceError::CorruptOrMissing)?;
+        if row.bitcoin_account_generation < 0 {
+            return Err(PersistenceError::CorruptOrMissing);
+        }
+        let generation = row.bitcoin_account_generation;
+        let credentials = self.decrypt_credentials(&CreatorRow {
+            id: row.id,
+            creator_lookup_hash: row.creator_lookup_hash,
+            credential_envelope: row.credential_envelope,
+        })?;
+        Ok((credentials, generation))
+    }
+
     /// Loads and authenticates one exact internal Creator row for worker composition.
     pub async fn load_by_id(
         &self,
@@ -359,6 +409,9 @@ impl CreatorStore {
             .bind(hash.as_bytes().as_slice()).fetch_optional(&mut *tx).await.map_err(|_| PersistenceError::Unavailable)?.ok_or(PersistenceError::CorruptOrMissing)?;
         let existing = self.decrypt_credentials(&row)?;
         existing.validate_reauthentication(replacement)?;
+        if existing.bitcoin_account_changed(replacement) {
+            return Err(PersistenceError::ReauthenticationMismatch);
+        }
         let bytes = replacement.encode()?;
         let envelope = self
             .crypto
@@ -376,6 +429,428 @@ impl CreatorStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         tx.commit().await.map_err(|_| PersistenceError::Unavailable)
+    }
+
+    /// Atomically installs a changed Bitcoin account, advances its issuance
+    /// generation, voids unpublished Bitcoin Marketplace preparations, suppresses
+    /// never-handed-off old proposals, and enqueues cancellation of every
+    /// canonically proposed old-account request. Accepted requests remain intact.
+    pub async fn rotate_bitcoin_account_after_receive(
+        &self,
+        lifecycles: &PaymentRequestLifecycleStore,
+        replacement: &CreatorCredentials,
+        receive_evidence: &[RequiredReceiveTarget],
+    ) -> Result<BitcoinAccountRotation, PersistenceError> {
+        let hash = self
+            .crypto
+            .lookup_hash(replacement.creator().to_string().as_bytes());
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let row = sqlx::query_as::<_, CreatorGenerationRow>(
+            "SELECT id, creator_lookup_hash, credential_envelope, bitcoin_account_generation
+             FROM creators WHERE creator_lookup_hash = $1 FOR UPDATE",
+        )
+        .bind(hash.as_bytes().as_slice())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?
+        .ok_or(PersistenceError::CorruptOrMissing)?;
+        let existing = self.decrypt_credentials(&CreatorRow {
+            id: row.id,
+            creator_lookup_hash: row.creator_lookup_hash.clone(),
+            credential_envelope: row.credential_envelope,
+        })?;
+        existing.validate_reauthentication(replacement)?;
+        if !existing.bitcoin_account_changed(replacement)
+            || existing.bitcoin_account().is_none()
+            || replacement.bitcoin_account().is_none()
+        {
+            return Err(PersistenceError::ReauthenticationMismatch);
+        }
+        let current_generation = row.bitcoin_account_generation;
+        let next_generation = current_generation
+            .checked_add(1)
+            .ok_or(PersistenceError::CorruptOrMissing)?;
+
+        let current_targets = lifecycles
+            .required_receive_targets_for_creator_rotation_in_transaction(&mut tx, row.id)
+            .await?;
+        if !PaymentRequestLifecycleStore::receive_evidence_covers(
+            &current_targets,
+            receive_evidence,
+        ) {
+            return Err(PersistenceError::Unavailable);
+        }
+
+        let invoice_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM invoices
+             WHERE creator_id = $1 AND bitcoin_address_lookup_hash IS NOT NULL
+               AND bitcoin_account_generation = $2
+             ORDER BY id FOR UPDATE",
+        )
+        .bind(row.id)
+        .bind(current_generation)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+
+        // Legacy preparations predate the generation column. Authenticate their
+        // encrypted terms before backfilling only Bitcoin-bearing rows.
+        let legacy_preparations: Vec<(Uuid, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, preparation_envelope FROM marketplace_payment_preparations
+             WHERE creator_id = $1 AND bitcoin_account_generation IS NULL
+             ORDER BY id FOR UPDATE",
+        )
+        .bind(row.id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        for (preparation_id, envelope) in legacy_preparations {
+            let plaintext = self
+                .crypto
+                .decrypt(
+                    &EnvelopeContext::marketplace_preparation(hash, preparation_id),
+                    &EncryptedEnvelope::from_bytes(envelope),
+                )
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            if super::marketplace_preparations::PreparationEnvelope::decode(&plaintext)?
+                .has_bitcoin()
+            {
+                sqlx::query(
+                    "UPDATE marketplace_payment_preparations
+                     SET bitcoin_account_generation = $2
+                     WHERE id = $1 AND bitcoin_account_generation IS NULL",
+                )
+                .bind(preparation_id)
+                .bind(current_generation)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            }
+        }
+
+        let marketplace_rows: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT id, state FROM marketplace_payment_preparations
+             WHERE creator_id = $1 AND bitcoin_account_generation = $2
+             ORDER BY id FOR UPDATE",
+        )
+        .bind(row.id)
+        .bind(current_generation)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+
+        let rotation_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO creator_bitcoin_account_rotations
+             (id, creator_id, from_generation, to_generation)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(rotation_id)
+        .bind(row.id)
+        .bind(current_generation)
+        .bind(next_generation)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+
+        let mut owners = invoice_ids
+            .into_iter()
+            .map(RotationOwner::Invoice)
+            .collect::<Vec<_>>();
+        let mut voided_preparation_count = 0_u64;
+        for (preparation_id, state) in marketplace_rows {
+            match state.as_str() {
+                "prepared" => {
+                    let voided = sqlx::query(
+                        "UPDATE marketplace_payment_preparations
+                         SET state = 'voided', voided_at = clock_timestamp(),
+                             updated_at = clock_timestamp()
+                         WHERE id = $1 AND state = 'prepared'",
+                    )
+                    .bind(preparation_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)?;
+                    if voided.rows_affected() != 1 {
+                        return Err(PersistenceError::Conflict);
+                    }
+                    sqlx::query(
+                        "INSERT INTO creator_bitcoin_account_rotation_items
+                         (rotation_id, marketplace_preparation_id, classification)
+                         VALUES ($1, $2, 'preparation_voided')",
+                    )
+                    .bind(rotation_id)
+                    .bind(preparation_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)?;
+                    voided_preparation_count += 1;
+                }
+                "active" => owners.push(RotationOwner::Marketplace(preparation_id)),
+                "voided" => {}
+                _ => return Err(PersistenceError::CorruptOrMissing),
+            }
+        }
+
+        let mut cancellation_pending_count = 0_u64;
+        for owner in owners {
+            let (invoice_id, marketplace_preparation_id) = match owner {
+                RotationOwner::Invoice(id) => (Some(id), None),
+                RotationOwner::Marketplace(id) => (None, Some(id)),
+            };
+            let proposal: (Uuid, Vec<u8>, String, Option<String>) = sqlx::query_as(
+                "SELECT id, intent_envelope, status, sdk_payment_request_id
+                 FROM outbox
+                 WHERE creator_id = $1
+                   AND invoice_id IS NOT DISTINCT FROM $2
+                   AND marketplace_preparation_id IS NOT DISTINCT FROM $3
+                   AND intent_kind = 'payment_request_proposal'
+                 ORDER BY created_at, id",
+            )
+            .bind(row.id)
+            .bind(invoice_id)
+            .bind(marketplace_preparation_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            let proposal_plaintext = self
+                .crypto
+                .decrypt(
+                    &EnvelopeContext::outbox_semantic_intent(hash, proposal.0),
+                    &EncryptedEnvelope::from_bytes(proposal.1),
+                )
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            let proposal_intent = DeliveryIntentV1::decode(&proposal_plaintext)
+                .map_err(|_| PersistenceError::CorruptOrMissing)?;
+            if !matches!(
+                proposal_intent.operation(),
+                crate::application::semantic_intent::DeliveryOperationV1::PaymentRequestProposal { .. }
+            ) {
+                return Err(PersistenceError::CorruptOrMissing);
+            }
+
+            let lifecycle_rows: Vec<(String, String)> = sqlx::query_as(
+                "SELECT sdk_payment_request_id, request_state
+                 FROM payment_request_lifecycles
+                 WHERE invoice_id IS NOT DISTINCT FROM $1
+                   AND marketplace_preparation_id IS NOT DISTINCT FROM $2
+                 ORDER BY sdk_payment_request_id FOR UPDATE",
+            )
+            .bind(invoice_id)
+            .bind(marketplace_preparation_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+            let parsed = lifecycle_rows
+                .iter()
+                .map(|(id, state)| {
+                    PaymentRequestLifecycleState::parse(state)
+                        .map(|state| (id, state))
+                        .ok_or(PersistenceError::CorruptOrMissing)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if parsed
+                .iter()
+                .any(|(_, state)| *state == PaymentRequestLifecycleState::InvalidConflict)
+            {
+                return Err(PersistenceError::Conflict);
+            }
+            if parsed
+                .iter()
+                .any(|(_, state)| *state == PaymentRequestLifecycleState::RecoveryRequired)
+            {
+                return Err(PersistenceError::Unavailable);
+            }
+            let accepted = parsed.iter().any(|(_, state)| {
+                matches!(
+                    state,
+                    PaymentRequestLifecycleState::Accepted
+                        | PaymentRequestLifecycleState::ProofSubmitted
+                        | PaymentRequestLifecycleState::ActiveRecurring
+                )
+            });
+            let proposed = parsed
+                .iter()
+                .filter(|(_, state)| *state == PaymentRequestLifecycleState::Proposed)
+                .map(|(id, _)| (*id).clone())
+                .collect::<Vec<_>>();
+
+            if accepted {
+                sqlx::query(
+                    "INSERT INTO creator_bitcoin_account_rotation_items
+                     (rotation_id, invoice_id, marketplace_preparation_id, classification)
+                     VALUES ($1, $2, $3, 'accepted')",
+                )
+                .bind(rotation_id)
+                .bind(invoice_id)
+                .bind(marketplace_preparation_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                continue;
+            }
+
+            if proposed.is_empty() {
+                if parsed.is_empty()
+                    && (proposal.3.is_some()
+                        || matches!(proposal.2.as_str(), "handed_off" | "delivered"))
+                {
+                    return Err(PersistenceError::Unavailable);
+                }
+                let classification = if parsed.is_empty()
+                    && matches!(proposal.2.as_str(), "queued" | "retryable" | "leased")
+                {
+                    let suppressed = sqlx::query(
+                        "UPDATE outbox
+                         SET status = 'permanently_failed', error_class = 'bitcoin_account_rotated',
+                             lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL,
+                             updated_at = clock_timestamp()
+                         WHERE id = $1 AND status IN ('queued', 'retryable', 'leased')",
+                    )
+                    .bind(proposal.0)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)?;
+                    if suppressed.rows_affected() != 1 {
+                        return Err(PersistenceError::Conflict);
+                    }
+                    "proposal_suppressed"
+                } else {
+                    "terminal"
+                };
+                sqlx::query(
+                    "INSERT INTO creator_bitcoin_account_rotation_items
+                     (rotation_id, invoice_id, marketplace_preparation_id, classification)
+                     VALUES ($1, $2, $3, $4)",
+                )
+                .bind(rotation_id)
+                .bind(invoice_id)
+                .bind(marketplace_preparation_id)
+                .bind(classification)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                continue;
+            }
+
+            for payment_request_id in proposed {
+                let existing_cancellation: Option<Uuid> = sqlx::query_scalar(
+                    "SELECT id FROM outbox
+                     WHERE creator_id = $1
+                       AND invoice_id IS NOT DISTINCT FROM $2
+                       AND marketplace_preparation_id IS NOT DISTINCT FROM $3
+                       AND intent_kind = 'payment_request_cancellation'
+                       AND cancellation_target_payment_request_id = $4",
+                )
+                .bind(row.id)
+                .bind(invoice_id)
+                .bind(marketplace_preparation_id)
+                .bind(&payment_request_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                let cancellation_outbox_id = if let Some(id) = existing_cancellation {
+                    id
+                } else {
+                    let cancellation = DeliveryIntentV1::payment_request_cancellation(
+                        &proposal_intent,
+                        payment_request_id.clone(),
+                    )
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                    let outbox_id = Uuid::new_v4();
+                    let plaintext = postcard::to_allocvec(&cancellation)
+                        .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                    let envelope = self
+                        .crypto
+                        .encrypt(
+                            &EnvelopeContext::outbox_semantic_intent(hash, outbox_id),
+                            &plaintext,
+                        )
+                        .map_err(|_| PersistenceError::CorruptOrMissing)?;
+                    sqlx::query(
+                        "INSERT INTO outbox
+                         (id, creator_id, invoice_id, marketplace_preparation_id,
+                          intent_envelope, intent_kind,
+                          cancellation_target_payment_request_id, status)
+                         VALUES ($1, $2, $3, $4, $5,
+                                 'payment_request_cancellation', $6, 'queued')",
+                    )
+                    .bind(outbox_id)
+                    .bind(row.id)
+                    .bind(invoice_id)
+                    .bind(marketplace_preparation_id)
+                    .bind(envelope.as_bytes())
+                    .bind(&payment_request_id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| PersistenceError::Unavailable)?;
+                    outbox_id
+                };
+                sqlx::query(
+                    "INSERT INTO creator_bitcoin_account_rotation_items
+                     (rotation_id, invoice_id, marketplace_preparation_id,
+                      sdk_payment_request_id, classification, cancellation_outbox_id)
+                     VALUES ($1, $2, $3, $4, 'cancellation_pending', $5)",
+                )
+                .bind(rotation_id)
+                .bind(invoice_id)
+                .bind(marketplace_preparation_id)
+                .bind(&payment_request_id)
+                .bind(cancellation_outbox_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+                cancellation_pending_count += 1;
+            }
+        }
+
+        let bytes = replacement.encode()?;
+        let envelope = self
+            .crypto
+            .encrypt(&EnvelopeContext::creator_credentials(hash, row.id), &bytes)
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let updated = sqlx::query(
+            "UPDATE creators
+             SET credential_envelope = $1, bitcoin_account_generation = $2,
+                 setup_complete = FALSE, updated_at = clock_timestamp()
+             WHERE id = $3 AND bitcoin_account_generation = $4",
+        )
+        .bind(envelope.as_bytes())
+        .bind(next_generation)
+        .bind(row.id)
+        .bind(current_generation)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        if updated.rows_affected() != 1 {
+            return Err(PersistenceError::Conflict);
+        }
+        sqlx::query(
+            "UPDATE creator_bitcoin_account_rotations
+             SET cancellation_count = $2, voided_preparation_count = $3
+             WHERE id = $1",
+        )
+        .bind(rotation_id)
+        .bind(
+            i64::try_from(cancellation_pending_count)
+                .map_err(|_| PersistenceError::InvalidInput)?,
+        )
+        .bind(i64::try_from(voided_preparation_count).map_err(|_| PersistenceError::InvalidInput)?)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(BitcoinAccountRotation {
+            generation: next_generation,
+            cancellation_pending_count,
+            voided_preparation_count,
+        })
     }
 
     /// Authenticates every creator authority envelope required at boot.
@@ -429,6 +904,14 @@ pub(crate) struct CreatorRow {
     pub(crate) creator_lookup_hash: Vec<u8>,
     pub(crate) credential_envelope: Vec<u8>,
 }
+
+#[derive(sqlx::FromRow)]
+struct CreatorGenerationRow {
+    id: Uuid,
+    creator_lookup_hash: Vec<u8>,
+    credential_envelope: Vec<u8>,
+    bitcoin_account_generation: i64,
+}
 impl CreatorRow {
     pub(crate) fn lookup_hash(&self) -> Result<LookupHash, PersistenceError> {
         self.creator_lookup_hash
@@ -470,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn reauthentication_preserves_account_and_rejects_key_rollback_or_substitution() {
+    fn reauthentication_validation_routes_changed_accounts_to_rotation() {
         let current = credentials(9, 3);
         assert!(
             current
@@ -490,9 +973,13 @@ mod tests {
         }
         let mut replacement = credentials(8, 4);
         replacement.bitcoin_account.as_mut().unwrap().account_index = 8;
-        assert!(current.validate_reauthentication(&replacement).is_err());
+        assert!(current.validate_reauthentication(&replacement).is_ok());
+        assert!(current.bitcoin_account_changed(&replacement));
         replacement.bitcoin_account.as_mut().unwrap().account_index = 7;
         replacement.bitcoin_account.as_mut().unwrap().xpub = Zeroizing::new("different".into());
+        assert!(current.validate_reauthentication(&replacement).is_ok());
+        assert!(current.bitcoin_account_changed(&replacement));
+        replacement.bitcoin_account = None;
         assert!(current.validate_reauthentication(&replacement).is_err());
     }
 }

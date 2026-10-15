@@ -23,8 +23,8 @@ use paykit_server::{
         CreatorCredentials, CreatorStore, MarketplaceActivationInput,
         MarketplaceLifecyclePersistenceError, MarketplacePreparationInput,
         MarketplacePreparationPayloadFactory, MarketplacePreparationPayloads,
-        MarketplacePreparationStore, MarketplaceResolutionOutcome, OutboxStore, PersistenceError,
-        run_migrations,
+        MarketplacePreparationStore, MarketplaceResolutionOutcome, OutboxStore,
+        PaymentRequestLifecycleStore, PersistenceError, run_migrations,
     },
     workers::outbox::{Adapter, HandoffError, HandoffResult, process_reconciliation},
 };
@@ -233,6 +233,10 @@ struct StoredPreparationEnvelope {
 }
 
 impl MarketplacePreparationPayloadFactory for Payloads {
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        Some(0)
+    }
+
     fn for_child_index(
         &self,
         child_index: i64,
@@ -244,6 +248,21 @@ impl MarketplacePreparationPayloadFactory for Payloads {
                 "7cceb26d-9042-4ea6-bfcb-01bbd778d76e".into(),
             ),
         })
+    }
+}
+
+struct GenerationPayloads(i64);
+
+impl MarketplacePreparationPayloadFactory for GenerationPayloads {
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        Some(self.0)
+    }
+
+    fn for_child_index(
+        &self,
+        child_index: i64,
+    ) -> Result<MarketplacePreparationPayloads, PersistenceError> {
+        Payloads.for_child_index(child_index)
     }
 }
 
@@ -456,6 +475,85 @@ fn input_with_payloads<'a>(
         payloads,
         ..input(creator, reader, operation_id, request_binding)
     }
+}
+
+#[tokio::test]
+async fn rotation_voids_old_preparation_and_new_operation_uses_current_generation() {
+    let database = TestDatabase::create().await;
+    let store = store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let old = store
+        .prepare(input(
+            &creator,
+            &reader,
+            "rotation-old-operation",
+            b"rotation-old-request",
+        ))
+        .await
+        .unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let current = creators.load(&creator).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator.clone(),
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 1,
+        }),
+        None,
+    );
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let rotation = creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &[])
+        .await
+        .unwrap();
+    assert_eq!(rotation.voided_preparation_count, 1);
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM marketplace_payment_preparations WHERE id = $1")
+            .bind(old.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(state, "voided");
+    assert_eq!(
+        store
+            .activate(MarketplaceActivationInput {
+                creator: &creator,
+                invoice_id: old.invoice_id(),
+                amount: 100,
+                asset: CriterionAsset::Btc,
+                proposal_acceptance_window: Duration::from_secs(60),
+            })
+            .await,
+        Err(MarketplaceLifecyclePersistenceError::LifecycleTerminal)
+    );
+
+    assert!(
+        store
+            .prepare(input_with_payloads(
+                &creator,
+                &reader,
+                "rotation-stale-operation",
+                b"rotation-stale-request",
+                &GenerationPayloads(0),
+            ))
+            .await
+            .is_err()
+    );
+    let new = store
+        .prepare(input_with_payloads(
+            &creator,
+            &reader,
+            "rotation-new-operation",
+            b"rotation-new-request",
+            &GenerationPayloads(1),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(new.invoice_id(), old.invoice_id());
+    database.cleanup().await;
 }
 
 async fn stored_preparation_envelope(

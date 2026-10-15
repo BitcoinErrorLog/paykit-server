@@ -38,6 +38,7 @@ pub struct MarketplacePreparationInput<'a> {
     pub reference: &'a str,
     pub operation_id: &'a str,
     pub request_binding: &'a [u8],
+
     /// Exact amount in `asset`'s base units.
     pub amount: u64,
     /// Denomination of `amount`.
@@ -89,6 +90,11 @@ pub struct MarketplacePreparationPayloads {
 
 /// Derives immutable proposal material from a transaction-reserved child index.
 pub trait MarketplacePreparationPayloadFactory: Send + Sync {
+    /// Generation observed with a Bitcoin endpoint, or `None` for non-Bitcoin terms.
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        None
+    }
+
     fn for_child_index(
         &self,
         child_index: i64,
@@ -332,7 +338,7 @@ struct PreparationEnvelopeV1 {
 /// Current preparation envelope. `version` is the stored version: 2 is written, 1
 /// is only read, as `{BTC, total_sats, [BTC]}`.
 #[derive(Serialize, Deserialize)]
-struct PreparationEnvelope {
+pub(crate) struct PreparationEnvelope {
     version: u8,
     operation_id: String,
     request_binding: Vec<u8>,
@@ -357,7 +363,7 @@ impl PreparationEnvelope {
             .map_err(|_| PersistenceError::CorruptOrMissing)
     }
 
-    fn decode(plaintext: &[u8]) -> Result<Self, PersistenceError> {
+    pub(crate) fn decode(plaintext: &[u8]) -> Result<Self, PersistenceError> {
         match plaintext.first() {
             Some(1) => {
                 let legacy: PreparationEnvelopeV1 = postcard::from_bytes(plaintext)
@@ -388,12 +394,17 @@ impl PreparationEnvelope {
             _ => Err(PersistenceError::CorruptOrMissing),
         }
     }
+
+    pub(crate) fn has_bitcoin(&self) -> bool {
+        self.terms.accepts(AcceptedAsset::Btc)
+    }
 }
 
 struct CreatorRow {
     id: Uuid,
     creator_lookup_hash: Vec<u8>,
     next_child_index: i64,
+    bitcoin_account_generation: i64,
 }
 
 struct PreparationRow {
@@ -965,19 +976,22 @@ impl MarketplacePreparationStore {
             .begin()
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
-        let creator = sqlx::query_as::<_, (Uuid, Vec<u8>, i64)>(
-            "SELECT id, creator_lookup_hash, next_child_index
+        let creator = sqlx::query_as::<_, (Uuid, Vec<u8>, i64, i64)>(
+            "SELECT id, creator_lookup_hash, next_child_index, bitcoin_account_generation
              FROM creators WHERE creator_lookup_hash = $1 FOR UPDATE",
         )
         .bind(creator_hash.as_bytes().as_slice())
         .fetch_optional(&mut *tx)
         .await
         .map_err(|_| PersistenceError::Unavailable)?
-        .map(|(id, creator_lookup_hash, next_child_index)| CreatorRow {
-            id,
-            creator_lookup_hash,
-            next_child_index,
-        })
+        .map(
+            |(id, creator_lookup_hash, next_child_index, bitcoin_account_generation)| CreatorRow {
+                id,
+                creator_lookup_hash,
+                next_child_index,
+                bitcoin_account_generation,
+            },
+        )
         .ok_or(PersistenceError::CorruptOrMissing)?;
         if stored_hash(&creator.creator_lookup_hash)? != creator_hash
             || creator.next_child_index < 0
@@ -1001,6 +1015,14 @@ impl MarketplacePreparationStore {
                 .await
                 .map_err(|_| PersistenceError::Unavailable)?;
             return Ok(result);
+        }
+
+        if input
+            .payloads
+            .expected_bitcoin_account_generation()
+            .is_some_and(|expected| expected != creator.bitcoin_account_generation)
+        {
+            return Err(PersistenceError::Conflict);
         }
 
         // The Creator lock may have been waited on for a long time. The preparation
@@ -1065,8 +1087,9 @@ impl MarketplacePreparationStore {
         sqlx::query(
             "INSERT INTO marketplace_payment_preparations
              (id, creator_id, operation_lookup_hash, request_lookup_hash,
-              reader_lookup_hash, preparation_envelope, prepared_at, prepare_expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+              reader_lookup_hash, preparation_envelope, prepared_at, prepare_expires_at,
+              bitcoin_account_generation)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(invoice_id)
         .bind(creator.id)
@@ -1076,6 +1099,12 @@ impl MarketplacePreparationStore {
         .bind(encrypted.as_bytes())
         .bind(prepared_at)
         .bind(prepare_expires_at)
+        .bind(
+            input
+                .payloads
+                .expected_bitcoin_account_generation()
+                .map(|_| creator.bitcoin_account_generation),
+        )
         .execute(&mut *tx)
         .await
         .map_err(classify_preparation_insert_error)?;

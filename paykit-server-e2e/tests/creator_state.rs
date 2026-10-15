@@ -12,7 +12,8 @@ use paykit_server::{
     crypto::Crypto,
     domain::locks::parse_creator,
     persistence::{
-        CreatorCredentials, CreatorStore, DeploymentStore, PersistenceError, run_migrations,
+        CreatorCredentials, CreatorStore, DeploymentStore, PaymentRequestLifecycleStore,
+        PersistenceError, run_migrations,
     },
     startup::initialize_database,
 };
@@ -705,5 +706,51 @@ async fn reauthentication_can_add_but_cannot_replace_approved_usdt_details() {
         creators.load(&creator()).await.unwrap().usdt_address(),
         Some(&address)
     );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn bitcoin_account_rotation_atomically_advances_generation_and_preserves_ready_semantics() {
+    let database = TestDatabase::create().await;
+    let creators = stores(&database).await;
+    creators
+        .create(&credentials(SESSION, XPUB, 7, [9; 32]))
+        .await
+        .unwrap();
+    creators.mark_setup_complete(&creator()).await.unwrap();
+    let replacement = credentials("rotated-session", OTHER_XPUB, 19, [9; 32]);
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+
+    let rotation = creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &[])
+        .await
+        .unwrap();
+    assert_eq!(rotation.generation, 1);
+    assert_eq!(rotation.cancellation_pending_count, 0);
+    assert_eq!(rotation.voided_preparation_count, 0);
+    let (stored, generation) = creators
+        .load_with_bitcoin_account_generation(&creator())
+        .await
+        .unwrap();
+    assert_eq!(generation, 1);
+    assert_eq!(stored.session_secret(), "rotated-session");
+    assert_eq!(stored.bitcoin_account().unwrap().xpub.as_str(), OTHER_XPUB);
+    assert_eq!(stored.bitcoin_account().unwrap().account_index, 19);
+    assert!(!creators.setup_complete(&creator()).await.unwrap());
+    creators.mark_setup_complete(&creator()).await.unwrap();
+    assert!(creators.setup_complete(&creator()).await.unwrap());
+    assert!(
+        creators
+            .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &[])
+            .await
+            .is_err(),
+        "exact reconnect replay must not create a second rotation"
+    );
+    let rotation_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM creator_bitcoin_account_rotations")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(rotation_count, 1);
     database.cleanup().await;
 }

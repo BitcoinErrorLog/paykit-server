@@ -31,6 +31,7 @@ pub struct AuthRequest {
     relay: Url,
     secret: Zeroizing<[u8; 32]>,
     claim_type: String,
+    reconnect: bool,
 }
 
 impl core::fmt::Debug for AuthRequest {
@@ -53,6 +54,9 @@ impl AuthRequest {
     /// Borrows the exact validated permission list used by the SDK signature and channel.
     pub fn claim_type(&self) -> &str {
         &self.claim_type
+    }
+    pub fn reconnect(&self) -> bool {
+        self.reconnect
     }
 }
 
@@ -108,7 +112,8 @@ pub fn parse_auth_request(
     parse_request(value, expected_capabilities, false)
 }
 
-/// Validates an explicit reconnect requesting Paykit access and no account material.
+/// Validates an explicit reconnect. Legacy Paykit-only reconnects remain valid;
+/// current reconnects may also authenticate optional receiving details.
 pub fn parse_reconnect_auth_request(
     value: &str,
     expected_capabilities: &str,
@@ -128,11 +133,7 @@ fn parse_request(
     let auth = parse_pubky_auth_url(value).map_err(|_| ClaimError::InvalidAuthRequest)?;
     let claim_type = unique_query(&url, QUERY_PARAMETER)?;
     if reconnect {
-        if claim_type != PAYKIT_ACCESS_CLAIM
-            && claim_type != format!("{PAYKIT_ACCESS_CLAIM}.{USDT_ADDRESS_CLAIM}")
-        {
-            return Err(ClaimError::InvalidAuthRequest);
-        }
+        validate_reconnect_claim_selection(&claim_type)?;
     } else {
         validate_setup_claim_selection(&claim_type)?;
     }
@@ -159,7 +160,26 @@ fn parse_request(
         relay,
         secret: Zeroizing::new(secret),
         claim_type,
+        reconnect,
     })
+}
+
+fn validate_reconnect_claim_selection(value: &str) -> Result<(), ClaimError> {
+    let mut paykit_access = false;
+    let mut watch_only_account = false;
+    let mut usdt_address = false;
+    for item in value.split('.') {
+        match item {
+            PAYKIT_ACCESS_CLAIM if !paykit_access => paykit_access = true,
+            WATCH_ONLY_ACCOUNT_CLAIM if !watch_only_account => watch_only_account = true,
+            USDT_ADDRESS_CLAIM if !usdt_address => usdt_address = true,
+            _ => return Err(ClaimError::InvalidAuthRequest),
+        }
+    }
+    if !paykit_access {
+        return Err(ClaimError::InvalidAuthRequest);
+    }
+    Ok(())
 }
 
 fn validate_setup_claim_selection(value: &str) -> Result<(), ClaimError> {
@@ -256,7 +276,13 @@ pub fn decrypt_and_verify(
         .split('.')
         .any(|item| item == USDT_ADDRESS_CLAIM)
     {
-        parse_receiving_payload(&plaintext, request)
+        parse_receiving_payload(&plaintext, request, request.reconnect())
+    } else if request.reconnect() && plaintext.len() == RECONNECT_PAYLOAD_LEN {
+        parse_reconnect_payload(&plaintext).map(|paykit_identity_secret_key| SetupCompanionClaim {
+            bitcoin_account: None,
+            paykit_identity_secret_key,
+            usdt_address: None,
+        })
     } else {
         parse_unsigned_payload(&plaintext)
     }
@@ -272,6 +298,10 @@ pub fn decrypt_and_verify_reconnect(
         return Err(ClaimError::InvalidAuthRequest);
     }
     let payload = verify_envelope(relay_body, request, creator)?;
+    parse_reconnect_payload(&payload)
+}
+
+fn parse_reconnect_payload(payload: &[u8]) -> Result<PaykitIdentitySecretKey, ClaimError> {
     if payload.len() != RECONNECT_PAYLOAD_LEN || payload[0] != 1 {
         return Err(ClaimError::InvalidPayload);
     }
@@ -284,6 +314,7 @@ pub fn decrypt_and_verify_reconnect(
 fn parse_receiving_payload(
     value: &[u8],
     request: &AuthRequest,
+    allow_omitted_bitcoin: bool,
 ) -> Result<SetupCompanionClaim, ClaimError> {
     use crate::domain::receiving::{USDT_CHAIN_ID, USDT_TOKEN, UsdtAddress};
     use std::str::FromStr;
@@ -320,7 +351,9 @@ fn parse_receiving_payload(
         .claim_type()
         .split('.')
         .any(|item| item == WATCH_ONLY_ACCOUNT_CLAIM);
-    if payload.bitcoin_account.is_some() != includes_bitcoin {
+    if (!allow_omitted_bitcoin && payload.bitcoin_account.is_some() != includes_bitcoin)
+        || (payload.bitcoin_account.is_some() && !includes_bitcoin)
+    {
         return Err(ClaimError::InvalidPayload);
     }
     let bitcoin_account = match payload.bitcoin_account {
@@ -505,7 +538,7 @@ mod tests {
             Err(ClaimError::AuthenticationFailed)
         );
         assert!(decrypt_and_verify(&body, &request, &signer.verifying_key()).is_err());
-        assert!(parse_reconnect_auth_request(&auth(&secret), LOCAL_DEMO_CAPABILITIES).is_err());
+        assert!(parse_reconnect_auth_request(&auth(&secret), LOCAL_DEMO_CAPABILITIES).is_ok());
     }
 
     #[test]
@@ -535,6 +568,49 @@ mod tests {
                 decrypt_and_verify_reconnect(&body, &request, &signer.verifying_key()).is_err()
             );
         }
+    }
+
+    #[test]
+    fn reconnect_authenticates_explicit_account_or_authenticated_omission() {
+        let secret = [7; 32];
+        let signer = SigningKey::from_bytes(&[5; 32]);
+        let selection = setup_claim_selection();
+        let request = parse_reconnect_auth_request(
+            &auth_with_selection(&secret, &selection),
+            LOCAL_DEMO_CAPABILITIES,
+        )
+        .unwrap();
+        assert!(request.reconnect());
+
+        let combined = signed_envelope(
+            &secret,
+            &secret,
+            &signer,
+            QUERY_PARAMETER,
+            &selection,
+            &unsigned(),
+        );
+        let changed = decrypt_and_verify(&combined, &request, &signer.verifying_key()).unwrap();
+        assert_eq!(changed.bitcoin_account.unwrap().account_index, 7);
+
+        let key = PaykitIdentitySecretKey::new([11; 32], 3).unwrap();
+        let omitted_payload = [
+            vec![1],
+            key.key_generation().to_be_bytes().to_vec(),
+            key.as_bytes().to_vec(),
+        ]
+        .concat();
+        let omitted = signed_envelope(
+            &secret,
+            &secret,
+            &signer,
+            QUERY_PARAMETER,
+            &selection,
+            &omitted_payload,
+        );
+        let omitted = decrypt_and_verify(&omitted, &request, &signer.verifying_key()).unwrap();
+        assert!(omitted.bitcoin_account.is_none());
+        assert_eq!(omitted.paykit_identity_secret_key, key);
     }
 
     fn auth(secret: &[u8; 32]) -> String {

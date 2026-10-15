@@ -162,10 +162,12 @@ impl CreatorReceivingProvider for CreatorStore {
         &self,
         creator: &CreatorPubky,
     ) -> Result<ReceivingDetails, PersistenceError> {
-        let credentials = self.load(creator).await?;
+        let (credentials, bitcoin_account_generation) =
+            self.load_with_bitcoin_account_generation(creator).await?;
         Ok(ReceivingDetails {
             bitcoin: credentials.bitcoin_account().cloned(),
             usdt: credentials.usdt_address().cloned(),
+            bitcoin_account_generation,
         })
     }
 }
@@ -230,6 +232,8 @@ pub trait IntentBuilder: Send + Sync {
 pub struct ReceivingDetails {
     pub bitcoin: Option<crate::domain::receiving::BitcoinAccount>,
     pub usdt: Option<crate::domain::receiving::UsdtAddress>,
+    /// Durable generation paired with `bitcoin`; zero is the migrated legacy generation.
+    pub bitcoin_account_generation: i64,
 }
 
 pub struct ReceivingAddresses {
@@ -356,6 +360,13 @@ struct DerivedInvoicePayloads<'a> {
     app_id: PaykitAppId,
 }
 impl InvoicePayloadFactory for DerivedInvoicePayloads<'_> {
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        self.receiving
+            .bitcoin
+            .as_ref()
+            .map(|_| self.receiving.bitcoin_account_generation)
+    }
+
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         let addresses = ReceivingAddresses {
             bitcoin: self

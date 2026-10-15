@@ -91,6 +91,79 @@ impl PaymentRequestLifecycleStore {
         }
     }
 
+    /// Counterparties whose Bitcoin-bearing requests may affect one Creator-wide
+    /// account-rotation snapshot.
+    pub async fn required_receive_targets_for_creator_rotation(
+        &self,
+        creator: &CreatorPubky,
+    ) -> Result<Vec<RequiredReceiveTarget>, PersistenceError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        let creator_hash = self.crypto.lookup_hash(creator.to_string().as_bytes());
+        let creator_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM creators WHERE creator_lookup_hash = $1")
+                .bind(creator_hash.as_bytes().as_slice())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?
+                .ok_or(PersistenceError::CorruptOrMissing)?;
+        let targets = self
+            .required_receive_targets_for_creator_rotation_in_transaction(
+                &mut transaction,
+                creator_id,
+            )
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(targets)
+    }
+
+    pub(crate) async fn required_receive_targets_for_creator_rotation_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        creator_id: Uuid,
+    ) -> Result<Vec<RequiredReceiveTarget>, PersistenceError> {
+        let rows = sqlx::query_as::<_, RequiredReceiveTargetRow>(
+            "SELECT DISTINCT ON (proposal.id)
+                    proposal.id, creator.creator_lookup_hash, proposal.intent_envelope
+             FROM outbox proposal
+             JOIN creators creator ON creator.id = proposal.creator_id
+             LEFT JOIN invoices invoice ON invoice.id = proposal.invoice_id
+             LEFT JOIN marketplace_payment_preparations preparation
+               ON preparation.id = proposal.marketplace_preparation_id
+             WHERE proposal.creator_id = $1
+               AND proposal.intent_kind = 'payment_request_proposal'
+               AND (invoice.bitcoin_address_lookup_hash IS NOT NULL
+                    OR preparation.id IS NOT NULL)
+               AND (
+                   NOT EXISTS (
+                       SELECT 1 FROM payment_request_lifecycles lifecycle
+                       WHERE lifecycle.invoice_id = invoice.id
+                          OR lifecycle.marketplace_preparation_id = preparation.id
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM payment_request_lifecycles lifecycle
+                       WHERE (lifecycle.invoice_id = invoice.id
+                              OR lifecycle.marketplace_preparation_id = preparation.id)
+                         AND lifecycle.request_state NOT IN (
+                             'proposal_expired', 'rejected', 'canceled'
+                         )
+                   )
+               )
+             ORDER BY proposal.id",
+        )
+        .bind(creator_id)
+        .fetch_all(&mut **transaction)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        self.decode_required_receive_targets(rows)
+    }
+
     pub async fn required_receive_targets_for_lock(
         &self,
         creator_id: Uuid,

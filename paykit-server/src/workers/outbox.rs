@@ -70,28 +70,20 @@ impl RetryableHandoffCause {
 pub enum HandoffFailure {
     Retryable(RetryableHandoffStage),
     ProposalExpired,
-    CancellationExpired,
+    CancellationObsolete,
     Permanent,
 }
 
 #[derive(Clone, Copy)]
-enum DeliveryExpiration {
-    Proposal(time::OffsetDateTime),
-    Cancellation(time::OffsetDateTime),
-}
+struct DeliveryExpiration(time::OffsetDateTime);
 
 impl DeliveryExpiration {
     const fn deadline(self) -> time::OffsetDateTime {
-        match self {
-            Self::Proposal(deadline) | Self::Cancellation(deadline) => deadline,
-        }
+        self.0
     }
 
     const fn failure(self) -> HandoffFailure {
-        match self {
-            Self::Proposal(_) => HandoffFailure::ProposalExpired,
-            Self::Cancellation(_) => HandoffFailure::CancellationExpired,
-        }
+        HandoffFailure::ProposalExpired
     }
 }
 
@@ -276,15 +268,10 @@ async fn handoff_steps_with_claim<A: Adapter + ?Sized>(
         DeliveryOperationV1::PaymentRequestProposal { .. } => intent
             .proposal_expires_at()
             .map_err(|_| HandoffFailure::Permanent)?
-            .map(DeliveryExpiration::Proposal),
-        DeliveryOperationV1::PaymentRequestCancellation { .. } => match claim {
-            Some((_, claim)) => Some(DeliveryExpiration::Cancellation(
-                claim
-                    .invoice_payment_deadline()
-                    .ok_or(HandoffFailure::Permanent)?,
-            )),
-            None => None,
-        },
+            .map(DeliveryExpiration),
+        // Cancellation is durable cleanup. A payment deadline must not strand an
+        // old-address request after account rotation or drain creation.
+        DeliveryOperationV1::PaymentRequestCancellation { .. } => None,
     };
     let payment_request_id = paykit_lib::PaymentRequestId::new(outbox_id.to_string())
         .map_err(|_| HandoffFailure::Permanent)?;
@@ -419,22 +406,13 @@ where
         DeliveryOperationV1::PaymentRequestProposal { .. } => intent
             .proposal_expires_at()
             .map_err(|_| PersistenceError::CorruptOrMissing)?
-            .map(DeliveryExpiration::Proposal),
-        DeliveryOperationV1::PaymentRequestCancellation { .. } => {
-            Some(DeliveryExpiration::Cancellation(
-                claim
-                    .invoice_payment_deadline()
-                    .ok_or(PersistenceError::CorruptOrMissing)?,
-            ))
-        }
+            .map(DeliveryExpiration),
+        DeliveryOperationV1::PaymentRequestCancellation { .. } => None,
     };
     if let Some(expiration) = expiration
         && store.proposal_expired(expiration.deadline()).await?
     {
-        let transitioned = match expiration {
-            DeliveryExpiration::Proposal(_) => store.mark_proposal_expired(claim).await?,
-            DeliveryExpiration::Cancellation(_) => store.mark_cancellation_expired(claim).await?,
-        };
+        let transitioned = store.mark_proposal_expired(claim).await?;
         return Ok((transitioned, ProcessingHealth::Available));
     }
     match execute(intent).await {
@@ -453,8 +431,8 @@ where
             .mark_proposal_expired(claim)
             .await
             .map(|transitioned| (transitioned, ProcessingHealth::Available)),
-        Err(HandoffFailure::CancellationExpired) => store
-            .mark_cancellation_expired(claim)
+        Err(HandoffFailure::CancellationObsolete) => store
+            .mark_cancellation_obsolete(claim)
             .await
             .map(|transitioned| (transitioned, ProcessingHealth::Available)),
         Err(HandoffFailure::Permanent) => store
@@ -494,14 +472,7 @@ pub async fn process_reconciliation_with_health(
                 .map(|transitioned| (transitioned, ProcessingHealth::PermanentFailure));
         }
     };
-    if let Some(DeliveryExpiration::Cancellation(deadline)) = expiration
-        && store.proposal_expired(deadline).await?
-    {
-        return store
-            .mark_handed_off_cancellation_expired(claim)
-            .await
-            .map(|transitioned| (transitioned, ProcessingHealth::Available));
-    }
+
     let outbound_message_id = match claim.sdk_outbound_message_id() {
         Ok(value) => value,
         Err(_) => {
@@ -569,7 +540,7 @@ fn reconciliation_expiration(
             intent
                 .proposal_expires_at()
                 .map_err(|_| PersistenceError::CorruptOrMissing)?
-                .map(DeliveryExpiration::Proposal)
+                .map(DeliveryExpiration)
         }
         "payment_request_cancellation" => {
             let intent = store.handed_off_delivery_intent(claim)?;
@@ -579,11 +550,7 @@ fn reconciliation_expiration(
             ) {
                 return Err(PersistenceError::CorruptOrMissing);
             }
-            Some(DeliveryExpiration::Cancellation(
-                claim
-                    .invoice_payment_deadline()
-                    .ok_or(PersistenceError::CorruptOrMissing)?,
-            ))
+            None
         }
         _ => return Err(PersistenceError::CorruptOrMissing),
     })
@@ -599,17 +566,7 @@ async fn retry_reconciliation_after_failure(
     if let Some(expiration) = expiration
         && store.proposal_expired(expiration.deadline()).await?
     {
-        match expiration {
-            DeliveryExpiration::Proposal(_) => {
-                stage = RetryableHandoffStage::ReconciliationPending;
-            }
-            DeliveryExpiration::Cancellation(_) => {
-                return store
-                    .mark_handed_off_cancellation_expired(claim)
-                    .await
-                    .map(|transitioned| (transitioned, ProcessingHealth::Available));
-            }
-        }
+        stage = RetryableHandoffStage::ReconciliationPending;
     }
     store
         .retry_reconciliation(claim, retry_delay, stage)

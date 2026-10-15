@@ -381,6 +381,9 @@ impl PrepareMarketplaceService {
         // invoices; a filter only narrows that set and never adds a rail.
         let allowed = |asset: AcceptedAsset| filter.as_ref().is_none_or(|set| set.contains(&asset));
         let bitcoin = receiving.bitcoin.filter(|_| allowed(AcceptedAsset::Btc));
+        let expected_bitcoin_account_generation = bitcoin
+            .as_ref()
+            .map(|_| receiving.bitcoin_account_generation);
         let usdt = receiving
             .usdt
             .filter(|_| self.usdt_enabled && allowed(AcceptedAsset::Usdt));
@@ -449,6 +452,7 @@ impl PrepareMarketplaceService {
             app_id: &self.app_id,
             bitcoin_network: &self.bitcoin_network,
             bitcoin,
+            bitcoin_account_generation: expected_bitcoin_account_generation,
             usdt,
         };
         // The preparation's whole life is fixed here, on the database clock, when the
@@ -543,10 +547,15 @@ struct MarketplacePayloads<'a> {
     app_id: &'a PaykitAppId,
     bitcoin_network: &'a BitcoinNetwork,
     bitcoin: Option<BitcoinAccount>,
+    bitcoin_account_generation: Option<i64>,
     usdt: Option<UsdtAddress>,
 }
 
 impl MarketplacePreparationPayloadFactory for MarketplacePayloads<'_> {
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        self.bitcoin_account_generation
+    }
+
     fn for_child_index(
         &self,
         child_index: i64,

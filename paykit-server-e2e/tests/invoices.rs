@@ -7,7 +7,8 @@ use paykit_server::{
     domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
     persistence::{
         AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
-        InvoicePayloads, InvoiceStore, PersistenceError, run_migrations,
+        InvoicePayloads, InvoiceStore, PaymentRequestLifecycleStore, PersistenceError,
+        run_migrations,
     },
 };
 use paykit_server_e2e::postgres::TestDatabase;
@@ -22,6 +23,17 @@ impl InvoicePayloadFactory for TestPayloads {
         Ok(InvoicePayloads {
             payment_request_intent: payment_intent(format!("test-address-{child_index}")),
         })
+    }
+}
+
+struct GenerationPayloads(i64);
+impl InvoicePayloadFactory for GenerationPayloads {
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        Some(self.0)
+    }
+
+    fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
+        TestPayloads.for_child_index(child_index)
     }
 }
 
@@ -51,7 +63,7 @@ fn payment_intent(address: String) -> DeliveryIntentV1 {
     common::payment_intent(&reader(), address)
 }
 
-static TEST_PAYLOADS: TestPayloads = TestPayloads;
+static TEST_PAYLOADS: GenerationPayloads = GenerationPayloads(0);
 
 fn crypto() -> Arc<Crypto> {
     Arc::new(Crypto::from_master_key(&[7; 32]).unwrap())
@@ -125,6 +137,154 @@ fn input<'a>(
         proposal_acceptance_seconds: 60 * 60,
         payment_window_seconds: 24 * 60 * 60,
     }
+}
+
+#[tokio::test]
+async fn creator_generation_fences_stale_bitcoin_invoice_issuance() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    sqlx::query("UPDATE creators SET bitcoin_account_generation = 1")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let creator = creator();
+    let reader = reader();
+    let stale = GenerationPayloads(0);
+    let current = GenerationPayloads(1);
+    let make_input = |bundle: &'static [u8], payloads| AtomicInvoiceInput {
+        creator: &creator,
+        reader: &reader,
+        bundle_binding: bundle,
+        lock_resource_binding: bundle,
+        payment_request_binding: bundle,
+        invoice_payloads: payloads,
+        proposal_acceptance_seconds: 60 * 60,
+        payment_window_seconds: 24 * 60 * 60,
+    };
+    assert_eq!(
+        store
+            .create_atomic(make_input(b"stale-generation", &stale))
+            .await,
+        Err(PersistenceError::Conflict)
+    );
+    let created = store
+        .create_atomic(make_input(b"current-generation", &current))
+        .await
+        .unwrap();
+    let generation: Option<i64> =
+        sqlx::query_scalar("SELECT bitcoin_account_generation FROM invoices WHERE id = $1")
+            .bind(created.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(generation, Some(1));
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn rotation_cancels_proposed_preserves_accepted_and_exact_replays_old_bundle() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = reader();
+    let proposed = store
+        .create_atomic(input(
+            &creator,
+            &reader,
+            b"rotation-proposed-bundle",
+            b"rotation-proposed-request",
+        ))
+        .await
+        .unwrap();
+    let accepted = store
+        .create_atomic(input(
+            &creator,
+            &reader,
+            b"rotation-accepted-bundle",
+            b"rotation-accepted-request",
+        ))
+        .await
+        .unwrap();
+    let proposed_request_id = uuid::Uuid::new_v4().to_string();
+    let accepted_request_id = uuid::Uuid::new_v4().to_string();
+    for (invoice_id, request_id, state, cursor) in [
+        (
+            proposed.invoice_id(),
+            proposed_request_id.as_str(),
+            "proposed",
+            1_i64,
+        ),
+        (
+            accepted.invoice_id(),
+            accepted_request_id.as_str(),
+            "accepted",
+            2_i64,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO payment_request_lifecycles
+             (invoice_id, sdk_payment_request_id, request_state, last_event_at,
+              last_stream_item_id)
+             VALUES ($1, $2, $3, NOW(), $4)",
+        )
+        .bind(invoice_id)
+        .bind(request_id)
+        .bind(state)
+        .bind(cursor)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    }
+    let lifecycles = PaymentRequestLifecycleStore::new(database.pool(), crypto());
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator)
+        .await
+        .unwrap();
+    let creators = CreatorStore::new(database.pool(), crypto());
+    let current = creators.load(&creator).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator.clone(),
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 7,
+        }),
+        None,
+    );
+    let rotation = creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+        .await
+        .unwrap();
+    assert_eq!(rotation.cancellation_pending_count, 1);
+    let classifications: Vec<String> = sqlx::query_scalar(
+        "SELECT classification FROM creator_bitcoin_account_rotation_items
+         ORDER BY classification",
+    )
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(classifications, vec!["accepted", "cancellation_pending"]);
+    let cancellation_targets: Vec<String> = sqlx::query_scalar(
+        "SELECT cancellation_target_payment_request_id FROM outbox
+         WHERE intent_kind = 'payment_request_cancellation'",
+    )
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(cancellation_targets, vec![proposed_request_id]);
+    let replay = store
+        .create_atomic(input(
+            &creator,
+            &reader,
+            b"rotation-proposed-bundle",
+            b"rotation-proposed-request",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.invoice_id(), proposed.invoice_id());
+    assert!(replay.replayed());
+    database.cleanup().await;
 }
 
 #[tokio::test]

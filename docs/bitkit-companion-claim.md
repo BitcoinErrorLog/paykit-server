@@ -87,12 +87,17 @@ The caller opens `GET /setup/reconnect` with `creator`, `return_to`, and `state`
 The canonical Creator must already exist before an AUTH request is created. It is
 retained in the in-memory flow and must exactly match the identity authenticated
 by Pubky AUTH; a different authorizer fails before credential writes or publication.
-Without USDT enabled, the URL requests `x-bitkit-claim=paykit-access-v1`. Its 41 unsigned bytes
-contain version, generation, and Paykit secret; with the signature and encryption
-envelope the relay body is 145 bytes. No Bitcoin account bytes or native account picker participate. Client IDs, display names, and relay URLs never select an account.
+Reconnect requests `paykit-access-v1.watch-only-account-v1`, plus
+`usdt-address-v1` when enabled. A 124-byte binary response explicitly supplies
+the authenticated Bitcoin account; a 41-byte Paykit-only response is an
+authenticated omission and preserves the current account. Client IDs, display
+names, and relay URLs never select an account.
 
-Under the Creator setup lock, reconnect loads the existing account index and xpub
-and retains them exactly. A missing Creator cannot be created by reconnect. Initial
+Under the Creator setup lock, an omitted or identical Bitcoin account is a no-op.
+A different valid BIP84 account for the configured network atomically advances the
+Creator account generation, fences stale address issuance, voids unpublished
+Bitcoin Marketplace preparations, and durably enqueues cancellation for unaccepted
+old-account requests. A missing Creator cannot be created by reconnect. Initial
 setup cannot overwrite an existing binding, including one awaiting publication retry.
 The same Paykit generation must retain the same secret; lower
 generations are rejected, and the delegated key and generation must match the
@@ -100,13 +105,15 @@ Creator's identity-signed Paykit Noise Key Authorization. Bitkit publishes that
 record before delegation using its owner-only authorizer session; Server receives
 neither the Pubky root secret nor authorization-path write access. The App Registry
 is discovery metadata, not key authority.
-Unexpected account material and failed verification leave existing credentials and setup
+Invalid account material and failed verification leave existing credentials and setup
 readiness unchanged. An abandoned approval performs no durable writes. Bitkit
 must retain existing account tracking/data on rejection or cancellation.
 
-Successful reauthorization replaces only credentials before republishing the
-server app, preserving invoices, reader assignments, pending delivery intents,
-and the next address allocation index. Publication failure retains retryable
+Successful reauthorization replaces credentials before republishing the server
+app, preserving invoices, reader assignments, old accepted-address observation,
+and the next address allocation index. Cancellation delivery is durable,
+asynchronous, and remains pending until canonical Paykit state confirms cancellation
+or prior acceptance. Publication failure retains retryable
 credentials with setup incomplete; it does not delete history or compensate by
 rewriting shared registry state.
 
@@ -122,7 +129,8 @@ generation; do not round it through a floating-point JSON representation.
 
 The local SDK relay test exercises both list orders through the generic
 signing/encryption API and rejects a reordered response binding. Single-permission
-payload tests check the 84/41-byte forms, initial setup rejection, and exact Paykit-only reconnect. The
+payload tests check the 84/41-byte forms, initial setup rejection, and reconnect
+with explicit or omitted account material. The
 PostgreSQL/Pubky setup composition covers valid BIP84 accounts,
 rejected and cancelled reconnects, preserved pending invoices, and key rotation.
 
@@ -142,8 +150,8 @@ requested, and `usdt-arbitrum-address` only if the user approves USDT sharing:
 
 Omitting the USDT field is an authenticated decline, not malformed setup. An
 unavailable address can be skipped while approving Bitcoin. No BTC or USDT
-spending key is shared. Reconnect requests `paykit-access-v1.usdt-address-v1`
-when enabled; omission retains the existing address, and a different existing
+spending key is shared. Reconnect also requests `watch-only-account-v1` when enabled; omission retains the
+existing Bitcoin account or USDT address, and a different existing
 address is rejected. JSON order is irrelevant to parsing, but the signature is
 verified over the original bytes. The same signature/channel/encryption rules
 above apply to the variable-length JSON payload (maximum 2048 unsigned bytes).

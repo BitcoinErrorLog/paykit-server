@@ -236,8 +236,11 @@ async fn reconnect_payload(
         .unwrap();
     let request =
         parse_reconnect_auth_request(&flow.authorization_url, PAYKIT_SESSION_CAPABILITIES).unwrap();
-    assert_eq!(request.claim_type(), "paykit-access-v1");
-    assert!(!flow.authorization_url.contains("watch-only-account-v1"));
+    assert_eq!(
+        request.claim_type(),
+        "paykit-access-v1.watch-only-account-v1"
+    );
+    assert!(flow.authorization_url.contains("watch-only-account-v1"));
     approve_payload(service, bootstrap, root, flow, payload, true).await
 }
 
@@ -460,14 +463,14 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
     let second = allocate_invoice(&invoices, &creator, &reader, b"second-before-reconnect").await;
     assert_eq!(second.reader_child_index(), 1);
     let before_reconnect = business_rows(&database).await;
-    let original = creators.load(&creator).await.unwrap();
-    let publication_calls = publisher.calls.load(Ordering::SeqCst);
-    // Even a correctly signed combined reply cannot smuggle account bytes into reconnect.
+    // An explicitly repeated account is an authenticated no-op.
     let combined = encode_unsigned_payload(0, &account(0).encode(), &key);
     assert_eq!(
         reconnect_payload(&service, &bootstrap, &root, &creator, combined.as_slice()).await,
-        PollResult::Failed
+        PollResult::Complete
     );
+    let original = creators.load(&creator).await.unwrap();
+    let publication_calls = publisher.calls.load(Ordering::SeqCst);
     let other_root = PubkyLocalSecretKey::new(pubky::Keypair::random().secret_key());
     let other = bootstrap
         .sign_up(&other_root, &home, None, PAYKIT_SESSION_CAPABILITIES)
@@ -488,7 +491,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         complete(&service, &bootstrap, &root, &key, 1).await,
         PollResult::Failed
     );
-    // A different valid xpub at the same account index must also be rejected.
+    // Initial setup cannot rotate an existing Creator; reconnect owns that operation.
     let mut different = account(0);
     different.chain_code = account(1).chain_code;
     let payload = encode_unsigned_payload(0, &different.encode(), &key);

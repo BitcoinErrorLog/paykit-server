@@ -149,7 +149,7 @@ where
         SetupOutcome::Started,
         SetupFailureClass::None,
     );
-    let verified = if request.claim_type() == PAYKIT_ACCESS_CLAIM {
+    let verified = if request.reconnect() && request.claim_type() == PAYKIT_ACCESS_CLAIM {
         decrypt_and_verify_reconnect(&body, request, creator).map(VerifiedCompanionClaim::Reconnect)
     } else {
         decrypt_and_verify(&body, request, creator).map(VerifiedCompanionClaim::Setup)

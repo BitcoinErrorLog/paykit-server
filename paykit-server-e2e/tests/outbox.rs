@@ -689,7 +689,7 @@ async fn individual_delivery_states_do_not_hide_systemic_delivery_failures() {
 }
 
 #[tokio::test]
-async fn cancellation_retries_until_payment_deadline_then_expires_without_another_handoff() {
+async fn cancellation_remains_retryable_after_payment_deadline() {
     let database = TestDatabase::create().await;
     let outbox = queued_invoice(&database).await;
     let initial_claim = outbox
@@ -782,7 +782,7 @@ async fn cancellation_retries_until_payment_deadline_then_expires_without_anothe
             .await
             .unwrap()
     );
-    assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(adapter.calls.load(Ordering::SeqCst), 2);
     let state: (String, Option<String>) =
         sqlx::query_as("SELECT status, error_class FROM outbox WHERE id = $1")
             .bind(expired.id())
@@ -792,11 +792,11 @@ async fn cancellation_retries_until_payment_deadline_then_expires_without_anothe
     assert_eq!(
         state,
         (
-            "permanently_failed".into(),
-            Some("cancellation_expired".into())
+            "retryable".into(),
+            Some("payment_request_cancellation".into())
         )
     );
-    assert!(outbox.delivery_available().await.unwrap());
+    assert!(!outbox.delivery_available().await.unwrap());
     database.cleanup().await;
 }
 

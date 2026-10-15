@@ -3,8 +3,8 @@
 use url::Url;
 
 use crate::bitkit_claim::{
-    AuthRequest, ClaimError, PAYKIT_ACCESS_CLAIM, QUERY_PARAMETER, parse_auth_request,
-    parse_reconnect_auth_request, required_capabilities, setup_claim_selection,
+    AuthRequest, ClaimError, QUERY_PARAMETER, parse_auth_request, parse_reconnect_auth_request,
+    required_capabilities, setup_claim_selection,
 };
 
 /// A secret-bearing request is retained only in the in-memory flow. Callers may
@@ -63,7 +63,7 @@ impl BitkitAuthStarter {
         self.start_request(false).await
     }
 
-    /// Refreshes delegated authority and optionally requests a missing USDT receiving address.
+    /// Refreshes delegated authority and authenticates optional replacement receiving details.
     pub async fn start_reconnect(&self) -> Result<StartedBitkitAuth, ClaimError> {
         self.start_request(true).await
     }
@@ -79,23 +79,7 @@ impl BitkitAuthStarter {
         if url.query_pairs().any(|(key, _)| key == QUERY_PARAMETER) {
             return Err(ClaimError::InvalidAuthRequest);
         }
-        let selection = if reconnect {
-            if self
-                .setup_selection
-                .split('.')
-                .any(|item| item == crate::bitkit_claim::USDT_ADDRESS_CLAIM)
-            {
-                format!(
-                    "{}.{}",
-                    PAYKIT_ACCESS_CLAIM,
-                    crate::bitkit_claim::USDT_ADDRESS_CLAIM
-                )
-            } else {
-                PAYKIT_ACCESS_CLAIM.to_owned()
-            }
-        } else {
-            self.setup_selection.clone()
-        };
+        let selection = self.setup_selection.clone();
         url.query_pairs_mut()
             .append_pair(QUERY_PARAMETER, &selection);
         let authorization_url = url.to_string();
@@ -171,5 +155,20 @@ mod tests {
             append_bitkit_claim(&augmented, LOCAL_DEMO_CAPABILITIES),
             Err(ClaimError::InvalidAuthRequest)
         );
+    }
+
+    #[tokio::test]
+    async fn reconnect_requests_authenticated_watch_only_account_material() {
+        let started = BitkitAuthStarter::new(
+            paykit_sdk::PubkySessionBootstrap::new(PAYKIT_CLIENT_ID).unwrap(),
+        )
+        .start_reconnect()
+        .await
+        .unwrap();
+        assert_eq!(
+            started.request.claim_type(),
+            "paykit-access-v1.watch-only-account-v1"
+        );
+        assert!(started.request.reconnect());
     }
 }

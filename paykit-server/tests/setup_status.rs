@@ -203,6 +203,7 @@ async fn asset_readiness_requires_the_optional_receiving_permission() {
                         )
                         .unwrap(),
                     ),
+                    bitcoin_account_generation: 0,
                 })
             } else {
                 Err(PersistenceError::InvalidInput)
@@ -295,7 +296,11 @@ mod receiving_readiness {
                 });
             let usdt = matches!(seller, Seller::UsdtOnly | Seller::Both)
                 .then(|| UsdtAddress::try_from(USDT_ADDRESS.to_owned()).unwrap());
-            Ok(ReceivingDetails { bitcoin, usdt })
+            Ok(ReceivingDetails {
+                bitcoin,
+                usdt,
+                bitcoin_account_generation: 0,
+            })
         }
     }
 
