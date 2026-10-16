@@ -5,13 +5,23 @@ use bitcoin::{
     bip32::{ChildNumber, Xpriv, Xpub},
     secp256k1::Secp256k1,
 };
+use locks_core::{
+    ids::CreatorPubky as RawCreatorPubky,
+    lock_policy::{
+        AccessPolicy, CONTENT_LOCK_VERSION, ContentLock, Criterion, LockLogic, LockServerConfig,
+        VerifierType,
+    },
+};
 use paykit_sdk::{
     ContactUpdate, PAYKIT_SESSION_CAPABILITIES, PaykitIdentitySecretKey, PubkyAuthCompanionClaim,
     PubkyLocalSecretKey, PubkyPublicKey, PubkySessionAccess, PubkySessionBootstrap,
     PubkySessionProvider, StorageAdapter,
 };
 use paykit_server::{
-    application::create_invoice::derive_bip84_p2wpkh_address,
+    application::create_invoice::{
+        CreateInvoiceRequest, CreateInvoiceService, LockFetchError, LockFetcher,
+        PaykitIntentBuilder, derive_bip84_p2wpkh_address,
+    },
     bitkit_claim::{
         ClaimError, QUERY_PARAMETER, encode_unsigned_payload, parse_auth_request,
         parse_reconnect_auth_request,
@@ -19,7 +29,13 @@ use paykit_server::{
     bitkit_setup::BitkitAuthStarter,
     config::{BitcoinNetwork, Config, ConfigEnvironment},
     crypto::Crypto,
-    domain::locks::{CreatorPubky, ReaderPubky, parse_creator, parse_reader},
+    domain::{
+        invoice::CriterionPaymentWindowHours,
+        locks::{
+            CreatorPubky, PubkyLockResource, ReaderPubky, parse_addressed_lock_resource,
+            parse_bundle_id, parse_creator, parse_reader,
+        },
+    },
     paykit::{CreatorSessionProvider, CreatorSessions},
     persistence::{
         AtomicInvoiceInput, AtomicInvoiceResult, CreatorStore, InvoicePayloadFactory,
@@ -32,6 +48,8 @@ use paykit_server::{
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use pubky_testnet::EphemeralTestnet;
+use std::collections::BTreeMap;
+use std::str::FromStr;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -39,6 +57,7 @@ use std::sync::{
 use std::time::Duration;
 
 mod common;
+use common::marketplace_rig::{ReadyRegistry, ReadySession};
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
 
@@ -190,6 +209,41 @@ fn account(index: u32) -> Xpub {
         )
         .unwrap();
     Xpub::from_priv(&secp, &key)
+}
+
+struct StaticLock(ContentLock);
+
+#[async_trait]
+impl LockFetcher for StaticLock {
+    async fn fetch(&self, _resource: &PubkyLockResource) -> Result<ContentLock, LockFetchError> {
+        Ok(self.0.clone())
+    }
+}
+
+fn creator_content_lock(creator: &CreatorPubky) -> ContentLock {
+    ContentLock {
+        version: CONTENT_LOCK_VERSION,
+        creator: RawCreatorPubky::from_str(&creator.to_string()).unwrap(),
+        primary_resource: None,
+        secondary_resources: BTreeMap::new(),
+        criteria: vec![Criterion {
+            criterion_id: "payment".into(),
+            verifier_type: VerifierType::PaykitPayment,
+            params: serde_json::json!({
+                "recipient_pubky": creator.to_string(),
+                "amount": "100",
+                "asset": "BTC"
+            }),
+        }],
+        lock_logic: LockLogic::All {
+            criteria: vec!["payment".into()],
+        },
+        access_policy: AccessPolicy {
+            requested_credential_ttl_seconds: 900,
+        },
+        lock_server: LockServerConfig { override_: None },
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+    }
 }
 
 async fn complete(
@@ -519,17 +573,46 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
     );
 
     let reader = parse_reader(&contact.to_app_key()).unwrap();
-    let rotated_invoice =
-        allocate_invoice(&invoices, &creator, &reader, b"new-account-invoice", 1, 1).await;
-    let expected_address =
-        derive_bip84_p2wpkh_address(&account(1).to_string(), 1, &BitcoinNetwork::Testnet, 0)
+    let lock = creator_content_lock(&creator);
+    let lock_resource =
+        parse_addressed_lock_resource(&format!("{creator}{}", lock.content_lock_path().unwrap()))
             .unwrap();
-    let stored_address_hash: Vec<u8> =
-        sqlx::query_scalar("SELECT bitcoin_address_lookup_hash FROM invoices WHERE id = $1")
-            .bind(rotated_invoice.invoice_id())
-            .fetch_one(database.pool())
-            .await
-            .unwrap();
+    // Production derivation reads the rotated account back from the Creator store.
+    let create_invoices = CreateInvoiceService::new(
+        Arc::new(ReadySession),
+        Arc::new(StaticLock(lock)),
+        Arc::new(ReadyRegistry),
+        common::app_id(),
+        Arc::new(creators.clone()),
+        BitcoinNetwork::Testnet,
+        Arc::new(invoices.clone()),
+        Arc::new(PaykitIntentBuilder::new(BitcoinNetwork::Testnet)),
+    );
+    let rotated_invoice = create_invoices
+        .create(CreateInvoiceRequest {
+            bundle_id: parse_bundle_id("000G40R40M30E209185GR38E1W").unwrap(),
+            lock_resource,
+            reader: reader.clone(),
+            payment_in: CriterionPaymentWindowHours::new(24).unwrap(),
+        })
+        .await
+        .unwrap();
+    let expected_address = derive_bip84_p2wpkh_address(
+        &account(1).to_string(),
+        1,
+        &BitcoinNetwork::Testnet,
+        rotated_invoice.reader_child_index(),
+    )
+    .unwrap();
+    let (stored_address_hash, stored_generation): (Vec<u8>, Option<i64>) = sqlx::query_as(
+        "SELECT bitcoin_address_lookup_hash, bitcoin_account_generation
+         FROM invoices WHERE id = $1",
+    )
+    .bind(rotated_invoice.invoice_id())
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(stored_generation, Some(1));
     assert_eq!(
         stored_address_hash,
         crypto
