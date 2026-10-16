@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use paykit_sdk::PaykitIdentitySecretKey;
 use paykit_server::{
-    application::semantic_intent::DeliveryIntentV1,
+    application::{
+        payment_request_status::{PaymentRequestStatusOperations, PaymentState},
+        semantic_intent::DeliveryIntentV1,
+    },
     crypto::{Crypto, EncryptedEnvelope, EnvelopeContext},
     domain::locks::{CreatorPubky, ReaderPubky, parse_bundle_id, parse_creator, parse_reader},
     persistence::{
@@ -389,11 +392,12 @@ async fn rotation_waits_for_admitted_proposal_then_cancels_it() {
 async fn admitted_proposal_rechecks_eligibility_after_rotation_wins() {
     let database = TestDatabase::create().await;
     let store = invoice_store(&database).await;
+    let bundle = parse_bundle_id("000G40R40M30E209185GR38E1W").unwrap();
     let created = store
         .create_atomic(input(
             &creator(),
             &reader(),
-            b"rotation-cutover-first-bundle",
+            bundle.to_string().as_bytes(),
             b"rotation-cutover-first-request",
         ))
         .await
@@ -488,13 +492,30 @@ async fn admitted_proposal_rechecks_eligibility_after_rotation_wins() {
     .await
     .unwrap();
     assert_eq!(suppressed, ("permanently_failed".into(), None, None, None));
-    let lifecycle_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM payment_request_lifecycles WHERE invoice_id = $1")
-            .bind(created.invoice_id())
-            .fetch_one(database.pool())
-            .await
-            .unwrap();
-    assert_eq!(lifecycle_count, 0);
+    let status = PaymentRequestStatusOperations::lookup(&store, &creator(), &bundle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status.request_state(),
+        paykit_server::domain::payment_request_lifecycle::PaymentRequestLifecycleState::Canceled
+    );
+    assert_eq!(status.payment_state(), PaymentState::Undetected);
+
+    sqlx::query("UPDATE invoices SET payment_expired_at = payment_deadline WHERE id = $1")
+        .bind(created.invoice_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let expired = PaymentRequestStatusOperations::lookup(&store, &creator(), &bundle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        expired.request_state(),
+        paykit_server::domain::payment_request_lifecycle::PaymentRequestLifecycleState::Canceled
+    );
+    assert_eq!(expired.payment_state(), PaymentState::Expired);
     database.cleanup().await;
 }
 

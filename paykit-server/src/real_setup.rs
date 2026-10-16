@@ -498,10 +498,11 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                     .load_with_id(&self.creator)
                     .await
                     .map_err(|_| ClaimError::InvalidEnvelope)?;
-                let session = self.sessions.provider(&self.creator);
-                session
-                    .seed_verified_reconnect(&self.session_secret, access.clone())
-                    .await;
+                let session = self.sessions.verified_reconnect_provider(
+                    &self.creator,
+                    &self.session_secret,
+                    access.clone(),
+                );
                 let adapter = PaykitAdapter::new(creator_id, session, paykit)
                     .map_err(|_| ClaimError::InvalidEnvelope)?
                     .with_lifecycles(lifecycles.clone());

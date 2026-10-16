@@ -23,7 +23,8 @@ use paykit_server::{
     paykit::{CreatorSessionProvider, CreatorSessions},
     persistence::{
         AtomicInvoiceInput, AtomicInvoiceResult, CreatorStore, InvoicePayloadFactory,
-        InvoicePayloads, InvoiceStore, PersistenceError, run_migrations,
+        InvoicePayloads, InvoiceStore, PaymentRequestLifecycleStore, PersistenceError,
+        run_migrations,
     },
     real_setup::{AppPublisher, RealSetupCompleter, SharedAppPublisher},
     setup::{PollResult, SetupLimits, SetupService, StartedFlow, SystemClock},
@@ -328,20 +329,17 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         .unwrap();
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(database.pool(), crypto.clone());
-    let invoices = InvoiceStore::new(database.pool(), crypto);
-    let sessions = CreatorSessions::new(
-        creators.clone(),
-        client.clone(),
-        paykit_server::config::PaykitConfig {
-            client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
-            app_id: paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
-            network: paykit_server::config::PaykitNetwork::Testnet,
-            proposal_acceptance_window: Duration::from_secs(60 * 60),
-            payment_window: Duration::from_secs(24 * 60 * 60),
-            conversion_payment_window: std::time::Duration::from_secs(3600),
-            marketplace_prepare_ttl: Duration::from_secs(15 * 60),
-        },
-    );
+    let invoices = InvoiceStore::new(database.pool(), crypto.clone());
+    let paykit_config = paykit_server::config::PaykitConfig {
+        client_id: pubky::ClientId::new("app.paykit.server").unwrap(),
+        app_id: paykit_lib::PaykitAppId::new("paykit-server").unwrap(),
+        network: paykit_server::config::PaykitNetwork::Testnet,
+        proposal_acceptance_window: Duration::from_secs(60 * 60),
+        payment_window: Duration::from_secs(24 * 60 * 60),
+        conversion_payment_window: std::time::Duration::from_secs(3600),
+        marketplace_prepare_ttl: Duration::from_secs(15 * 60),
+    };
+    let sessions = CreatorSessions::new(creators.clone(), client.clone(), paykit_config.clone());
     let publisher = Arc::new(FailAfterPublication {
         creators: creators.clone(),
         sessions: sessions.clone(),
@@ -356,8 +354,12 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         )),
         publisher.clone(),
         creators.clone(),
-        sessions,
+        sessions.clone(),
         BitcoinNetwork::Testnet,
+    )
+    .with_bitcoin_rotation(
+        PaymentRequestLifecycleStore::new(database.pool(), crypto.clone()),
+        paykit_config,
     );
     let service = SetupService::new(
         vec!["https://app.example".into()],
@@ -457,6 +459,59 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         PollResult::Complete
     );
     assert!(creators.setup_complete(&creator).await.unwrap());
+
+    let old_credentials = creators.load(&creator).await.unwrap();
+    let old_access = sessions
+        .provider(&creator)
+        .load_session_access()
+        .await
+        .unwrap()
+        .unwrap();
+    bootstrap
+        .revoke_grant(old_credentials.session_secret(), &old_access)
+        .await
+        .unwrap();
+    let changed_account = encode_unsigned_payload(1, &account(1).encode(), &key);
+    assert_eq!(
+        reconnect_payload(
+            &service,
+            &bootstrap,
+            &root,
+            &creator,
+            changed_account.as_slice()
+        )
+        .await,
+        PollResult::Complete,
+        "verified replacement grant must survive reconciliation after the old grant is revoked"
+    );
+    let changed = creators.load(&creator).await.unwrap();
+    assert_eq!(
+        changed.bitcoin_account().unwrap().xpub.as_str(),
+        account(1).to_string()
+    );
+    assert_eq!(
+        creators
+            .load_with_bitcoin_account_generation(&creator)
+            .await
+            .unwrap()
+            .1,
+        1
+    );
+
+    // Restore the original fixture account before exercising the existing
+    // reconnect and invoice-preservation matrix below.
+    let restored_account = encode_unsigned_payload(0, &account(0).encode(), &key);
+    assert_eq!(
+        reconnect_payload(
+            &service,
+            &bootstrap,
+            &root,
+            &creator,
+            restored_account.as_slice()
+        )
+        .await,
+        PollResult::Complete
+    );
     let reader = parse_reader(&contact.to_app_key()).unwrap();
     let pending = allocate_invoice(&invoices, &creator, &reader, b"pending-before-reconnect").await;
     assert_eq!(pending.reader_child_index(), 0);

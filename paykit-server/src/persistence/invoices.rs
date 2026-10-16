@@ -888,7 +888,16 @@ impl InvoiceStore {
         invoice_id: Uuid,
     ) -> Result<Option<PaymentRequestStatusSummary>, PersistenceError> {
         let row = sqlx::query_as::<_, PaymentRequestStatusRow>(
-            "SELECT lifecycle.request_state, invoices.payment_status,
+            "SELECT COALESCE(
+                        lifecycle.request_state,
+                        CASE WHEN EXISTS (
+                            SELECT 1
+                            FROM creator_bitcoin_account_rotation_items rotation_item
+                            WHERE rotation_item.invoice_id = invoices.id
+                              AND rotation_item.classification = 'proposal_suppressed'
+                        ) THEN 'canceled' END
+                    ) AS request_state,
+                    invoices.payment_status,
                     invoices.confirmation_count, invoices.amount_matched,
                     invoices.invoice_created_at, invoices.payment_deadline,
                     invoices.payment_expired_at,

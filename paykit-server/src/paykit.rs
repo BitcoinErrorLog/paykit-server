@@ -58,6 +58,7 @@ pub struct CreatorSessionProvider {
     client_id: String,
     cache: Arc<TokioMutex<Option<CachedSession>>>,
     payment_request_refreshes: Arc<payment_status::PaymentRequestRefreshes>,
+    verified_reconnect: bool,
 }
 
 impl CreatorSessionProvider {
@@ -87,20 +88,8 @@ impl CreatorSessionProvider {
             client_id: config.client_id.to_string(),
             cache: Arc::new(TokioMutex::new(None)),
             payment_request_refreshes: Arc::new(payment_status::PaymentRequestRefreshes::default()),
+            verified_reconnect: false,
         }
-    }
-
-    /// Seeds a verified reconnect grant for pre-commit reconciliation. If the
-    /// transaction later fails, normal credential matching evicts this cache entry.
-    pub(crate) async fn seed_verified_reconnect(
-        &self,
-        session_secret: &str,
-        access: PubkySessionAccess,
-    ) {
-        *self.cache.lock().await = Some(CachedSession {
-            session_secret: zeroize::Zeroizing::new(session_secret.to_owned()),
-            access,
-        });
     }
 }
 
@@ -108,6 +97,9 @@ impl CreatorSessionProvider {
 impl PubkySessionProvider for CreatorSessionProvider {
     async fn load_session_access(&self) -> paykit_sdk::Result<Option<PubkySessionAccess>> {
         let mut cache = self.cache.lock().await;
+        if self.verified_reconnect {
+            return Ok(cache.as_ref().map(|cached| cached.access.clone()));
+        }
         let credentials = self
             .creators
             .load(&self.creator)
@@ -210,6 +202,28 @@ impl CreatorSessions {
                 )
             })
             .clone()
+    }
+
+    /// Isolated provider for reconciliation before changed-account credentials
+    /// commit. Caller has already verified identity, session, and Paykit key.
+    pub(crate) fn verified_reconnect_provider(
+        &self,
+        creator: &CreatorPubky,
+        session_secret: &str,
+        access: PubkySessionAccess,
+    ) -> CreatorSessionProvider {
+        CreatorSessionProvider {
+            creators: self.creators.clone(),
+            creator: creator.clone(),
+            public_client: self.pubky.clone(),
+            client_id: self.config.client_id.to_string(),
+            cache: Arc::new(TokioMutex::new(Some(CachedSession {
+                session_secret: zeroize::Zeroizing::new(session_secret.to_owned()),
+                access,
+            }))),
+            payment_request_refreshes: Arc::new(payment_status::PaymentRequestRefreshes::default()),
+            verified_reconnect: true,
+        }
     }
 }
 
