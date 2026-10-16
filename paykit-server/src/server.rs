@@ -28,7 +28,7 @@ use crate::{
     crypto::Crypto,
     domain::locks::{BundleId, CreatorPubky, PubkyLockResource, ReaderPubky},
     http::{self, auth::SignedServiceAuth},
-    paykit::{CreatorSessions, PaykitAdapter, creator_mutation_lock},
+    paykit::{CreatorSessions, PaykitAdapter, creator_mutation_lock, sdk_error_label},
     persistence::{
         CreatorStore, InvoiceStore, MarketplacePreparationStore, OutboxRetryClass, OutboxStore,
         PaymentDrainStore, PaymentRequestLifecycleStore, PersistenceError,
@@ -531,43 +531,51 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
             Some(creators) => creators,
             None => match workers.creators.ready_ids().await {
                 Ok(creators) => creators,
-                Err(_) => {
+                Err(error) => {
+                    tracing::warn!(
+                        stage = "shared_transport",
+                        step = "creator_ids_load",
+                        category = error.diagnostic_label(),
+                        "Paykit transport maintenance unavailable"
+                    );
                     runtime.set_paykit_transport_available(false);
                     continue;
                 }
             },
         };
-        let mut available = true;
         let mut deferred = false;
         for creator in creators {
             if !runtime.may_start_worker_claim() {
                 return;
             }
-            let maintained = match creator_adapter(&workers, creator).await {
+            // One Creator's session or peer failure is retried on the next pass and
+            // must not withdraw every Creator's rail.
+            let failure = match creator_adapter(&workers, creator).await {
                 Ok(adapter) => match adapter.maintain_transport().await {
-                    Ok(()) => true,
+                    Ok(()) => None,
                     Err(
                         PaykitSdkError::ConcurrentUpdate { .. }
                         | PaykitSdkError::SharedStateBusy { .. },
                     ) => {
                         deferred = true;
-                        true
+                        None
                     }
-                    Err(_) => false,
+                    Err(error) => Some(("maintain_transport", sdk_error_label(&error))),
                 },
-                Err(_) => false,
+                Err(error) => Some(("adapter_build", error.diagnostic_label())),
             };
-            if !maintained {
-                available = false;
+            if let Some((step, category)) = failure {
                 tracing::warn!(
                     stage = "shared_transport",
+                    step,
+                    category,
                     "Paykit transport maintenance failed"
                 );
             }
         }
-        // A targeted success cannot clear another Creator's failure or deferred work.
-        if !available || (full_scan && !deferred) {
-            runtime.set_paykit_transport_available(available);
+        // A targeted pass cannot clear a failed Creator enumeration or deferred work.
+        if full_scan && !deferred {
+            runtime.set_paykit_transport_available(true);
         }
     }
 }
@@ -580,6 +588,15 @@ fn outbox_batch_size(config: &OutboxConfig) -> i64 {
 enum AdapterBuildError {
     Permanent,
     Unavailable,
+}
+
+impl AdapterBuildError {
+    const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::Permanent => "adapter_permanent",
+            Self::Unavailable => "adapter_unavailable",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1062,6 +1079,10 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
     }
 }
 
+/// Only failing to enumerate Creators is systemic here. One Creator's receive or
+/// projection failure (often one Reader's homeserver) is retried on the next pass
+/// and must not withdraw every Creator's rail; durable delivery failures still
+/// degrade readiness through `delivery_available`.
 async fn reconcile_payment_request_lifecycles(
     workers: Arc<WorkerComponents>,
     hinted_creators: Option<&[Uuid]>,
@@ -1070,7 +1091,15 @@ async fn reconcile_payment_request_lifecycles(
         Some(creators) => creators.to_vec(),
         None => match workers.payment_request_lifecycles.creator_ids().await {
             Ok(creator_ids) => creator_ids,
-            Err(_) => return false,
+            Err(error) => {
+                tracing::warn!(
+                    stage = "lifecycle_reconciliation",
+                    step = "creator_ids_load",
+                    category = error.diagnostic_label(),
+                    "Payment request lifecycle reconciliation unavailable"
+                );
+                return false;
+            }
         },
     };
     let mut batch = JoinSet::new();
@@ -1079,25 +1108,89 @@ async fn reconcile_payment_request_lifecycles(
         batch.spawn(async move {
             let adapter = creator_adapter(&workers, creator_id)
                 .await
-                .map_err(|_| ())?;
+                .map_err(|error| ("adapter_build", error.diagnostic_label()))?;
             adapter
                 .receive_and_project_payment_requests(&workers.payment_request_lifecycles)
                 .await
-                .map_err(|_| ())
+                .map_err(|error| ("receive_and_project", error.diagnostic_label()))
         });
     }
     let mut available = true;
     while let Some(result) = batch.join_next().await {
-        if !matches!(result, Ok(Ok(()))) {
-            available = false;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err((step, category))) => {
+                tracing::warn!(
+                    stage = "lifecycle_reconciliation",
+                    step,
+                    category,
+                    "Creator payment request reconciliation deferred"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(
+                    stage = "lifecycle_reconciliation",
+                    step = "task_join",
+                    "Payment request lifecycle reconciliation task failed"
+                );
+                available = false;
+            }
         }
     }
     available
 }
 
+/// A single failed tick is routine for a remote Electrum server. Readiness turns
+/// degraded only once failures persist for both a tick count and a wall-clock
+/// span, so a short `poll_interval` cannot turn a blip into a withdrawn rail.
+const ELECTRUM_DEGRADED_AFTER_FAILURES: u32 = 3;
+const ELECTRUM_DEGRADED_AFTER: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElectrumTick {
+    /// No observation target, so Electrum was not called.
+    Idle,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Default)]
+struct ElectrumReadiness {
+    last_success: Option<tokio::time::Instant>,
+    consecutive_failures: u32,
+}
+
+impl ElectrumReadiness {
+    /// Records one observer tick and returns whether Electrum counts as available.
+    /// Only a completed observation is evidence of Electrum success; an idle tick
+    /// keeps the no-work readiness without establishing any. Before any success a
+    /// failure is reported immediately.
+    fn record(&mut self, tick: ElectrumTick, now: tokio::time::Instant) -> bool {
+        match tick {
+            ElectrumTick::Idle => true,
+            ElectrumTick::Succeeded => {
+                self.last_success = Some(now);
+                self.consecutive_failures = 0;
+                true
+            }
+            ElectrumTick::Failed => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                match self.last_success {
+                    None => false,
+                    Some(last_success) => {
+                        self.consecutive_failures < ELECTRUM_DEGRADED_AFTER_FAILURES
+                            || now.saturating_duration_since(last_success) < ELECTRUM_DEGRADED_AFTER
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
     let mut interval = tokio::time::interval(workers.electrum_poll_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut readiness = ElectrumReadiness::default();
     loop {
         tokio::select! {
             _ = runtime.cancelled() => break,
@@ -1106,34 +1199,65 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
         if !runtime.may_start_worker_claim() {
             break;
         }
-        let invoice_targets = workers.invoices.observation_targets().await;
-        let marketplace_targets = workers.marketplace_preparations.observation_targets().await;
-        let mut available = invoice_targets.is_ok() && marketplace_targets.is_ok();
-        if let Ok(targets) = invoice_targets
-            && !targets.is_empty()
-            && observe_once(
-                workers.electrum.as_ref(),
-                &workers.invoices,
-                &workers.bitcoin_network,
-                &targets,
-            )
-            .await
-            .is_err()
-        {
-            available = false;
+        let mut failure: Option<(&'static str, &'static str)> = None;
+        let mut observed = false;
+        match workers.invoices.observation_targets().await {
+            Ok(targets) if !targets.is_empty() => {
+                observed = true;
+                if let Err(error) = observe_once(
+                    workers.electrum.as_ref(),
+                    &workers.invoices,
+                    &workers.bitcoin_network,
+                    &targets,
+                )
+                .await
+                {
+                    failure.get_or_insert(("invoice_observation", error.diagnostic_label()));
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                failure.get_or_insert(("invoice_targets_load", error.diagnostic_label()));
+            }
         }
-        if let Ok(targets) = marketplace_targets
-            && !targets.is_empty()
-            && observe_marketplace_once(
-                workers.electrum.as_ref(),
-                workers.marketplace_preparations.as_ref(),
-                &workers.bitcoin_network,
-                &targets,
-            )
-            .await
-            .is_err()
-        {
-            available = false;
+        match workers.marketplace_preparations.observation_targets().await {
+            Ok(targets) if !targets.is_empty() => {
+                observed = true;
+                if let Err(error) = observe_marketplace_once(
+                    workers.electrum.as_ref(),
+                    workers.marketplace_preparations.as_ref(),
+                    &workers.bitcoin_network,
+                    &targets,
+                )
+                .await
+                {
+                    failure.get_or_insert(("marketplace_observation", error.diagnostic_label()));
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                failure.get_or_insert(("marketplace_targets_load", error.diagnostic_label()));
+            }
+        }
+        let tick = match (failure, observed) {
+            (Some(_), _) => ElectrumTick::Failed,
+            (None, true) => ElectrumTick::Succeeded,
+            (None, false) => ElectrumTick::Idle,
+        };
+        let now = tokio::time::Instant::now();
+        let available = readiness.record(tick, now);
+        if let Some((step, category)) = failure {
+            tracing::warn!(
+                stage = "electrum_observation",
+                step,
+                category,
+                consecutive_failures = readiness.consecutive_failures,
+                degraded = !available,
+                "Electrum observation tick failed"
+            );
+        }
+        if tick == ElectrumTick::Succeeded {
+            runtime.metrics().record_electrum_success(now.into_std());
         }
         runtime.set_electrum_available(available);
     }
@@ -1607,6 +1731,55 @@ mod tests {
                 .default_delay(),
             Duration::from_secs(300)
         );
+    }
+
+    #[test]
+    fn electrum_blips_do_not_degrade_until_failures_persist() {
+        use ElectrumTick::{Failed, Succeeded};
+        let start = tokio::time::Instant::now();
+        let mut readiness = ElectrumReadiness::default();
+        assert!(readiness.record(Succeeded, start));
+
+        // Second-scale bursts as seen on a 1 s poll interval stay available.
+        for second in 1..=5 {
+            assert!(readiness.record(Failed, start + Duration::from_secs(second)));
+        }
+        assert!(readiness.record(Succeeded, start + Duration::from_secs(6)));
+        assert_eq!(readiness.consecutive_failures, 0);
+
+        // Long-interval polling needs the tick count as well as the span.
+        let last_success = start + Duration::from_secs(6);
+        assert!(readiness.record(Failed, last_success + Duration::from_secs(40)));
+        assert!(readiness.record(Failed, last_success + Duration::from_secs(80)));
+        assert!(!readiness.record(Failed, last_success + Duration::from_secs(120)));
+
+        // A sustained outage on a short interval degrades once the span elapses.
+        let mut readiness = ElectrumReadiness::default();
+        assert!(readiness.record(Succeeded, start));
+        for second in 1..30 {
+            assert!(readiness.record(Failed, start + Duration::from_secs(second)));
+        }
+        assert!(!readiness.record(Failed, start + Duration::from_secs(30)));
+        assert!(readiness.record(Succeeded, start + Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn electrum_failure_before_any_success_is_reported_immediately() {
+        let start = tokio::time::Instant::now();
+        let mut readiness = ElectrumReadiness::default();
+        assert!(!readiness.record(ElectrumTick::Failed, start));
+        assert!(readiness.record(ElectrumTick::Succeeded, start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn idle_electrum_ticks_never_establish_success() {
+        let start = tokio::time::Instant::now();
+        let mut readiness = ElectrumReadiness::default();
+        for second in 0..60 {
+            assert!(readiness.record(ElectrumTick::Idle, start + Duration::from_secs(second)));
+        }
+        assert_eq!(readiness.last_success, None);
+        assert!(!readiness.record(ElectrumTick::Failed, start + Duration::from_secs(60)));
     }
 
     #[tokio::test]
