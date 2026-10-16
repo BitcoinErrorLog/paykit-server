@@ -231,6 +231,7 @@ impl Server {
         let session_validator = Arc::new(CreatorSessionValidator {
             creators: creators.clone(),
             sessions: sessions.clone(),
+            identity_states: IdentityStateReads::default(),
         });
         let invoice_service = Arc::new(
             CreateInvoiceService::with_invoice_windows(
@@ -1279,6 +1280,60 @@ fn map_electrum_error(_: ObserverError) -> ServerBuildError {
 struct CreatorSessionValidator {
     creators: CreatorStore,
     sessions: CreatorSessions,
+    identity_states: IdentityStateReads,
+}
+
+/// How long a Creator's last identity state read stands in for one that lost
+/// the shared-state lock. It outlasts the SDK's 5-minute uncertain-write
+/// cooldown, during which another holder keeps the lock.
+const IDENTITY_STATE_BUSY_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// When each Creator's identity state was last read. Reading it takes the
+/// Creator's shared-state write lock, which Bitkit, the outbox workers and
+/// concurrent readiness checks also take, so a busy lock says nothing about
+/// whether the state is there.
+#[derive(Clone, Default)]
+struct IdentityStateReads {
+    read_at: Arc<std::sync::Mutex<std::collections::HashMap<String, tokio::time::Instant>>>,
+}
+
+impl IdentityStateReads {
+    /// The outcome of the identity state step: a read state is recorded, and a
+    /// read that lost the lock passes when the state was read within
+    /// [`IDENTITY_STATE_BUSY_GRACE`]. Every other failure is unchanged.
+    fn outcome(
+        &self,
+        creator: &CreatorPubky,
+        loaded: Result<bool, PaykitSdkError>,
+        now: tokio::time::Instant,
+    ) -> Result<(), SessionValidationError> {
+        let mut read_at = self
+            .read_at
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        match loaded {
+            Ok(true) => {
+                read_at.retain(|_, at| now.duration_since(*at) < IDENTITY_STATE_BUSY_GRACE);
+                read_at.insert(creator.to_string(), now);
+                Ok(())
+            }
+            Ok(false) => {
+                read_at.remove(&creator.to_string());
+                Err(SessionValidationError::Invalid)
+            }
+            Err(PaykitSdkError::SharedStateBusy { .. })
+                if read_at
+                    .get(&creator.to_string())
+                    .is_some_and(|at| now.duration_since(*at) < IDENTITY_STATE_BUSY_GRACE) =>
+            {
+                Ok(())
+            }
+            Err(error) => {
+                let mapped = map_session_validation_error(error);
+                Err(session_failure("identity_state_load", mapped))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1359,15 +1414,12 @@ impl SessionValidator for CreatorSessionValidator {
             return Err(SessionValidationError::Invalid);
         }
         use paykit_sdk::StorageAdapter;
-        paykit_sdk::PubkySharedStateStorage::new(provider)
+        let loaded = paykit_sdk::PubkySharedStateStorage::new(provider)
             .transaction(|tx| Ok(tx.load_identity_state()))
             .await
-            .map_err(|error| {
-                let mapped = map_session_validation_error(error);
-                session_failure("identity_state_load", mapped)
-            })?
-            .ok_or(SessionValidationError::Invalid)?;
-        Ok(())
+            .map(|state| state.is_some());
+        self.identity_states
+            .outcome(creator, loaded, tokio::time::Instant::now())
     }
 }
 
@@ -1534,6 +1586,61 @@ fn reader_authorization<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn busy() -> Result<bool, PaykitSdkError> {
+        Err(PaykitSdkError::SharedStateBusy {
+            context: "Pubky shared state remains locked; retry later".into(),
+            source: None,
+        })
+    }
+
+    #[test]
+    fn a_busy_shared_state_lock_keeps_a_recently_read_identity_state() {
+        let reads = IdentityStateReads::default();
+        let creator = crate::domain::locks::parse_creator(
+            "pubky3f4khszd4gzg38bsazw88dmcfws36js9ct19s9dikb3a9ht3r84y",
+        )
+        .expect("creator");
+        let start = tokio::time::Instant::now();
+
+        assert_eq!(
+            reads.outcome(&creator, busy(), start),
+            Err(SessionValidationError::Unavailable),
+            "a busy lock with no earlier read cannot say"
+        );
+        assert_eq!(reads.outcome(&creator, Ok(true), start), Ok(()));
+        assert_eq!(
+            reads.outcome(&creator, busy(), start + Duration::from_secs(5 * 60)),
+            Ok(()),
+            "a busy lock within the grace keeps the earlier read"
+        );
+        assert_eq!(
+            reads.outcome(&creator, busy(), start + IDENTITY_STATE_BUSY_GRACE),
+            Err(SessionValidationError::Unavailable),
+            "the grace runs from the last read, not the last busy answer"
+        );
+        assert_eq!(
+            reads.outcome(
+                &creator,
+                Err(PaykitSdkError::Transport {
+                    context: "read encrypted Pubky shared state".into(),
+                    source: None,
+                }),
+                start + Duration::from_secs(1),
+            ),
+            Err(SessionValidationError::Unavailable),
+            "only a busy lock is covered"
+        );
+        assert_eq!(
+            reads.outcome(&creator, Ok(false), start + Duration::from_secs(2)),
+            Err(SessionValidationError::Invalid)
+        );
+        assert_eq!(
+            reads.outcome(&creator, busy(), start + Duration::from_secs(3)),
+            Err(SessionValidationError::Unavailable),
+            "missing identity state forgets the earlier read"
+        );
+    }
 
     #[test]
     fn reader_authorization_is_verified_only_for_a_fetched_record() {
