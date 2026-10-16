@@ -28,7 +28,7 @@ use crate::{
     crypto::Crypto,
     domain::locks::{BundleId, CreatorPubky, PubkyLockResource, ReaderPubky},
     http::{self, auth::SignedServiceAuth},
-    paykit::{CreatorSessions, PaykitAdapter, creator_mutation_lock},
+    paykit::{CreatorSessions, PaykitAdapter, creator_mutation_lock, sdk_error_label},
     persistence::{
         CreatorStore, InvoiceStore, MarketplacePreparationStore, OutboxRetryClass, OutboxStore,
         PaymentDrainStore, PaymentRequestLifecycleStore, PersistenceError,
@@ -560,7 +560,7 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
                         deferred = true;
                         None
                     }
-                    Err(_) => Some(("maintain_transport", "transport")),
+                    Err(error) => Some(("maintain_transport", sdk_error_label(&error))),
                 },
                 Err(error) => Some(("adapter_build", error.diagnostic_label())),
             };
@@ -1146,6 +1146,14 @@ async fn reconcile_payment_request_lifecycles(
 const ELECTRUM_DEGRADED_AFTER_FAILURES: u32 = 3;
 const ELECTRUM_DEGRADED_AFTER: Duration = Duration::from_secs(30);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ElectrumTick {
+    /// No observation target, so Electrum was not called.
+    Idle,
+    Succeeded,
+    Failed,
+}
+
 #[derive(Debug, Default)]
 struct ElectrumReadiness {
     last_success: Option<tokio::time::Instant>,
@@ -1154,27 +1162,28 @@ struct ElectrumReadiness {
 
 impl ElectrumReadiness {
     /// Records one observer tick and returns whether Electrum counts as available.
-    /// Before any success there is no evidence to hold onto, so a failure is
-    /// reported immediately.
-    fn record(&mut self, succeeded: bool, now: tokio::time::Instant) -> bool {
-        if succeeded {
-            self.last_success = Some(now);
-            self.consecutive_failures = 0;
-            return true;
-        }
-        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        match self.last_success {
-            None => false,
-            Some(last_success) => {
-                self.consecutive_failures < ELECTRUM_DEGRADED_AFTER_FAILURES
-                    || now.saturating_duration_since(last_success) < ELECTRUM_DEGRADED_AFTER
+    /// Only a completed observation is evidence of Electrum success; an idle tick
+    /// keeps the no-work readiness without establishing any. Before any success a
+    /// failure is reported immediately.
+    fn record(&mut self, tick: ElectrumTick, now: tokio::time::Instant) -> bool {
+        match tick {
+            ElectrumTick::Idle => true,
+            ElectrumTick::Succeeded => {
+                self.last_success = Some(now);
+                self.consecutive_failures = 0;
+                true
+            }
+            ElectrumTick::Failed => {
+                self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                match self.last_success {
+                    None => false,
+                    Some(last_success) => {
+                        self.consecutive_failures < ELECTRUM_DEGRADED_AFTER_FAILURES
+                            || now.saturating_duration_since(last_success) < ELECTRUM_DEGRADED_AFTER
+                    }
+                }
             }
         }
-    }
-
-    fn last_success_age(&self, now: tokio::time::Instant) -> Option<Duration> {
-        self.last_success
-            .map(|last_success| now.saturating_duration_since(last_success))
     }
 }
 
@@ -1191,8 +1200,10 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
             break;
         }
         let mut failure: Option<(&'static str, &'static str)> = None;
+        let mut observed = false;
         match workers.invoices.observation_targets().await {
             Ok(targets) if !targets.is_empty() => {
+                observed = true;
                 if let Err(error) = observe_once(
                     workers.electrum.as_ref(),
                     &workers.invoices,
@@ -1211,6 +1222,7 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
         }
         match workers.marketplace_preparations.observation_targets().await {
             Ok(targets) if !targets.is_empty() => {
+                observed = true;
                 if let Err(error) = observe_marketplace_once(
                     workers.electrum.as_ref(),
                     workers.marketplace_preparations.as_ref(),
@@ -1227,8 +1239,13 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
                 failure.get_or_insert(("marketplace_targets_load", error.diagnostic_label()));
             }
         }
+        let tick = match (failure, observed) {
+            (Some(_), _) => ElectrumTick::Failed,
+            (None, true) => ElectrumTick::Succeeded,
+            (None, false) => ElectrumTick::Idle,
+        };
         let now = tokio::time::Instant::now();
-        let available = readiness.record(failure.is_none(), now);
+        let available = readiness.record(tick, now);
         if let Some((step, category)) = failure {
             tracing::warn!(
                 stage = "electrum_observation",
@@ -1239,10 +1256,8 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
                 "Electrum observation tick failed"
             );
         }
-        if let Some(age) = readiness.last_success_age(now) {
-            runtime.metrics().set_electrum_last_success_age_seconds(
-                i64::try_from(age.as_secs()).unwrap_or(i64::MAX),
-            );
+        if tick == ElectrumTick::Succeeded {
+            runtime.metrics().record_electrum_success(now.into_std());
         }
         runtime.set_electrum_available(available);
     }
@@ -1720,44 +1735,51 @@ mod tests {
 
     #[test]
     fn electrum_blips_do_not_degrade_until_failures_persist() {
+        use ElectrumTick::{Failed, Succeeded};
         let start = tokio::time::Instant::now();
         let mut readiness = ElectrumReadiness::default();
-        assert!(readiness.record(true, start));
+        assert!(readiness.record(Succeeded, start));
 
         // Second-scale bursts as seen on a 1 s poll interval stay available.
         for second in 1..=5 {
-            assert!(readiness.record(false, start + Duration::from_secs(second)));
+            assert!(readiness.record(Failed, start + Duration::from_secs(second)));
         }
-        assert!(readiness.record(true, start + Duration::from_secs(6)));
+        assert!(readiness.record(Succeeded, start + Duration::from_secs(6)));
         assert_eq!(readiness.consecutive_failures, 0);
 
         // Long-interval polling needs the tick count as well as the span.
         let last_success = start + Duration::from_secs(6);
-        assert!(readiness.record(false, last_success + Duration::from_secs(40)));
-        assert!(readiness.record(false, last_success + Duration::from_secs(80)));
-        assert!(!readiness.record(false, last_success + Duration::from_secs(120)));
-        assert_eq!(
-            readiness.last_success_age(last_success + Duration::from_secs(120)),
-            Some(Duration::from_secs(120))
-        );
+        assert!(readiness.record(Failed, last_success + Duration::from_secs(40)));
+        assert!(readiness.record(Failed, last_success + Duration::from_secs(80)));
+        assert!(!readiness.record(Failed, last_success + Duration::from_secs(120)));
 
         // A sustained outage on a short interval degrades once the span elapses.
         let mut readiness = ElectrumReadiness::default();
-        assert!(readiness.record(true, start));
+        assert!(readiness.record(Succeeded, start));
         for second in 1..30 {
-            assert!(readiness.record(false, start + Duration::from_secs(second)));
+            assert!(readiness.record(Failed, start + Duration::from_secs(second)));
         }
-        assert!(!readiness.record(false, start + Duration::from_secs(30)));
-        assert!(readiness.record(true, start + Duration::from_secs(31)));
+        assert!(!readiness.record(Failed, start + Duration::from_secs(30)));
+        assert!(readiness.record(Succeeded, start + Duration::from_secs(31)));
     }
 
     #[test]
     fn electrum_failure_before_any_success_is_reported_immediately() {
         let start = tokio::time::Instant::now();
         let mut readiness = ElectrumReadiness::default();
-        assert!(!readiness.record(false, start));
-        assert_eq!(readiness.last_success_age(start), None);
-        assert!(readiness.record(true, start + Duration::from_secs(1)));
+        assert!(!readiness.record(ElectrumTick::Failed, start));
+        assert!(readiness.record(ElectrumTick::Succeeded, start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn idle_electrum_ticks_never_establish_success() {
+        let start = tokio::time::Instant::now();
+        let mut readiness = ElectrumReadiness::default();
+        for second in 0..60 {
+            assert!(readiness.record(ElectrumTick::Idle, start + Duration::from_secs(second)));
+        }
+        assert_eq!(readiness.last_success, None);
+        assert!(!readiness.record(ElectrumTick::Failed, start + Duration::from_secs(60)));
     }
 
     #[tokio::test]

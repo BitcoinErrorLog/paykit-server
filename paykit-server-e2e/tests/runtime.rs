@@ -225,22 +225,12 @@ impl InvoicePayloadFactory for Payloads {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn one_creators_failed_lifecycle_reconciliation_keeps_delivery_ready() {
-    let logs = captured_worker_logs();
-    let logged_from = logs.len();
-    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
-    let database = TestDatabase::create().await;
-    run_migrations(database.pool()).await.unwrap();
-    let testnet = build_pubky_testnet().await;
-
-    // A Creator with Payment Request history whose session can no longer be
-    // restored, so every lifecycle receive for it fails. Its outbox work is
-    // terminal, so no durable delivery failure is pending.
+/// Seeds an unrestorable-session Creator with one invoice (an Electrum
+/// observation target) whose outbox work is already terminal.
+async fn seed_unrestorable_creator_with_terminal_invoice(database: &TestDatabase) {
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creator = parse_creator(TRUSTED_KEY).unwrap();
-    let creators = CreatorStore::new(database.pool(), crypto.clone());
-    creators
+    CreatorStore::new(database.pool(), crypto.clone())
         .create(&CreatorCredentials::new(
             creator.clone(),
             "invalid-session".into(),
@@ -276,6 +266,75 @@ async fn one_creators_failed_lifecycle_reconciliation_keeps_delivery_ready() {
     .execute(database.pool())
     .await
     .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_observer_ticks_do_not_grant_the_first_electrum_failure_grace() {
+    let logs = captured_worker_logs();
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let testnet = build_pubky_testnet().await;
+    let endpoint = unavailable_electrum_endpoint().await;
+    let server = Server::build_with_pubky(
+        config(database.database_url(), &endpoint, "1s"),
+        database.pool().clone(),
+        testnet.sdk().unwrap(),
+    )
+    .await
+    .unwrap();
+    let runtime = server.runtime();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(server.run_until(listener, async move {
+        let _ = shutdown_rx.await;
+    }));
+
+    // With no observation target the observer never calls Electrum.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime.readiness().await.electrum != ComponentState::Ready {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("idle observer ticks must keep the no-work readiness");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(runtime.readiness().await.electrum, ComponentState::Ready);
+
+    let logged_from = logs.len();
+    seed_unrestorable_creator_with_terminal_invoice(&database).await;
+    // The first real observation fails; well inside the 30 s grace, so only the
+    // absence of any prior success can make it degrade.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime.readiness().await.electrum != ComponentState::Degraded {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("a first failed observation after idle ticks must degrade immediately");
+    assert!(logs.contains_since(logged_from, "Electrum observation tick failed"));
+    let metrics = runtime.metrics().encode().unwrap();
+    assert!(metrics.contains("paykit_electrum_success_observed 0"));
+    assert!(!metrics.contains("paykit_electrum_last_success_age_seconds"));
+
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_creators_failed_lifecycle_reconciliation_keeps_delivery_ready() {
+    let logs = captured_worker_logs();
+    let logged_from = logs.len();
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let testnet = build_pubky_testnet().await;
+
+    // A Creator with Payment Request history whose session can no longer be
+    // restored, so every lifecycle receive for it fails. Its outbox work is
+    // terminal, so no durable delivery failure is pending.
+    seed_unrestorable_creator_with_terminal_invoice(&database).await;
 
     let endpoint = unavailable_electrum_endpoint().await;
     let server = Server::build_with_pubky(

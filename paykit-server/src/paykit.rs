@@ -1087,6 +1087,24 @@ fn parse_peer(reader: &str) -> Result<PubkyPublicKey, HandoffError> {
     PubkyPublicKey::from_raw_or_app_key(reader).map_err(|_| HandoffError::Permanent)
 }
 
+/// Closed, identifier-free label for an SDK failure; never includes error text.
+pub(crate) const fn sdk_error_label(error: &PaykitSdkError) -> &'static str {
+    match error {
+        PaykitSdkError::ConcurrentUpdate { .. } => "concurrent_update",
+        PaykitSdkError::SharedStateBusy { .. } => "shared_state_busy",
+        PaykitSdkError::Storage { .. } => "storage",
+        PaykitSdkError::Identity { .. } => "identity",
+        PaykitSdkError::Transport { .. } => "transport",
+        PaykitSdkError::NotFound { .. } => "not_found",
+        PaykitSdkError::Protocol { .. } => "protocol",
+        PaykitSdkError::LinkObservation { .. } => "link_observation",
+        PaykitSdkError::Policy { .. } => "policy",
+        PaykitSdkError::PaymentAdapter { .. } => "payment_adapter",
+        PaykitSdkError::RecoveryRequired { .. } => "recovery_required",
+        _ => "other",
+    }
+}
+
 fn classify(error: PaykitSdkError) -> HandoffError {
     match error {
         PaykitSdkError::Protocol { .. } => HandoffError::Permanent,

@@ -1,6 +1,6 @@
 //! Identifier-free Prometheus metrics for the process runtime.
 
-use std::sync::Mutex;
+use std::{sync::Mutex, time::Instant};
 
 use prometheus_client::{
     encoding::text::encode,
@@ -23,6 +23,8 @@ pub struct Metrics {
     outbox_permanent_failures: Counter,
     electrum_available: Gauge,
     electrum_last_success_age_seconds: Gauge,
+    electrum_success_observed: Gauge,
+    electrum_last_success: Mutex<Option<Instant>>,
     payment_states: Gauge,
     runtime_active: Gauge,
     session_validation_results: Counter,
@@ -38,6 +40,7 @@ impl Metrics {
         let outbox_permanent_failures = Counter::default();
         let electrum_available = Gauge::default();
         let electrum_last_success_age_seconds = Gauge::default();
+        let electrum_success_observed = Gauge::default();
         let payment_states = Gauge::default();
         let runtime_active = Gauge::default();
         let session_validation_results = Counter::default();
@@ -72,9 +75,9 @@ impl Metrics {
             electrum_available.clone(),
         );
         registry.register(
-            "paykit_electrum_last_success_age_seconds",
-            "Age of last Electrum success.",
-            electrum_last_success_age_seconds.clone(),
+            "paykit_electrum_success_observed",
+            "Whether any Electrum observation has succeeded since startup.",
+            electrum_success_observed.clone(),
         );
         registry.register(
             "paykit_payment_states",
@@ -100,6 +103,8 @@ impl Metrics {
             outbox_permanent_failures,
             electrum_available,
             electrum_last_success_age_seconds,
+            electrum_success_observed,
+            electrum_last_success: Mutex::new(None),
             payment_states,
             runtime_active,
             session_validation_results,
@@ -122,8 +127,27 @@ impl Metrics {
     pub fn set_electrum_available(&self, available: bool) {
         self.electrum_available.set(i64::from(available));
     }
-    pub fn set_electrum_last_success_age_seconds(&self, seconds: i64) {
-        self.electrum_last_success_age_seconds.set(seconds.max(0));
+    /// Records a completed Electrum observation. The age gauge is only exposed
+    /// once a success exists, so a scrape never reports `0` for "never".
+    pub fn record_electrum_success(&self, at: Instant) {
+        let mut last_success = self
+            .electrum_last_success
+            .lock()
+            .expect("Electrum success mutex is not poisoned");
+        if last_success.is_none() {
+            self.registry
+                .lock()
+                .expect("metrics registry mutex is not poisoned")
+                .register(
+                    "paykit_electrum_last_success_age_seconds",
+                    "Seconds since the last successful Electrum observation.",
+                    self.electrum_last_success_age_seconds.clone(),
+                );
+            self.electrum_success_observed.set(1);
+        }
+        if last_success.is_none_or(|previous| at > previous) {
+            *last_success = Some(at);
+        }
     }
     pub fn set_payment_states(&self, value: i64) {
         self.payment_states.set(value);
@@ -135,6 +159,19 @@ impl Metrics {
         self.session_validation_results.inc();
     }
     pub fn encode(&self) -> Result<String, std::fmt::Error> {
+        self.encode_at(Instant::now())
+    }
+
+    fn encode_at(&self, now: Instant) -> Result<String, std::fmt::Error> {
+        let last_success = *self
+            .electrum_last_success
+            .lock()
+            .expect("Electrum success mutex is not poisoned");
+        if let Some(last_success) = last_success {
+            let age = now.saturating_duration_since(last_success).as_secs();
+            self.electrum_last_success_age_seconds
+                .set(i64::try_from(age).unwrap_or(i64::MAX));
+        }
         let mut text = String::new();
         encode(
             &mut text,
@@ -150,5 +187,66 @@ impl Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    fn line<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+        text.lines()
+            .find(|line| line.starts_with(&format!("{name} ")))
+    }
+
+    #[test]
+    fn electrum_success_age_is_absent_before_any_success() {
+        let metrics = Metrics::new();
+        let text = metrics.encode_at(Instant::now()).unwrap();
+        assert_eq!(
+            line(&text, "paykit_electrum_success_observed"),
+            Some("paykit_electrum_success_observed 0")
+        );
+        assert!(!text.contains("paykit_electrum_last_success_age_seconds"));
+    }
+
+    #[test]
+    fn electrum_success_age_advances_between_scrapes_without_new_ticks() {
+        let metrics = Metrics::new();
+        let success = Instant::now();
+        metrics.record_electrum_success(success);
+        let first = metrics.encode_at(success + Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            line(&first, "paykit_electrum_last_success_age_seconds"),
+            Some("paykit_electrum_last_success_age_seconds 5")
+        );
+        assert_eq!(
+            line(&first, "paykit_electrum_success_observed"),
+            Some("paykit_electrum_success_observed 1")
+        );
+        let later = metrics
+            .encode_at(success + Duration::from_secs(47))
+            .unwrap();
+        assert_eq!(
+            line(&later, "paykit_electrum_last_success_age_seconds"),
+            Some("paykit_electrum_last_success_age_seconds 47")
+        );
+
+        metrics.record_electrum_success(success + Duration::from_secs(50));
+        let refreshed = metrics
+            .encode_at(success + Duration::from_secs(52))
+            .unwrap();
+        assert_eq!(
+            line(&refreshed, "paykit_electrum_last_success_age_seconds"),
+            Some("paykit_electrum_last_success_age_seconds 2")
+        );
+        assert_eq!(
+            refreshed
+                .matches("# TYPE paykit_electrum_last_success_age_seconds")
+                .count(),
+            1
+        );
     }
 }
