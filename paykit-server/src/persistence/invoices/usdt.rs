@@ -1,11 +1,11 @@
 //! Invoice attribution for authenticated Paykit USDT evidence.
 
 use super::*;
-use crate::{
-    domain::receiving::USDT_ENDPOINT,
-    usdt::{ArbitrumVerifier, PaymentContext, VerificationError, VerifiedTransfer},
+use crate::usdt::{
+    ArbitrumVerifier, MAX_SCAN_CANDIDATES, PaymentCandidate, PaymentContext, VerificationError,
+    VerifiedTransfer,
 };
-use paykit_sdk::{PaymentRequestLocalRole, PaymentRequestRecord};
+use paykit_sdk::{PaymentProofRecord, PaymentRequestLocalRole, PaymentRequestRecord};
 
 #[derive(Serialize, Deserialize)]
 struct TransferFacts {
@@ -53,17 +53,26 @@ impl InvoiceStore {
         creator_hash: LookupHash,
         envelope: Vec<u8>,
         identity_hash: Vec<u8>,
-    ) -> Result<TransferFacts, PersistenceError> {
-        let facts: TransferFacts = postcard::from_bytes(
-            &self
-                .crypto
-                .decrypt(
-                    &EnvelopeContext::usdt_observation(creator_hash, id, invoice),
-                    &EncryptedEnvelope::from_bytes(envelope),
-                )
-                .map_err(|_| PersistenceError::CorruptOrMissing)?,
-        )
-        .map_err(|_| PersistenceError::CorruptOrMissing)?;
+    ) -> Result<(TransferFacts, Option<[u8; 20]>), PersistenceError> {
+        let plaintext = self
+            .crypto
+            .decrypt(
+                &EnvelopeContext::usdt_observation(creator_hash, id, invoice),
+                &EncryptedEnvelope::from_bytes(envelope),
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let (facts, suffix): (TransferFacts, _) = postcard::take_from_bytes(&plaintext)
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        // Existing envelopes contain only facts; verified refreshes append the attested sender.
+        let sender = if suffix.is_empty() {
+            None
+        } else {
+            Some(
+                suffix
+                    .try_into()
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?,
+            )
+        };
         if identity_hash
             != self
                 .crypto
@@ -72,7 +81,7 @@ impl InvoiceStore {
         {
             return Err(PersistenceError::CorruptOrMissing);
         }
-        Ok(facts)
+        Ok((facts, sender))
     }
 
     /// Resolves invoices only through their already-attributed SDK lifecycle record.
@@ -147,77 +156,245 @@ impl InvoiceStore {
             reference: &terms.payment_reference,
             recipient: &recipient,
         };
-        let mut candidates = std::collections::BTreeMap::<_, Vec<_>>::new();
-        for proof in &record.payment_proofs {
-            if proof.payment_endpoint_identifier == USDT_ENDPOINT
-                && let Ok(identity) = crate::usdt::payment_identity(&context, proof)
-            {
-                candidates.entry(identity).or_default().push(proof);
+        let scan = verifier
+            .payment_scan(&context, &record.payment_proofs)
+            .await;
+        let mut candidates = if bundle.is_some() || scan.is_none() {
+            self.owned_usdt_candidates(
+                &row,
+                creator_hash,
+                &payment,
+                bundle.is_some(),
+                &context,
+                &record.payment_proofs,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+        if let Some(scan) = &scan {
+            for candidate in &scan.candidates {
+                if candidates.len() == MAX_SCAN_CANDIDATES {
+                    break;
+                }
+                if !candidates
+                    .iter()
+                    .any(|owned| owned.identity == candidate.identity)
+                {
+                    candidates.push(candidate.clone());
+                }
             }
         }
-        for (identity, proofs) in candidates {
+        let mut observed = std::collections::HashSet::new();
+        for candidate in &candidates {
+            let identity = &candidate.identity;
             let identity_hash = self.crypto.usdt_transfer_lookup_hash(identity.as_bytes());
-            let skip: Option<bool> = sqlx::query_scalar(
+            let existing: Option<(bool, bool, bool)> = sqlx::query_as(
                 "SELECT COALESCE(finalized OR ($2 AND invoice_id = $3 AND present
-                    AND checked_at <= NOW() AND checked_at > NOW() - INTERVAL '1 minute'), FALSE)
+                    AND checked_at <= NOW() AND checked_at > NOW() - INTERVAL '1 minute'), FALSE),
+                    present, COALESCE(invoice_id = $3, FALSE)
                  FROM usdt_observations WHERE transfer_lookup_hash = $1",
             )
             .bind(identity_hash.as_bytes().as_slice())
-            .bind(bundle.is_none())
+            .bind(bundle.is_none() && scan.is_some())
             .bind(row.id)
             .fetch_optional(&self.pool)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
-            if skip == Some(true) {
+            if existing.is_some_and(|(_, _, owned)| !owned) {
                 continue;
             }
-            // Corrective proofs cannot erase another valid account attestation for the same event.
-            let mut verified = None;
-            for proof in proofs {
-                match verifier.verify(&context, proof).await {
-                    Ok(Some(transfer)) => {
-                        verified = Some(transfer);
-                        break;
-                    }
-                    Ok(None) | Err(VerificationError::InvalidProof) => {}
-                    Err(VerificationError::Unavailable) => {
-                        return Err(PersistenceError::Unavailable);
-                    }
+            if existing.is_some_and(|(skip, _, _)| skip) {
+                observed.insert(identity.as_str());
+                continue;
+            }
+            if existing.is_some() {
+                // Reserve before RPC so failures and restarts retain the refresh interval.
+                let reserved = sqlx::query(
+                    "UPDATE usdt_observations SET checked_at = NOW()
+                     WHERE invoice_id = $1 AND transfer_lookup_hash = $2 AND NOT finalized
+                       AND ($3 OR checked_at > NOW() OR checked_at <= NOW() -
+                         CASE WHEN present THEN INTERVAL '1 minute' ELSE INTERVAL '15 seconds' END)")
+                    .bind(row.id).bind(identity_hash.as_bytes().as_slice()).bind(bundle.is_some())
+                    .execute(&self.pool).await.map_err(|_| PersistenceError::Unavailable)?;
+                if reserved.rows_affected() == 0 {
+                    continue;
                 }
             }
+            let verified = match verifier.verify_candidate(&context, candidate).await {
+                Ok(value) => value,
+                Err(VerificationError::InvalidProof) => None,
+                Err(VerificationError::Unavailable) => return Err(PersistenceError::Unavailable),
+            };
             match verified {
                 Some(transfer) => {
-                    self.apply_usdt_transfer(&row, creator_hash, &payment, transfer)
+                    if self
+                        .apply_usdt_transfer(&row, creator_hash, &payment, transfer)
                         .await?
+                    {
+                        observed.insert(identity.as_str());
+                    }
                 }
                 None => {
-                    let mut tx = self
-                        .pool
-                        .begin()
-                        .await
-                        .map_err(|_| PersistenceError::Unavailable)?;
-                    sqlx::query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE")
-                        .bind(row.id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|_| PersistenceError::Unavailable)?;
-                    sqlx::query("UPDATE usdt_observations SET present = FALSE, confirmations = 0 WHERE invoice_id = $1 AND transfer_lookup_hash = $2 AND NOT finalized")
-                        .bind(row.id).bind(identity_hash.as_bytes().as_slice()).execute(&mut *tx).await.map_err(|_| PersistenceError::Unavailable)?;
-                    self.project_payments(
-                        &mut tx,
-                        row.id,
-                        creator_hash,
-                        &payment,
-                        OffsetDateTime::now_utc(),
-                    )
-                    .await?;
-                    tx.commit()
-                        .await
-                        .map_err(|_| PersistenceError::Unavailable)?;
+                    if !existing.is_some_and(|(_, present, owned)| present && owned) {
+                        continue;
+                    }
+                    self.clear_usdt_transfer(&row, creator_hash, &payment, &identity_hash)
+                        .await?;
                 }
             }
         }
+        if let Some(scan) = &scan {
+            verifier
+                .finish_payment_scan(
+                    scan,
+                    scan.candidates
+                        .iter()
+                        .all(|candidate| observed.contains(candidate.identity.as_str())),
+                )
+                .await;
+        }
+        if bundle.is_some() {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            let selected = self
+                .usdt_payment(&mut tx, &row, creator_hash, destination.required_amount)
+                .await?;
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            // A bounded pass must not report an unrefreshed receipt as fresh payment status.
+            if selected.is_some_and(|(identity, payment)| {
+                !payment.finalized && !observed.contains(identity.as_str())
+            }) {
+                return Err(PersistenceError::Unavailable);
+            }
+        }
         Ok(())
+    }
+
+    async fn owned_usdt_candidates(
+        &self,
+        row: &UsdtInvoiceRow,
+        creator_hash: LookupHash,
+        payment: &InvoicePaymentRecordV1,
+        force: bool,
+        context: &PaymentContext<'_>,
+        proofs: &[PaymentProofRecord],
+    ) -> Result<Vec<PaymentCandidate>, PersistenceError> {
+        let preferred = if force {
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            let selected = self
+                .usdt_payment(
+                    &mut tx,
+                    row,
+                    creator_hash,
+                    payment
+                        .usdt
+                        .as_ref()
+                        .ok_or(PersistenceError::CorruptOrMissing)?
+                        .required_amount,
+                )
+                .await?;
+            tx.commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            selected.map(|(identity, _)| {
+                self.crypto
+                    .usdt_transfer_lookup_hash(identity.as_bytes())
+                    .as_bytes()
+                    .to_vec()
+            })
+        } else {
+            None
+        };
+        let observations: Vec<UsdtObservationRow> = sqlx::query_as(
+            "SELECT id, observation_envelope, transfer_lookup_hash, confirmations, finalized
+             FROM usdt_observations WHERE invoice_id = $1 AND NOT finalized
+               AND ($2 OR checked_at > NOW() OR checked_at <= NOW() -
+                 CASE WHEN present THEN INTERVAL '1 minute' ELSE INTERVAL '15 seconds' END)
+             ORDER BY COALESCE(transfer_lookup_hash = $4, FALSE) DESC, present DESC, checked_at, id LIMIT $3",
+        )
+        .bind(row.id)
+        .bind(force)
+        .bind(MAX_SCAN_CANDIDATES as i64)
+        .bind(preferred)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let mut candidates = Vec::new();
+        let mut legacy_candidates = None;
+        for observation in observations {
+            let (facts, sender) = self.transfer_facts(
+                observation.id,
+                row.id,
+                creator_hash,
+                observation.observation_envelope,
+                observation.transfer_lookup_hash,
+            )?;
+            let candidate = if let Some(sender) = sender {
+                Some(
+                    PaymentCandidate::from_observation(&facts.identity, sender)
+                        .map_err(|_| PersistenceError::CorruptOrMissing)?,
+                )
+            } else {
+                if legacy_candidates.is_none() {
+                    legacy_candidates = PaymentCandidate::from_proofs(context, proofs);
+                }
+                legacy_candidates
+                    .as_ref()
+                    .and_then(|candidates| candidates.get(&facts.identity))
+                    .cloned()
+            };
+            if let Some(candidate) = candidate {
+                candidates.push(candidate);
+            } else {
+                // Unsupported histories cannot sustain nonfinal credit without an attestation anchor.
+                let identity_hash = self
+                    .crypto
+                    .usdt_transfer_lookup_hash(facts.identity.as_bytes());
+                self.clear_usdt_transfer(row, creator_hash, payment, &identity_hash)
+                    .await?;
+            }
+        }
+        Ok(candidates)
+    }
+
+    async fn clear_usdt_transfer(
+        &self,
+        row: &UsdtInvoiceRow,
+        creator_hash: LookupHash,
+        payment: &InvoicePaymentRecordV1,
+        identity_hash: &LookupHash,
+    ) -> Result<(), PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        sqlx::query("SELECT id FROM invoices WHERE id = $1 FOR UPDATE")
+            .bind(row.id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        sqlx::query("UPDATE usdt_observations SET present = FALSE, confirmations = 0, checked_at = NOW() WHERE invoice_id = $1 AND transfer_lookup_hash = $2 AND NOT finalized")
+            .bind(row.id).bind(identity_hash.as_bytes().as_slice()).execute(&mut *tx).await.map_err(|_| PersistenceError::Unavailable)?;
+        self.project_payments(
+            &mut tx,
+            row.id,
+            creator_hash,
+            payment,
+            OffsetDateTime::now_utc(),
+        )
+        .await?;
+        tx.commit().await.map_err(|_| PersistenceError::Unavailable)
     }
 
     async fn apply_usdt_transfer(
@@ -226,7 +403,7 @@ impl InvoiceStore {
         creator_hash: LookupHash,
         payment: &InvoicePaymentRecordV1,
         transfer: VerifiedTransfer,
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<bool, PersistenceError> {
         let transfer_hash = self
             .crypto
             .usdt_transfer_lookup_hash(transfer.identity.as_bytes());
@@ -246,10 +423,10 @@ impl InvoiceStore {
             .map_err(|_| PersistenceError::Unavailable)?;
         if let Some((_, invoice_id, finalized)) = existing {
             if invoice_id != Some(row.id) {
-                return Ok(());
+                return Ok(false);
             }
             if finalized {
-                return Ok(());
+                return Ok(true);
             }
         }
         let id = existing.map(|(id, _, _)| id).unwrap_or_else(Uuid::new_v4);
@@ -262,7 +439,8 @@ impl InvoiceStore {
             .crypto
             .encrypt(
                 &EnvelopeContext::usdt_observation(creator_hash, id, row.id),
-                &postcard::to_allocvec(&facts).map_err(|_| PersistenceError::CorruptOrMissing)?,
+                &postcard::to_allocvec(&(facts, transfer.sender))
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?,
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         let confirmations =
@@ -281,7 +459,7 @@ impl InvoiceStore {
             .bind(id).bind(row.id).bind(transfer_hash.as_bytes().as_slice()).bind(envelope.as_bytes())
             .bind(confirmations).bind(transfer.finalized).fetch_one(&mut *tx).await.map_err(|_| PersistenceError::Unavailable)?;
         if owner != Some(row.id) {
-            return Ok(());
+            return Ok(false);
         }
         self.project_payments(
             &mut tx,
@@ -291,7 +469,10 @@ impl InvoiceStore {
             OffsetDateTime::now_utc(),
         )
         .await?;
-        tx.commit().await.map_err(|_| PersistenceError::Unavailable)
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(true)
     }
 
     pub(super) async fn usdt_payment(
@@ -300,13 +481,13 @@ impl InvoiceStore {
         row: &UsdtInvoiceRow,
         creator_hash: LookupHash,
         required: u64,
-    ) -> Result<Option<super::settlement::ObservedPayment>, PersistenceError> {
+    ) -> Result<Option<(String, super::settlement::ObservedPayment)>, PersistenceError> {
         let observations: Vec<UsdtObservationRow> = sqlx::query_as(
             "SELECT id, observation_envelope, transfer_lookup_hash, confirmations, finalized FROM usdt_observations WHERE invoice_id = $1 AND present")
             .bind(row.id).fetch_all(&mut **tx).await.map_err(|_| PersistenceError::Unavailable)?;
-        let mut selected: Option<super::settlement::ObservedPayment> = None;
+        let mut selected: Option<(String, super::settlement::ObservedPayment)> = None;
         for observation in observations {
-            let facts = self.transfer_facts(
+            let (facts, _) = self.transfer_facts(
                 observation.id,
                 row.id,
                 creator_hash,
@@ -337,11 +518,10 @@ impl InvoiceStore {
                     payment.confirmations,
                 )
             };
-            if selected
-                .as_ref()
-                .is_none_or(|current| rank(&candidate) > rank(current))
-            {
-                selected = Some(candidate);
+            if selected.as_ref().is_none_or(|(identity, current)| {
+                (rank(&candidate), &facts.identity) > (rank(current), identity)
+            }) {
+                selected = Some((facts.identity, candidate));
             }
         }
         Ok(selected)
@@ -378,7 +558,7 @@ impl InvoiceStore {
             .ok_or(PersistenceError::CorruptOrMissing)?;
         self.usdt_payment(tx, &row, creator_hash, destination.required_amount)
             .await?
-            .map(|payment| {
+            .map(|(_, payment)| {
                 Ok(UsdtPaymentStatus {
                     confirmations: u32::try_from(payment.confirmations)
                         .map_err(|_| PersistenceError::CorruptOrMissing)?,

@@ -300,6 +300,18 @@ pub enum LifecycleSyncError {
     PartialReceive,
 }
 
+impl LifecycleSyncError {
+    pub(crate) const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::Sdk => "sdk",
+            Self::Persistence => "persistence",
+            Self::Conflict => "conflict",
+            Self::InvalidProjection => "invalid_projection",
+            Self::PartialReceive => "partial_receive",
+        }
+    }
+}
+
 impl std::fmt::Debug for PaykitAdapter {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("PaykitAdapter { .. }")
@@ -1073,6 +1085,24 @@ pub(crate) fn creator_mutation_lock(creator_id: Uuid) -> Arc<CreatorMutationLock
 
 fn parse_peer(reader: &str) -> Result<PubkyPublicKey, HandoffError> {
     PubkyPublicKey::from_raw_or_app_key(reader).map_err(|_| HandoffError::Permanent)
+}
+
+/// Closed, identifier-free label for an SDK failure; never includes error text.
+pub(crate) const fn sdk_error_label(error: &PaykitSdkError) -> &'static str {
+    match error {
+        PaykitSdkError::ConcurrentUpdate { .. } => "concurrent_update",
+        PaykitSdkError::SharedStateBusy { .. } => "shared_state_busy",
+        PaykitSdkError::Storage { .. } => "storage",
+        PaykitSdkError::Identity { .. } => "identity",
+        PaykitSdkError::Transport { .. } => "transport",
+        PaykitSdkError::NotFound { .. } => "not_found",
+        PaykitSdkError::Protocol { .. } => "protocol",
+        PaykitSdkError::LinkObservation { .. } => "link_observation",
+        PaykitSdkError::Policy { .. } => "policy",
+        PaykitSdkError::PaymentAdapter { .. } => "payment_adapter",
+        PaykitSdkError::RecoveryRequired { .. } => "recovery_required",
+        _ => "other",
+    }
 }
 
 fn classify(error: PaykitSdkError) -> HandoffError {

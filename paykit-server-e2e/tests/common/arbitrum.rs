@@ -107,7 +107,13 @@ impl Rpc {
             }
             let result = match request["method"].as_str().unwrap() {
                 "eth_chainId" => json!(format!("0x{:x}", chain.chain_id)),
-                "eth_getTransactionReceipt" => chain.receipt.clone(),
+                "eth_getTransactionReceipt" => {
+                    if request["params"][0] == chain.receipt["transactionHash"] {
+                        chain.receipt.clone()
+                    } else {
+                        Value::Null
+                    }
+                }
                 "eth_blockNumber" => json!(format!("0x{:x}", chain.head)),
                 "eth_getBlockByNumber" if request["params"][0] == "finalized" => {
                     json!({"number":if chain.finalized {"0x64"}else{"0x63"}})

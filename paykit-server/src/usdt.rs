@@ -1,6 +1,7 @@
 //! Direct Arbitrum USDT0 receipts and Paykit ERC-20 account attestations.
 
 use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
     str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
@@ -66,6 +67,7 @@ pub struct VerifiedTransfer {
     pub(crate) timestamp: OffsetDateTime,
     pub(crate) confirmations: u32,
     pub(crate) finalized: bool,
+    pub(crate) sender: [u8; 20],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +81,7 @@ pub struct ArbitrumVerifier {
     client: reqwest::Client,
     url: url::Url,
     chain_tip: Arc<Mutex<Option<(Instant, ChainTip)>>>,
+    scans: Arc<Mutex<ScanCache>>,
 }
 
 const CHAIN_TIP_TTL: Duration = Duration::from_secs(5);
@@ -87,6 +90,133 @@ const CHAIN_TIP_TTL: Duration = Duration::from_secs(5);
 struct ChainTip {
     head: u64,
     finalized: Option<u64>,
+}
+
+const MAX_REQUEST_PROOFS: usize = 128;
+pub(crate) const MAX_SCAN_CANDIDATES: usize = 8;
+const MAX_SCAN_REQUESTS: usize = 1024;
+const UNMATCHED_RETRY_DELAY: Duration = Duration::from_secs(15);
+const SCAN_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
+
+struct ScanState {
+    fingerprint: blake3::Hash,
+    // None reserves a slot whose first scan has not run.
+    cursor: Option<usize>,
+    sweep_complete: bool,
+    retry_at: Instant,
+    last_used: Instant,
+}
+
+#[derive(Default)]
+struct ScanCache {
+    requests: HashMap<blake3::Hash, ScanState>,
+    waiting: Option<(blake3::Hash, blake3::Hash)>,
+    last_admitted: Option<blake3::Hash>,
+}
+
+impl ScanCache {
+    fn oldest_ready(&self, now: Instant, current: blake3::Hash) -> Option<blake3::Hash> {
+        self.requests
+            .iter()
+            .filter(|(key, state)| {
+                **key != current
+                    && state.retry_at <= now
+                    && (state.cursor.is_none()
+                        || state.sweep_complete
+                        || now.duration_since(state.last_used) >= SCAN_IDLE_TTL)
+            })
+            .min_by_key(|(_, state)| state.last_used)
+            .map(|(key, _)| *key)
+    }
+
+    fn defer(&mut self, key: blake3::Hash, fingerprint: blake3::Hash) {
+        // Circular key order prevents a stable reconciliation order from starving later requests.
+        let rank = |key: blake3::Hash| {
+            (
+                self.last_admitted
+                    .is_some_and(|last| key.as_bytes() <= last.as_bytes()),
+                *key.as_bytes(),
+            )
+        };
+        if self
+            .waiting
+            .is_none_or(|(waiting, _)| rank(key) <= rank(waiting))
+        {
+            self.waiting = Some((key, fingerprint));
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct PaymentCandidate {
+    pub(crate) identity: String,
+    hash: B256,
+    index: usize,
+    senders: BTreeSet<Address>,
+}
+
+impl PaymentCandidate {
+    pub(crate) fn from_proofs(
+        context: &PaymentContext<'_>,
+        proofs: &[PaymentProofRecord],
+    ) -> Option<BTreeMap<String, Self>> {
+        if proofs.len() > MAX_REQUEST_PROOFS {
+            return None;
+        }
+        let mut candidates = BTreeMap::<String, PaymentCandidate>::new();
+        for record in proofs {
+            if let Ok((_, hash, index, sender)) = parse_proof(context, record) {
+                let identity = format!("{USDT_CHAIN_ID}:{hash:#x}:{index}");
+                candidates
+                    .entry(identity.clone())
+                    .or_insert_with(|| PaymentCandidate {
+                        identity,
+                        hash,
+                        index,
+                        senders: BTreeSet::new(),
+                    })
+                    .senders
+                    .insert(sender);
+            }
+        }
+        Some(candidates)
+    }
+
+    /// Uses the sender authenticated when the owned observation was recorded.
+    pub(crate) fn from_observation(
+        identity: &str,
+        sender: [u8; 20],
+    ) -> Result<Self, VerificationError> {
+        let mut parts = identity.split(':');
+        let (Some(chain), Some(hash), Some(index), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(VerificationError::InvalidProof);
+        };
+        if chain != USDT_CHAIN_ID {
+            return Err(VerificationError::InvalidProof);
+        }
+        let hash = B256::from_str(canonical_hex(hash, 32)?)
+            .map_err(|_| VerificationError::InvalidProof)?;
+        let index = index
+            .parse::<usize>()
+            .map_err(|_| VerificationError::InvalidProof)?;
+        if identity != format!("{USDT_CHAIN_ID}:{hash:#x}:{index}") {
+            return Err(VerificationError::InvalidProof);
+        }
+        Ok(Self {
+            identity: identity.to_owned(),
+            hash,
+            index,
+            senders: BTreeSet::from([Address::from(sender)]),
+        })
+    }
+}
+
+pub(crate) struct PaymentScan {
+    key: blake3::Hash,
+    fingerprint: blake3::Hash,
+    pub(crate) candidates: Vec<PaymentCandidate>,
 }
 
 impl ArbitrumVerifier {
@@ -100,7 +230,119 @@ impl ArbitrumVerifier {
             client,
             url,
             chain_tip: Arc::new(Mutex::new(None)),
+            scans: Arc::new(Mutex::new(ScanCache::default())),
         })
+    }
+
+    pub(crate) async fn payment_scan(
+        &self,
+        context: &PaymentContext<'_>,
+        proofs: &[PaymentProofRecord],
+    ) -> Option<PaymentScan> {
+        self.payment_scan_at(context, proofs, Instant::now()).await
+    }
+
+    async fn payment_scan_at(
+        &self,
+        context: &PaymentContext<'_>,
+        proofs: &[PaymentProofRecord],
+        now: Instant,
+    ) -> Option<PaymentScan> {
+        // Keep all attestations for an event together; partial sets can hide its valid signer.
+        if proofs.len() > MAX_REQUEST_PROOFS {
+            return None;
+        }
+        let key = blake3::hash(
+            &serde_json::to_vec(&(
+                context.payer,
+                context.payee,
+                context.request_id,
+                context.reference,
+                context.recipient,
+            ))
+            .expect("payment context is serializable"),
+        );
+        let fingerprint = proof_fingerprint(proofs);
+        let mut scan = PaymentScan {
+            key,
+            fingerprint,
+            candidates: Vec::new(),
+        };
+        if proofs.is_empty() {
+            return Some(scan);
+        }
+        let mut cache = self.scans.lock().await;
+        if cache
+            .requests
+            .get(&key)
+            .is_none_or(|state| state.cursor.is_some())
+            && let Some((waiting, fingerprint)) = cache.waiting
+            && let Some(oldest) = cache.oldest_ready(now, key)
+        {
+            cache.requests.remove(&oldest);
+            cache.requests.insert(
+                waiting,
+                ScanState {
+                    fingerprint,
+                    cursor: None,
+                    sweep_complete: false,
+                    retry_at: now + UNMATCHED_RETRY_DELAY,
+                    last_used: now,
+                },
+            );
+            cache.waiting = None;
+            cache.last_admitted = Some(waiting);
+        }
+        if !cache.requests.contains_key(&key) && cache.requests.len() >= MAX_SCAN_REQUESTS {
+            let Some(oldest) = cache.oldest_ready(now, key) else {
+                cache.defer(key, fingerprint);
+                return Some(scan);
+            };
+            cache.requests.remove(&oldest);
+        }
+        let state = cache.requests.entry(key).or_insert(ScanState {
+            fingerprint,
+            cursor: None,
+            sweep_complete: false,
+            retry_at: now,
+            last_used: now,
+        });
+        if state.fingerprint != fingerprint {
+            state.fingerprint = fingerprint;
+            state.retry_at = now;
+            state.cursor = None;
+            state.sweep_complete = false;
+        }
+        state.last_used = now;
+        if state.retry_at > now && state.cursor.is_some() {
+            return Some(scan);
+        }
+        let cursor = state.cursor.unwrap_or(0);
+        // Proof count bounds a full sweep even when several proofs share one event.
+        state.sweep_complete |= cursor.saturating_add(MAX_SCAN_CANDIDATES) >= proofs.len();
+        state.cursor = Some(cursor.wrapping_add(MAX_SCAN_CANDIDATES));
+        state.retry_at = now + UNMATCHED_RETRY_DELAY;
+        drop(cache);
+
+        let candidates = PaymentCandidate::from_proofs(context, proofs)?;
+        let candidates: Vec<_> = candidates.into_values().collect();
+        if !candidates.is_empty() {
+            let cursor = cursor % candidates.len();
+            scan.candidates = (0..candidates.len().min(MAX_SCAN_CANDIDATES))
+                .map(|offset| candidates[(cursor + offset) % candidates.len()].clone())
+                .collect();
+        }
+        Some(scan)
+    }
+
+    pub(crate) async fn finish_payment_scan(&self, scan: &PaymentScan, all_observed: bool) {
+        if all_observed
+            && !scan.candidates.is_empty()
+            && let Some(state) = self.scans.lock().await.requests.get_mut(&scan.key)
+            && state.fingerprint == scan.fingerprint
+        {
+            state.retry_at = Instant::now();
+        }
     }
 
     async fn chain_tip(&self, minimum_block: u64) -> Result<ChainTip, VerificationError> {
@@ -174,10 +416,29 @@ impl ArbitrumVerifier {
         context: &PaymentContext<'_>,
         record: &PaymentProofRecord,
     ) -> Result<Option<VerifiedTransfer>, VerificationError> {
-        let (proof, hash, index, sender) = parse_proof(context, record)?;
+        let (_, hash, index, sender) = parse_proof(context, record)?;
+        self.verify_candidate(
+            context,
+            &PaymentCandidate {
+                identity: format!("{USDT_CHAIN_ID}:{hash:#x}:{index}"),
+                hash,
+                index,
+                senders: BTreeSet::from([sender]),
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn verify_candidate(
+        &self,
+        context: &PaymentContext<'_>,
+        candidate: &PaymentCandidate,
+    ) -> Result<Option<VerifiedTransfer>, VerificationError> {
+        let hash = candidate.hash;
+        let index = candidate.index;
         let mut tip = self.chain_tip(0).await?;
         let receipt = self
-            .call("eth_getTransactionReceipt", json!([proof.transaction_hash]))
+            .call("eth_getTransactionReceipt", json!([hash]))
             .await?;
         if receipt.is_null() {
             return Ok(None);
@@ -212,7 +473,13 @@ impl ArbitrumVerifier {
             .as_array()
             .ok_or(VerificationError::Unavailable)?;
         let log = logs.get(index).ok_or(VerificationError::InvalidProof)?;
-        let amount = transfer_amount(log, sender, context.recipient, hash, &receipt["blockHash"])?;
+        let sender = parse_hash(&log["topics"][1]).map_err(|_| VerificationError::InvalidProof)?;
+        let sender = candidate
+            .senders
+            .iter()
+            .find(|address| address.into_word() == sender)
+            .ok_or(VerificationError::InvalidProof)?;
+        let amount = transfer_amount(log, *sender, context.recipient, hash, &receipt["blockHash"])?;
         let confirmations = tip
             .head
             .checked_sub(number)
@@ -226,8 +493,26 @@ impl ArbitrumVerifier {
             timestamp,
             confirmations,
             finalized,
+            sender: sender.into_array(),
         }))
     }
+}
+
+fn proof_fingerprint(proofs: &[PaymentProofRecord]) -> blake3::Hash {
+    let bindings: Vec<_> = proofs
+        .iter()
+        .map(|proof| {
+            (
+                &proof.payment_app_id,
+                &proof.payment_endpoint_identifier,
+                &proof.payment_reference,
+                &proof.billing_period,
+                &proof.conversion_quote_id,
+                &proof.proof,
+            )
+        })
+        .collect();
+    blake3::hash(&serde_json::to_vec(&bindings).expect("payment proofs are serializable"))
 }
 
 /// Validates account attestation before looking up a durable observation.
@@ -379,4 +664,228 @@ fn quantity(value: &Value) -> Result<u64, VerificationError> {
         .and_then(|v| v.strip_prefix("0x"))
         .and_then(|v| u64::from_str_radix(v, 16).ok())
         .ok_or(VerificationError::Unavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recoverable_proof() -> PaymentProofRecord {
+        let signature = Secp256k1::new().sign_ecdsa_recoverable(
+            &Message::from_digest([1; 32]),
+            &secp256k1::SecretKey::from_slice(&[1; 32]).unwrap(),
+        );
+        let (recovery, compact) = signature.serialize_compact();
+        let mut signature = compact.to_vec();
+        signature.push(27 + recovery.to_i32() as u8);
+        serde_json::from_value(json!({
+            "event_id": "00000000-0000-4000-8000-000000000001", "stream_item_id": 1,
+            "payment_reference": "payment", "payment_app_id": "paykit-server",
+            "payment_endpoint_identifier": USDT_ENDPOINT,
+            "recorded_at": "2026-10-07T00:00:00Z",
+            "proof": {
+                "type": "erc20-transfer-eip712", "chain_id": USDT_CHAIN_ID,
+                "transaction_hash": format!("0x{}", "11".repeat(32)),
+                "receipt_log_index": "0",
+                "signature": format!("0x{}", alloy_primitives::hex::encode(signature)),
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn scan_capacity_preserves_active_retry_delays() {
+        let verifier = ArbitrumVerifier::new("http://127.0.0.1:1".parse().unwrap()).unwrap();
+        let recipient =
+            UsdtAddress::try_from("0x2222222222222222222222222222222222222222".to_owned()).unwrap();
+        let context = PaymentContext {
+            payer: "payer",
+            payee: "payee",
+            request_id: "0",
+            reference: "payment",
+            recipient: &recipient,
+        };
+        let proofs = [recoverable_proof()];
+        let mut admitted = Vec::new();
+        for _ in 0..2 {
+            let mut candidates = 0;
+            for index in 0..=MAX_SCAN_REQUESTS {
+                let request_id = index.to_string();
+                let scan = verifier
+                    .payment_scan(
+                        &PaymentContext {
+                            request_id: &request_id,
+                            ..context
+                        },
+                        &proofs,
+                    )
+                    .await
+                    .unwrap();
+                candidates += scan.candidates.len();
+                verifier.finish_payment_scan(&scan, false).await;
+            }
+            admitted.push(candidates);
+        }
+        assert_eq!(admitted, [MAX_SCAN_REQUESTS, 0]);
+        assert_eq!(
+            verifier.scans.lock().await.requests.len(),
+            MAX_SCAN_REQUESTS
+        );
+
+        // A retained request keeps its slot even when it is the only eligible victim.
+        let retained = verifier.payment_scan(&context, &proofs).await.unwrap();
+        verifier
+            .scans
+            .lock()
+            .await
+            .requests
+            .get_mut(&retained.key)
+            .unwrap()
+            .retry_at = Instant::now();
+        let mut corrected = proofs.clone();
+        corrected[0]
+            .proof
+            .insert("receipt_log_index".into(), json!("1"));
+        let corrected_scan = verifier.payment_scan(&context, &corrected).await.unwrap();
+        assert_eq!(corrected_scan.candidates.len(), 1);
+        verifier.finish_payment_scan(&corrected_scan, true).await;
+
+        // A completed scan releases its slot without evicting any active cooldown.
+        let pending_id = MAX_SCAN_REQUESTS.to_string();
+        let pending = PaymentContext {
+            request_id: &pending_id,
+            ..context
+        };
+        let scan = verifier.payment_scan(&pending, &proofs).await.unwrap();
+        assert_eq!(scan.candidates.len(), 1);
+        assert_eq!(
+            verifier.scans.lock().await.requests.len(),
+            MAX_SCAN_REQUESTS
+        );
+        assert!(
+            verifier
+                .payment_scan(&pending, &proofs)
+                .await
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+
+        // Once its delay expires, an unchanged request can retry normally.
+        verifier
+            .scans
+            .lock()
+            .await
+            .requests
+            .get_mut(&scan.key)
+            .unwrap()
+            .retry_at = Instant::now();
+        assert_eq!(
+            verifier
+                .payment_scan(&pending, &proofs)
+                .await
+                .unwrap()
+                .candidates
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_requests_progress_in_stable_reconciliation_order() {
+        let verifier = ArbitrumVerifier::new("http://127.0.0.1:1".parse().unwrap()).unwrap();
+        let recipient =
+            UsdtAddress::try_from("0x2222222222222222222222222222222222222222".to_owned()).unwrap();
+        let proof = recoverable_proof();
+        let proofs: Vec<_> = (0..MAX_SCAN_CANDIDATES + 1)
+            .map(|index| {
+                let mut proof = proof.clone();
+                proof
+                    .proof
+                    .insert("receipt_log_index".into(), json!(index.to_string()));
+                proof
+            })
+            .collect();
+        let mut seen = vec![BTreeSet::new(); MAX_SCAN_REQUESTS + 3];
+        let mut now = Instant::now();
+        for _ in 0..16 {
+            now += UNMATCHED_RETRY_DELAY + Duration::from_secs(1);
+            let mut admitted = 0;
+            for (index, candidates) in seen.iter_mut().enumerate() {
+                let request_id = index.to_string();
+                let context = PaymentContext {
+                    payer: "payer",
+                    payee: "payee",
+                    request_id: &request_id,
+                    reference: "payment",
+                    recipient: &recipient,
+                };
+                let scan = verifier
+                    .payment_scan_at(&context, &proofs, now + Duration::from_nanos(index as u64))
+                    .await
+                    .unwrap();
+                if !scan.candidates.is_empty() {
+                    candidates.extend(scan.candidates.iter().map(|candidate| candidate.index));
+                    admitted += 1;
+                }
+                verifier.finish_payment_scan(&scan, false).await;
+            }
+            assert!(admitted <= MAX_SCAN_REQUESTS);
+            assert!(verifier.scans.lock().await.requests.len() <= MAX_SCAN_REQUESTS);
+            if seen
+                .iter()
+                .all(|candidates| candidates.len() == proofs.len())
+            {
+                break;
+            }
+        }
+        for (index, candidates) in seen.iter().enumerate() {
+            assert_eq!(candidates.len(), proofs.len(), "request {index}");
+        }
+    }
+
+    #[tokio::test]
+    async fn inactive_partial_scans_release_capacity() {
+        let verifier = ArbitrumVerifier::new("http://127.0.0.1:1".parse().unwrap()).unwrap();
+        let recipient =
+            UsdtAddress::try_from("0x2222222222222222222222222222222222222222".to_owned()).unwrap();
+        let context = PaymentContext {
+            payer: "payer",
+            payee: "payee",
+            request_id: "pending",
+            reference: "payment",
+            recipient: &recipient,
+        };
+        let proofs = vec![recoverable_proof(); MAX_SCAN_CANDIDATES + 1];
+        let now = Instant::now();
+        for index in 0..MAX_SCAN_REQUESTS {
+            verifier.scans.lock().await.requests.insert(
+                blake3::hash(&index.to_le_bytes()),
+                ScanState {
+                    fingerprint: proof_fingerprint(&proofs),
+                    cursor: Some(MAX_SCAN_CANDIDATES),
+                    sweep_complete: false,
+                    retry_at: now,
+                    last_used: now,
+                },
+            );
+        }
+        assert!(
+            verifier
+                .payment_scan_at(&context, &proofs, now)
+                .await
+                .unwrap()
+                .candidates
+                .is_empty()
+        );
+        let scan = verifier
+            .payment_scan_at(&context, &proofs, now + SCAN_IDLE_TTL)
+            .await
+            .unwrap();
+        assert_eq!(scan.candidates.len(), 1);
+        assert_eq!(
+            verifier.scans.lock().await.requests.len(),
+            MAX_SCAN_REQUESTS
+        );
+    }
 }
