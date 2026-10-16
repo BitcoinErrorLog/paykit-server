@@ -5,8 +5,11 @@ use paykit_sdk::{PaymentRequestLocalRole, PaymentRequestRecord};
 use super::*;
 use crate::{
     application::marketplace_status::MarketplaceUsdtStatus,
-    domain::receiving::{USDT_CHAIN_ID, USDT_ENDPOINT},
-    usdt::{ArbitrumVerifier, PaymentContext, VerificationError, VerifiedTransfer},
+    domain::receiving::USDT_CHAIN_ID,
+    usdt::{
+        ArbitrumVerifier, MAX_SCAN_CANDIDATES, PaymentCandidate, PaymentContext, VerificationError,
+        VerifiedTransfer,
+    },
 };
 
 /// Facts of one verified ERC-20 receipt. The identity is `chain:transaction:log_index`.
@@ -116,72 +119,134 @@ impl MarketplacePreparationStore {
             reference: &terms.payment_reference,
             recipient: &recipient,
         };
-        let mut candidates = std::collections::BTreeMap::<_, Vec<_>>::new();
-        for proof in &record.payment_proofs {
-            if proof.payment_endpoint_identifier == USDT_ENDPOINT
-                && let Ok(identity) = crate::usdt::payment_identity(&context, proof)
-            {
-                candidates.entry(identity).or_default().push(proof);
+        let scan = verifier
+            .payment_scan(&context, &record.payment_proofs)
+            .await;
+        let owned_candidates;
+        let candidates = match &scan {
+            Some(scan) => &scan.candidates,
+            None => {
+                owned_candidates = self.owned_usdt_candidates(&target, creator_hash).await?;
+                &owned_candidates
             }
-        }
-        for (identity, proofs) in candidates {
+        };
+        let mut observed = 0;
+        for candidate in candidates {
+            let identity = &candidate.identity;
             let identity_hash = self.crypto.usdt_transfer_lookup_hash(identity.as_bytes());
-            let skip: Option<bool> = sqlx::query_scalar(
-                "SELECT COALESCE(finalized OR (marketplace_preparation_id = $2 AND present
-                    AND checked_at <= NOW() AND checked_at > NOW() - INTERVAL '1 minute'), FALSE)
+            let existing: Option<(bool, bool, bool)> = sqlx::query_as(
+                "SELECT COALESCE(finalized OR ($3 AND marketplace_preparation_id = $2 AND present
+                    AND checked_at <= NOW() AND checked_at > NOW() - INTERVAL '1 minute'), FALSE),
+                    present, COALESCE(marketplace_preparation_id = $2, FALSE)
                  FROM usdt_observations WHERE transfer_lookup_hash = $1",
             )
             .bind(identity_hash.as_bytes().as_slice())
             .bind(target.preparation_id)
+            .bind(scan.is_some())
             .fetch_optional(&self.pool)
             .await
             .map_err(|_| PersistenceError::Unavailable)?;
-            if skip == Some(true) {
+            if existing.is_some_and(|(_, _, owned)| !owned) {
                 continue;
             }
-            // Corrective proofs cannot erase another valid account attestation for the same event.
-            let mut verified = None;
-            for proof in proofs {
-                match verifier.verify(&context, proof).await {
-                    Ok(Some(transfer)) => {
-                        verified = Some(transfer);
-                        break;
-                    }
-                    Ok(None) | Err(VerificationError::InvalidProof) => {}
-                    Err(VerificationError::Unavailable) => {
-                        return Err(PersistenceError::Unavailable);
-                    }
+            if existing.is_some_and(|(skip, _, _)| skip) {
+                observed += 1;
+                continue;
+            }
+            if existing.is_some() {
+                // Reserve before RPC so failures and restarts retain the refresh interval.
+                let reserved = sqlx::query(
+                    "UPDATE usdt_observations SET checked_at = NOW()
+                     WHERE marketplace_preparation_id = $1 AND transfer_lookup_hash = $2 AND NOT finalized
+                       AND (checked_at > NOW() OR checked_at <= NOW() -
+                         CASE WHEN present THEN INTERVAL '1 minute' ELSE INTERVAL '15 seconds' END)")
+                    .bind(target.preparation_id).bind(identity_hash.as_bytes().as_slice())
+                    .execute(&self.pool).await.map_err(|_| PersistenceError::Unavailable)?;
+                if reserved.rows_affected() == 0 {
+                    continue;
                 }
             }
+            let verified = match verifier.verify_candidate(&context, candidate).await {
+                Ok(value) => value,
+                Err(VerificationError::InvalidProof) => None,
+                Err(VerificationError::Unavailable) => return Err(PersistenceError::Unavailable),
+            };
             match verified {
                 Some(transfer) => {
-                    self.apply_usdt_transfer(&target, creator_hash, transfer)
-                        .await?;
+                    observed += usize::from(
+                        self.apply_usdt_transfer(&target, creator_hash, transfer)
+                            .await?,
+                    );
                 }
                 None => {
-                    let mut tx = self
-                        .pool
-                        .begin()
-                        .await
-                        .map_err(|_| PersistenceError::Unavailable)?;
-                    lock_active_settlement(&mut tx, target.preparation_id).await?;
-                    sqlx::query(
-                        "UPDATE usdt_observations SET present = FALSE, confirmations = 0
-                         WHERE marketplace_preparation_id = $1 AND transfer_lookup_hash = $2
-                           AND NOT finalized",
-                    )
-                    .bind(target.preparation_id)
-                    .bind(identity_hash.as_bytes().as_slice())
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|_| PersistenceError::Unavailable)?;
-                    tx.commit()
-                        .await
-                        .map_err(|_| PersistenceError::Unavailable)?;
+                    if !existing.is_some_and(|(_, present, owned)| present && owned) {
+                        continue;
+                    }
+                    self.clear_usdt_transfer(target.preparation_id, &identity_hash)
+                        .await?;
                 }
             }
         }
+        if let Some(scan) = &scan {
+            verifier
+                .finish_payment_scan(scan, observed == candidates.len())
+                .await;
+        }
         Ok(())
+    }
+
+    async fn owned_usdt_candidates(
+        &self,
+        target: &UsdtTarget,
+        creator_hash: LookupHash,
+    ) -> Result<Vec<PaymentCandidate>, PersistenceError> {
+        let observations: Vec<UsdtObservationRow> = sqlx::query_as(
+            "SELECT id, observation_envelope, transfer_lookup_hash, confirmations, finalized
+             FROM usdt_observations WHERE marketplace_preparation_id = $1 AND NOT finalized
+               AND (checked_at > NOW() OR checked_at <= NOW() -
+                 CASE WHEN present THEN INTERVAL '1 minute' ELSE INTERVAL '15 seconds' END)
+             ORDER BY checked_at, id LIMIT $2",
+        )
+        .bind(target.preparation_id)
+        .bind(MAX_SCAN_CANDIDATES as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let mut candidates = Vec::new();
+        for observation in observations {
+            let (facts, sender) =
+                self.usdt_facts(creator_hash, target.preparation_id, &observation)?;
+            if let Some(sender) = sender {
+                candidates.push(
+                    PaymentCandidate::from_observation(&facts.identity, sender)
+                        .map_err(|_| PersistenceError::CorruptOrMissing)?,
+                );
+            } else {
+                // Unsupported histories cannot sustain nonfinal credit without an attestation anchor.
+                let identity_hash = self
+                    .crypto
+                    .usdt_transfer_lookup_hash(facts.identity.as_bytes());
+                self.clear_usdt_transfer(target.preparation_id, &identity_hash)
+                    .await?;
+            }
+        }
+        Ok(candidates)
+    }
+
+    async fn clear_usdt_transfer(
+        &self,
+        preparation_id: Uuid,
+        identity_hash: &LookupHash,
+    ) -> Result<(), PersistenceError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        lock_active_settlement(&mut tx, preparation_id).await?;
+        sqlx::query("UPDATE usdt_observations SET present = FALSE, confirmations = 0, checked_at = NOW() WHERE marketplace_preparation_id = $1 AND transfer_lookup_hash = $2 AND NOT finalized")
+            .bind(preparation_id).bind(identity_hash.as_bytes().as_slice()).execute(&mut *tx).await.map_err(|_| PersistenceError::Unavailable)?;
+        tx.commit().await.map_err(|_| PersistenceError::Unavailable)
     }
 
     async fn apply_usdt_transfer(
@@ -189,7 +254,7 @@ impl MarketplacePreparationStore {
         target: &UsdtTarget,
         creator_hash: LookupHash,
         transfer: VerifiedTransfer,
-    ) -> Result<(), PersistenceError> {
+    ) -> Result<bool, PersistenceError> {
         let transfer_hash = self
             .crypto
             .usdt_transfer_lookup_hash(transfer.identity.as_bytes());
@@ -211,7 +276,7 @@ impl MarketplacePreparationStore {
             // The unique transfer identity fences a receipt owned elsewhere, and a
             // finalized receipt is never rewritten.
             if owner != Some(target.preparation_id) || finalized {
-                return Ok(());
+                return Ok(owner == Some(target.preparation_id));
             }
         }
         let id = existing.map_or_else(Uuid::new_v4, |(id, _, _)| id);
@@ -228,7 +293,8 @@ impl MarketplacePreparationStore {
                     id,
                     target.preparation_id,
                 ),
-                &postcard::to_allocvec(&facts).map_err(|_| PersistenceError::CorruptOrMissing)?,
+                &postcard::to_allocvec(&(facts, transfer.sender))
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?,
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
         let confirmations =
@@ -256,9 +322,12 @@ impl MarketplacePreparationStore {
         .await
         .map_err(|_| PersistenceError::Unavailable)?;
         if owner != Some(target.preparation_id) {
-            return Ok(());
+            return Ok(false);
         }
-        tx.commit().await.map_err(|_| PersistenceError::Unavailable)
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(true)
     }
 
     fn decode_preparation_envelope(
@@ -287,21 +356,30 @@ impl MarketplacePreparationStore {
         creator_hash: LookupHash,
         preparation_id: Uuid,
         row: &UsdtObservationRow,
-    ) -> Result<MarketplaceUsdtFacts, PersistenceError> {
-        let facts: MarketplaceUsdtFacts = postcard::from_bytes(
-            &self
-                .crypto
-                .decrypt(
-                    &EnvelopeContext::usdt_observation_for_marketplace(
-                        creator_hash,
-                        row.id,
-                        preparation_id,
-                    ),
-                    &EncryptedEnvelope::from_bytes(row.observation_envelope.clone()),
-                )
-                .map_err(|_| PersistenceError::CorruptOrMissing)?,
-        )
-        .map_err(|_| PersistenceError::CorruptOrMissing)?;
+    ) -> Result<(MarketplaceUsdtFacts, Option<[u8; 20]>), PersistenceError> {
+        let plaintext = self
+            .crypto
+            .decrypt(
+                &EnvelopeContext::usdt_observation_for_marketplace(
+                    creator_hash,
+                    row.id,
+                    preparation_id,
+                ),
+                &EncryptedEnvelope::from_bytes(row.observation_envelope.clone()),
+            )
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let (facts, suffix): (MarketplaceUsdtFacts, _) = postcard::take_from_bytes(&plaintext)
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        // Existing envelopes contain only facts; verified refreshes append the attested sender.
+        let sender = if suffix.is_empty() {
+            None
+        } else {
+            Some(
+                suffix
+                    .try_into()
+                    .map_err(|_| PersistenceError::CorruptOrMissing)?,
+            )
+        };
         if row.transfer_lookup_hash
             != self
                 .crypto
@@ -311,7 +389,7 @@ impl MarketplacePreparationStore {
         {
             return Err(PersistenceError::CorruptOrMissing);
         }
-        Ok(facts)
+        Ok((facts, sender))
     }
 
     /// Authenticates every Marketplace USDT receipt against its keyed identity hash.
@@ -386,7 +464,7 @@ impl MarketplacePreparationStore {
         let mut selected: Option<((bool, bool, bool, u32), MarketplaceUsdtStatus)> = None;
         let mut first_qualifying_at: Option<OffsetDateTime> = None;
         for row in rows {
-            let facts = self.usdt_facts(creator_hash, preparation_id, &row)?;
+            let (facts, _) = self.usdt_facts(creator_hash, preparation_id, &row)?;
             let confirmations =
                 u32::try_from(row.confirmations).map_err(|_| PersistenceError::CorruptOrMissing)?;
             let amount_matched = facts.amount >= required;

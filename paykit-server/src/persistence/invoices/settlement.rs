@@ -74,6 +74,7 @@ impl InvoiceStore {
         let usdt = if let Some(destination) = &payment.usdt {
             self.usdt_payment(tx, &row, creator_hash, destination.required_amount)
                 .await?
+                .map(|(_, payment)| payment)
         } else {
             None
         };

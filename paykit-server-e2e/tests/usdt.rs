@@ -1,20 +1,33 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use axum::{
+    Extension,
+    body::{Body, to_bytes},
+    http::{Request, StatusCode},
+};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use ed25519_dalek::{Signer, SigningKey};
+use tower::ServiceExt;
+
 use paykit_lib::{
     PaykitAppId, PaymentAmount, PaymentEndpointIdentifier, PaymentEndpointPayload,
     PaymentReference, PaymentRequestTerms,
 };
-use paykit_sdk::PaykitIdentitySecretKey;
+use paykit_sdk::{PaykitIdentitySecretKey, PaymentRequestRecord};
 use paykit_server::{
     application::{
-        payment_request_status::{PaymentRequestStatusOperations, PaymentRequestStatusSummary},
+        payment_request_status::{
+            PaymentRequestStatusError, PaymentRequestStatusOperations, PaymentRequestStatusSummary,
+        },
         semantic_intent::DeliveryIntentV1,
     },
     crypto::Crypto,
     domain::{
         invoice::CriterionAsset,
         locks::{
-            BundleId, parse_addressed_lock_resource, parse_bundle_id, parse_creator, parse_reader,
+            BundleId, CreatorPubky, parse_addressed_lock_resource, parse_bundle_id, parse_creator,
+            parse_reader,
         },
         receiving::{USDT_ENDPOINT, UsdtAddress},
     },
@@ -372,6 +385,7 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         .unwrap();
     assert_eq!(status(&store, &bundles[0]).await, (false, 0));
     rpc.chain.lock().unwrap().reorg = false;
+    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
     restarted
         .observe_usdt_request(creator_id, &creator, &record(0), &rpc.verifier, None)
         .await
@@ -382,7 +396,8 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
     let mut evidence = record(0);
     let mut incorrect = proof(1);
     incorrect.payment_reference = evidence.payment_proofs[0].payment_reference.clone();
-    evidence.payment_proofs.insert(0, incorrect.clone());
+    evidence.payment_proofs = vec![proof(0); 7];
+    evidence.payment_proofs.push(incorrect.clone());
     evidence.payment_proofs.push(incorrect);
     store
         .observe_usdt_request(
@@ -394,7 +409,19 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         )
         .await
         .unwrap();
+    store
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &evidence,
+            &rpc.verifier,
+            Some(&bundles[0]),
+        )
+        .await
+        .unwrap();
     assert_eq!(status(&store, &bundles[0]).await, (true, 2));
+    // Check provider failures independently of the conflicting attestations.
+    evidence.payment_proofs = vec![proof(0)];
     rpc.chain.lock().unwrap().unavailable = true;
     assert!(matches!(
         store
@@ -422,7 +449,7 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
         .await
         .unwrap();
     assert_eq!(status(&store, &bundles[1]).await, (false, 0));
-    let restarted = InvoiceStore::new(database.pool(), crypto);
+    let restarted = InvoiceStore::new(database.pool(), crypto.clone());
     rpc.chain.lock().unwrap().reorg = true;
     restarted
         .observe_usdt_request(
@@ -474,7 +501,425 @@ async fn invoices_share_an_address_but_never_share_payment_evidence() {
             .unwrap()
             .finalized
     );
+    rpc.chain.lock().unwrap().unavailable = false;
+    for (finalized, legacy) in [(false, false), (false, true), (true, false)] {
+        rpc.chain.lock().unwrap().finalized = finalized;
+        let (observation_id, envelope): (uuid::Uuid, Vec<u8>) = sqlx::query_as(
+            "SELECT id, observation_envelope FROM usdt_observations WHERE invoice_id = $1",
+        )
+        .bind(ids[0])
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        let context = paykit_server::crypto::EnvelopeContext::usdt_observation(
+            crypto.lookup_hash(creator.to_string().as_bytes()),
+            observation_id,
+            ids[0],
+        );
+        let plaintext = crypto
+            .decrypt(
+                &context,
+                &paykit_server::crypto::EncryptedEnvelope::from_bytes(envelope),
+            )
+            .unwrap();
+        if legacy {
+            let envelope = crypto
+                .encrypt(&context, &plaintext[..plaintext.len() - 20])
+                .unwrap();
+            sqlx::query("UPDATE usdt_observations SET observation_envelope = $1 WHERE id = $2")
+                .bind(envelope.as_bytes())
+                .bind(observation_id)
+                .execute(database.pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "UPDATE usdt_observations SET finalized = $1, present = TRUE, confirmations = 2, checked_at = NOW()",
+        )
+        .bind(finalized)
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+        let mut evidence = record(0);
+        let mut missing = proof(0);
+        missing
+            .proof
+            .insert("transaction_hash".into(), json!(format!("0x{:064x}", 2)));
+        evidence.payment_proofs.push(missing);
+        rpc.requests.lock().unwrap().clear();
+        for _ in 0..3 {
+            store
+                .observe_usdt_request(creator_id, &creator, &evidence, &verifier, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            rpc.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _)| method == "eth_getTransactionReceipt")
+                .count(),
+            1
+        );
+        assert_eq!(status(&store, &bundles[0]).await, (true, 2));
+        if !finalized {
+            let (code, body) =
+                status_response(&store, creator_id, &evidence, &verifier, &bundles[0]).await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(body["usdt_arbitrum"]["amount_matched"], true);
+            if legacy {
+                let envelope: Vec<u8> = sqlx::query_scalar(
+                    "SELECT observation_envelope FROM usdt_observations WHERE id = $1",
+                )
+                .bind(observation_id)
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+                assert_eq!(
+                    crypto
+                        .decrypt(
+                            &context,
+                            &paykit_server::crypto::EncryptedEnvelope::from_bytes(envelope)
+                        )
+                        .unwrap(),
+                    plaintext
+                );
+            }
+            // Forced refresh must not reopen discovery of the missing receipt.
+            store
+                .observe_usdt_request(creator_id, &creator, &evidence, &verifier, None)
+                .await
+                .unwrap();
+            rpc.chain.lock().unwrap().reorg = true;
+            let (code, body) =
+                status_response(&store, creator_id, &evidence, &verifier, &bundles[0]).await;
+            assert_eq!(code, StatusCode::OK);
+            assert!(body["usdt_arbitrum"].is_null());
+            assert_eq!(status(&store, &bundles[0]).await, (false, 0));
+            assert_eq!(
+                rpc.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(method, _)| method == "eth_getTransactionReceipt")
+                    .count(),
+                3,
+            );
+            rpc.chain.lock().unwrap().reorg = false;
+        }
+    }
+    // Failed background refreshes keep their durable interval, even after restart.
+    sqlx::query("UPDATE usdt_observations SET finalized = FALSE, present = TRUE")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    rpc.chain.lock().unwrap().unavailable = true;
+    for proof_count in [1, 129] {
+        sqlx::query("UPDATE usdt_observations SET checked_at = NOW() - INTERVAL '2 minutes'")
+            .execute(database.pool())
+            .await
+            .unwrap();
+        let mut evidence = record(0);
+        evidence.payment_proofs = vec![proof(0); proof_count];
+        let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+        rpc.requests.lock().unwrap().clear();
+        assert!(
+            store
+                .observe_usdt_request(creator_id, &creator, &evidence, &verifier, None)
+                .await
+                .is_err()
+        );
+        for retry in [
+            verifier.clone(),
+            ArbitrumVerifier::new(rpc.url.clone()).unwrap(),
+        ] {
+            store
+                .observe_usdt_request(creator_id, &creator, &evidence, &retry, None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            rpc.requests.lock().unwrap().len(),
+            1,
+            "one failed background attempt across restart"
+        );
+        let (code, _) =
+            status_response(&store, creator_id, &evidence, &verifier, &bundles[0]).await;
+        assert_eq!(
+            code,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "explicit reads cannot use failed refreshes as fresh facts"
+        );
+        assert_eq!(status(&store, &bundles[0]).await, (true, 2));
+    }
+    rpc.chain.lock().unwrap().unavailable = false;
+    rpc.chain.lock().unwrap().finalized = false;
+    // Status checks prioritize owned receipts even when discovery has a full batch ahead of them.
+    sqlx::query("UPDATE usdt_observations SET finalized = FALSE, present = TRUE")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let mut evidence = record(0);
+    evidence.payment_proofs.extend((1..=8).map(|index| {
+        let mut missing = proof(0);
+        missing
+            .proof
+            .insert("transaction_hash".into(), json!(format!("0x{index:064x}")));
+        missing
+    }));
+    rpc.chain.lock().unwrap().reorg = true;
+    let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+    rpc.requests.lock().unwrap().clear();
+    let (code, body) = status_response(&store, creator_id, &evidence, &verifier, &bundles[0]).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(
+        body["usdt_arbitrum"].is_null(),
+        "owned receipt must be refreshed before new discovery"
+    );
+    assert_eq!(
+        rpc.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(method, _)| method == "eth_getTransactionReceipt")
+            .count(),
+        8
+    );
+    rpc.chain.lock().unwrap().reorg = false;
+
+    // With multiple owned receipts, the status winner is checked first. Unrefreshed
+    // survivors cannot support a paid response when a bounded batch removes the others.
+    sqlx::query("UPDATE usdt_observations SET checked_at = NOW() - INTERVAL '2 minutes'")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+    store
+        .observe_usdt_request(creator_id, &creator, &record(0), &verifier, None)
+        .await
+        .unwrap();
+    let (observation_id, bytes): (uuid::Uuid, Vec<u8>) = sqlx::query_as(
+        "SELECT id, observation_envelope FROM usdt_observations WHERE invoice_id = $1",
+    )
+    .bind(ids[0])
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let creator_hash = crypto.lookup_hash(creator.to_string().as_bytes());
+    let plaintext = crypto
+        .decrypt(
+            &paykit_server::crypto::EnvelopeContext::usdt_observation(
+                creator_hash,
+                observation_id,
+                ids[0],
+            ),
+            &paykit_server::crypto::EncryptedEnvelope::from_bytes(bytes),
+        )
+        .unwrap();
+    let (_, amount, timestamp, sender): (String, u64, OffsetDateTime, [u8; 20]) =
+        postcard::from_bytes(&plaintext).unwrap();
+    for reorg in [false, true] {
+        for index in 1..=8 {
+            let id = uuid::Uuid::new_v4();
+            let identity = format!("42161:0x{index:064x}:1");
+            let envelope = crypto
+                .encrypt(
+                    &paykit_server::crypto::EnvelopeContext::usdt_observation(
+                        creator_hash,
+                        id,
+                        ids[0],
+                    ),
+                    &postcard::to_allocvec(&(identity.clone(), amount, timestamp, sender)).unwrap(),
+                )
+                .unwrap();
+            sqlx::query("INSERT INTO usdt_observations (id, invoice_id, transfer_lookup_hash, observation_envelope, confirmations, present, finalized) VALUES ($1,$2,$3,$4,2,TRUE,FALSE)")
+                .bind(id).bind(ids[0]).bind(crypto.usdt_transfer_lookup_hash(identity.as_bytes()).as_bytes().as_slice()).bind(envelope.as_bytes())
+                .execute(database.pool()).await.unwrap();
+        }
+        let mut evidence = record(0);
+        evidence.payment_proofs = vec![proof(0); 129];
+        rpc.chain.lock().unwrap().reorg = reorg;
+        for pass in 0..2 {
+            rpc.requests.lock().unwrap().clear();
+            let (code, body) =
+                status_response(&store, creator_id, &evidence, &verifier, &bundles[0]).await;
+            if reorg && pass == 0 {
+                assert_eq!(
+                    code,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "a remaining unrefreshed winner must not report paid"
+                );
+            } else {
+                assert_eq!(code, StatusCode::OK);
+                assert_eq!(body["usdt_arbitrum"].is_object(), !reorg);
+            }
+            assert!(
+                rpc.requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(method, _)| method == "eth_getTransactionReceipt")
+                    .count()
+                    <= 8
+            );
+        }
+        sqlx::query("DELETE FROM usdt_observations WHERE invoice_id = $1 AND id != $2")
+            .bind(ids[0])
+            .bind(observation_id)
+            .execute(database.pool())
+            .await
+            .unwrap();
+    }
+    rpc.chain.lock().unwrap().reorg = false;
+    // Overflowing discovery does not suppress independently owned receipt refreshes.
+    let mut evidence = record(0);
+    evidence.payment_proofs = vec![proof(0); 129];
+    sqlx::query("UPDATE usdt_observations SET finalized = FALSE")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let mut original = rpc.chain.lock().unwrap().clone();
+    original.finalized = false;
+    let mut reorg = original.clone();
+    reorg.reorg = true;
+    let mut wrong_sender = original.clone();
+    wrong_sender.receipt["logs"][1]["topics"][1] = json!(BLOCK);
+    let mut unavailable = original.clone();
+    unavailable.unavailable = true;
+    for (chain_state, paid) in [
+        (original.clone(), true),
+        (unavailable, true),
+        (reorg, false),
+        (original.clone(), true),
+        (wrong_sender, false),
+        (original, true),
+    ] {
+        let unavailable = chain_state.unavailable;
+        *rpc.chain.lock().unwrap() = chain_state;
+        sqlx::query("UPDATE usdt_observations SET checked_at = NOW() - INTERVAL '2 minutes'")
+            .execute(database.pool())
+            .await
+            .unwrap();
+        let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+        let result = store
+            .observe_usdt_request(creator_id, &creator, &evidence, &verifier, None)
+            .await;
+        assert_eq!(result.is_err(), unavailable);
+        let (code, body) =
+            status_response(&store, creator_id, &evidence, &verifier, &bundles[0]).await;
+        assert_eq!(
+            code,
+            if unavailable {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            }
+        );
+        if !unavailable {
+            assert_eq!(body["usdt_arbitrum"].is_object(), paid);
+        }
+        assert_eq!(status(&store, &bundles[0]).await.0, paid);
+    }
+    // An explicit invoice status read bypasses the present-receipt background interval.
+    rpc.chain.lock().unwrap().reorg = true;
+    let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+    let (code, body) = status_response(&store, creator_id, &evidence, &verifier, &bundles[0]).await;
+    assert_eq!(code, StatusCode::OK);
+    assert!(body["usdt_arbitrum"].is_null());
+    assert_eq!(status(&store, &bundles[0]).await, (false, 0));
+    // Finalized receipts remain available without contacting an unavailable provider.
+    rpc.chain.lock().unwrap().reorg = false;
+    rpc.chain.lock().unwrap().finalized = true;
+    sqlx::query("UPDATE usdt_observations SET checked_at = NOW() - INTERVAL '2 minutes'")
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+    let (code, body) = status_response(&store, creator_id, &evidence, &verifier, &bundles[0]).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(body["usdt_arbitrum"]["finalized"], true);
+    rpc.chain.lock().unwrap().unavailable = true;
+    rpc.requests.lock().unwrap().clear();
+    let (code, body) = status_response(&store, creator_id, &evidence, &verifier, &bundles[0]).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(body["usdt_arbitrum"]["finalized"], true);
+    assert!(rpc.requests.lock().unwrap().is_empty());
     database.cleanup().await;
+}
+
+// Supplies received SDK records at the status port; persistence, RPC, auth and HTTP are real.
+struct ReceiptStatus {
+    store: InvoiceStore,
+    creator_id: uuid::Uuid,
+    record: PaymentRequestRecord,
+    verifier: ArbitrumVerifier,
+}
+
+#[async_trait]
+impl PaymentRequestStatusOperations for ReceiptStatus {
+    async fn lookup(
+        &self,
+        creator: &CreatorPubky,
+        bundle: &BundleId,
+    ) -> Result<Option<PaymentRequestStatusSummary>, PaymentRequestStatusError> {
+        self.store
+            .observe_usdt_request(
+                self.creator_id,
+                creator,
+                &self.record,
+                &self.verifier,
+                Some(bundle),
+            )
+            .await
+            .map_err(|_| PaymentRequestStatusError::Unavailable)?;
+        PaymentRequestStatusOperations::lookup(&self.store, creator, bundle).await
+    }
+}
+
+async fn status_response(
+    store: &InvoiceStore,
+    creator_id: uuid::Uuid,
+    record: &PaymentRequestRecord,
+    verifier: &ArbitrumVerifier,
+    bundle: &BundleId,
+) -> (StatusCode, Value) {
+    use paykit_server::http::{
+        auth::signature_preimage, payment_requests::payment_requests_router,
+    };
+    let key = SigningKey::from_bytes(&[7; 32]);
+    let router = payment_requests_router(Arc::new(ReceiptStatus {
+        store: store.clone(),
+        creator_id,
+        record: record.clone(),
+        verifier: verifier.clone(),
+    }))
+    .layer(Extension(common::marketplace_rig::signed_auth(&key)));
+    let body =
+        serde_json::to_vec(&json!({"creator":CREATOR,"bundle_id":bundle.to_string()})).unwrap();
+    let signature = key.sign(&signature_preimage(
+        "POST",
+        "/payment-requests/status",
+        &body,
+    ));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/payment-requests/status")
+                .header(
+                    "X-Paykit-Signature",
+                    URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let code = response.status();
+    let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+    (code, serde_json::from_slice(&body).unwrap())
 }
 
 async fn payment_status(store: &InvoiceStore, bundle: &BundleId) -> PaymentRequestStatusSummary {
@@ -898,4 +1343,36 @@ async fn locks_ignores_a_transfer_a_marketplace_request_already_owns() {
     .await
     .unwrap();
     assert_eq!(owners, (0, 1));
+    // Evidence owned by a different request cannot keep unmatched scans hot.
+    for finalized in [false, true] {
+        sqlx::query("UPDATE usdt_observations SET finalized = $1")
+            .bind(finalized)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        let verifier = ArbitrumVerifier::new(rpc.url.clone()).unwrap();
+        let mut evidence = record(0);
+        let mut missing = proof(0);
+        missing
+            .proof
+            .insert("transaction_hash".into(), json!(format!("0x{:064x}", 2)));
+        evidence.payment_proofs.push(missing);
+        rpc.chain.lock().unwrap().receipt = Value::Null;
+        rpc.requests.lock().unwrap().clear();
+        for _ in 0..3 {
+            invoices
+                .observe_usdt_request(creator_id, &creator, &evidence, &verifier, Some(&bundle))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            rpc.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(method, _)| method == "eth_getTransactionReceipt")
+                .count(),
+            1
+        );
+    }
 }
