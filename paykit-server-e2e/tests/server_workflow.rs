@@ -445,6 +445,22 @@ fn status_request(
     )
 }
 
+fn payment_request_status_request(
+    signing_key: &SigningKey,
+    fixture: &CreatorFixture,
+    bundle: &str,
+) -> Request<Body> {
+    signed_request(
+        signing_key,
+        Method::POST,
+        "/payment-requests/status",
+        format!(
+            r#"{{"bundle_id":"{bundle}","creator":"{}"}}"#,
+            fixture.creator
+        ),
+    )
+}
+
 fn readiness_request() -> Request<Body> {
     Request::builder()
         .method(Method::GET)

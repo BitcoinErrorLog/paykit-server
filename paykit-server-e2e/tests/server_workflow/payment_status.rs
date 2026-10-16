@@ -3,7 +3,7 @@ use paykit_lib::{PaymentAmount, PaymentEndpointIdentifier, PaymentReference, Pay
 use paykit_server::{
     application::payment_request_status::PaymentRequestStatusError,
     paykit::{CreatorSessions, PaykitAdapter},
-    persistence::{InvoiceStore, OutboxStore, PaymentRequestLifecycleStore},
+    persistence::{CreatorCredentials, InvoiceStore, OutboxStore, PaymentRequestLifecycleStore},
     workers::outbox::Adapter,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -143,6 +143,179 @@ async fn status_receives_required_peer_without_consuming_unrelated_messages() {
             .len(),
         1
     );
+    drop(server);
+    pool.close().await;
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn status_route_returns_canceled_for_rotation_suppressed_proposal() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    let signing_key = SigningKey::from_bytes(&[7; 32]);
+    let config = config(database.database_url(), &signing_key, "1h");
+    let pool = initialize_database(&config).await.unwrap();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(&pool, crypto.clone());
+    let fixture = create_creator(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        CreatorSpec {
+            seed: 43,
+            account_index: 0,
+            amount_sats: 100,
+            counter_seed: 100,
+        },
+    )
+    .await;
+    let (reader, _, _) = create_peer(&bootstrap, &homeserver).await;
+    let server = Server::build_with_transports(
+        config,
+        pool.clone(),
+        pubky,
+        Arc::new(DeterministicElectrum::new(&[&fixture])),
+    )
+    .await
+    .unwrap();
+    let response = server
+        .router()
+        .oneshot(invoice_request(&signing_key, &fixture, &reader, BUNDLE_A))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let creator_id = creators.ready_ids().await.unwrap()[0];
+    let lifecycles = PaymentRequestLifecycleStore::new(&pool, crypto);
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&fixture.creator)
+        .await
+        .unwrap();
+    assert!(evidence.is_empty());
+    let current = creators.load(&fixture.creator).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        fixture.creator.clone(),
+        current.session_secret().to_owned(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: account_xpub(44, 1).into(),
+            account_index: 1,
+        }),
+        None,
+    );
+    let rotation = creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+        .await
+        .unwrap();
+    assert_eq!(rotation.cancellation_pending_count, 0);
+    assert!(
+        lifecycles
+            .required_receive_targets_for_bundle(creator_id, &parse_bundle_id(BUNDLE_A).unwrap(),)
+            .await
+            .unwrap()
+            .is_empty(),
+        "suppressed pre-handoff proposal must not require an impossible receive"
+    );
+
+    let response = server
+        .router()
+        .oneshot(payment_request_status_request(
+            &signing_key,
+            &fixture,
+            BUNDLE_A,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["request_state"], "canceled");
+    assert_eq!(body["payment_state"], "undetected");
+
+    drop(server);
+    pool.close().await;
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn status_route_returns_proposal_expired_for_expired_pre_handoff_proposal() {
+    let _testnet_guard = PUBKY_TESTNET_LOCK.lock().await;
+    let database = TestDatabase::create().await;
+    let signing_key = SigningKey::from_bytes(&[7; 32]);
+    let config = config(database.database_url(), &signing_key, "1h");
+    let pool = initialize_database(&config).await.unwrap();
+    let testnet = build_pubky_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
+    let creators = CreatorStore::new(&pool, crypto.clone());
+    let fixture = create_creator(
+        &bootstrap,
+        &homeserver,
+        &creators,
+        CreatorSpec {
+            seed: 43,
+            account_index: 0,
+            amount_sats: 100,
+            counter_seed: 100,
+        },
+    )
+    .await;
+    let (reader, _, _) = create_peer(&bootstrap, &homeserver).await;
+    let server = Server::build_with_transports(
+        config,
+        pool.clone(),
+        pubky,
+        Arc::new(DeterministicElectrum::new(&[&fixture])),
+    )
+    .await
+    .unwrap();
+    let response = server
+        .router()
+        .oneshot(invoice_request(&signing_key, &fixture, &reader, BUNDLE_A))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let creator_id = creators.ready_ids().await.unwrap()[0];
+    let outbox = OutboxStore::new(&pool, crypto.clone());
+    let claim = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(60))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(outbox.mark_proposal_expired(&claim).await.unwrap());
+    let lifecycles = PaymentRequestLifecycleStore::new(&pool, crypto);
+    assert!(
+        lifecycles
+            .required_receive_targets_for_bundle(creator_id, &parse_bundle_id(BUNDLE_A).unwrap(),)
+            .await
+            .unwrap()
+            .is_empty(),
+        "expired pre-handoff proposal must not require an impossible receive"
+    );
+
+    let response = server
+        .router()
+        .oneshot(payment_request_status_request(
+            &signing_key,
+            &fixture,
+            BUNDLE_A,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 32 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["request_state"], "proposal_expired");
+    assert_eq!(body["payment_state"], "undetected");
+
     drop(server);
     pool.close().await;
     database.cleanup().await;

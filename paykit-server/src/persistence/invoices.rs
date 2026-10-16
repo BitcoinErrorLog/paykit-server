@@ -895,7 +895,15 @@ impl InvoiceStore {
                             FROM creator_bitcoin_account_rotation_items rotation_item
                             WHERE rotation_item.invoice_id = invoices.id
                               AND rotation_item.classification = 'proposal_suppressed'
-                        ) THEN 'canceled' END
+                        ) THEN 'canceled'
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM outbox proposal
+                            WHERE proposal.invoice_id = invoices.id
+                              AND proposal.intent_kind = 'payment_request_proposal'
+                              AND proposal.status = 'permanently_failed'
+                              AND proposal.error_class = 'proposal_expired'
+                        ) THEN 'proposal_expired' END
                     ) AS request_state,
                     invoices.payment_status,
                     invoices.confirmation_count, invoices.amount_matched,
