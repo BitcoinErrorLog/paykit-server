@@ -138,21 +138,21 @@ impl PaymentRequestLifecycleStore {
                ON preparation.id = proposal.marketplace_preparation_id
              WHERE proposal.creator_id = $1
                AND proposal.intent_kind = 'payment_request_proposal'
-               AND (invoice.bitcoin_address_lookup_hash IS NOT NULL
-                    OR preparation.id IS NOT NULL)
                AND (
-                   NOT EXISTS (
+                   invoice.bitcoin_account_generation = creator.bitcoin_account_generation
+                   OR preparation.bitcoin_account_generation = creator.bitcoin_account_generation
+               )
+               AND (
+                   (proposal.status IN ('handed_off', 'delivered') AND NOT EXISTS (
                        SELECT 1 FROM payment_request_lifecycles lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
                           OR lifecycle.marketplace_preparation_id = preparation.id
-                   )
+                   ))
                    OR EXISTS (
                        SELECT 1 FROM payment_request_lifecycles lifecycle
                        WHERE (lifecycle.invoice_id = invoice.id
                               OR lifecycle.marketplace_preparation_id = preparation.id)
-                         AND lifecycle.request_state NOT IN (
-                             'proposal_expired', 'rejected', 'canceled'
-                         )
+                         AND lifecycle.request_state = 'proposed'
                    )
                )
              ORDER BY proposal.id",

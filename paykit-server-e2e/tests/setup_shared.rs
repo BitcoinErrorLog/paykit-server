@@ -42,19 +42,27 @@ mod common;
 #[path = "fixtures/sdk.rs"]
 mod sdk_fixtures;
 
-struct AccountPayloads<'a>(&'a ReaderPubky);
+struct AccountPayloads<'a> {
+    reader: &'a ReaderPubky,
+    account: u32,
+    generation: i64,
+}
 
 impl InvoicePayloadFactory for AccountPayloads<'_> {
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        Some(self.generation)
+    }
+
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         let address = derive_bip84_p2wpkh_address(
-            &account(0).to_string(),
-            0,
+            &account(self.account).to_string(),
+            self.account,
             &BitcoinNetwork::Testnet,
             child_index,
         )
         .unwrap();
         Ok(InvoicePayloads {
-            payment_request_intent: common::payment_intent(self.0, address.clone()),
+            payment_request_intent: common::payment_intent(self.reader, address.clone()),
         })
     }
 }
@@ -64,6 +72,8 @@ async fn allocate_invoice(
     creator: &CreatorPubky,
     reader: &ReaderPubky,
     binding: &[u8],
+    account: u32,
+    generation: i64,
 ) -> AtomicInvoiceResult {
     invoices
         .create_atomic(AtomicInvoiceInput {
@@ -72,7 +82,11 @@ async fn allocate_invoice(
             bundle_binding: binding,
             lock_resource_binding: binding,
             payment_request_binding: binding,
-            invoice_payloads: &AccountPayloads(reader),
+            invoice_payloads: &AccountPayloads {
+                reader,
+                account,
+                generation,
+            },
 
             proposal_acceptance_seconds: 60 * 60,
             payment_window_seconds: 24 * 60 * 60,
@@ -472,6 +486,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         .await
         .unwrap();
     let changed_account = encode_unsigned_payload(1, &account(1).encode(), &key);
+    let calls_before_rotation = publisher.calls.load(Ordering::SeqCst);
     assert_eq!(
         reconnect_payload(
             &service,
@@ -497,10 +512,71 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
             .1,
         1
     );
+    assert_eq!(
+        publisher.calls.load(Ordering::SeqCst),
+        calls_before_rotation + 1,
+        "changed-account reconnect must publish before completing setup"
+    );
 
-    // Restore the original fixture account before exercising the existing
-    // reconnect and invoice-preservation matrix below.
+    let reader = parse_reader(&contact.to_app_key()).unwrap();
+    let rotated_invoice =
+        allocate_invoice(&invoices, &creator, &reader, b"new-account-invoice", 1, 1).await;
+    let expected_address =
+        derive_bip84_p2wpkh_address(&account(1).to_string(), 1, &BitcoinNetwork::Testnet, 0)
+            .unwrap();
+    let stored_address_hash: Vec<u8> =
+        sqlx::query_scalar("SELECT bitcoin_address_lookup_hash FROM invoices WHERE id = $1")
+            .bind(rotated_invoice.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        stored_address_hash,
+        crypto
+            .bitcoin_address_lookup_hash(expected_address.as_bytes())
+            .as_bytes(),
+        "next invoice must derive from the replacement account"
+    );
+
+    sqlx::query(
+        "UPDATE outbox
+         SET status = 'delivered', sdk_outbound_message_id = '1',
+             sdk_event_id = 'event-unreachable', sdk_payment_request_id = 'request-unreachable'
+         WHERE id = $1",
+    )
+    .bind(rotated_invoice.payment_request_outbox_id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+
+    // Current handed-off work without a projected lifecycle still fails closed.
     let restored_account = encode_unsigned_payload(0, &account(0).encode(), &key);
+    assert_eq!(
+        reconnect_payload(
+            &service,
+            &bootstrap,
+            &root,
+            &creator,
+            restored_account.as_slice()
+        )
+        .await,
+        PollResult::Failed
+    );
+    assert_eq!(
+        creators
+            .load_with_bitcoin_account_generation(&creator)
+            .await
+            .unwrap()
+            .1,
+        1
+    );
+
+    // Once the unreachable target is historical, it must not block a later rotation.
+    sqlx::query("UPDATE invoices SET bitcoin_account_generation = 0 WHERE id = $1")
+        .bind(rotated_invoice.invoice_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
     assert_eq!(
         reconnect_payload(
             &service,
@@ -512,11 +588,26 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         .await,
         PollResult::Complete
     );
-    let reader = parse_reader(&contact.to_app_key()).unwrap();
-    let pending = allocate_invoice(&invoices, &creator, &reader, b"pending-before-reconnect").await;
-    assert_eq!(pending.reader_child_index(), 0);
-    let second = allocate_invoice(&invoices, &creator, &reader, b"second-before-reconnect").await;
-    assert_eq!(second.reader_child_index(), 1);
+    let pending = allocate_invoice(
+        &invoices,
+        &creator,
+        &reader,
+        b"pending-before-reconnect",
+        0,
+        2,
+    )
+    .await;
+    assert_eq!(pending.reader_child_index(), 1);
+    let second = allocate_invoice(
+        &invoices,
+        &creator,
+        &reader,
+        b"second-before-reconnect",
+        0,
+        2,
+    )
+    .await;
+    assert_eq!(second.reader_child_index(), 2);
     let before_reconnect = business_rows(&database).await;
     // An explicitly repeated account is an authenticated no-op.
     let combined = encode_unsigned_payload(0, &account(0).encode(), &key);
@@ -726,10 +817,10 @@ poll_interval = "1s"
         replay.payment_request_outbox_id(),
         pending.payment_request_outbox_id()
     );
-    assert_eq!(replay.reader_child_index(), 0);
+    assert_eq!(replay.reader_child_index(), 1);
     assert_eq!(business_rows(&database).await, before_reconnect);
-    let next = allocate_invoice(&invoices, &creator, &reader, b"after-key-rotation").await;
-    assert_eq!(next.reader_child_index(), 2);
+    let next = allocate_invoice(&invoices, &creator, &reader, b"after-key-rotation", 0, 2).await;
+    assert_eq!(next.reader_child_index(), 3);
     assert_ne!(next.invoice_id(), pending.invoice_id());
     let rotated_access = provider.load_session_access().await.unwrap().unwrap();
     assert_eq!(

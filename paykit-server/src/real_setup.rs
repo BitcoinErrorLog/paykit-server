@@ -46,6 +46,21 @@ fn stage_result<T, E>(
     }
 }
 
+fn completion_for_setup_result(result: Result<bool, ClaimError>) -> Completion {
+    match result {
+        Ok(true) => Completion::DurableSuccess,
+        Err(ClaimError::TransientUnavailable) => Completion::TransientUnavailable,
+        Ok(false) | Err(_) => Completion::DefinitiveFailure,
+    }
+}
+
+fn rotation_sync_error(error: crate::paykit::LifecycleSyncError) -> ClaimError {
+    match error {
+        crate::paykit::LifecycleSyncError::PartialReceive => ClaimError::TransientUnavailable,
+        _ => ClaimError::InvalidEnvelope,
+    }
+}
+
 /// Server capabilities for receiving payments and issuing Payment Requests.
 pub fn server_app() -> PaykitApp {
     PaykitApp::new(
@@ -346,18 +361,16 @@ impl SetupCompleter for RealSetupCompleter {
             reconnect: expected_creator.is_some(),
             bitcoin_rotation: self.bitcoin_rotation.clone(),
         };
-        match receive_verify_commit(
-            self.relay.as_ref(),
-            &commit,
-            &attempt.request,
-            &verifying_key,
-            self.relay_deadline,
+        completion_for_setup_result(
+            receive_verify_commit(
+                self.relay.as_ref(),
+                &commit,
+                &attempt.request,
+                &verifying_key,
+                self.relay_deadline,
+            )
+            .await,
         )
-        .await
-        {
-            Ok(true) => Completion::DurableSuccess,
-            Ok(false) | Err(_) => Completion::DefinitiveFailure,
-        }
     }
 }
 
@@ -513,7 +526,7 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                 let evidence = adapter
                     .reconcile_for_bitcoin_account_rotation(&mutation_guard, lifecycles)
                     .await
-                    .map_err(|_| ClaimError::InvalidEnvelope)?;
+                    .map_err(rotation_sync_error)?;
                 self.creators
                     .rotate_bitcoin_account_after_receive(lifecycles, &credentials, &evidence)
                     .await
@@ -628,6 +641,16 @@ mod tests {
         assert_eq!(
             verify_authorized_key(&substituted, &key),
             Err(ClaimError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn partial_receive_is_retryable_setup_unavailability() {
+        assert_eq!(
+            completion_for_setup_result(Err(rotation_sync_error(
+                crate::paykit::LifecycleSyncError::PartialReceive,
+            ))),
+            Completion::TransientUnavailable
         );
     }
 }

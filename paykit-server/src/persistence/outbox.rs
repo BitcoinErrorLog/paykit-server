@@ -275,6 +275,17 @@ impl OutboxStore {
                      'payment_request_proposal', \
                      'payment_request_cancellation', 'reconciliation' \
                    ) \
+                   AND NOT (o.intent_kind = 'payment_request_cancellation' AND ( \
+                       EXISTS ( \
+                           SELECT 1 FROM invoices invoice \
+                           WHERE invoice.id = o.invoice_id \
+                             AND invoice.payment_deadline <= clock_timestamp() \
+                       ) OR EXISTS ( \
+                           SELECT 1 FROM marketplace_payment_preparations preparation \
+                           WHERE preparation.id = o.marketplace_preparation_id \
+                             AND preparation.payment_deadline <= clock_timestamp() \
+                       ) \
+                   )) \
                    AND (o.intent_kind <> 'payment_request_proposal' OR ( \
                        o.proposal_lookup_hash IS NOT NULL AND (EXISTS ( \
                            SELECT 1 FROM invoices invoice \
@@ -735,19 +746,6 @@ impl OutboxStore {
             .await
     }
 
-    pub async fn mark_cancellation_expired(
-        &self,
-        claim: &ClaimedOutbox,
-    ) -> Result<bool, PersistenceError> {
-        self.transition(
-            claim,
-            "permanently_failed",
-            Some("cancellation_expired"),
-            None,
-        )
-        .await
-    }
-
     pub async fn mark_cancellation_obsolete(
         &self,
         claim: &ClaimedOutbox,
@@ -756,19 +754,6 @@ impl OutboxStore {
             claim,
             "permanently_failed",
             Some("cancellation_obsolete"),
-            None,
-        )
-        .await
-    }
-
-    pub async fn mark_handed_off_cancellation_expired(
-        &self,
-        claim: &ClaimedHandoff,
-    ) -> Result<bool, PersistenceError> {
-        self.reconciliation_transition(
-            claim,
-            "permanently_failed",
-            Some("cancellation_expired"),
             None,
         )
         .await

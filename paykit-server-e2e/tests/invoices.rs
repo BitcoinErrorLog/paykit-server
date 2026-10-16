@@ -40,6 +40,22 @@ impl InvoicePayloadFactory for GenerationPayloads {
     }
 }
 
+struct ReaderPayloads(ReaderPubky);
+impl InvoicePayloadFactory for ReaderPayloads {
+    fn expected_bitcoin_account_generation(&self) -> Option<i64> {
+        Some(0)
+    }
+
+    fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
+        Ok(InvoicePayloads {
+            payment_request_intent: common::payment_intent(
+                &self.0,
+                format!("test-address-{child_index}"),
+            ),
+        })
+    }
+}
+
 struct EmptyAddressPayloads;
 impl InvoicePayloadFactory for EmptyAddressPayloads {
     fn for_child_index(&self, _child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
@@ -199,13 +215,19 @@ async fn rotation_cancels_proposed_preserves_accepted_and_exact_replays_old_bund
         ))
         .await
         .unwrap();
+    let accepted_reader = second_reader();
+    let accepted_payloads = ReaderPayloads(accepted_reader.clone());
     let accepted = store
-        .create_atomic(input(
-            &creator,
-            &reader,
-            b"rotation-accepted-bundle",
-            b"rotation-accepted-request",
-        ))
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &accepted_reader,
+            bundle_binding: b"rotation-accepted-bundle",
+            lock_resource_binding: b"rotation-accepted-request",
+            payment_request_binding: b"rotation-accepted-request",
+            invoice_payloads: &accepted_payloads,
+            proposal_acceptance_seconds: 60 * 60,
+            payment_window_seconds: 24 * 60 * 60,
+        })
         .await
         .unwrap();
     let proposed_request_id = uuid::Uuid::new_v4().to_string();
@@ -243,6 +265,11 @@ async fn rotation_cancels_proposed_preserves_accepted_and_exact_replays_old_bund
         .required_receive_targets_for_creator_rotation(&creator)
         .await
         .unwrap();
+    assert_eq!(
+        evidence.len(),
+        1,
+        "accepted requests cannot still change rotation classification"
+    );
     let creators = CreatorStore::new(database.pool(), crypto());
     let current = creators.load(&creator).await.unwrap();
     let replacement = CreatorCredentials::new(
@@ -375,7 +402,30 @@ async fn rotation_waits_for_admitted_proposal_then_cancels_it() {
     .unwrap();
     worker_fence.release().await.unwrap();
 
-    let result = rotation.await.unwrap().unwrap();
+    assert_eq!(
+        rotation.await.unwrap(),
+        Err(PersistenceError::Unavailable),
+        "newly projected current work must invalidate stale receive evidence"
+    );
+    let evidence = lifecycles
+        .required_receive_targets_for_creator_rotation(&creator())
+        .await
+        .unwrap();
+    let current = creators.load(&creator()).await.unwrap();
+    let replacement = CreatorCredentials::new(
+        creator(),
+        "rotated-session".into(),
+        current.paykit_identity_secret().clone(),
+        Some(paykit_server::domain::receiving::BitcoinAccount {
+            xpub: "replacement-xpub".to_owned().into(),
+            account_index: 7,
+        }),
+        None,
+    );
+    let result = creators
+        .rotate_bitcoin_account_after_receive(&lifecycles, &replacement, &evidence)
+        .await
+        .unwrap();
     assert_eq!(result.cancellation_pending_count, 1);
     let cancellation_target: String = sqlx::query_scalar(
         "SELECT cancellation_target_payment_request_id FROM outbox

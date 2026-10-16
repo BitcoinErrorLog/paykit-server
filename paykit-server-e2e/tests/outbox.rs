@@ -796,7 +796,10 @@ async fn cancellation_remains_retryable_after_payment_deadline() {
             Some("payment_request_cancellation".into())
         )
     );
-    assert!(!outbox.delivery_available().await.unwrap());
+    assert!(
+        outbox.delivery_available().await.unwrap(),
+        "one stale reader-scoped cancellation must not remain a systemic outage"
+    );
     database.cleanup().await;
 }
 

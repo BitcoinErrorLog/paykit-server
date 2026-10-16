@@ -113,6 +113,7 @@ pub(crate) fn claim_failure_class(error: &ClaimError) -> SetupFailureClass {
         ClaimError::InvalidPayload => SetupFailureClass::InvalidPayload,
         ClaimError::InvalidEnvelope => SetupFailureClass::InvalidEnvelope,
         ClaimError::AuthenticationFailed => SetupFailureClass::Authentication,
+        ClaimError::TransientUnavailable => SetupFailureClass::Transport,
     }
 }
 

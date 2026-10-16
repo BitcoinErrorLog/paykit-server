@@ -93,6 +93,8 @@ pub enum ClaimError {
     InvalidEnvelope,
     #[error("companion authentication failed")]
     AuthenticationFailed,
+    #[error("setup dependencies temporarily unavailable")]
+    TransientUnavailable,
 }
 
 pub fn required_capabilities() -> String {
