@@ -300,6 +300,18 @@ pub enum LifecycleSyncError {
     PartialReceive,
 }
 
+impl LifecycleSyncError {
+    pub(crate) const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::Sdk => "sdk",
+            Self::Persistence => "persistence",
+            Self::Conflict => "conflict",
+            Self::InvalidProjection => "invalid_projection",
+            Self::PartialReceive => "partial_receive",
+        }
+    }
+}
+
 impl std::fmt::Debug for PaykitAdapter {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("PaykitAdapter { .. }")

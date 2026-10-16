@@ -44,6 +44,17 @@ pub enum ObserverError {
     Persistence,
 }
 
+impl ObserverError {
+    pub(crate) const fn diagnostic_label(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::WrongNetwork => "wrong_network",
+            Self::InvalidObservation => "invalid_observation",
+            Self::Persistence => "persistence",
+        }
+    }
+}
+
 /// Concrete synchronous Electrum client isolated behind the async observation port.
 pub struct ElectrumAdapter {
     endpoint: Arc<str>,
