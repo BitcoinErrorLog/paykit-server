@@ -56,6 +56,9 @@ mod sdk_fixtures;
 #[path = "server_workflow/connection_status.rs"]
 mod connection_status;
 
+#[path = "server_workflow/payment_drain.rs"]
+mod payment_drain;
+
 #[path = "server_workflow/payment_status.rs"]
 mod payment_status;
 

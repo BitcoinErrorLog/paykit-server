@@ -187,10 +187,10 @@ impl PaymentRequestLifecycleStore {
              WHERE invoice.creator_id = $1
                AND invoice.lock_resource_lookup_hash = $2
                AND (
-                   NOT EXISTS (
+                   (proposal.status <> 'permanently_failed' AND NOT EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
-                   )
+                   ))
                    OR EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
@@ -273,10 +273,10 @@ impl PaymentRequestLifecycleStore {
              WHERE invoice.creator_id = $1
                AND invoice.lock_resource_lookup_hash = $2
                AND (
-                   NOT EXISTS (
+                   (proposal.status <> 'permanently_failed' AND NOT EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id
-                   )
+                   ))
                    OR EXISTS (
                        SELECT 1 FROM payment_request_lifecycles AS lifecycle
                        WHERE lifecycle.invoice_id = invoice.id

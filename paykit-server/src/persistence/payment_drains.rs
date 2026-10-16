@@ -101,6 +101,7 @@ struct InvoiceLifecycleRow {
     request_state: Option<String>,
     sdk_payment_request_id: Option<String>,
     last_event_at: Option<OffsetDateTime>,
+    pre_handoff_terminal_state: Option<String>,
 }
 
 struct PreparedCancellation {
@@ -559,7 +560,23 @@ impl PaymentDrainStore {
 
         let rows = sqlx::query_as::<_, InvoiceLifecycleRow>(
             "SELECT invoices.id AS invoice_id, lifecycle.request_state,
-                    lifecycle.sdk_payment_request_id, lifecycle.last_event_at
+                    lifecycle.sdk_payment_request_id, lifecycle.last_event_at,
+                    CASE WHEN lifecycle.invoice_id IS NULL THEN
+                        CASE WHEN EXISTS (
+                            SELECT 1
+                            FROM creator_bitcoin_account_rotation_items rotation_item
+                            WHERE rotation_item.invoice_id = invoices.id
+                              AND rotation_item.classification = 'proposal_suppressed'
+                        ) THEN 'canceled'
+                        WHEN EXISTS (
+                            SELECT 1
+                            FROM outbox proposal
+                            WHERE proposal.invoice_id = invoices.id
+                              AND proposal.intent_kind = 'payment_request_proposal'
+                              AND proposal.status = 'permanently_failed'
+                              AND proposal.error_class = 'proposal_expired'
+                        ) THEN 'proposal_expired' END
+                    END AS pre_handoff_terminal_state
              FROM invoices
              LEFT JOIN payment_request_lifecycles AS lifecycle
                ON lifecycle.invoice_id = invoices.id
@@ -589,6 +606,11 @@ impl PaymentDrainStore {
                 .push(row);
         }
         for (invoice_id, attempts) in attempts_by_invoice {
+            if let Some(classification) = pre_handoff_terminal_classification(&attempts)? {
+                terminal_count += 1;
+                classifications.push((invoice_id, classification));
+                continue;
+            }
             let parsed = attempts
                 .iter()
                 .map(|attempt| {
@@ -899,6 +921,27 @@ impl PaymentDrainStore {
     }
 }
 
+/// Classifies a lifecycle-less invoice whose proposal never reached the SDK and
+/// ended terminally, matching the Payment Request status projection.
+fn pre_handoff_terminal_classification(
+    attempts: &[InvoiceLifecycleRow],
+) -> Result<Option<&'static str>, PersistenceError> {
+    let [attempt] = attempts else {
+        return Ok(None);
+    };
+    if attempt.request_state.is_some() {
+        return Ok(None);
+    }
+    let Some(state) = attempt.pre_handoff_terminal_state.as_deref() else {
+        return Ok(None);
+    };
+    match PaymentRequestLifecycleState::parse(state) {
+        Some(PaymentRequestLifecycleState::Canceled) => Ok(Some("canceled")),
+        Some(PaymentRequestLifecycleState::ProposalExpired) => Ok(Some("proposal_expired")),
+        _ => Err(PersistenceError::CorruptOrMissing),
+    }
+}
+
 fn cancellation_set_hash(crypto: &Crypto, cancellations: &[PreparedCancellation]) -> LookupHash {
     cancellation_rows_hash(
         crypto,
@@ -998,6 +1041,41 @@ mod tests {
             status: status.to_owned(),
             created_at: OffsetDateTime::UNIX_EPOCH,
         }
+    }
+
+    fn attempt(
+        request_state: Option<&str>,
+        pre_handoff_terminal_state: Option<&str>,
+    ) -> InvoiceLifecycleRow {
+        InvoiceLifecycleRow {
+            invoice_id: Uuid::nil(),
+            request_state: request_state.map(str::to_owned),
+            sdk_payment_request_id: request_state.map(|_| "request".to_owned()),
+            last_event_at: request_state.map(|_| OffsetDateTime::UNIX_EPOCH),
+            pre_handoff_terminal_state: pre_handoff_terminal_state.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn pre_handoff_terminal_classification_only_covers_lifecycle_less_terminal_proposals() {
+        assert_eq!(
+            pre_handoff_terminal_classification(&[attempt(None, Some("canceled"))]).unwrap(),
+            Some("canceled")
+        );
+        assert_eq!(
+            pre_handoff_terminal_classification(&[attempt(None, Some("proposal_expired"))])
+                .unwrap(),
+            Some("proposal_expired")
+        );
+        assert_eq!(
+            pre_handoff_terminal_classification(&[attempt(None, None)]).unwrap(),
+            None
+        );
+        assert_eq!(
+            pre_handoff_terminal_classification(&[attempt(Some("proposed"), None)]).unwrap(),
+            None
+        );
+        assert!(pre_handoff_terminal_classification(&[attempt(None, Some("accepted"))]).is_err());
     }
 
     #[test]
