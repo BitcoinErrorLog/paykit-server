@@ -4,14 +4,14 @@ name: Upstream source image
 # Dockerfile, unmodified, and publishes it under an immutable source tag.
 on:
   push:
-    branches: [cursor/upstream-image-755918e-af86]
+    branches: [cursor/upstream-image-d1ab529-af86]
 
 permissions:
   contents: read
 
 env:
   UPSTREAM_REPOSITORY: pubky/paykit-server
-  UPSTREAM_SHA: 755918ec41bfde76368213be33e86a4e21fbb5ef
+  UPSTREAM_SHA: d1ab529e5ab469868c231406755db24b906c66a8
   IMAGE_NAME: paykit-server
 
 jobs:
