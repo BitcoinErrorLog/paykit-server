@@ -920,15 +920,15 @@ sequenceDiagram
     participant S as Pubky Swaps provider
     participant LN as Lightning
     participant BTC as Bitcoin L1
-    W->>W: derive preimage P and hash H, claim key; persist intent
+    W->>W: derive preimage P and hash H, claim key, persist intent
     W->>S: paykit.intent (swap, give btc-lightning-bolt11, want btc-bitcoin-p2tr, hash H)
-    S-->>W: paykit.intent_quote (signed; htlc timeout, fee, hold invoice on H)
+    S-->>W: paykit.intent_quote (signed, htlc timeout, fee, hold invoice on H)
     W->>W: check terms, persist signed terms
     W->>LN: pay hold invoice on H (funds held, not settled)
     W->>S: paykit.intent_accept (terms_hash, sig)
     S->>BTC: lock on-chain HTLC on H to owner claim key
     S->>W: paykit.intent_status in_transit (lockup txid)
-    W->>BTC: verify lockup amount, script, timeout; claim with P
+    W->>BTC: verify lockup amount, script, timeout, claim with P
     S->>LN: settle hold invoice with P (now public)
     S->>W: paykit.intent_settled + receipt_access
 ```
@@ -976,7 +976,7 @@ sequenceDiagram
     W->>N: status poll
     N-->>W: refunded, refund txid
     W->>BTC: verify refund receipt credits own address
-    W->>W: leg status refunded; release allowance reservation; no automatic retry
+    W->>W: leg status refunded, release allowance reservation, no automatic retry
 ```
 
 ### 11.5 Hash-lock failure: solver declines after the owner funds
