@@ -1,6 +1,6 @@
 # Paykit Capabilities: one capability and intent layer for Paykit peers
 
-Design proposal for team review. Author: `BitcoinErrorLog`. 27 October 2026. Answers question 8 of the Paykit Intents draft ([BitcoinErrorLog/paykit-server#34](https://github.com/BitcoinErrorLog/paykit-server/pull/34)) and the blocker on [pubky/paykit-rs#209](https://github.com/pubky/paykit-rs/issues/209).
+Design proposal for team review. Author: `BitcoinErrorLog`. 27 October 2026; updated 29 October 2026 with the pubky-swap review on [pubky/paykit-rs#229](https://github.com/pubky/paykit-rs/issues/229#issuecomment-6459055920). Answers question 8 of the Paykit Intents draft ([BitcoinErrorLog/paykit-server#34](https://github.com/BitcoinErrorLog/paykit-server/pull/34)) and the blocker on [pubky/paykit-rs#209](https://github.com/pubky/paykit-rs/issues/209).
 
 ## Current state
 
@@ -10,8 +10,8 @@ Design proposal for team review. Author: `BitcoinErrorLog`. 27 October 2026. Ans
 4. Signing uses the Noise routing key that the identity has already authorized. There are no new identity keys, no Ring prompts and no new session scopes.
 5. paykit-rs gets one additive request: an SDK API to send and confirm messages of kinds outside `paykit.*`. It needs no wire change.
 6. The 23 Oct pubky-swap review (points A to I) is adopted as written in the swap profile (§13.1).
-7. No code exists yet. pubky-swap already ships several pieces the swap profile needs ([#95](https://github.com/coreyphillips/pubky-swap/pull/95) to [#99](https://github.com/coreyphillips/pubky-swap/pull/99), 23 Oct).
-8. The review asks are in §19.
+7. No code exists yet. pubky-swap already ships several pieces the swap profile needs ([#95](https://github.com/coreyphillips/pubky-swap/pull/95) to [#99](https://github.com/coreyphillips/pubky-swap/pull/99), 23 Oct). On 28 Oct `coreyphillips` confirmed the swap mapping at pubky-swap `main` `8686702` and took ownership of `swap/1` and `liquidity/1`; his five corrections are folded in (§6.2, §10.1, §12, §13.1).
+8. The review asks are in §19. Design review runs on [pubky/paykit-rs#229](https://github.com/pubky/paykit-rs/issues/229).
 
 ---
 
@@ -152,7 +152,7 @@ Path: `/pub/paykit/ext/capabilities/v1/apps/{app_id}.json`. There is one file pe
       "edges": [
         {"from": "btc-lightning-bolt11", "to": "btc-bitcoin-p2tr", "dir": "reverse",
          "min": "25000", "max": "5000000", "unit": "sat",
-         "fee": {"base": "100", "ppm": "2500"},
+         "fee": {"base": "100", "ppm": "2500", "onchain": "310"},
          "atomicity": "hash", "lock_profiles": ["taproot_boltz", "p2wsh"],
          "sides": ["exact_out"], "fund_within_secs": 120}
       ],
@@ -184,7 +184,7 @@ Path: `/pub/paykit/ext/capabilities/v1/apps/{app_id}.json`. There is one file pe
 - `valid_until` is required, so a descriptor that is no longer refreshed lapses.
 - The file is at most 65,536 bytes, with at most 32 profile entries and at most 64 edges per profile.
 - **Profiles are open-world, profile contents are closed-world.** A reader ignores an unknown `profile` (as LSPS0 does with unknown protocols). It treats a known profile at an unknown major version as unknown. Inside a known profile version, unknown members make that entry invalid; the rest of the descriptor stays usable.
-- **Edges** are the routing primitive that every value-moving profile shares, so a router can build a graph without parsing profile internals. `from` and `to` are Payment Endpoint Identifiers in their owner-facing format (pubky-swap review point E). Amounts are base-unit integer strings with an explicit `unit`. `atomicity` is a class from §11. `via` names any external network used internally. `lock_profiles` and `sides` are optional.
+- **Edges** are the routing primitive that every value-moving profile shares, so a router can build a graph without parsing profile internals. `from` and `to` are Payment Endpoint Identifiers in their owner-facing format (pubky-swap review point E). Amounts are base-unit integer strings with an explicit `unit`. `fee` has `base`, `ppm` and an optional `onchain` component, and the indicative fee for an amount `a` is `base + floor(a × ppm / 1,000,000) + onchain`. `min` is the minimum the provider actually enforces, which can be higher than its configured floor. A router that pre-ranks on a lower fee or a lower minimum understates cost and sends RFQs that get `amount_below_minimum`. `atomicity` is a class from §11. `via` names any external network used internally. `lock_profiles` and `sides` are optional.
 - **A descriptor binds nothing.** It reserves no liquidity and promises no price. Only a signed quote binds (§10).
 
 ### 6.3 Private descriptor
@@ -313,7 +313,7 @@ route(intent, policy, allowance?):
                 and the provider is not denied
   paths       = candidate single edges, plus two-edge paths joined on an endpoint identifier
                 (two legs at most in v1)
-  pre-rank    = indicative cost from edge fees, then atomicity, then reputation
+  pre-rank    = indicative cost from edge fees (base + ppm + onchain), then atomicity, then reputation
   ask         = top policy.fanout_budget (default 3), concurrently
   usable      = signed, valid, expiring more than 5 s from now, within intent limits,
                 funding <= balance
@@ -335,7 +335,7 @@ This is Bitkit's shipped USDT selection rule (bitkit-core `modules/usdt`, cited 
 Nothing here is a reputation system; these are its inputs:
 
 - signed quotes, which make no-shows attributable;
-- fading after commit;
+- fading after commit (a commit answered by neither a contract nor an allowed refusal, §10.1);
 - optional public settlement attestations (`paykit-cap/attestation/v1` over `contract_hash` and the outcome);
 - fidelity bonds referenced in descriptors;
 - Pubky tags on provider profiles.
@@ -344,7 +344,7 @@ Nothing here is a reputation system; these are its inputs:
 
 ### 10.1 Quote
 
-A quote is firm until `valid_until`. There is no last look before commit. Measured compact size: 717 bytes for a swap quote.
+A quote is firm on price until `valid_until`, but it reserves nothing (review point A). At commit the provider rechecks capacity, rate limits and access, so a commit on a valid quote may still be refused with `liquidity_unavailable`, `rate_limited` or `access_denied`. Those three refusals at commit are allowed and do not count as fading; the owner commits to the next quote. Fading is a commit answered by neither a contract nor one of those refusals, or by a contract on terms other than the quote's. Measured compact size: 717 bytes for a swap quote.
 
 ```json
 {"version":1,"kind":"paykit-cap.quote","app_id":"pubky-swap","event_id":"<uuid>","flow_id":"<uuid>",
@@ -410,7 +410,7 @@ Refund and timing rules per class are #34 §10.3 and §10.4, unchanged. pubky-sw
 
 `unsupported_route`, `amount_below_minimum`, `amount_above_maximum`, `liquidity_unavailable`, `pricing_unavailable`, `quote_expired`, `invalid_destination`, `invalid_request`, `unsupported_protocol`, `offer_stale`, `atomicity_unsupported`, `rate_limited`, `access_denied`, `internal_error`.
 
-All of these except `atomicity_unsupported` are pubky-swap's shipped `RejectCode` ([pubky-swap#98](https://github.com/coreyphillips/pubky-swap/pull/98)). Its query-only codes, `pending` and `not_found`, answer `status_request`. A reader treats an unknown code as a generic decline.
+All of these except `atomicity_unsupported` are pubky-swap's shipped `RejectCode` ([pubky-swap#98](https://github.com/coreyphillips/pubky-swap/pull/98)). `not_found` answers `status_request` only. `pending` answers `status_request` and also a retried or concurrent commit while the provider is still admitting it ([CLIENT_ADAPTERS.md](https://github.com/coreyphillips/pubky-swap/blob/8686702/docs/CLIENT_ADAPTERS.md)). At commit it therefore means "query again": the owner sends `status_request` or retries the same commit bytes, and never treats it as a decline. A reader treats an unknown code as a generic decline.
 
 ### 12.2 Leg status (closed)
 
@@ -445,7 +445,9 @@ These come from Bitkit's USDT stack and from pubky-swap:
 | Failure | Defence |
 | --- | --- |
 | Provider never answers the RFQ | `respond_by` passes and the router uses the other quotes. Nothing is committed |
-| Provider fades after commit (no contract) | Nothing is funded; the owner commits to the next quote. The signed quote and commit make the fade attributable |
+| Commit refused with `liquidity_unavailable`, `rate_limited` or `access_denied` | Allowed, because quotes reserve nothing. Nothing is funded; the owner commits to the next quote. Not counted as fading |
+| Commit answered with `pending` | Admission is still in progress. Query again with `status_request`; never treat it as a decline |
+| Provider fades after commit (no contract and no allowed refusal) | Nothing is funded; the owner commits to the next quote. The signed quote and commit make the fade attributable |
 | Contract reply lost | `status_request` returns the signed contract and the latest status |
 | Provider never funds after the owner's funding is final | Timeout refund on the owner's lock, or a cooperative refund where the profile supports one. Missing `fund_within_secs` is attributable |
 | Owner never claims (free option) | Short lock windows on volatile pairs; an optional `commit_fee` priced in the quote; reputation |
@@ -455,27 +457,28 @@ These come from Bitkit's USDT stack and from pubky-swap:
 
 ## 13. Profiles
 
-Each profile names its owner, its edges, the bodies of its messages and its atomicity. The swap and Paykit-features profiles are specified in enough detail to build. The others are sketches, so their owners can say whether the core fits before anyone writes them.
+Each profile names its owner, its edges, the bodies of its messages and its atomicity. The swap and Paykit-features profiles are specified in enough detail to build. The others are sketches, so their owners can say whether the core fits before anyone writes them. Owners confirmed so far: `coreyphillips` for `swap/1` and `liquidity/1` (28 Oct, on [pubky/paykit-rs#229](https://github.com/pubky/paykit-rs/issues/229#issuecomment-6459055920)). The rest are proposed or open.
 
 ### 13.1 `swap/1`: Lightning and on-chain Bitcoin swaps (first profile)
 
-Proposed owner: `coreyphillips` (pubky-swap). Atomicity: `hash`. Rails: Lightning plus P2WSH or Taproot (Boltz-compatible) HTLCs. This maps one to one onto pubky-swap's existing wire family (`swap-common/src/messages.rs` at `main`):
+Owner: `coreyphillips` (pubky-swap), confirmed on [pubky/paykit-rs#229](https://github.com/pubky/paykit-rs/issues/229#issuecomment-6459055920) (28 Oct). Atomicity: `hash`. Rails: Lightning plus P2WSH or Taproot (Boltz-compatible) HTLCs. This maps one to one onto pubky-swap's existing wire family (`swap-common/src/messages.rs` at [`8686702`](https://github.com/coreyphillips/pubky-swap/tree/8686702), confirmed by its owner):
 
 | Core | pubky-swap | Body |
 | --- | --- | --- |
-| Descriptor `swap/1` entry | `SwapOffer` | `offer_id`, `network`, edges per direction (`min_amount_sat` and `max_amount_sat`, `base_fee_sat`, `fee_ppm`, `fund_within_secs`), `htlc_timeout_blocks`, `required_confirmations`. Refreshed as fees move the minimum |
+| Descriptor `swap/1` entry | `SwapOffer` | `offer_id`, `network`, one edge per offered direction, `htlc_timeout_blocks`, `required_confirmations`. Each edge's `min` is `effective_min_amount_sat()` (the configured `min_amount_sat` raised to 10 × `onchain_fee_sat`), not `min_amount_sat`. `max` is `max_amount_sat`. `fee` is `base_fee_sat`, `fee_ppm` and `onchain_fee_sat`, matching `quote_fee()`. These values and `fund_within_secs` are offer-wide today, so both direction edges carry the same numbers. Refreshed as fees move the minimum |
 | `rfq` | `QuoteRequest` | `offer_id`, `dir`, `amount_sat`. `client_pkarr` always comes from the authenticated link, never from the body |
 | `quote` | `Quote` | Fee breakdown, `total_sat`, timeouts, `fund_within_secs`, `valid_until`. No side effects |
 | `commit` | `SwapRequest` | `lock_profile` (`p2wsh` or `taproot_boltz`, from `script_type`), `payment_hash` (H), `claim_pubkey` on reverse, `refund_pubkey` and `invoice` on submarine. A submarine invoice usually goes in a blob |
 | `contract` | `SwapAccept` | `swap_id`, `lock_profile`, `onchain_amount_sat`, `timeout_block_height`, `provider_pubkey`, the hold invoice on reverse (in a blob). The script and address may be omitted because the client derives them ([#99](https://github.com/coreyphillips/pubky-swap/pull/99)) |
 | `status` | `SwapStatusUpdate` | `SwapState::leg_status`, with the settling txid in `reference` ([#97](https://github.com/coreyphillips/pubky-swap/pull/97)) |
-| `status_request` | `SwapStatusRequest` → `SwapStatusSnapshot` | The snapshot carries the signed contract, the state and the observed txids |
+| `status_request` | `SwapStatusRequest` → `SwapStatusSnapshot` | The snapshot carries the contract (`SwapAccept`), the state and the observed txids. Nothing is signed at `main`; the snapshot returns the plain `SwapAccept`. Signing quotes and contracts, and storing the signed contract so `status_request` can return it, is adapter work |
 | `refusal` | `Reject` with `RejectCode` | §12.1 |
-| `paykit-cap.swap.refund_nonces`, `paykit-cap.swap.refund_partial` | `CoopSignature` (reserved) | A MuSig2 nonce round, then a partial signature, for a cooperative refund on a Taproot submarine swap (review point D). Deferred until pubky-swap supports cooperative signing (its roadmap Phase 8). A reverse swap needs no signature: the provider cancels the hold invoice. P2WSH has no cooperative path |
+| `paykit-cap.swap.coop_nonces`, `paykit-cap.swap.coop_partial` | `CoopSignature` (reserved for any cooperative key-path spend) | A MuSig2 nonce round, then a partial signature, for any cooperative key-path spend on a Taproot contract: a cooperative refund on a submarine swap (review point D) or a cooperative claim on a reverse swap. Deferred until pubky-swap supports cooperative signing (its roadmap Phase 8). A reverse swap's refund needs no signature: the provider cancels the hold invoice. P2WSH has no cooperative path |
 
 Profile rules:
 
 - `exact_out` only in v1. A reverse leg's `credit_min` is the locked amount, and the wallet subtracts its own claim fee when scoring (review point H).
+- One swap edge is one leg. pubky-swap's `leg_status` covers the whole route, so `status.leg` is `0` for a swap. A later split into separate Lightning and chain legs can wrap it (open in [pubky-swap#89](https://github.com/coreyphillips/pubky-swap/issues/89)).
 - The value check before revealing is pubky-swap's: one output of the right value. The draft's sum across live outputs is the stricter check that other hash profiles use.
 - Settlement keys are fresh per swap. Seed-derived preimages and keys (`HKDF(seed, "paykit-intent/P", flow_id)`) are a wallet change in Bitkit.
 - The same signed payloads may travel over iroh `pubky-swap/direct/1` for lower latency. Swap state never depends on which carrier delivered a message.
@@ -529,7 +532,7 @@ Proposed owner: open (Paykit team with Bitkit). This gives automatic cross-asset
 
 ### 13.5 `liquidity/1`: channel purchase and JIT liquidity (sketch)
 
-Proposed owner: `coreyphillips`, from [pubky-swap#84](https://github.com/coreyphillips/pubky-swap/issues/84) (Bitkit buying channels from its selected Pubky Swap provider).
+Owner: `coreyphillips`, confirmed on [pubky/paykit-rs#229](https://github.com/pubky/paykit-rs/issues/229#issuecomment-6459055920) (28 Oct). This stays a sketch until the Phase 1 contract in [pubky-swap#84](https://github.com/coreyphillips/pubky-swap/issues/84) is settled: which LSPS revisions, and whether the first release is Pubky-only or also LSPS0. #84 covers Bitkit buying channels from its selected Pubky Swap provider.
 
 - **Mapping:** the descriptor caches `lsps1.get_info` options and the `lsps2.get_info` fee menu as indicative terms. `rfq` and `quote` map to `get_info` with the LSP's signed terms; LSPS2's `promise` is already a stateless quote. `commit` maps to `create_order` or `buy`, and `contract` to the order's payment details or the `scid`. Funding is the payment. Settlement evidence is the channel funding txid and the channel becoming ready.
 - **Message bodies:** the LSPS JSON bodies travel verbatim inside `body.lsps`, so standard LSP code can be reused. LSPS0 over BOLT 8 stays the standard path, and the Pubky envelope is an adapter, as #84 already says.
@@ -606,7 +609,7 @@ A provider such as a pubky-swap daemon is a separate identity. Its operator sign
 6. **§6.4, §8.4 (`fund_within`):** the clock starts when the owner's funding is final, and the value is declared per direction (I).
 7. **§6.5:** add `status_request` (F). Use the closed refusal codes and leg statuses as pubky-swap shipped them.
 8. **§6.2, §5.3:** `exact_out` only for hash routes in v1. On a reverse leg, `credit_min` is the locked amount (H).
-9. **§10.4 and `intent_refund_consent`:** move to the swap profile as a nonce round plus a partial signature, and defer it (D).
+9. **§10.4 and `intent_refund_consent`:** move to the swap profile as `coop_nonces` and `coop_partial` (a nonce round plus a partial signature, for any cooperative key-path spend), and defer it (D).
 10. **§11.1 (first proof):** use a two-leg path: a reverse swap whose claim pays the 1Click deposit address (C). Alternatively, change the first proof (question 1).
 11. **§9 (Allowances V2):** move out of this spec. Point to `allowance-route/1` as the V1-compatible path, and leave V2 to paykit-rs.
 12. **§10.2:** add `attested` between `escrow` and `credit_bounded`.
@@ -619,7 +622,7 @@ A provider such as a pubky-swap daemon is a separate identity. Its operator sign
 | --- | --- |
 | pubky/paykit-rs (`paykit-sdk`, `paykit-ffi`) | One additive API, with no wire or registry change. (1) Queue an Event Message whose kind is outside `paykit.*` on the identity-wide outbound queue, with the same FIFO, retry and exact-bytes rules. (2) Let the app register extension kinds it understands, so the SDK confirms them with `paykit.delivery_confirmation`. (3) Read retained unknown-kind stream items by kind prefix. (4) Optionally, sign with the routing key under a caller-supplied domain. Today the library sends arbitrary kinds only in tests (`send_private_application_message_for_test`). Swift and Kotlin bindings for the same |
 | pubky/paykit-server | Verify `routed-fill-v1` inside `proof`. Publish a `paykit-features/1` descriptor for each seller app. No routing |
-| coreyphillips/pubky-swap | Own `swap/1` and `liquidity/1`. Publish the descriptor from `SwapOffer`. Add the adapter at the provider edge, over iroh first and then Encrypted Links |
+| coreyphillips/pubky-swap | Owns `swap/1` and `liquidity/1` (confirmed 28 Oct). Publish the descriptor from `SwapOffer`. Add the adapter at the provider edge, over iroh first and then Encrypted Links. The adapter signs quotes and contracts and stores the signed contract for `status_request`; nothing is signed at `main` |
 | synonymdev/bitkit-core, Bitkit apps | Router (§9), descriptor verification, profile clients, the review screen (provider, atomicity, maximum debit, trust label), routed-fill signing |
 | pubky/locks | Later: `conditional/1` with a Locks criterion as the condition |
 | Atomicity project | Later: `credit-route/1` |
@@ -642,7 +645,7 @@ A provider such as a pubky-swap daemon is a separate identity. Its operator sign
 2. **Namespace:** may descriptors and blobs live under `/pub/paykit/ext/`, which keeps the existing `/pub/paykit/:rw` session and so adds no new prompt? Should the paykit-rs specifications note `ext/` as reserved for extensions, informationally?
 3. **Cryptography** (`dzdidi`, `Jasonvdb`): is it acceptable to sign with the routing key, which is also used in X25519 path derivation, under the domain strings in §5? Or should we take the subkey fallback?
 4. **Deployed hazards:** please confirm the two rules in §8.1: no top-level `allowance_id`, and extension events only to peers that advertise them. Is there any other deployed reader behaviour that an extension kind could trip?
-5. **pubky-swap** (`coreyphillips`): does §13.1 match the code at `main` and review points A to I? Will you own `swap/1`, and `liquidity/1` from #84?
+5. **pubky-swap** (`coreyphillips`): answered 28 Oct on [pubky/paykit-rs#229](https://github.com/pubky/paykit-rs/issues/229#issuecomment-6459055920). §13.1 matches `main` at `8686702`, and points A to I are adopted correctly. His five corrections are folded into §6.2, §10.1, §12 and §13.1. He owns `swap/1`, and `liquidity/1` once the Phase 1 contract in pubky-swap#84 is settled.
 6. **Bitkit** (`ovitrif`, `ben-kaufman`): the router lives in bitkit-core. Which profiles come first? `paykit-features/1` is proposed as the cheapest. Can the review screen hold the trust labels with zero extra approvals?
 7. **paykit-server** (`dzdidi`): `routed-fill-v1` verification, and publishing `paykit-features/1` for sellers.
 8. **Ownership and home:** who owns the core spec and the profile registry? Should it be a new repository or a folder outside `paykit-lib`?
