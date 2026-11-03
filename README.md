@@ -214,7 +214,9 @@ offers the same request through a `Continue with Bitkit` deep link. On Android
 the link becomes an intent URL naming the Bitkit build for `bitcoin.network`
 (`to.bitkit`, `to.bitkit.tnet` or `to.bitkit.dev`), because Pubky Ring also
 handles `pubkyauth://` links; signet has no Bitkit build and keeps the plain
-link. The QR always carries the plain `pubkyauth://` request. Production
+link. The QR always carries the plain `pubkyauth://` request, and clicking it
+copies that request to the clipboard; in Chromium browsers the embedding iframe
+needs `allow="clipboard-write"` for the copy. Production
 has no companion handle, helper endpoint or state, helper UI, or helper in the
 production package/runtime surface.
 

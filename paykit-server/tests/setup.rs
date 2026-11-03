@@ -576,7 +576,7 @@ async fn request_json(router: axum::Router, uri: &str, payload: serde_json::Valu
 
 async fn body(response: Response) -> String {
     String::from_utf8(
-        to_bytes(response.into_body(), 32 * 1024)
+        to_bytes(response.into_body(), 64 * 1024)
             .await
             .unwrap()
             .to_vec(),
@@ -1389,7 +1389,9 @@ async fn setup_shell_matches_the_bitkit_qr_and_touch_deep_link_shape() {
         "frame-ancestors https://app.example"
     );
     let shell = body(response).await;
-    assert!(shell.contains("<main><span class=\"qr\" data-testid=\"paykit-auth-qr\">"));
+    assert!(shell.contains(
+        "<main><div class=\"qr-wrap\"><button type=\"button\" class=\"qr\" data-testid=\"paykit-auth-qr\" data-url=\"pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;\" aria-label=\"Copy authorization link\">"
+    ));
     assert!(shell.contains(
         "<a class=\"bitkit-btn\" href=\"pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;\">Continue with Bitkit</a></main>"
     ));
@@ -1400,10 +1402,12 @@ async fn setup_shell_matches_the_bitkit_qr_and_touch_deep_link_shape() {
     assert!(!shell.contains("companion"));
     assert!(!shell.contains("authenticate-paykit"));
     assert!(!shell.contains("xpub"));
-    assert_eq!(shell.matches("pubkyauth://signin?").count(), 1);
+    // The QR's copy value and the touch link.
+    assert_eq!(shell.matches("pubkyauth://signin?").count(), 2);
     assert!(shell.contains("new Set([408,425,429,502,503,504])"));
     assert!(shell.contains("delay=500"));
     assert!(shell.contains("Math.min(delay*2,5000)"));
+    assert!(shell.contains("navigator.clipboard.writeText(qr.dataset.url)"));
     assert!(shell.contains("const state=\"opaque\";const targetOrigin=\"https://app.example\""));
     assert!(shell.contains("postMessage({type:'paykit-setup-callback',state},targetOrigin)"));
     assert!(shell.contains(
@@ -1428,8 +1432,12 @@ async fn setup_iframe_escapes_the_auth_url_and_keeps_it_out_of_the_script() {
     let (instructions, script) = shell
         .split_once("<script>")
         .expect("setup shell contains polling script");
-    // The URL reaches the page only as the touch-device deep link, HTML-escaped, and never as a
-    // value the polling script could read or forward.
+    // The URL reaches the page only in the markup, HTML-escaped, as the QR's copy value and the
+    // touch-device deep link, and never in the script source.
+    assert!(
+        instructions
+            .contains(r#"data-url="pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;""#)
+    );
     assert!(instructions.contains(
         r#"<a class="bitkit-btn" href="pubkyauth://signin?secret=mock&amp;label=&lt;approve&gt;""#
     ));
@@ -1462,9 +1470,9 @@ async fn reconnect_shell(service: SetupService, creator: &str) -> String {
 
 fn qr_markup(shell: &str) -> &str {
     let start = shell
-        .find("<span class=\"qr\"")
+        .find("<button type=\"button\" class=\"qr\"")
         .expect("setup shell contains the QR");
-    let end = shell[start..].find("</span>").expect("QR span closes") + start;
+    let end = shell[start..].find("</button>").expect("QR button closes") + start;
     &shell[start..end]
 }
 
@@ -1532,7 +1540,8 @@ async fn android_reconnect_targets_bitkit_and_keeps_the_paykit_only_qr() {
         with_network
             .matches("x-bitkit-claim=paykit-access-v1")
             .count(),
-        3
+        // The touch link, its Android and iOS variants, and the QR's copy value.
+        4
     );
     assert!(!with_network.contains("watch-only-account-v1"));
     assert_eq!(qr_markup(&with_network), qr_markup(&without_network));
