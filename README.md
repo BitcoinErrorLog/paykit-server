@@ -233,6 +233,13 @@ There is no manual claim route. Completion posts only
 `{ type: "paykit-setup-callback", state }` or the same callback with a coarse
 error to the exact caller origin.
 
+As soon as it renders, before its first poll, the page also posts
+`{ type: "paykit-setup-ready", state }` once to the same origin. Embedders can keep
+the frame hidden until it arrives: an error body (`429 rate_limited`,
+`503 unavailable`, a proxy page) never sends it, so it is never shown. It is a
+separate type because a `paykit-setup-callback` without `error` means setup
+completed.
+
 Before delegation, Bitkit publishes the identity-signed Paykit Noise Key
 Authorization using `PAYKIT_AUTHORIZER_SESSION_CAPABILITIES` and
 `publish_paykit_noise_key_authorization()`, before publishing private app
