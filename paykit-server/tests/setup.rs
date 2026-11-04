@@ -1337,7 +1337,17 @@ async fn valid_setup_preserves_polling_and_secret_free_callback_shell() {
     assert!(shell.contains(
         "postMessage({type:'paykit-setup-callback',state,error:'setup-failed'},targetOrigin)"
     ));
-    assert_eq!(shell.matches("postMessage(").count(), 2);
+    assert_eq!(shell.matches("postMessage(").count(), 3);
+    // The ready report is posted once, before the first poll is scheduled.
+    let ready = "postMessage({type:'paykit-setup-ready',state},targetOrigin)";
+    assert_eq!(shell.matches(ready).count(), 1);
+    assert!(shell.find(ready).unwrap() < shell.find("setTimeout(poll,delay)").unwrap());
+    // It is the script's first statement after the constants it reads, so a throw in the Bitkit
+    // deep-link or QR clipboard wiring cannot keep a rendered page from reporting ready.
+    let script = &shell[shell.find("<script>").unwrap()..];
+    let ready_at = script.find(ready).unwrap();
+    assert!(ready_at < script.find("const bitkitButton=").unwrap());
+    assert!(ready_at < script.find("const qr=").unwrap());
     assert!(!shell.contains("</script><img"));
     assert!(shell.contains("\\u003c/script\\u003e\\u003cimg\\u003e"));
     assert!(shell.contains(r#"data-testid="paykit-auth-qr""#));
