@@ -117,7 +117,14 @@ Nothing else is needed, and no identity-key signature is added.
  "key_generation":1,"signing_key":"<base64url Ed25519 public key>","sig":"<base64url Ed25519 by the routing key>"}
 ```
 
-It holds no timestamp, it is written in JCS form, and Ed25519 signatures are deterministic (RFC 8032), so every app of the identity produces byte-identical bytes and concurrent writes cannot conflict. The file is rewritten after each key rotation. Evidence bundles embed a copy (below).
+It holds no timestamp, it is written in JCS form, and Ed25519 signatures are deterministic (RFC 8032), so every app of the identity produces byte-identical bytes for one generation, and concurrent writes for the same generation cannot conflict. The file is rewritten after each key rotation. Evidence bundles embed a copy (below).
+
+**Writing the delegation.** An app writes `signing-key.json` only for the generation that the published Noise Key Authorization names, and reads the authorization again immediately before each write. An app that holds only an older `K_g` does not write. A stale delegation makes readers reject every current-generation object of the identity at step 3 below, until it is rewritten. The check and the write are not atomic, so an app that read generation `g` just before a rotation can still overwrite the `g+1` delegation. Repair covers that window: an app on the published generation reads `signing-key.json` when it starts and before it publishes a descriptor or sends a signed object, and rewrites it when it names a lower generation or is missing. A reader whose fetched delegation names a lower generation than the authorization does not cache that result, and fetches again on its next verification.
+
+**Encodings.** These apply to every object in this document, `signing-key.json` and the §10.1 terms included:
+
+- An identity (`owner`, `provider` and every other member that names one) is the bare z-base-32 encoding of the 32-byte public key: 52 lowercase characters, with no `pubky` or `pk:` prefix and no URL form. In pubky-common this is `PublicKey::z32()`, not its `Display` form (`pubky<z32>`). A reader rejects any other form rather than normalizing it, because a signature covers the exact bytes.
+- base64url is RFC 4648 §5 without padding: 43 characters for a 32-byte key and 86 for a 64-byte signature.
 
 **Signature inputs.** Signed objects use RFC 8785 JCS, as Locks does. The subkey delegation, the descriptor and the attestation are signed with Ed25519 over
 
