@@ -235,6 +235,100 @@ async fn a_resolved_request_no_longer_awaits_its_receipt() {
     rig.cleanup().await;
 }
 
+#[tokio::test]
+async fn a_resolution_and_a_receipt_store_are_serialized() {
+    let rig = rig(
+        Seller {
+            bitcoin: true,
+            usdt: false,
+        },
+        false,
+    )
+    .await;
+    let creator_id = creator_id(&rig).await;
+    let mut invoices = Vec::new();
+    for operation in ["resolve-first-order", "store-first-order"] {
+        let (_, prepared) = rig
+            .prepare(operation, "50000", "BTC", &["BTC"], 3_600)
+            .await;
+        let invoice = invoice_id(&prepared);
+        assert_eq!(
+            rig.activate(&invoice, "50000", "BTC").await.0,
+            StatusCode::OK
+        );
+        invoices.push(invoice);
+    }
+    let (resolve_first, store_first) = (&invoices[0], &invoices[1]);
+
+    // A resolution holding the request's lock: the store waits for it, then
+    // sees the request resolved and stores nothing.
+    let resolve_first_id = Uuid::parse_str(resolve_first).unwrap();
+    let request_id = proposal_id(&rig, resolve_first).await;
+    let mut resolution = rig.database.pool().begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM marketplace_payment_preparations WHERE id = $1 FOR UPDATE")
+        .bind(resolve_first_id)
+        .execute(&mut *resolution)
+        .await
+        .unwrap();
+    let store = rig.store.clone();
+    let pending = tokio::spawn(async move {
+        store
+            .store_seller_receipt(
+                creator_id,
+                resolve_first_id,
+                &seller_receipt(&Uuid::new_v4().to_string(), request_id),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!pending.is_finished(), "the store should wait for the lock");
+    sqlx::query(
+        "UPDATE marketplace_payment_preparations
+         SET business_outcome = 'refunded', resolved_at = clock_timestamp()
+         WHERE id = $1",
+    )
+    .bind(resolve_first_id)
+    .execute(&mut *resolution)
+    .await
+    .unwrap();
+    resolution.commit().await.unwrap();
+    assert_eq!(
+        pending.await.unwrap().unwrap(),
+        SellerReceiptStored::NotOpen
+    );
+    assert_eq!(
+        receipt_route(&rig, CREATOR, resolve_first).await.1["receipt"],
+        serde_json::Value::Null
+    );
+
+    // A Receipt stored first stays after the request is resolved.
+    let receipt_id = Uuid::new_v4().to_string();
+    let request_id = proposal_id(&rig, store_first).await;
+    assert_eq!(
+        rig.store
+            .store_seller_receipt(
+                creator_id,
+                Uuid::parse_str(store_first).unwrap(),
+                &seller_receipt(&receipt_id, request_id),
+            )
+            .await
+            .unwrap(),
+        SellerReceiptStored::Stored
+    );
+    let (status, _) = rig
+        .post(
+            "/marketplace/payment-requests/resolve",
+            serde_json::json!({"creator": CREATOR, "invoice_id": store_first, "outcome": "paid_manually"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        receipt_route(&rig, CREATOR, store_first).await.1["receipt"]["receipt_id"],
+        receipt_id
+    );
+    rig.cleanup().await;
+}
+
 /// The Creator's identity on a Pubky testnet: the seller's wallet App
 /// (`bitkit`) and the server's grant share its hosted SDK state.
 struct SharedIdentity {

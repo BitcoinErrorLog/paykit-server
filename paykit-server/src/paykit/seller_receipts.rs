@@ -206,7 +206,7 @@ impl PaykitAdapter {
                 .await
             {
                 Ok(SellerReceiptStored::Stored) => stored += 1,
-                Ok(SellerReceiptStored::Unchanged) => {}
+                Ok(SellerReceiptStored::Unchanged | SellerReceiptStored::NotOpen) => {}
                 Ok(SellerReceiptStored::KeptFirst) => warn!(
                     stage = "seller_receipts",
                     step = "store",

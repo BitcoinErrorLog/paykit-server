@@ -166,7 +166,10 @@ Location, so the buyer can fetch the same Receipt. It lists the identity's issue
 and decrypts only matches, at most four per read, so the seller's other Receipts
 are never opened or stored. It does not compare amounts: the stored Receipt
 reports what the wallet said. The first accepted Receipt per request is stored
-encrypted and append-only; a different one later is logged and dropped. Attribution
+encrypted and append-only; a different one later is logged and dropped. The store
+locks the request's row, as resolution and voiding do, and stores only while the
+request is still open, so a request resolved first gets no Receipt and a Receipt
+stored first stays after resolution. Attribution
 by App ID assumes the identity's Apps write their own App ID honestly: the shared
 state does not authenticate which App wrote a record.
 

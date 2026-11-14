@@ -629,7 +629,7 @@ and persistence distinctions without formatting their source errors. Pubky's
 URL-bearing AUTH relay targets are disabled at every log level; application-owned
 setup stages provide the safe replacement diagnostics.
 
-On SIGTERM or SIGINT, readiness changes first, normal admission and new worker claims stop, and admitted work drains for at most `shutdown.drain_timeout`. Remaining work is cancelled at the deadline, except Allowance intake: it starts no new read once shutdown begins, but a read already running is an SDK mutation and is awaited past the deadline. Each Creator has at most one read running; it waits at most 20 seconds for the Creator lock, its work is bounded by the SDK's per-link record cap, and each of its Pubky requests times out after 30 seconds. Durable leases can be reclaimed after restart; pending memory-only setup flows are lost.
+On SIGTERM or SIGINT, readiness changes first, normal admission and new worker claims stop, and admitted work drains for at most `shutdown.drain_timeout`. Remaining work is cancelled at the deadline, except Allowance intake and the seller Receipt reader: neither starts a new read once shutdown begins, but a read already running holds the shared-state lock and is awaited past the deadline. For Allowance intake, each Creator has at most one read running; it waits at most 20 seconds for the Creator lock, its work is bounded by the SDK's per-link record cap, and each of its Pubky requests times out after 30 seconds. Durable leases can be reclaimed after restart; pending memory-only setup flows are lost.
 
 ## Invoice and delivery semantics
 

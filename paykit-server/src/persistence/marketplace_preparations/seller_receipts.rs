@@ -42,6 +42,9 @@ pub enum SellerReceiptStored {
     Unchanged,
     /// Another Receipt was already stored for the invoice; it is kept.
     KeptFirst,
+    /// The request was resolved, voided or never proposed before this Receipt
+    /// could be stored; nothing is stored.
+    NotOpen,
 }
 
 #[derive(sqlx::FromRow)]
@@ -155,40 +158,65 @@ impl MarketplacePreparationStore {
                 &plaintext,
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let inserted = sqlx::query(
-            "INSERT INTO marketplace_seller_receipts
-             (preparation_id, creator_id, receipt_lookup_hash, receipt_envelope)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT (preparation_id) DO NOTHING",
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        // Lock the request as `resolve` and `void` do, so a resolution either
+        // commits first and is seen here, or waits until this Receipt is stored.
+        let open: Option<bool> = sqlx::query_scalar(
+            "SELECT preparation.state = 'active'
+                    AND preparation.business_outcome IS NULL
+                    AND EXISTS (SELECT 1 FROM outbox
+                                WHERE outbox.marketplace_preparation_id = preparation.id
+                                  AND outbox.intent_kind = 'payment_request_proposal')
+             FROM marketplace_payment_preparations preparation
+             WHERE preparation.id = $1 AND preparation.creator_id = $2
+             FOR UPDATE OF preparation",
         )
         .bind(invoice_id)
         .bind(creator_id)
-        .bind(receipt_hash.as_bytes().as_slice())
-        .bind(envelope.as_bytes())
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|error| match error {
-            sqlx::Error::Database(_) => PersistenceError::CorruptOrMissing,
-            _ => PersistenceError::Unavailable,
-        })?;
-        if inserted.rows_affected() == 1 {
-            return Ok(SellerReceiptStored::Stored);
-        }
-        let stored: Vec<u8> = sqlx::query_scalar(
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let open = open.ok_or(PersistenceError::CorruptOrMissing)?;
+        let stored: Option<Vec<u8>> = sqlx::query_scalar(
             "SELECT receipt_lookup_hash FROM marketplace_seller_receipts
              WHERE preparation_id = $1 AND creator_id = $2",
         )
         .bind(invoice_id)
         .bind(creator_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(|_| PersistenceError::Unavailable)?
-        .ok_or(PersistenceError::CorruptOrMissing)?;
-        if stored_hash(&stored)? == receipt_hash {
-            Ok(SellerReceiptStored::Unchanged)
-        } else {
-            Ok(SellerReceiptStored::KeptFirst)
-        }
+        .map_err(|_| PersistenceError::Unavailable)?;
+        let outcome = match stored {
+            Some(stored) if stored_hash(&stored)? == receipt_hash => SellerReceiptStored::Unchanged,
+            Some(_) => SellerReceiptStored::KeptFirst,
+            None if !open => SellerReceiptStored::NotOpen,
+            None => {
+                sqlx::query(
+                    "INSERT INTO marketplace_seller_receipts
+                     (preparation_id, creator_id, receipt_lookup_hash, receipt_envelope)
+                     VALUES ($1, $2, $3, $4)",
+                )
+                .bind(invoice_id)
+                .bind(creator_id)
+                .bind(receipt_hash.as_bytes().as_slice())
+                .bind(envelope.as_bytes())
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| match error {
+                    sqlx::Error::Database(_) => PersistenceError::CorruptOrMissing,
+                    _ => PersistenceError::Unavailable,
+                })?;
+                SellerReceiptStored::Stored
+            }
+        };
+        tx.commit()
+            .await
+            .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(outcome)
     }
 
     async fn seller_receipt_snapshot(
