@@ -30,6 +30,7 @@ use paykit_server::{
         invoice_pricing::ExchangeRates,
         marketplace_lifecycle::MarketplaceLifecycleService,
         marketplace_preparation::PrepareMarketplaceService,
+        marketplace_receipt::MarketplaceReceiptService,
         marketplace_status::MarketplaceStatusService,
     },
     bitcoin::{ObservationTarget, ObservedOutput},
@@ -40,6 +41,7 @@ use paykit_server::{
         auth::{SignedServiceAuth, signature_preimage},
         marketplace_lifecycle::marketplace_lifecycle_router,
         marketplace_preparation::marketplace_preparation_router,
+        marketplace_receipt::marketplace_receipt_router,
         marketplace_status::marketplace_status_router,
     },
     persistence::{CreatorCredentials, CreatorStore, MarketplacePreparationStore, run_migrations},
@@ -56,6 +58,7 @@ pub const STATUS_FIXTURES: &str = "marketplace-payment-request-status";
 pub const PREPARE: &str = "/marketplace/payment-requests/prepare";
 pub const ACTIVATE: &str = "/marketplace/payment-requests/activate";
 pub const STATUS: &str = "/marketplace/payment-requests/status";
+pub const RECEIPT: &str = "/marketplace/payment-requests/receipt";
 pub const VOLATILE: [(&str, &str); 4] = [
     ("invoice_id", "4c6e66c7-8a8b-4d54-b97b-340cedb3e1d0"),
     ("prepare_expires_at", "2026-10-23T09:15:00Z"),
@@ -229,26 +232,34 @@ pub async fn rig_with(
     prepare_ttl: Duration,
     request_deadline: Option<Duration>,
 ) -> Rig {
+    let credentials = CreatorCredentials::new(
+        creator(),
+        "session-secret".into(),
+        PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+        seller
+            .bitcoin
+            .then(|| paykit_server::domain::receiving::BitcoinAccount {
+                xpub: account_xpub().into(),
+                account_index: 0,
+            }),
+        seller
+            .usdt
+            .then(|| USDT_ADDRESS.to_owned().try_into().unwrap()),
+    );
+    rig_for(credentials, usdt_enabled, prepare_ttl, request_deadline).await
+}
+
+/// A rig for any Creator, such as one with live Pubky credentials.
+pub async fn rig_for(
+    credentials: CreatorCredentials,
+    usdt_enabled: bool,
+    prepare_ttl: Duration,
+    request_deadline: Option<Duration>,
+) -> Rig {
     let database = TestDatabase::create().await;
     run_migrations(database.pool()).await.unwrap();
     let creators = CreatorStore::new(database.pool(), crypto());
-    creators
-        .create(&CreatorCredentials::new(
-            creator(),
-            "session-secret".into(),
-            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
-            seller
-                .bitcoin
-                .then(|| paykit_server::domain::receiving::BitcoinAccount {
-                    xpub: account_xpub().into(),
-                    account_index: 0,
-                }),
-            seller
-                .usdt
-                .then(|| USDT_ADDRESS.to_owned().try_into().unwrap()),
-        ))
-        .await
-        .unwrap();
+    creators.create(&credentials).await.unwrap();
     let store = Arc::new(MarketplacePreparationStore::new(database.pool(), crypto()));
     let feed = Arc::new(Feed {
         price: std::sync::Mutex::new("81000"),
@@ -278,10 +289,12 @@ pub async fn rig_with(
         Duration::from_secs(30 * 60),
     ));
     let status = Arc::new(MarketplaceStatusService::new(store.clone()));
+    let receipt = Arc::new(MarketplaceReceiptService::new(store.clone()));
     let key = SigningKey::from_bytes(&[11; 32]);
     let router = marketplace_preparation_router(preparation)
         .merge(marketplace_lifecycle_router(lifecycle))
         .merge(marketplace_status_router(status))
+        .merge(marketplace_receipt_router(receipt))
         .layer(Extension(signed_auth(&key)));
     Rig {
         database,

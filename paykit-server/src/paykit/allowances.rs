@@ -325,7 +325,7 @@ impl PaykitAdapter {
 
 /// The Locks Reader identity of a linked peer, in the canonical form invoice
 /// admission hashes.
-fn reader_of(peer: &PubkyPublicKey) -> Option<ReaderPubky> {
+pub(super) fn reader_of(peer: &PubkyPublicKey) -> Option<ReaderPubky> {
     parse_reader(&format!("pubky{peer}")).ok()
 }
 

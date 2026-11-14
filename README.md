@@ -48,13 +48,15 @@ Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report sec
 
 The [architecture contract](docs/architecture.md) describes shared identity,
 credential ownership, and immutable invoice attribution. Rust dependencies pin
-`paykit-lib` and `paykit-sdk` to the paykit-rs `v0.1.1-rc8` release tag in
-`Cargo.toml`, and `Cargo.lock` records its commit
-`adbe24aca6b326d28312abb7e73e8aa6a0392882`. Paykit release candidates are
+`paykit-lib` and `paykit-sdk` in `Cargo.toml` to paykit-rs commit
+`98bc8da957c61b0e37ff44e1bbc43b1b2695c325`, the head of
+[pubky/paykit-rs#358](https://github.com/pubky/paykit-rs/pull/358), which adds
+reading a Receipt another App on the identity issued. That commit is pinned
+until a Paykit release tag containing it is published. Paykit release candidates are
 published as Git tags, not on crates.io. The server does not count payment
 evidence earlier than its own Payment Request proposal record time, less a
 payment-method tolerance, as paying the request
-([Payment time and attribution](https://github.com/pubky/paykit-rs/blob/v0.1.1-rc8/specs/payment-requests.md#payment-time-and-attribution)).
+([Payment time and attribution](https://github.com/pubky/paykit-rs/blob/98bc8da957c61b0e37ff44e1bbc43b1b2695c325/specs/payment-requests.md#payment-time-and-attribution)).
 Direct `pubky` and `pubky-testnet` dependencies are pinned to `0.16.2`.
 
 Shared-state recovery requires Homeserver `0.16.2` or newer with the required GCS
@@ -90,6 +92,7 @@ Business routes:
 - signed `POST /marketplace/payment-requests/void`
 - signed `POST /marketplace/payment-requests/resolve`
 - signed `POST /marketplace/payment-requests/status`
+- signed `POST /marketplace/payment-requests/receipt`
 - signed `POST /connections/status`
 - signed `POST /transactions/status`
 - signed `POST /setup/status`
@@ -256,6 +259,21 @@ are never combined. `payment_state` is `confirmed` when either rail has an inclu
 payment, `detected` when a receipt is present with no confirmations, and `expired` once the
 deadline has passed with no qualifying payment on either rail. Fixtures captured from the
 real services are under `docs/fixtures/marketplace-payment-request-status/`.
+
+`POST /marketplace/payment-requests/receipt` takes the same closed
+`{"creator","invoice_id"}` input and returns the Receipt the seller's wallet issued
+for that request, as `{"invoice_id", "receipt"}`. `receipt` is `null` until one is
+stored, then `receipt_id`, `app_id` (the issuing App), `payment_request_id`,
+`payment_reference`, `payment_endpoint_identifier`, `amount` (`{"value","currency"}`
+or `null`), `metadata` (the Receipt Metadata object, such as `{"txid": ...}` for
+on-chain and USDT payments or `{"payment_hash": ...}` for Lightning), `issued_at`
+(when the wallet recorded it) and `stored_at`. It reads only persisted state, never
+Pubky or the SDK; unknown invoices and wrong Creators return the same `404`. The
+amount is reported as the Receipt states it, not checked against the request: a
+partial or larger payment is the seller's to judge. Receipts are read only with
+`paykit.marketplace_seller_receipts = true` (off by default); see
+[Seller Receipts](docs/architecture.md#seller-receipts). The status response is
+unchanged.
 
 Marketplace lifecycle conflicts use recovery-specific `409` codes. `prepare_expired`
 requires a new preparation attempt; `lifecycle_terminal` means activation lost to
@@ -722,7 +740,9 @@ response fixtures for Locks are published under
 
 The server receives and durably projects Paykit Payment Request acceptance, rejection, proof, and cancellation records from the identity's shared SDK state. It exposes no payer inbox or proof-submission API. Direct invoice-address observation remains the only Bitcoin payment-attribution input; Paykit Server never decides Locks access.
 
-Paykit Receipt issuance, Receipt Access delivery, and receipt storage are unsupported.
+Paykit Server never issues Receipts or delivers Receipt Access. It stores only the
+Receipt a seller's wallet issued for a Marketplace request, read from the
+Creator's shared SDK state (see [Seller Receipts](docs/architecture.md#seller-receipts)).
 
 ## Retention and data lifecycle
 

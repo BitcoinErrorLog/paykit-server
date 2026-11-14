@@ -1856,6 +1856,7 @@ async fn assert_public_sdk_handoff(creator_initiates: bool) {
         conversion_payment_window: std::time::Duration::from_secs(3600),
         marketplace_prepare_ttl: Duration::from_secs(15 * 60),
         allowance_intake: false,
+        marketplace_seller_receipts: false,
     };
     let sessions = CreatorSessions::new(creators.clone(), testnet.sdk().unwrap(), config.clone());
     let provider = sessions.provider(&creator);

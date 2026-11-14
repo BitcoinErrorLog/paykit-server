@@ -8,7 +8,10 @@ use thiserror::Error;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
+mod seller_receipts;
 mod usdt;
+
+pub use seller_receipts::{OpenSellerReceiptRequest, SellerReceiptStored};
 
 use crate::{
     application::{

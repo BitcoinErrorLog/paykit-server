@@ -352,6 +352,20 @@ fn allowance_intake_is_off_by_default_and_can_be_enabled() {
 }
 
 #[test]
+fn marketplace_seller_receipts_are_off_by_default_and_can_be_enabled() {
+    let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
+    assert!(!config.paykit.marketplace_seller_receipts);
+
+    let enabled = valid_toml().replace(
+        "network = \"testnet\"\n\n[bitcoin]",
+        "network = \"testnet\"\nmarketplace_seller_receipts = true\n\n[bitcoin]",
+    );
+    assert!(enabled.contains("marketplace_seller_receipts = true"));
+    let config = Config::from_toml_and_environment(&enabled, environment()).unwrap();
+    assert!(config.paykit.marketplace_seller_receipts);
+}
+
+#[test]
 fn rejects_removed_retention_section() {
     let config = format!("{}\n[retention]\ncleanup_batch_size = 100\n", valid_toml());
 

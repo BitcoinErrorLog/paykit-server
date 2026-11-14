@@ -5,7 +5,7 @@ use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
 use uuid::Uuid;
 
-const REQUIRED_TABLES: [&str; 14] = [
+const REQUIRED_TABLES: [&str; 15] = [
     "deployment_metadata",
     "creators",
     "reader_assignments",
@@ -20,6 +20,7 @@ const REQUIRED_TABLES: [&str; 14] = [
     "invoice_provider_v2",
     "invoice_provider_v2_current_sample",
     "invoice_provider_v2_first_threshold_evidence",
+    "marketplace_seller_receipts",
 ];
 
 const PRE_SETTLEMENT_MIGRATIONS: [&str; 13] = [

@@ -43,6 +43,12 @@ marketplace_prepare_ttl = "15m"
 # on where readers send Allowances. Each read is one SDK call bounded by the
 # per-link record cap, run under the Creator mutation lock.
 allowance_intake = false
+# Read the Receipts the seller's wallet issues for Marketplace requests, so
+# POST /marketplace/payment-requests/receipt can report them. Off by default.
+# Reads take the Creator's shared-state lock, which Bitkit also needs: at most
+# one per Creator every 30 seconds, only while a Marketplace request is open
+# without a stored seller Receipt.
+marketplace_seller_receipts = false
 # "testnet" targets the pinned Pubky client's fixed localhost testnet ports.
 # Run the Pubky static testnet; this is not a hosted public network.
 network = "testnet"

@@ -3,6 +3,7 @@ pub mod create_invoice;
 pub mod invoice_pricing;
 pub mod marketplace_lifecycle;
 pub mod marketplace_preparation;
+pub mod marketplace_receipt;
 pub mod marketplace_status;
 pub mod marketplace_terms;
 pub mod payment_drain;

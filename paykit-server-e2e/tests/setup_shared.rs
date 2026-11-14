@@ -411,6 +411,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
         conversion_payment_window: std::time::Duration::from_secs(3600),
         marketplace_prepare_ttl: Duration::from_secs(15 * 60),
         allowance_intake: false,
+        marketplace_seller_receipts: false,
     };
     let sessions = CreatorSessions::new(creators.clone(), client.clone(), paykit_config.clone());
     let publisher = Arc::new(FailAfterPublication {
@@ -1281,6 +1282,7 @@ signed_burst = 200
                 conversion_payment_window: Duration::from_secs(3600),
                 marketplace_prepare_ttl: Duration::from_secs(15 * 60),
                 allowance_intake: false,
+                marketplace_seller_receipts: false,
             },
         );
         let completer = RealSetupCompleter::new(
