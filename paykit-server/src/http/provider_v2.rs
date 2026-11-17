@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::{
-    application::provider_v2::{ProviderV2CreateRequest, ProviderV2Error, ProviderV2Service},
+    application::{
+        payment_request_status::{BitcoinPaymentStatus, UsdtPaymentStatus},
+        provider_v2::{ProviderV2CreateRequest, ProviderV2Error, ProviderV2Service},
+    },
     domain::{
         locks::{parse_addressed_lock_resource, parse_bundle_id, parse_creator, parse_reader},
         provider_v2::{ProviderV2Payment, ProviderV2Sample},
@@ -66,6 +69,10 @@ struct StatusResponse {
     minimum_confirmations: u8,
     current_sample: Option<SampleResponse>,
     first_threshold_satisfied: Option<SampleResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bitcoin: Option<Option<BitcoinPaymentStatus>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usdt_arbitrum: Option<Option<UsdtPaymentStatus>>,
 }
 
 #[derive(Serialize)]
@@ -179,6 +186,7 @@ fn create_response(result: ProviderV2CreateResult) -> Result<CreateResponse, Api
 }
 
 fn status_response(summary: ProviderV2Status) -> Result<StatusResponse, ApiError> {
+    let include_rail_status = summary.asset.as_str() == "USDT";
     Ok(StatusResponse {
         creator: summary.creator,
         bundle_id: summary.bundle_id,
@@ -196,13 +204,15 @@ fn status_response(summary: ProviderV2Status) -> Result<StatusResponse, ApiError
             .deadline
             .format(&Rfc3339)
             .map_err(|_| ApiError::InternalError)?,
-        asset: "BTC",
+        asset: summary.asset.as_str(),
         minimum_confirmations: summary.minimum_confirmations,
         current_sample: summary.current_sample.map(sample_response).transpose()?,
         first_threshold_satisfied: summary
             .first_threshold_satisfied
             .map(sample_response)
             .transpose()?,
+        bitcoin: include_rail_status.then_some(summary.bitcoin),
+        usdt_arbitrum: include_rail_status.then_some(summary.usdt_arbitrum),
     })
 }
 
@@ -292,6 +302,25 @@ mod tests {
         let mut invalid = body();
         invalid.deadline = "2030-01-01T00:00:00.000000001Z".into();
         assert_eq!(parse_create(invalid).unwrap_err(), ApiError::InvalidRequest);
+    }
+
+    #[test]
+    fn exact_btc_and_usdt_wire_fixtures_parse_as_base_units() {
+        let btc: CreateBody = serde_json::from_str(include_str!(
+            "../../../docs/fixtures/provider-v2/create-btc.json"
+        ))
+        .unwrap();
+        let btc = parse_create(btc).unwrap();
+        assert_eq!(btc.payment.asset().as_str(), "BTC");
+        assert_eq!(btc.payment.amount_units(), 1);
+
+        let usdt: CreateBody = serde_json::from_str(include_str!(
+            "../../../docs/fixtures/provider-v2/create-usdt.json"
+        ))
+        .unwrap();
+        let usdt = parse_create(usdt).unwrap();
+        assert_eq!(usdt.payment.asset().as_str(), "USDT");
+        assert_eq!(usdt.payment.amount_units(), 5_000_001);
     }
 
     #[test]

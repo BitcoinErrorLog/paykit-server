@@ -235,6 +235,11 @@ pub trait InvoicePayloadFactory: Send + Sync {
         None
     }
 
+    /// Maximum lifetime for a fixed cross-asset quote, when one is used.
+    fn maximum_payment_seconds(&self) -> Option<u64> {
+        None
+    }
+
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError>;
 }
 
@@ -527,6 +532,7 @@ impl InvoiceStore {
              WHERE payment_expired_at IS NULL
                AND payment_deadline < $1
                AND EXISTS (SELECT 1 FROM invoice_provider_v2 provider WHERE provider.invoice_id = invoices.id)
+               AND first_amount_matched_observed_at IS NULL
                AND NOT EXISTS (SELECT 1 FROM invoice_provider_v2_first_threshold_evidence evidence WHERE evidence.invoice_id = invoices.id)",
         )
         .bind(observed_at)
@@ -966,6 +972,16 @@ impl InvoiceStore {
         transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         invoice_id: Uuid,
     ) -> Result<Option<PaymentRequestStatusSummary>, PersistenceError> {
+        self.payment_request_status_by_invoice_with_fallback(transaction, invoice_id, None)
+            .await
+    }
+
+    async fn payment_request_status_by_invoice_with_fallback(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        invoice_id: Uuid,
+        request_state_fallback: Option<PaymentRequestLifecycleState>,
+    ) -> Result<Option<PaymentRequestStatusSummary>, PersistenceError> {
         let row = sqlx::query_as::<_, PaymentRequestStatusRow>(
             "SELECT COALESCE(
                         lifecycle.request_state,
@@ -1023,7 +1039,7 @@ impl InvoiceStore {
             return Ok(None);
         };
         let usdt = self.usdt_payment_status(transaction, invoice_id).await?;
-        row.into_summary(usdt).map(Some)
+        row.into_summary(usdt, request_state_fallback).map(Some)
     }
 
     /// Records one direct, invoice-address-specific output observation. The
@@ -2052,12 +2068,14 @@ impl PaymentRequestStatusRow {
     fn into_summary(
         self,
         usdt: Option<UsdtPaymentStatus>,
+        request_state_fallback: Option<PaymentRequestLifecycleState>,
     ) -> Result<PaymentRequestStatusSummary, PersistenceError> {
         let row = self;
         let request_state = row
             .request_state
             .as_deref()
             .and_then(PaymentRequestLifecycleState::parse)
+            .or(request_state_fallback)
             .ok_or(PersistenceError::CorruptOrMissing)?;
         let payment_state = if row.payment_expired_at.is_some() {
             PaymentState::Expired

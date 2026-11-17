@@ -277,17 +277,25 @@ impl Server {
                     .map_err(|_| ServerBuildError::ExchangeRates)?,
             )),
         );
-        let provider_v2_service = Arc::new(ProviderV2Service::new(
-            session_validator.clone(),
-            Arc::new(PubkyAppRegistryDiscovery {
-                storage: pubky.public_storage(),
-            }),
-            Arc::new(creators.clone()),
-            invoices.clone(),
-            config.paykit.app_id.clone(),
-            config.deployment_invariants().bitcoin_network.clone(),
-            config.paykit.proposal_acceptance_window,
-        ));
+        let provider_v2_service = Arc::new(
+            ProviderV2Service::new(
+                session_validator.clone(),
+                Arc::new(PubkyAppRegistryDiscovery {
+                    storage: pubky.public_storage(),
+                }),
+                Arc::new(creators.clone()),
+                invoices.clone(),
+                config.paykit.app_id.clone(),
+                config.deployment_invariants().bitcoin_network.clone(),
+                config.paykit.proposal_acceptance_window,
+            )
+            .with_usdt(usdt.is_some())
+            .with_conversion_payment_window(config.paykit.conversion_payment_window)
+            .with_exchange_rates(Arc::new(
+                crate::application::invoice_pricing::BlocktankRates::new()
+                    .map_err(|_| ServerBuildError::ExchangeRates)?,
+            )),
+        );
         let marketplace_preparation_service = Arc::new(
             PrepareMarketplaceService::new(
                 session_validator.clone(),

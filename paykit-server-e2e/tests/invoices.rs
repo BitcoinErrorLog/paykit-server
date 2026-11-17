@@ -9,14 +9,19 @@ use axum::{
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use bitcoin::hashes::{Hash, sha256};
 use ed25519_dalek::{Signer, SigningKey};
-use paykit_lib::{PaykitAppId, PaykitAppRegistry};
+use paykit_lib::{
+    PaykitAppId, PaykitAppRegistry, PaymentAmount, PaymentEndpointIdentifier,
+    PaymentEndpointPayload, PaymentReference, PaymentRequestTerms,
+};
 use paykit_sdk::PaykitIdentitySecretKey;
 use paykit_server::{
     application::{
         create_invoice::{
-            AppRegistryDiscovery, CreatorReceivingProvider, ReaderAuthorization, ReceivingDetails,
-            RegistryDiscoveryError, SessionValidationError, SessionValidator,
+            AppRegistryDiscovery, CreateInvoiceError, CreatorReceivingProvider,
+            ReaderAuthorization, ReceivingDetails, RegistryDiscoveryError, SessionValidationError,
+            SessionValidator,
         },
+        invoice_pricing::ExchangeRates,
         payment_request_status::{PaymentRequestStatusOperations, PaymentState},
         provider_v2::{
             ProviderV2CreateRequest, ProviderV2Error, ProviderV2Service, provider_v2_request_hash,
@@ -29,7 +34,11 @@ use paykit_server::{
         CreatorPubky, ReaderPubky, parse_addressed_lock_resource, parse_bundle_id, parse_creator,
         parse_reader,
     },
-    domain::{payment::BitcoinOutpoint, provider_v2::ProviderV2Payment},
+    domain::{
+        payment::BitcoinOutpoint,
+        provider_v2::{ProviderV2Asset, ProviderV2Payment},
+        receiving::USDT_ENDPOINT,
+    },
     http::{
         auth::{SignedServiceAuth, signature_preimage},
         provider_v2::provider_v2_router,
@@ -56,6 +65,44 @@ impl InvoicePayloadFactory for TestPayloads {
     fn for_child_index(&self, child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
         Ok(InvoicePayloads {
             payment_request_intent: payment_intent(format!("test-address-{child_index}")),
+        })
+    }
+}
+
+struct UsdtPayloads {
+    reader: ReaderPubky,
+    amount: &'static str,
+    reference: String,
+}
+impl InvoicePayloadFactory for UsdtPayloads {
+    fn for_child_index(&self, _child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
+        let endpoint = PaymentEndpointIdentifier::new(USDT_ENDPOINT).unwrap();
+        let terms = PaymentRequestTerms::builder(
+            PaymentAmount::new(self.amount, "usdt").unwrap(),
+            PaymentReference::new(self.reference.clone()).unwrap(),
+            vec![endpoint.clone()],
+        )
+        .required_app_id(Some(common::app_id()))
+        .payment_endpoints(Some(std::collections::HashMap::from([(
+            endpoint,
+            PaymentEndpointPayload::new(
+                serde_json::json!({
+                    "value": common::arbitrum::RECIPIENT,
+                    "chain_id": paykit_server::domain::receiving::USDT_CHAIN_ID,
+                    "token": paykit_server::domain::receiving::USDT_TOKEN
+                })
+                .to_string(),
+            ),
+        )])))
+        .build()
+        .unwrap();
+        Ok(InvoicePayloads {
+            payment_request_intent: DeliveryIntentV1::payment_request(
+                self.reader.to_string(),
+                common::app_id(),
+                &terms,
+            )
+            .unwrap(),
         })
     }
 }
@@ -151,7 +198,67 @@ fn second_reader() -> ReaderPubky {
     parse_reader(&second_creator().to_string()).unwrap()
 }
 
+fn regtest_account_xpub() -> String {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let master = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Regtest, &[42; 32]).unwrap();
+    let path: bitcoin::bip32::DerivationPath = "m/84'/1'/0'".parse().unwrap();
+    let account = master.derive_priv(&secp, &path).unwrap();
+    bitcoin::bip32::Xpub::from_priv(&secp, &account).to_string()
+}
+
 struct PanicAdapters;
+
+struct ReadyAdapters;
+
+struct FixedRates;
+
+#[async_trait]
+impl ExchangeRates for FixedRates {
+    async fn usd_per_btc(&self) -> Result<String, CreateInvoiceError> {
+        Ok("100000".to_owned())
+    }
+}
+
+#[async_trait]
+impl SessionValidator for ReadyAdapters {
+    async fn validate(&self, _creator: &CreatorPubky) -> Result<(), SessionValidationError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AppRegistryDiscovery for ReadyAdapters {
+    async fn discover(
+        &self,
+        _reader: &ReaderPubky,
+    ) -> Result<Option<PaykitAppRegistry>, RegistryDiscoveryError> {
+        let mut registry =
+            PaykitAppRegistry::new(Some(paykit_lib::derive_paykit_noise_public_key(&[8; 32])));
+        registry
+            .register_app(
+                PaykitAppId::new("bitkit").unwrap(),
+                paykit_lib::PaykitApp::new(
+                    "Bitkit",
+                    paykit_lib::PaykitAppCapabilities {
+                        private_payments: false,
+                        payment_requests: true,
+                        receipts: false,
+                        outgoing_payments: true,
+                    },
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        Ok(Some(registry))
+    }
+
+    async fn authorization(
+        &self,
+        _reader: &ReaderPubky,
+    ) -> Result<ReaderAuthorization, RegistryDiscoveryError> {
+        Ok(ReaderAuthorization::Verified)
+    }
+}
 
 #[async_trait]
 impl SessionValidator for PanicAdapters {
@@ -537,6 +644,374 @@ async fn signed_provider_v2_routes_emit_exact_create_replay_and_status_vectors()
     .await;
     assert_eq!(after_deadline, populated);
 
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn signed_provider_v2_usdt_create_replay_and_status_use_production_terms() {
+    let database = TestDatabase::create().await;
+    run_migrations(database.pool()).await.unwrap();
+    let crypto = crypto();
+    let creators = CreatorStore::new(database.pool(), crypto.clone());
+    creators
+        .create(&CreatorCredentials::new(
+            creator(),
+            "session-secret".into(),
+            PaykitIdentitySecretKey::new([9; 32], 1).unwrap(),
+            Some(paykit_server::domain::receiving::BitcoinAccount {
+                xpub: regtest_account_xpub().into(),
+                account_index: 0,
+            }),
+            Some(common::arbitrum::RECIPIENT.to_owned().try_into().unwrap()),
+        ))
+        .await
+        .unwrap();
+    let store = InvoiceStore::new(database.pool(), crypto.clone());
+    let adapters = Arc::new(ReadyAdapters);
+    let service = ProviderV2Service::new(
+        adapters.clone(),
+        adapters,
+        Arc::new(creators),
+        store,
+        PaykitAppId::new("paykit-server").unwrap(),
+        BitcoinNetwork::Regtest,
+        Duration::from_secs(60),
+    )
+    .with_usdt(true)
+    .with_exchange_rates(Arc::new(FixedRates));
+    let key = SigningKey::from_bytes(&[32; 32]);
+    let router =
+        provider_v2_router(Arc::new(service)).layer(Extension(provider_v2_signed_auth(&key)));
+    let deadline: OffsetDateTime = sqlx::query_scalar(
+        "SELECT date_trunc('milliseconds', clock_timestamp() + INTERVAL '30 minutes')",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let deadline = deadline.format(&Rfc3339).unwrap();
+    let create_body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "bundle_id": PROVIDER_V2_BUNDLE,
+        "lock_resource": LOCK_RESOURCE,
+        "reader": reader().to_string(),
+        "payment": {
+            "recipient_pubky": CREATOR,
+            "amount": "5000001",
+            "asset": "USDT",
+            "minimum_confirmations": 1
+        },
+        "deadline": deadline
+    }))
+    .unwrap();
+
+    let created = exact_response_body(
+        router
+            .clone()
+            .oneshot(signed_provider_v2_request(
+                &key,
+                "/v2/invoices",
+                &create_body,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let replay = exact_response_body(
+        router
+            .clone()
+            .oneshot(signed_provider_v2_request(
+                &key,
+                "/v2/invoices",
+                &create_body,
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(replay, created);
+
+    let mut changed: serde_json::Value = serde_json::from_slice(&create_body).unwrap();
+    changed["payment"]["amount"] = serde_json::Value::String("5000002".into());
+    let changed_body = serde_json_canonicalizer::to_vec(&changed).unwrap();
+    let conflict = router
+        .clone()
+        .oneshot(signed_provider_v2_request(
+            &key,
+            "/v2/invoices",
+            &changed_body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+
+    let status_body = serde_json_canonicalizer::to_vec(&serde_json::json!({
+        "creator": CREATOR,
+        "bundle_id": PROVIDER_V2_BUNDLE
+    }))
+    .unwrap();
+    let status: serde_json::Value = serde_json::from_str(
+        &exact_response_body(
+            router
+                .oneshot(signed_provider_v2_request(
+                    &key,
+                    "/v2/invoices/status",
+                    &status_body,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(status["asset"], "USDT");
+    assert_eq!(status["request_state"], "proposed");
+    assert_eq!(status["payment_state"], "undetected");
+    assert!(status["bitcoin"].is_null());
+    assert!(status["usdt_arbitrum"].is_null());
+
+    let outbox = OutboxStore::new(database.pool(), crypto);
+    let claims = outbox
+        .claim(uuid::Uuid::new_v4(), 10, Duration::from_secs(30))
+        .await
+        .unwrap();
+    assert_eq!(claims.len(), 1);
+    let intent = outbox.delivery_intent(&claims[0]).unwrap();
+    let terms = intent.terms().unwrap();
+    assert_eq!(terms.amount, "5.000001");
+    assert_eq!(terms.asset, "usdt");
+    assert_eq!(
+        terms.accepted_endpoint_identifiers,
+        vec!["btc-regtest-p2wpkh".to_owned(), USDT_ENDPOINT.to_owned()]
+    );
+    assert_eq!(terms.rates.len(), 1);
+    assert_eq!(terms.rates[0].asset, "btc");
+    assert!(!terms.rates[0].value.is_empty());
+    let bitcoin_endpoint: serde_json::Value =
+        serde_json::from_str(&terms.payment_endpoints["btc-regtest-p2wpkh"]).unwrap();
+    assert!(
+        bitcoin_endpoint["value"]
+            .as_str()
+            .unwrap()
+            .starts_with("bcrt1")
+    );
+    let endpoint: serde_json::Value =
+        serde_json::from_str(&terms.payment_endpoints[USDT_ENDPOINT]).unwrap();
+    assert_eq!(endpoint["value"], common::arbitrum::RECIPIENT);
+    assert_eq!(
+        endpoint["chain_id"],
+        paykit_server::domain::receiving::USDT_CHAIN_ID
+    );
+    assert_eq!(
+        endpoint["token"],
+        paykit_server::domain::receiving::USDT_TOKEN
+    );
+
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn provider_v2_usdt_create_replay_conflict_and_restart_status_use_canonical_record() {
+    let database = TestDatabase::create().await;
+    let store = invoice_store(&database).await;
+    let creator = creator();
+    let reader = parse_reader(CREATOR).unwrap();
+    let bundle = parse_bundle_id(PROVIDER_V2_BUNDLE).unwrap();
+    let lock_resource = parse_addressed_lock_resource(LOCK_RESOURCE).unwrap();
+    let deadline: OffsetDateTime = sqlx::query_scalar(
+        "SELECT date_trunc('milliseconds', clock_timestamp() + INTERVAL '30 minutes')",
+    )
+    .fetch_one(database.pool())
+    .await
+    .unwrap();
+    let request = ProviderV2CreateRequest {
+        bundle_id: bundle.clone(),
+        payment: ProviderV2Payment::parse(&creator.to_string(), "50000", "USDT", 1, &creator)
+            .unwrap(),
+        lock_resource,
+        reader: reader.clone(),
+        deadline,
+    };
+    let request_hash = provider_request_hash(&request);
+    let proof_fixture = common::arbitrum::fixture(0);
+    let payloads = UsdtPayloads {
+        reader: reader.clone(),
+        amount: "0.05",
+        reference: proof_fixture["binding"]["paymentReference"]
+            .as_str()
+            .unwrap()
+            .to_owned(),
+    };
+    let input = || ProviderV2AtomicInvoiceInput {
+        creator: &creator,
+        reader: &reader,
+        bundle_binding: PROVIDER_V2_BUNDLE.as_bytes(),
+        lock_resource_binding: PROVIDER_V2_BUNDLE.as_bytes(),
+        request_hash,
+        deadline,
+        minimum_confirmations: 1,
+        invoice_payloads: &payloads,
+        proposal_acceptance_seconds: 60,
+    };
+
+    let created = store.create_provider_v2_atomic(input()).await.unwrap();
+    assert!(!created.replayed());
+    let replay = store.create_provider_v2_atomic(input()).await.unwrap();
+    assert!(replay.replayed());
+    assert_eq!(replay.invoice_id(), created.invoice_id());
+    let stored_asset: String =
+        sqlx::query_scalar("SELECT asset FROM invoice_provider_v2 WHERE invoice_id = $1")
+            .bind(created.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(stored_asset, "USDT");
+
+    let changed_asset = store
+        .create_provider_v2_atomic(provider_v2_input(
+            &creator,
+            &reader,
+            PROVIDER_V2_BUNDLE.as_bytes(),
+            provider_request_hash(&provider_request(reader.clone(), "5000001", deadline)),
+            deadline,
+        ))
+        .await;
+    assert_eq!(changed_asset.unwrap_err(), PersistenceError::Conflict);
+
+    let restarted = InvoiceStore::new(database.pool(), crypto());
+    let status = restarted
+        .provider_v2_status(&creator, &bundle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.asset, ProviderV2Asset::Usdt);
+    assert_eq!(status.payment_state, "undetected");
+    assert!(status.current_sample.is_none());
+    assert!(status.usdt_arbitrum.is_none());
+
+    sqlx::query(
+        "INSERT INTO payment_request_lifecycles (
+             invoice_id, sdk_payment_request_id, request_state, state_event_id,
+             last_stream_item_id, last_event_at, proposal_recorded_at
+         ) VALUES ($1, $2, 'proof_submitted', $3, 1, clock_timestamp(), clock_timestamp())",
+    )
+    .bind(created.invoice_id())
+    .bind(
+        proof_fixture["binding"]["paymentRequestId"]
+            .as_str()
+            .unwrap(),
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let rpc = common::arbitrum::Rpc::start().await;
+    rpc.chain.lock().unwrap().finalized = true;
+    let creator_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM creators")
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+    store
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &common::arbitrum::record(0),
+            &rpc.verifier,
+            Some(&bundle),
+        )
+        .await
+        .unwrap();
+    let paid = restarted
+        .provider_v2_status(&creator, &bundle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(paid.payment_state, "confirmed");
+    let usdt = paid.usdt_arbitrum.unwrap();
+    assert!(usdt.amount_matched);
+    assert!(usdt.paid_on_time);
+    assert!(usdt.finalized);
+    assert!(paid.bitcoin.is_none());
+
+    sqlx::query(
+        "UPDATE payment_request_lifecycles
+         SET request_state = 'rejected', state_event_id = $1,
+             last_stream_item_id = last_stream_item_id + 1,
+             last_event_at = clock_timestamp()
+         WHERE invoice_id = $2",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(created.invoice_id())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let terminal = restarted
+        .provider_v2_status(&creator, &bundle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        terminal.request_state,
+        paykit_server::domain::payment_request_lifecycle::PaymentRequestLifecycleState::Rejected
+    );
+    assert_eq!(terminal.payment_state, "confirmed");
+    assert!(terminal.usdt_arbitrum.unwrap().finalized);
+    assert!(terminal.bitcoin.is_none());
+
+    let buyer_contact_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM buyer_contacts WHERE invoice_id = $1")
+            .bind(created.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(buyer_contact_count, 1);
+
+    // A later Bitcoin observation sweep must not expire timely canonical USDT settlement.
+    restarted
+        .observation_targets_at(deadline + time::Duration::seconds(1))
+        .await
+        .unwrap();
+    let after_deadline = restarted
+        .provider_v2_status(&creator, &bundle)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_deadline.payment_state, "confirmed");
+    assert!(after_deadline.usdt_arbitrum.unwrap().paid_on_time);
+
+    // Exact duplicate proof remains one immutable observation.
+    store
+        .observe_usdt_request(
+            creator_id,
+            &creator,
+            &common::arbitrum::record(0),
+            &rpc.verifier,
+            Some(&bundle),
+        )
+        .await
+        .unwrap();
+    let observation_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM usdt_observations WHERE invoice_id = $1")
+            .bind(created.invoice_id())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(observation_count, 1);
+
+    let drains = PaymentDrainStore::new(database.pool(), crypto());
+    let drain = drains.create(&request.lock_resource).await.unwrap();
+    assert!(drain.completed());
+    assert_eq!(drain.accepted_count(), 0);
+    let cleanup_token = crypto().payment_drain_cleanup_token(drain.drain_id());
+    drains
+        .cleanup_completed(&request.lock_resource, cleanup_token.as_bytes())
+        .await
+        .unwrap();
+    assert!(
+        restarted
+            .provider_v2_status(&creator, &bundle)
+            .await
+            .unwrap()
+            .is_some()
+    );
     database.cleanup().await;
 }
 

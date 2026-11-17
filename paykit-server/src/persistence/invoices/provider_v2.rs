@@ -1,8 +1,9 @@
 use super::*;
 
+use crate::application::payment_request_status::{BitcoinPaymentStatus, UsdtPaymentStatus};
 use crate::domain::{
     payment_request_lifecycle::PaymentRequestLifecycleState,
-    provider_v2::{ProviderV2Sample, ProviderV2SampleStatus},
+    provider_v2::{ProviderV2Asset, ProviderV2Sample, ProviderV2SampleStatus},
 };
 
 /// Inputs for one atomic provider-v2 invoice and proposal admission.
@@ -54,9 +55,12 @@ pub struct ProviderV2Status {
     pub invoice_created_at: OffsetDateTime,
     pub proposal_expires_at: OffsetDateTime,
     pub deadline: OffsetDateTime,
+    pub asset: ProviderV2Asset,
     pub minimum_confirmations: u8,
     pub current_sample: Option<ProviderV2Sample>,
     pub first_threshold_satisfied: Option<ProviderV2Sample>,
+    pub bitcoin: Option<BitcoinPaymentStatus>,
+    pub usdt_arbitrum: Option<UsdtPaymentStatus>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -84,6 +88,7 @@ struct ProviderStatusRow {
     invoice_created_at: OffsetDateTime,
     proposal_expires_at: OffsetDateTime,
     deadline: OffsetDateTime,
+    asset: String,
     minimum_confirmations: i16,
     payment_expired_at: Option<OffsetDateTime>,
     request_state: Option<String>,
@@ -203,6 +208,7 @@ impl InvoiceStore {
     ) -> Result<ProviderV2CreateResult, PersistenceError> {
         if input.minimum_confirmations > 6
             || input.proposal_acceptance_seconds == 0
+            || input.invoice_payloads.maximum_payment_seconds() == Some(0)
             || !input.deadline.nanosecond().is_multiple_of(1_000)
         {
             return Err(PersistenceError::InvalidInput);
@@ -271,6 +277,17 @@ impl InvoiceStore {
         }
         if now >= input.deadline {
             return Err(PersistenceError::DeadlineElapsed);
+        }
+        if let Some(maximum_payment_seconds) = input.invoice_payloads.maximum_payment_seconds() {
+            let maximum_payment_seconds = i64::try_from(maximum_payment_seconds)
+                .map_err(|_| PersistenceError::InvalidInput)?;
+            if input.deadline
+                > now
+                    .checked_add(Duration::seconds(maximum_payment_seconds))
+                    .ok_or(PersistenceError::InvalidInput)?
+            {
+                return Err(PersistenceError::InvalidInput);
+            }
         }
         let max_proposal = input
             .deadline
@@ -341,10 +358,25 @@ impl InvoiceStore {
             creator.next_child_index,
             &payloads.payment_request_intent,
         )?;
-        if !payment_record.has_bitcoin()
-            || payment_record.has_usdt()
-            || payment_record.bitcoin_required_amount()? == 0
-        {
+        let terms = payloads
+            .payment_request_intent
+            .terms()
+            .map_err(|_| PersistenceError::CorruptOrMissing)?;
+        let asset = match terms.asset.as_str() {
+            "btc" => ProviderV2Asset::Btc,
+            "usdt" => ProviderV2Asset::Usdt,
+            _ => return Err(PersistenceError::InvalidInput),
+        };
+        if match asset {
+            ProviderV2Asset::Btc => {
+                !payment_record.has_bitcoin()
+                    || payment_record.has_usdt()
+                    || payment_record.bitcoin_required_amount()? == 0
+            }
+            ProviderV2Asset::Usdt => {
+                !payment_record.has_usdt() || payment_record.usdt_required_amount()? == 0
+            }
+        } {
             return Err(PersistenceError::InvalidInput);
         }
 
@@ -390,9 +422,10 @@ impl InvoiceStore {
                 &intent_plaintext,
             )
             .map_err(|_| PersistenceError::CorruptOrMissing)?;
-        let bitcoin_address_hash = self
-            .crypto
-            .bitcoin_address_lookup_hash(payment_record.bitcoin_address()?.as_bytes());
+        let bitcoin_address_hash = payment_record.bitcoin.as_ref().map(|destination| {
+            self.crypto
+                .bitcoin_address_lookup_hash(destination.address.as_bytes())
+        });
         let derivation_hash = self
             .crypto
             .bitcoin_derivation_index_lookup_hash(creator_hash, creator.next_child_index);
@@ -422,7 +455,11 @@ impl InvoiceStore {
         .bind(input.request_hash.as_slice())
         .bind(invoice_envelope.as_bytes())
         .bind(payment_record_envelope.as_bytes())
-        .bind(bitcoin_address_hash.as_bytes().as_slice())
+        .bind(
+            bitcoin_address_hash
+                .as_ref()
+                .map(|hash| hash.as_bytes().as_slice()),
+        )
         .bind(derivation_hash.as_bytes().as_slice())
         .bind(now)
         .bind(proposal_expires_at)
@@ -434,12 +471,13 @@ impl InvoiceStore {
 
         sqlx::query(
             "INSERT INTO invoice_provider_v2
-             (invoice_id, request_hash, deadline, minimum_confirmations, proposal_expires_at)
-             VALUES ($1,$2,$3,$4,$5)",
+             (invoice_id, request_hash, deadline, asset, minimum_confirmations, proposal_expires_at)
+             VALUES ($1,$2,$3,$4,$5,$6)",
         )
         .bind(invoice_id)
         .bind(input.request_hash.as_slice())
         .bind(input.deadline)
+        .bind(asset.as_str())
         .bind(i16::from(input.minimum_confirmations))
         .bind(proposal_expires_at)
         .execute(&mut *tx)
@@ -490,7 +528,7 @@ impl InvoiceStore {
         let row = sqlx::query_as::<_, ProviderStatusRow>(
             "SELECT invoices.id AS invoice_id, creators.creator_lookup_hash,
                     invoices.invoice_created_at, provider.proposal_expires_at, provider.deadline,
-                    provider.minimum_confirmations, invoices.payment_expired_at,
+                    provider.asset, provider.minimum_confirmations, invoices.payment_expired_at,
                     (SELECT request_state FROM payment_request_lifecycles lifecycle
                      WHERE lifecycle.invoice_id = invoices.id
                      ORDER BY CASE request_state
@@ -560,12 +598,43 @@ impl InvoiceStore {
                 )
             })
             .ok_or(PersistenceError::CorruptOrMissing)?;
+        let asset = match row.asset.as_str() {
+            "BTC" => ProviderV2Asset::Btc,
+            "USDT" => ProviderV2Asset::Usdt,
+            _ => return Err(PersistenceError::CorruptOrMissing),
+        };
+        let rail_status = if asset == ProviderV2Asset::Usdt {
+            let mut status_tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            let rail_status = self
+                .payment_request_status_by_invoice_with_fallback(
+                    &mut status_tx,
+                    row.invoice_id,
+                    Some(request_state),
+                )
+                .await?;
+            status_tx
+                .commit()
+                .await
+                .map_err(|_| PersistenceError::Unavailable)?;
+            rail_status
+        } else {
+            None
+        };
         let payment_state = if row.payment_expired_at.is_some() {
             "expired"
         } else {
-            current
-                .as_ref()
-                .map_or("undetected", |sample| sample.status().as_str())
+            match asset {
+                ProviderV2Asset::Btc => current
+                    .as_ref()
+                    .map_or("undetected", |sample| sample.status().as_str()),
+                ProviderV2Asset::Usdt => rail_status
+                    .as_ref()
+                    .map_or("undetected", |status| status.payment_state().as_str()),
+            }
         };
         Ok(Some(ProviderV2Status {
             creator: creator.to_string(),
@@ -575,10 +644,13 @@ impl InvoiceStore {
             invoice_created_at: row.invoice_created_at,
             proposal_expires_at: row.proposal_expires_at,
             deadline: row.deadline,
+            asset,
             minimum_confirmations: u8::try_from(row.minimum_confirmations)
                 .map_err(|_| PersistenceError::CorruptOrMissing)?,
             current_sample: current,
             first_threshold_satisfied: first,
+            bitcoin: rail_status.as_ref().and_then(|status| status.bitcoin()),
+            usdt_arbitrum: rail_status.and_then(|status| status.usdt_arbitrum()),
         }))
     }
 

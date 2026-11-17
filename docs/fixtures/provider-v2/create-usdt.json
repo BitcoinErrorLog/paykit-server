@@ -1,0 +1,12 @@
+{
+  "bundle_id": "000G40R40M30E209185GR38E1W",
+  "payment": {
+    "recipient_pubky": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+    "amount": "5000001",
+    "asset": "USDT",
+    "minimum_confirmations": 1
+  },
+  "lock_resource": "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy/pub/app.locks/000G40R40M30E209185GR38E1W8124GK2GAHC5RR34D1P70X3RFG.json",
+  "reader": "pubkyykrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+  "deadline": "2099-01-01T00:00:00Z"
+}

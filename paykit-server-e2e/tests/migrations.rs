@@ -59,6 +59,8 @@ const PROVIDER_V2_MIGRATION: &str =
     include_str!("../../paykit-server/migrations/0024_provider_v2_contract.sql");
 const PROVIDER_V2_DRAIN_FENCE_MIGRATION: &str =
     include_str!("../../paykit-server/migrations/0025_provider_v2_drain_fence.sql");
+const PROVIDER_V2_USDT_MIGRATION: &str =
+    include_str!("../../paykit-server/migrations/0028_provider_v2_usdt.sql");
 
 /// PostgreSQL advisory locks are server-wide, not database-scoped. These
 /// migration tests deliberately use the production migration lock key, so
@@ -141,6 +143,93 @@ async fn provider_v2_migration_preserves_v1_rows_and_closes_binding_constraints(
         .bind(rows[1].2)
         .execute(pool)
         .await,
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn provider_v2_usdt_migration_preserves_btc_rows_and_keeps_assets_closed() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    apply_migrations_through_creator_rotation(pool).await;
+    sqlx::raw_sql(DRAIN_CANCELLATION_OWNERSHIP_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(PROVIDER_V2_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+    let creator_id = insert_creator(pool).await;
+    insert_invoice(
+        pool,
+        creator_id,
+        b"provider-usdt-a",
+        b"provider-usdt-request-a",
+    )
+    .await;
+    insert_invoice(
+        pool,
+        creator_id,
+        b"provider-usdt-b",
+        b"provider-usdt-request-b",
+    )
+    .await;
+    let invoices: Vec<(Uuid, time::OffsetDateTime, time::OffsetDateTime)> = sqlx::query_as(
+        "SELECT id, payment_deadline, proposal_expires_at FROM invoices ORDER BY payment_request_lookup_hash",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO invoice_provider_v2
+         (invoice_id, request_hash, deadline, minimum_confirmations, proposal_expires_at)
+         VALUES ($1,$2,$3,1,$4)",
+    )
+    .bind(invoices[0].0)
+    .bind([91_u8; 32].as_slice())
+    .bind(invoices[0].1)
+    .bind(invoices[0].2)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    sqlx::raw_sql(PROVIDER_V2_USDT_MIGRATION)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let existing_asset: String =
+        sqlx::query_scalar("SELECT asset FROM invoice_provider_v2 WHERE invoice_id = $1")
+            .bind(invoices[0].0)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(existing_asset, "BTC");
+    sqlx::query(
+        "INSERT INTO invoice_provider_v2
+         (invoice_id, request_hash, deadline, asset, minimum_confirmations, proposal_expires_at)
+         VALUES ($1,$2,$3,'USDT',1,$4)",
+    )
+    .bind(invoices[1].0)
+    .bind([92_u8; 32].as_slice())
+    .bind(invoices[1].1)
+    .bind(invoices[1].2)
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_check_violation(
+        sqlx::query("UPDATE invoice_provider_v2 SET asset = 'usdt' WHERE invoice_id = $1")
+            .bind(invoices[1].0)
+            .execute(pool)
+            .await,
+    );
+    assert_check_violation(
+        sqlx::query("UPDATE invoice_provider_v2 SET asset = 'USD' WHERE invoice_id = $1")
+            .bind(invoices[1].0)
+            .execute(pool)
+            .await,
     );
     database.cleanup().await;
 }
@@ -267,7 +356,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=27).collect::<Vec<_>>());
+    assert_eq!(applied_versions, (1..=28).collect::<Vec<_>>());
 
     let proposal_recorded_at: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns

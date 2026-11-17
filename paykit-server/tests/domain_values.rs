@@ -213,12 +213,12 @@ fn domain_criterion_accepts_supported_assets_and_positive_decimal_u64_satoshis()
 }
 
 #[test]
-fn provider_v2_payment_is_btc_only_preserves_amount_lexeme_and_bounds_threshold() {
+fn provider_v2_payment_preserves_amount_lexeme_and_bounds_threshold() {
     let creator = parse_creator(CREATOR).unwrap();
     let payment = ProviderV2Payment::parse(CREATOR, "0001", "BTC", 6, &creator).unwrap();
 
     assert_eq!(payment.amount_lexeme(), "0001");
-    assert_eq!(payment.amount_sats(), 1);
+    assert_eq!(payment.amount_units(), 1);
     assert_eq!(payment.minimum_confirmations(), 6);
 
     for (recipient, amount, asset, threshold) in [
