@@ -48,15 +48,13 @@ Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report sec
 
 The [architecture contract](docs/architecture.md) describes shared identity,
 credential ownership, and immutable invoice attribution. Rust dependencies pin
-`paykit-lib` and `paykit-sdk` in `Cargo.toml` to paykit-rs commit
-`98bc8da957c61b0e37ff44e1bbc43b1b2695c325`, the head of
-[pubky/paykit-rs#358](https://github.com/pubky/paykit-rs/pull/358), which adds
-reading a Receipt another App on the identity issued. That commit is pinned
-until a Paykit release tag containing it is published. Paykit release candidates are
+`paykit-lib` and `paykit-sdk` in `Cargo.toml` to the
+[`v0.1.1-rc9`](https://github.com/pubky/paykit-rs/releases/tag/v0.1.1-rc9) tag.
+Paykit release candidates are
 published as Git tags, not on crates.io. The server does not count payment
 evidence earlier than its own Payment Request proposal record time, less a
 payment-method tolerance, as paying the request
-([Payment time and attribution](https://github.com/pubky/paykit-rs/blob/98bc8da957c61b0e37ff44e1bbc43b1b2695c325/specs/payment-requests.md#payment-time-and-attribution)).
+([Payment time and attribution](https://github.com/pubky/paykit-rs/blob/v0.1.1-rc9/specs/payment-requests.md#payment-time-and-attribution)).
 Direct `pubky` and `pubky-testnet` dependencies are pinned to `0.16.2`.
 
 Shared-state recovery requires Homeserver `0.16.2` or newer with the required GCS
