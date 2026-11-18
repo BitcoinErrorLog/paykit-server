@@ -192,7 +192,7 @@ fn captured_worker_logs() -> CapturedLogs {
         let logs = CapturedLogs::default();
         let writer = logs.clone();
         tracing_subscriber::fmt()
-            .with_env_filter("paykit_server::server=warn")
+            .with_env_filter("paykit_server::server=debug")
             .with_ansi(false)
             .with_writer(move || writer.clone())
             .try_init()
