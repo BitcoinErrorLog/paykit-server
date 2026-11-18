@@ -4059,7 +4059,7 @@ dependencies = [
 
 [[package]]
 name = "paykit-server"
-version = "0.1.1-rc3"
+version = "0.1.1-rc4"
 dependencies = [
  "alloy-primitives",
  "alloy-sol-types",
@@ -4108,7 +4108,7 @@ dependencies = [
 
 [[package]]
 name = "paykit-server-e2e"
-version = "0.1.1-rc3"
+version = "0.1.1-rc4"
 dependencies = [
  "anyhow",
  "async-trait",
