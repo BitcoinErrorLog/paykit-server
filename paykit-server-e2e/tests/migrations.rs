@@ -357,7 +357,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=28).collect::<Vec<_>>());
+    assert_eq!(applied_versions, (1..=29).collect::<Vec<_>>());
 
     let proposal_recorded_at: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns
