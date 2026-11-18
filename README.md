@@ -48,13 +48,13 @@ Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report sec
 
 The [architecture contract](docs/architecture.md) describes shared identity,
 credential ownership, and immutable invoice attribution. Rust dependencies pin
-`paykit-lib` and `paykit-sdk` to the paykit-rs `v0.1.1-rc8` release tag in
+`paykit-lib` and `paykit-sdk` to the paykit-rs `v0.1.1-rc9` release tag in
 `Cargo.toml`, and `Cargo.lock` records its commit
-`adbe24aca6b326d28312abb7e73e8aa6a0392882`. Paykit release candidates are
+`0b9c63d25dbd0cd5e7cf6ec577bc170732d350be`. Paykit release candidates are
 published as Git tags, not on crates.io. The server does not count payment
 evidence earlier than its own Payment Request proposal record time, less a
 payment-method tolerance, as paying the request
-([Payment time and attribution](https://github.com/pubky/paykit-rs/blob/v0.1.1-rc8/specs/payment-requests.md#payment-time-and-attribution)).
+([Payment time and attribution](https://github.com/pubky/paykit-rs/blob/v0.1.1-rc9/specs/payment-requests.md#payment-time-and-attribution)).
 Direct `pubky` and `pubky-testnet` dependencies are pinned to `0.16.2`.
 
 Shared-state recovery requires Homeserver `0.16.2` or newer with the required GCS
@@ -62,7 +62,7 @@ behavior on every serving instance. Drain older writes and coordinate all
 writers before adopting this release; updating the dependency does not deploy
 Homeservers or establish operational readiness. See the
 [Paykit 0.1.0 integration requirements](https://github.com/pubky/paykit-rs/releases/tag/v0.1.0)
-and the [Paykit v0.1.1-rc8 release](https://github.com/pubky/paykit-rs/releases/tag/v0.1.1-rc8).
+and the [Paykit v0.1.1-rc9 release](https://github.com/pubky/paykit-rs/releases/tag/v0.1.1-rc9).
 Before deploying this release, read [Persistence, startup, and upgrades](#persistence-startup-and-upgrades):
 Paykit `v0.1.1-rc6` and later store hosted state in a format earlier Paykit releases cannot read.
 
