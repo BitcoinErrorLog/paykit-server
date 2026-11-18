@@ -338,9 +338,16 @@ async fn checkout(
             .context("Missing Bitcoin address")?,
     )?
     .require_network(Network::Regtest)?;
-    payer
-        .claim_payment_request_for_execution(creator.clone(), &id)
+    // The guarded claim refuses a blocked creator. The claimed proposal must be
+    // the one whose terms were checked above.
+    let claimed = payer
+        .claim_payment_request_for_preparation(creator.clone(), &id)
         .await?;
+    ensure!(
+        claimed.proposal_stream_item_id == Some(proposal_stream_item_id)
+            && claimed.terms.as_ref() == Some(terms),
+        "Claimed request differs from the checked invoice"
+    );
     payer
         .accept_payment_request(creator.clone(), &id, proposal_stream_item_id)
         .await?;

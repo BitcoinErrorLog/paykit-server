@@ -691,6 +691,63 @@ fn quantity(value: &Value) -> Result<u64, VerificationError> {
 mod tests {
     use super::*;
 
+    /// Byte length of the largest Payment Proof a reader's wallet can send for
+    /// this server's USDT method, as `submit_payment_proof` would queue it.
+    /// Variable fields take their longest values: the reader's App ID, the
+    /// Allowance ID an automatic payment may add, the transaction hash and
+    /// signature lengths of the ERC-20 profile, and the 78 digits of the
+    /// largest uint256 receipt log index.
+    fn largest_usdt_payment_proof_len(payment_reference: &str) -> usize {
+        let proof = json!({
+            "type": "erc20-transfer-eip712",
+            "chain_id": USDT_CHAIN_ID,
+            "transaction_hash": format!("0x{}", "f".repeat(64)),
+            "receipt_log_index": U256::MAX.to_string(),
+            "signature": format!("0x{}", "f".repeat(130)),
+        });
+        let Value::Object(proof) = proof else {
+            unreachable!("the proof is a JSON object")
+        };
+        paykit_sdk::payment_proof_event_len(
+            &paykit_lib::PaykitAppId::new("a".repeat(64)).unwrap(),
+            &paykit_lib::PaymentReference::new(payment_reference.to_owned()).unwrap(),
+            paykit_sdk::PaymentProofSubmission {
+                billing_period: None,
+                payment_app_id: paykit_lib::PaykitAppId::new(crate::config::PAYKIT_APP_ID).unwrap(),
+                payment_endpoint_identifier: paykit_lib::PaymentEndpointIdentifier::new(
+                    USDT_ENDPOINT,
+                )
+                .unwrap(),
+                conversion_quote_id: None,
+                proof,
+                allowance_id: Some(paykit_lib::AllowanceId::new_v4()),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_largest_usdt_payment_proof_fits_one_private_message() {
+        // The server's Payment References are hyphenated UUIDs.
+        let reference = uuid::Uuid::new_v4().hyphenated().to_string();
+        let len = largest_usdt_payment_proof_len(&reference);
+        assert!(
+            len <= paykit_lib::pubky_noise::snow_crypto::PUBKY_NOISE_MSG_LEN,
+            "{len} bytes"
+        );
+        assert_eq!(U256::MAX.to_string().len(), 78);
+    }
+
+    #[test]
+    fn the_usdt_payment_proof_budget_catches_a_proof_that_does_not_fit() {
+        let longest_reference = "r".repeat(paykit_lib::PAYMENT_REFERENCE_MAX_LEN);
+        let len = largest_usdt_payment_proof_len(&longest_reference);
+        assert!(
+            len > paykit_lib::pubky_noise::snow_crypto::PUBKY_NOISE_MSG_LEN,
+            "{len} bytes"
+        );
+    }
+
     fn recoverable_proof() -> PaymentProofRecord {
         let signature = Secp256k1::new().sign_ecdsa_recoverable(
             &Message::from_digest([1; 32]),

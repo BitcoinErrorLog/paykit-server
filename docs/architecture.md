@@ -50,6 +50,23 @@ The SDK owns encrypted identity-wide homeserver state under WebDAV locks. Apps
 share Encrypted Links and history; app IDs attribute requests and outbound records.
 The server does not maintain a PostgreSQL copy of SDK state. Its transport worker
 receives private events and processes queued delivery without executing payments.
+
+The server receives by polling. Transport maintenance, background lifecycle
+refresh, and each status, drain, or rotation read use Paykit's polling receive
+calls for the peers they need, and a status answer requires that receive to
+succeed. The server does not start Paykit's SSE-assisted private intake
+(`start_private_intake`). Its supervisor holds one lease over the whole
+identity-wide state, not over one App's peers. While the lease is live, polling
+any established Linked Peer of the identity fails with
+`PrivateIntakeModeConflict` on every SDK handle that shares the state, and only
+the supervisor's owner can drain the packets it buffers. Bitkit shares each
+Creator's state and can only poll, because Paykit's Swift and Kotlin bindings do
+not expose the supervisor, so a server supervisor would stop the Creator's
+wallet from receiving. The supervisor's freshness evidence is also its stream
+state and last audit, by default up to about a minute old, while a status answer
+needs a receive made for it. If another runtime runs that intake over a
+Creator's state, the server's receives from those peers fail, status reads report
+unavailable, and a refused receive never counts as an empty inbox.
 An Allowance intake worker can accept, as the Allowee, the Allowance proposals
 a reader leaves on the server link, so the reader's wallet can pay later
 requests without a prompt. It is off by default and turned on with

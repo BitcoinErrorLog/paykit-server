@@ -13,7 +13,7 @@ use crate::{
         payment_request_lifecycle::{
             PaymentRequestLifecycleProjection, PaymentRequestLifecycleState,
             PersistedPaymentRequestLifecycle, aggregate_lifecycle,
-            cursor_stable_transition_allowed,
+            cursor_stable_transition_allowed, late_acceptance_rederivation_allowed,
         },
     },
     persistence::PersistenceError,
@@ -572,9 +572,11 @@ impl PaymentRequestLifecycleStore {
                 .ok_or(PersistenceError::CorruptOrMissing)?;
             let source_cursors_equal = stream_cursor == existing.last_stream_item_id
                 && outbound_cursor == existing.last_outbound_message_id;
-            let equal_cursor_update_allowed = existing.state_event_id == projection.state_event_id
+            let equal_cursor_update_allowed = (existing.state_event_id
+                == projection.state_event_id
                 && (existing_state == projection.request_state
-                    || cursor_stable_transition_allowed(existing_state, projection.request_state));
+                    || cursor_stable_transition_allowed(existing_state, projection.request_state)))
+                || late_acceptance_rederivation_allowed(existing_state, projection);
             if lifecycle_owner(existing.invoice_id, existing.marketplace_preparation_id)? != owner
                 || existing.sdk_payment_request_id != projection.payment_request_id
                 || (existing_state == PaymentRequestLifecycleState::ProposalExpired

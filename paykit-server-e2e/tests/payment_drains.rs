@@ -411,6 +411,7 @@ async fn insert_projectable_attempt(
         last_outbound_message_id: Some(99),
         last_event_at: OffsetDateTime::from_unix_timestamp(1_800_000_100).unwrap(),
         proposal_recorded_at: None,
+        acceptance_recorded_at: None,
     }
 }
 

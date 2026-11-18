@@ -766,11 +766,20 @@ async fn allowance_proposed_on_the_server_link_covers_the_next_locks_invoice() {
         local_enabled: true,
         recurrence_eligible: true,
     };
-    // The wallet App claims the request for execution before it accepts it.
-    reader
-        .claim_payment_request_for_execution(scope.counterparty.clone(), &scope.payment_request_id)
+    // The wallet App claims the request for preparation before it accepts it,
+    // and checks it claimed the proposal whose terms it evaluated.
+    let claimed = reader
+        .claim_payment_request_for_preparation(
+            scope.counterparty.clone(),
+            &scope.payment_request_id,
+        )
         .await
         .unwrap();
+    assert_eq!(
+        claimed.proposal_stream_item_id,
+        request.proposal_stream_item_id
+    );
+    assert_eq!(claimed.terms.as_ref(), Some(&terms));
     let association = reader
         .accept_payment_request_automatically(
             scope.clone(),

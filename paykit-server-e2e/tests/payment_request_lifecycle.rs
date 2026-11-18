@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
+use base64::{Engine, engine::general_purpose::STANDARD};
 use paykit_lib::{
     PaykitAppId, PaymentAmount, PaymentEndpointIdentifier, PaymentEndpointPayload,
     PaymentReference, PaymentRequestTerms,
 };
+use paykit_sdk::{InMemoryStorage, PaykitSdk, PaykitSdkConfig, PaymentRequestRecord};
 use paykit_server::{
     application::semantic_intent::{DeliveryIntentV1, PaymentTermsV1},
     crypto::{Crypto, EnvelopeContext},
@@ -13,6 +15,7 @@ use paykit_server::{
             PaymentRequestLifecycleProjection, PaymentRequestLifecycleState, ProposalCorrelation,
         },
     },
+    paykit::{ExplicitInputsPaymentAdapter, project_payment_request_record},
     persistence::{
         PaymentRequestLifecycleApply, PaymentRequestLifecycleStore, PersistenceError,
         run_migrations,
@@ -20,7 +23,7 @@ use paykit_server::{
 };
 use paykit_server_e2e::postgres::TestDatabase;
 use std::collections::HashMap;
-use time::{Duration, OffsetDateTime};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
@@ -77,9 +80,37 @@ async fn attributable_invoice(
     creator_id: Uuid,
     ordinal: u8,
 ) -> (Uuid, Uuid, String) {
+    attributable_invoice_with(database, crypto, creator_id, ordinal, proposal_intent).await
+}
+
+async fn attributable_invoice_with(
+    database: &TestDatabase,
+    crypto: &Crypto,
+    creator_id: Uuid,
+    ordinal: u8,
+    intent: fn(&str) -> DeliveryIntentV1,
+) -> (Uuid, Uuid, String) {
+    attributable_invoice_for_request(
+        database,
+        crypto,
+        creator_id,
+        ordinal,
+        Uuid::new_v4().to_string(),
+        intent,
+    )
+    .await
+}
+
+async fn attributable_invoice_for_request(
+    database: &TestDatabase,
+    crypto: &Crypto,
+    creator_id: Uuid,
+    ordinal: u8,
+    payment_request_id: String,
+    intent: fn(&str) -> DeliveryIntentV1,
+) -> (Uuid, Uuid, String) {
     let bundle_id = Uuid::from_u128(u128::from(ordinal) + 1);
     let invoice_id = Uuid::new_v4();
-    let payment_request_id = Uuid::new_v4().to_string();
     let outbox_id = Uuid::new_v4();
     let intent_envelope = crypto
         .encrypt(
@@ -87,7 +118,7 @@ async fn attributable_invoice(
                 crypto.lookup_hash(CREATOR.as_bytes()),
                 outbox_id,
             ),
-            &postcard::to_allocvec(&proposal_intent(&payment_request_id)).unwrap(),
+            &postcard::to_allocvec(&intent(&payment_request_id)).unwrap(),
         )
         .unwrap();
     let created_at = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
@@ -286,6 +317,7 @@ fn projection(
         last_outbound_message_id: Some(1),
         last_event_at: recorded_at,
         proposal_recorded_at: None,
+        acceptance_recorded_at: None,
     }
 }
 
@@ -843,6 +875,273 @@ async fn active_drain_rejects_new_attempts_but_allows_existing_attempt_progress(
     assert_eq!(
         store.apply(creator_id, &accepted).await.unwrap(),
         PaymentRequestLifecycleApply::Applied
+    );
+
+    database.cleanup().await;
+}
+
+const PROPOSAL_EXPIRES_AT: &str = "2027-01-15T08:00:00Z";
+
+fn expiring_proposal_intent(payment_reference: &str) -> DeliveryIntentV1 {
+    let mut intent = proposal_intent(payment_reference);
+    intent
+        .set_deadlines(PROPOSAL_EXPIRES_AT.into(), "2027-01-16T08:00:00Z".into())
+        .unwrap();
+    intent
+}
+
+/// What Paykit before `v0.1.1-rc3` stored for an Acceptance the server fetched
+/// at `fetched_at`, at or after the proposal expiry, and the state `rederived`
+/// that Paykit now derives from the same stored events.
+fn late_acceptance(
+    payment_request_id: String,
+    fetched_at: OffsetDateTime,
+    rederived: PaymentRequestLifecycleState,
+) -> (
+    PaymentRequestLifecycleProjection,
+    PaymentRequestLifecycleProjection,
+) {
+    let terms = expiring_proposal_intent(&payment_request_id)
+        .terms()
+        .unwrap()
+        .clone();
+    let mut invalid = projection(
+        payment_request_id,
+        PaymentRequestLifecycleState::InvalidConflict,
+        3,
+        fetched_at,
+    );
+    invalid.proposal.terms = terms;
+    let mut current = invalid.clone();
+    current.request_state = rederived;
+    current.state_event_id = Some(Uuid::new_v4().to_string());
+    current.acceptance_recorded_at = Some(fetched_at);
+    (invalid, current)
+}
+
+fn proposal_expiry() -> OffsetDateTime {
+    OffsetDateTime::parse(PROPOSAL_EXPIRES_AT, &Rfc3339).unwrap()
+}
+
+#[tokio::test]
+async fn a_stored_invalid_request_takes_the_state_derived_for_a_late_fetched_acceptance() {
+    let (database, crypto, store, creator_id) = setup().await;
+    for (ordinal, rederived) in [
+        (40, PaymentRequestLifecycleState::Accepted),
+        (41, PaymentRequestLifecycleState::ProofSubmitted),
+    ] {
+        let (_, bundle_id, payment_request_id) = attributable_invoice_with(
+            &database,
+            &crypto,
+            creator_id,
+            ordinal,
+            expiring_proposal_intent,
+        )
+        .await;
+        let (invalid, current) = late_acceptance(
+            payment_request_id,
+            proposal_expiry() + Duration::minutes(5),
+            rederived,
+        );
+        assert_eq!(
+            store.apply(creator_id, &invalid).await.unwrap(),
+            PaymentRequestLifecycleApply::Applied
+        );
+
+        // Same source cursors and event time, new state and state event.
+        assert_eq!(
+            store.apply(creator_id, &current).await.unwrap(),
+            PaymentRequestLifecycleApply::Applied
+        );
+        let restarted = PaymentRequestLifecycleStore::new(database.pool(), crypto.clone());
+        assert_eq!(
+            restarted
+                .load(&creator(), bundle_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .request_state,
+            rederived
+        );
+        assert_eq!(
+            restarted.apply(creator_id, &current).await.unwrap(),
+            PaymentRequestLifecycleApply::ExactReplay
+        );
+    }
+
+    database.cleanup().await;
+}
+
+struct NoSession;
+
+#[async_trait::async_trait]
+impl paykit_sdk::PubkySessionProvider for NoSession {
+    async fn load_session_access(
+        &self,
+    ) -> paykit_sdk::Result<Option<paykit_sdk::PubkySessionAccess>> {
+        Ok(None)
+    }
+
+    async fn load_public_storage(&self) -> paykit_sdk::Result<Option<pubky::PublicStorage>> {
+        Ok(None)
+    }
+
+    async fn clear_session_access(&self) -> paykit_sdk::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CanceledRequestHistory {
+    state_blob_base64: String,
+    old_record: PaymentRequestRecord,
+}
+
+#[tokio::test]
+async fn a_canceled_request_replayed_from_legacy_sdk_state_recovers_after_restart() {
+    let (database, crypto, store, creator_id) = setup().await;
+    let history: CanceledRequestHistory = serde_json::from_str(include_str!(
+        "fixtures/canceled-late-acceptance-sdk-0.1.0.json"
+    ))
+    .unwrap();
+    let (_, bundle_id, _) = attributable_invoice_for_request(
+        &database,
+        &crypto,
+        creator_id,
+        43,
+        history.old_record.payment_request_id.clone(),
+        expiring_proposal_intent,
+    )
+    .await;
+    let invalid = project_payment_request_record(&history.old_record).unwrap();
+    assert_eq!(
+        invalid.request_state,
+        PaymentRequestLifecycleState::InvalidConflict
+    );
+    assert_eq!(invalid.acceptance_recorded_at, None);
+    assert_eq!(
+        store.apply(creator_id, &invalid).await.unwrap(),
+        PaymentRequestLifecycleApply::Applied
+    );
+    drop(store);
+
+    let blob = STANDARD.decode(history.state_blob_base64).unwrap();
+    let state = paykit_sdk::storage::decode_storage_state_blob(&blob).unwrap();
+    let sdk = PaykitSdk::new(
+        InMemoryStorage::from_state(state),
+        NoSession,
+        ExplicitInputsPaymentAdapter,
+        PaykitSdkConfig::new("paykit-server").unwrap(),
+    );
+    let records = sdk.payment_requests().await.unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].payment_proofs.len(), 1);
+    let current = project_payment_request_record(&records[0]).unwrap();
+    assert_eq!(
+        current.request_state,
+        PaymentRequestLifecycleState::Canceled
+    );
+    assert_eq!(current.state_event_id, invalid.state_event_id);
+    assert_eq!(
+        current.state_event_id.as_deref(),
+        Some("8a0d8b4c-913f-4e31-9f2c-2a6f5bb4d102")
+    );
+    assert_eq!(current.last_stream_item_id, invalid.last_stream_item_id);
+    assert_eq!(
+        current.last_outbound_message_id,
+        invalid.last_outbound_message_id
+    );
+    assert_eq!(current.last_event_at, invalid.last_event_at);
+    assert_eq!(
+        current.acceptance_recorded_at,
+        Some(proposal_expiry() + Duration::seconds(2))
+    );
+
+    let restarted = PaymentRequestLifecycleStore::new(database.pool(), crypto.clone());
+    assert_eq!(
+        restarted
+            .load(&creator(), bundle_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .request_state,
+        PaymentRequestLifecycleState::InvalidConflict
+    );
+    let mut regressed_stream = current.clone();
+    regressed_stream.last_stream_item_id = current.last_stream_item_id.map(|id| id - 1);
+    let mut regressed_outbound = current.clone();
+    regressed_outbound.last_outbound_message_id = current.last_outbound_message_id.map(|id| id - 1);
+    let mut regressed_time = current.clone();
+    regressed_time.last_event_at -= Duration::seconds(1);
+    for refused in [regressed_stream, regressed_outbound, regressed_time] {
+        assert_eq!(
+            restarted.apply(creator_id, &refused).await,
+            Err(PersistenceError::Conflict)
+        );
+    }
+    let mut misattributed = current.clone();
+    misattributed.proposal.terms.amount = "2".into();
+    assert_eq!(
+        restarted.apply(creator_id, &misattributed).await,
+        Err(PersistenceError::CorruptOrMissing)
+    );
+    assert_eq!(
+        restarted.apply(creator_id, &current).await.unwrap(),
+        PaymentRequestLifecycleApply::Applied
+    );
+    drop(restarted);
+
+    let restarted = PaymentRequestLifecycleStore::new(database.pool(), crypto);
+    let persisted = restarted
+        .load(&creator(), bundle_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        persisted.request_state,
+        PaymentRequestLifecycleState::Canceled
+    );
+    assert_eq!(persisted.last_event_at, current.last_event_at);
+    assert_eq!(
+        restarted.apply(creator_id, &current).await.unwrap(),
+        PaymentRequestLifecycleApply::ExactReplay
+    );
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn a_stored_invalid_request_stays_invalid_without_a_late_fetched_acceptance() {
+    let (database, crypto, store, creator_id) = setup().await;
+    let (_, bundle_id, payment_request_id) =
+        attributable_invoice_with(&database, &crypto, creator_id, 42, expiring_proposal_intent)
+            .await;
+    let (invalid, current) = late_acceptance(
+        payment_request_id,
+        proposal_expiry() + Duration::minutes(5),
+        PaymentRequestLifecycleState::Canceled,
+    );
+    store.apply(creator_id, &invalid).await.unwrap();
+
+    let mut in_time = current.clone();
+    in_time.acceptance_recorded_at = Some(proposal_expiry() - Duration::seconds(1));
+    let mut without_time = current.clone();
+    without_time.acceptance_recorded_at = None;
+    let mut reproposed = current;
+    reproposed.request_state = PaymentRequestLifecycleState::Proposed;
+    for refused in [in_time, without_time, reproposed] {
+        assert_eq!(
+            store.apply(creator_id, &refused).await,
+            Err(PersistenceError::Conflict)
+        );
+    }
+    assert_eq!(
+        store
+            .load(&creator(), bundle_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .request_state,
+        PaymentRequestLifecycleState::InvalidConflict
     );
 
     database.cleanup().await;

@@ -1,0 +1,51 @@
+{
+  "state_blob_base64": "AQAAAQE0ZGY5c3NlOWJwMW51ZnRpbTN5aHhpdWs2dzZyNWhkZHNza2p5Z3B5ZHV4N2VzeGpzdGlvbxQyMDI3LTAxLTE1VDA3OjU5OjUwWgAAAAAAAAAAAAAAAAAAAgE0dGtycTh6bXdiOGEzbTlrMTVjc3UzcTE3cW1mZ3FucDlkc2ticmc5dXExcnlkcHl4cDdxeQ1wYXlraXQtc2VydmVyFnBheWtpdC5wYXltZW50X3JlcXVlc3THBHsiYXBwX2lkIjoicGF5a2l0LXNlcnZlciIsImV2ZW50X2lkIjoiOGEwZDhiNGMtOTEzZi00ZTMxLTlmMmMtMmE2ZjViYjRkMTAxIiwia2luZCI6InBheWtpdC5wYXltZW50X3JlcXVlc3QiLCJwYXltZW50X3JlcXVlc3RfaWQiOiJiN2Y5YzJhMS02ZDQzLTRiMGUtYThkNC0wZmUyYzcxMmFiMzMiLCJyZXF1ZXN0Ijp7ImFjY2VwdGVkX3BheW1lbnRfZW5kcG9pbnRfaWRlbnRpZmllcnMiOlsiYnRjLWJpdGNvaW4tcDJ3cGtoIl0sImFtb3VudCI6eyJhc3NldCI6ImJ0YyIsInZhbHVlIjoiMSJ9LCJtZXRhZGF0YSI6e30sInBheW1lbnRfZGVhZGxpbmUiOnsidGltZXN0YW1wIjoiMjAyNy0wMS0xNlQwODowMDowMFoiLCJ0eXBlIjoiYXQifSwicGF5bWVudF9lbmRwb2ludHMiOnsiYnRjLWJpdGNvaW4tcDJ3cGtoIjoicGF5bG9hZCJ9LCJwYXltZW50X3JlZmVyZW5jZSI6ImI3ZjljMmExLTZkNDMtNGIwZS1hOGQ0LTBmZTJjNzEyYWIzMyIsInByb3Bvc2FsX2V4cGlyZXNfYXQiOiIyMDI3LTAxLTE1VDA4OjAwOjAwWiIsInJlY3VycmVuY2UiOm51bGwsInJlcXVpcmVkX2FwcF9pZCI6InBheWtpdC1zZXJ2ZXIifSwidmVyc2lvbiI6MX0CARQyMDI3LTAxLTE1VDA3OjU5OjUwWhQyMDI3LTAxLTE1VDA3OjU5OjUwWgEUMjAyNy0wMS0xNVQwNzo1OTo1MFoBFDIwMjctMDEtMTVUMDc6NTk6NTBaAAAAAjR0a3JxOHptd2I4YTNtOWsxNWNzdTNxMTdxbWZncW5wOWRza2JyZzl1cTFyeWRweXhwN3F5DXBheWtpdC1zZXJ2ZXIjcGF5a2l0LnBheW1lbnRfcmVxdWVzdF9jYW5jZWxsYXRpb27BAXsiYXBwX2lkIjoicGF5a2l0LXNlcnZlciIsImV2ZW50X2lkIjoiOGEwZDhiNGMtOTEzZi00ZTMxLTlmMmMtMmE2ZjViYjRkMTAyIiwia2luZCI6InBheWtpdC5wYXltZW50X3JlcXVlc3RfY2FuY2VsbGF0aW9uIiwicGF5bWVudF9yZXF1ZXN0X2lkIjoiYjdmOWMyYTEtNmQ0My00YjBlLWE4ZDQtMGZlMmM3MTJhYjMzIiwidmVyc2lvbiI6MX0CARQyMDI3LTAxLTE1VDA4OjAwOjAxWhQyMDI3LTAxLTE1VDA4OjAwOjAxWgEUMjAyNy0wMS0xNVQwODowMDowMVoBFDIwMjctMDEtMTVUMDg6MDA6MDFaAAAAAwIBNHRrcnE4em13YjhhM205azE1Y3N1M3ExN3FtZmdxbnA5ZHNrYnJnOXVxMXJ5ZHB5eHA3cXkBuAF7ImFwcF9pZCI6ImJpdGtpdCIsImV2ZW50X2lkIjoiOGEwZDhiNGMtOTEzZi00ZTMxLTlmMmMtMmE2ZjViYjRkMTAzIiwia2luZCI6InBheWtpdC5wYXltZW50X3JlcXVlc3RfYWNjZXB0YW5jZSIsInBheW1lbnRfcmVxdWVzdF9pZCI6ImI3ZjljMmExLTZkNDMtNGIwZS1hOGQ0LTBmZTJjNzEyYWIzMyIsInZlcnNpb24iOjF9AQEBIXBheWtpdC5wYXltZW50X3JlcXVlc3RfYWNjZXB0YW5jZQEGYml0a2l0ASFwYXlraXQucGF5bWVudF9yZXF1ZXN0X2FjY2VwdGFuY2UAABQyMDI3LTAxLTE1VDA4OjAwOjAyWgI0dGtycTh6bXdiOGEzbTlrMTVjc3UzcTE3cW1mZ3FucDlkc2ticmc5dXExcnlkcHl4cDdxeQLrAnsiYXBwX2lkIjoiYml0a2l0IiwiYmlsbGluZ19wZXJpb2QiOm51bGwsImV2ZW50X2lkIjoiOGEwZDhiNGMtOTEzZi00ZTMxLTlmMmMtMmE2ZjViYjRkMTA0Iiwia2luZCI6InBheWtpdC5wYXltZW50X3Byb29mIiwicGF5bWVudF9hcHBfaWQiOiJwYXlraXQtc2VydmVyIiwicGF5bWVudF9lbmRwb2ludF9pZGVudGlmaWVyIjoiYnRjLWJpdGNvaW4tcDJ3cGtoIiwicGF5bWVudF9yZWZlcmVuY2UiOiJiN2Y5YzJhMS02ZDQzLTRiMGUtYThkNC0wZmUyYzcxMmFiMzMiLCJwYXltZW50X3JlcXVlc3RfaWQiOiJiN2Y5YzJhMS02ZDQzLTRiMGUtYThkNC0wZmUyYzcxMmFiMzMiLCJwcm9vZiI6eyJ0eGlkIjoiZml4dHVyZSJ9LCJ2ZXJzaW9uIjoxfQEBARRwYXlraXQucGF5bWVudF9wcm9vZgEGYml0a2l0ARRwYXlraXQucGF5bWVudF9wcm9vZgAAFDIwMjctMDEtMTVUMDg6MDA6MDNaAwMCNHRrcnE4em13YjhhM205azE1Y3N1M3ExN3FtZmdxbnA5ZHNrYnJnOXVxMXJ5ZHB5eHA3cXkkOGEwZDhiNGMtOTEzZi00ZTMxLTlmMmMtMmE2ZjViYjRkMTA0NHRrcnE4em13YjhhM205azE1Y3N1M3ExN3FtZmdxbnA5ZHNrYnJnOXVxMXJ5ZHB5eHA3cXkkOGEwZDhiNGMtOTEzZi00ZTMxLTlmMmMtMmE2ZjViYjRkMTA0FHBheWtpdC5wYXltZW50X3Byb29mR3NoYTI1NjphOTkxMmU1ZDkwYThlYzQ2ZWUzYjM3ZWNlODg1ZTllYmQ5MDA0NmI2NjdiYWYwNmRhODdjYjQ5M2JkOTM0MjE2AgAANHRrcnE4em13YjhhM205azE1Y3N1M3ExN3FtZmdxbnA5ZHNrYnJnOXVxMXJ5ZHB5eHA3cXkkOGEwZDhiNGMtOTEzZi00ZTMxLTlmMmMtMmE2ZjViYjRkMTAzNHRrcnE4em13YjhhM205azE1Y3N1M3ExN3FtZmdxbnA5ZHNrYnJnOXVxMXJ5ZHB5eHA3cXkkOGEwZDhiNGMtOTEzZi00ZTMxLTlmMmMtMmE2ZjViYjRkMTAzIXBheWtpdC5wYXltZW50X3JlcXVlc3RfYWNjZXB0YW5jZUdzaGEyNTY6NTYwOWJiNGE3YTFmZDE5NTFlNjJkYTFkOTI5OGYzOGM5MGE1ZWU4ZTNiN2M3MTBjN2Y5MjIxZDQ3Zjk1NTM5YgEAAAAAAA==",
+  "old_record": {
+    "accepted_event_id": null,
+    "accepted_outbound_status": null,
+    "canceled_event_id": "8a0d8b4c-913f-4e31-9f2c-2a6f5bb4d102",
+    "canceled_outbound_status": "Sent",
+    "conversion_quotes": [],
+    "counterparty": "tkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy",
+    "execution_claim_app_id": null,
+    "invalid_reason": "Payment Request acceptance arrived after proposal expiry",
+    "last_event_at": "2027-01-15T08:00:03Z",
+    "last_outbound_message_id": 2,
+    "last_outbound_status": "Sent",
+    "last_stream_item_id": 2,
+    "local_role": "Payee",
+    "payer_app_id": null,
+    "payment_proofs": [],
+    "payment_request_id": "b7f9c2a1-6d43-4b0e-a8d4-0fe2c712ab33",
+    "proposal_app_id": "paykit-server",
+    "proposal_event_id": "8a0d8b4c-913f-4e31-9f2c-2a6f5bb4d101",
+    "proposal_outbound_message_id": 1,
+    "proposal_outbound_status": "Sent",
+    "proposal_stream_item_id": null,
+    "rejected_event_id": null,
+    "rejected_outbound_status": null,
+    "state": "InvalidConflict",
+    "terms": {
+      "accepted_payment_endpoint_identifiers": [
+        "btc-bitcoin-p2wpkh"
+      ],
+      "amount": {
+        "asset": "btc",
+        "value": "1"
+      },
+      "conversion": null,
+      "metadata": {},
+      "payment_deadline": {
+        "timestamp": "2027-01-16T08:00:00Z",
+        "type": "at"
+      },
+      "payment_endpoints": {
+        "btc-bitcoin-p2wpkh": "payload"
+      },
+      "payment_reference": "b7f9c2a1-6d43-4b0e-a8d4-0fe2c712ab33",
+      "proposal_expires_at": "2027-01-15T08:00:00Z",
+      "recurrence": null,
+      "required_app_id": "paykit-server"
+    }
+  }
+}

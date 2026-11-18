@@ -48,18 +48,23 @@ Before submitting changes, read [`CONTRIBUTING.md`](CONTRIBUTING.md). Report sec
 
 The [architecture contract](docs/architecture.md) describes shared identity,
 credential ownership, and immutable invoice attribution. Rust dependencies pin
-`paykit-lib` and `paykit-sdk` to the paykit-rs Git tag `v0.1.1-rc5` in `Cargo.toml`,
-locked to commit `ebb8b08d9e0656a2ccb7aa0f026a225da6d747a0` in `Cargo.lock`. As that
-release requires, the server does not count payment evidence earlier than its own
-Payment Request proposal record time, less a payment-method tolerance, as paying
-the request ([Payment time and attribution](https://github.com/pubky/paykit-rs/blob/v0.1.1-rc5/specs/payment-requests.md#payment-time-and-attribution)). Direct `pubky` and `pubky-testnet` dependencies are pinned to `0.16.2`.
+`paykit-lib` and `paykit-sdk` to the paykit-rs `v0.1.1-rc8` release tag in
+`Cargo.toml`, and `Cargo.lock` records its commit
+`adbe24aca6b326d28312abb7e73e8aa6a0392882`. Paykit release candidates are
+published as Git tags, not on crates.io. The server does not count payment
+evidence earlier than its own Payment Request proposal record time, less a
+payment-method tolerance, as paying the request
+([Payment time and attribution](https://github.com/pubky/paykit-rs/blob/v0.1.1-rc8/specs/payment-requests.md#payment-time-and-attribution)).
+Direct `pubky` and `pubky-testnet` dependencies are pinned to `0.16.2`.
 
 Shared-state recovery requires Homeserver `0.16.2` or newer with the required GCS
 behavior on every serving instance. Drain older writes and coordinate all
 writers before adopting this release; updating the dependency does not deploy
 Homeservers or establish operational readiness. See the
 [Paykit 0.1.0 integration requirements](https://github.com/pubky/paykit-rs/releases/tag/v0.1.0)
-and the [`v0.1.1-rc5` changelog](https://github.com/pubky/paykit-rs/blob/v0.1.1-rc5/CHANGELOG.md).
+and the [Paykit v0.1.1-rc8 release](https://github.com/pubky/paykit-rs/releases/tag/v0.1.1-rc8).
+Before deploying this release, read [Persistence, startup, and upgrades](#persistence-startup-and-upgrades):
+Paykit `v0.1.1-rc6` and later store hosted state in a format earlier Paykit releases cannot read.
 
 ## Executable boundary
 
@@ -404,7 +409,18 @@ Different Creators may use the same numeric child index because their xpubs and 
 
 ## Persistence, startup, and upgrades
 
-PostgreSQL stores server credentials, address allocation, invoices, and delivery intents. The Paykit SDK stores encrypted identity-wide state on the Creator's homeserver under WebDAV locks; it is not cached as an authoritative PostgreSQL SDK blob. Other authorized apps can advance the same links and delivery queue. A background worker receives private messages and processes outbound work without executing wallet payments.
+PostgreSQL stores server credentials, address allocation, invoices, and delivery intents. The Paykit SDK stores encrypted identity-wide state on the Creator's homeserver under WebDAV locks; it is not cached as an authoritative PostgreSQL SDK blob. Other authorized apps can advance the same links and delivery queue. A background worker receives private messages by polling each linked peer and processes outbound work without executing wallet payments. The [architecture contract](docs/architecture.md#state-ownership) explains why the server does not use Paykit's SSE-assisted private intake.
+
+Paykit `v0.1.1-rc6` and later store that identity-wide state as SDK state blob version 4. The
+server reads state written by earlier Paykit releases, and its first write to a
+Creator's hosted state stores it in the new format. Paykit releases before
+`v0.1.1-rc6` cannot read version 4 and fail every operation on that state, and
+there is no way back to the old format. Before deploying, confirm that every other
+app that uses a Creator's hosted state, such as that Creator's Bitkit, runs a Paykit
+build from `v0.1.1-rc6` or later. For Bitkit, this requires **3.1.1 or later** on
+both iOS and Android. Bitkit 3.1.1 includes Paykit rc8; Bitkit 3.1.0 and older
+include Paykit releases that cannot read version 4. Updating the server does not
+update those apps.
 
 Shared hosted-state deployments require Pubky Homeserver **0.16.2 or newer**
 with the required GCS behavior on every serving instance.
@@ -673,6 +689,13 @@ and `paid_on_time`; the last requires a full payment within the inclusive invoic
 payment window. Arbitrum additionally reports `finalized` from the verified
 canonical receipt and the RPC finalized block. Amounts and confirmation counts
 are never combined across rails.
+
+A request that Paykit before `v0.1.1-rc3` recorded as invalid only because the
+server fetched an in-time Acceptance after the proposal expiry is no longer
+invalid. Paykit now derives `accepted` for it, `proof_submitted` once a Payment
+Proof arrived, or `canceled` if the Acceptance crossed a payee Cancellation.
+The server stores that state. A status read that answered with a `409` conflict
+for such a request reports that lifecycle after the upgrade.
 
 `payment_state: confirmed` means a payment is included in a block, not that it
 meets Locks' settlement policy. Locks must check the request lifecycle, then
