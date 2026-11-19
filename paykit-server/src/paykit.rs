@@ -312,6 +312,41 @@ impl PaymentAdapter for ExplicitInputsPaymentAdapter {}
 type CreatorSdk =
     PaykitSdk<PubkySharedStateStorage, CreatorSessionProvider, ExplicitInputsPaymentAdapter>;
 
+#[cfg(test)]
+pub(crate) struct TransportOperationFixture {
+    receive_results: StdMutex<Option<Vec<paykit_sdk::Result<()>>>>,
+    outbound_results: StdMutex<Option<Vec<paykit_sdk::Result<OutboundPrivateSendReport>>>>,
+}
+
+#[cfg(test)]
+impl TransportOperationFixture {
+    pub(crate) fn new(
+        receive_results: Vec<paykit_sdk::Result<()>>,
+        outbound_results: Vec<paykit_sdk::Result<OutboundPrivateSendReport>>,
+    ) -> Self {
+        Self {
+            receive_results: StdMutex::new(Some(receive_results)),
+            outbound_results: StdMutex::new(Some(outbound_results)),
+        }
+    }
+
+    fn take_receive_results(&self) -> Vec<paykit_sdk::Result<()>> {
+        self.receive_results
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("transport fixture receive results may be consumed only once")
+    }
+
+    fn take_outbound_results(&self) -> Vec<paykit_sdk::Result<OutboundPrivateSendReport>> {
+        self.outbound_results
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+            .expect("transport fixture outbound results may be consumed only once")
+    }
+}
+
 /// Public-SDK-only handoff implementation for one Creator.
 pub struct PaykitAdapter {
     sdk: CreatorSdk,
@@ -324,6 +359,8 @@ pub struct PaykitAdapter {
     usdt: Option<(InvoiceStore, crate::usdt::ArbitrumVerifier)>,
     marketplace: Option<Arc<MarketplacePreparationStore>>,
     lifecycles: Option<PaymentRequestLifecycleStore>,
+    #[cfg(test)]
+    transport_operations: Option<TransportOperationFixture>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -440,7 +477,9 @@ impl PaykitAdapter {
         self.sdk
             .process_outbound_private_messages(parse_peer(intent.reader_pubky())?)
             .await
-            .and_then(check_send_report)
+            .and_then(|report| {
+                check_send_report(report).map_err(TransportMaintenanceError::into_sdk_error)
+            })
             .map_err(classify)
     }
 
@@ -448,6 +487,33 @@ impl PaykitAdapter {
     /// No request is claimed, accepted, or executed by the server.
     /// Lock or revision contention is deferred to the next poll; other failures take precedence.
     pub async fn maintain_transport(&self) -> paykit_sdk::Result<()> {
+        self.maintain_transport_classified()
+            .await
+            .map_err(TransportMaintenanceError::into_sdk_error)
+    }
+
+    pub(crate) async fn maintain_transport_classified(
+        &self,
+    ) -> Result<(), TransportMaintenanceError> {
+        let mut results = self
+            .receive_transport_operation_results()
+            .await
+            .map_err(TransportMaintenanceError::from_sdk_error)?
+            .into_iter()
+            .map(classify_transport_result)
+            .collect::<Vec<_>>();
+        // A peer's receive failure must not prevent other peers' queued sends.
+        results.push(self.maintain_outbound_transport_classified().await);
+        check_transport_results(&results)
+    }
+
+    async fn receive_transport_operation_results(
+        &self,
+    ) -> paykit_sdk::Result<Vec<paykit_sdk::Result<()>>> {
+        #[cfg(test)]
+        if let Some(operations) = &self.transport_operations {
+            return Ok(operations.take_receive_results());
+        }
         let peers = {
             let _guard = self.mutation_lock.lock().await;
             self.sdk.linked_peers().await?
@@ -465,14 +531,39 @@ impl PaykitAdapter {
                     .map(|_| ()),
             );
         }
-        // A peer's receive failure must not prevent other peers' queued sends.
-        results.push(self.maintain_outbound_transport().await);
-        check_transport_results(&results)
+        Ok(results)
     }
 
     /// Processes durable outbound work without polling linked-peer inboxes.
     /// Periodic transport maintenance still receives before discovering queued sends.
     pub async fn maintain_outbound_transport(&self) -> paykit_sdk::Result<()> {
+        self.maintain_outbound_transport_classified()
+            .await
+            .map_err(TransportMaintenanceError::into_sdk_error)
+    }
+
+    pub(crate) async fn maintain_outbound_transport_classified(
+        &self,
+    ) -> Result<(), TransportMaintenanceError> {
+        let results = self
+            .outbound_transport_operation_results()
+            .await
+            .into_iter()
+            .map(|result| match result {
+                Ok(report) => check_send_report(report),
+                Err(error) => Err(TransportMaintenanceError::from_sdk_error(error)),
+            })
+            .collect::<Vec<_>>();
+        check_transport_results(&results)
+    }
+
+    async fn outbound_transport_operation_results(
+        &self,
+    ) -> Vec<paykit_sdk::Result<OutboundPrivateSendReport>> {
+        #[cfg(test)]
+        if let Some(operations) = &self.transport_operations {
+            return operations.take_outbound_results();
+        }
         let mut results = Vec::new();
         let pending = {
             let _guard = self.mutation_lock.lock().await;
@@ -484,17 +575,12 @@ impl PaykitAdapter {
                     // Finish an admitted peer operation before giving foreground
                     // work the next turn on the Creator-local mutation fence.
                     let _guard = self.mutation_lock.lock().await;
-                    results.push(
-                        self.sdk
-                            .process_outbound_private_messages(peer)
-                            .await
-                            .and_then(check_send_report),
-                    );
+                    results.push(self.sdk.process_outbound_private_messages(peer).await);
                 }
             }
             Err(error) => results.push(Err(error)),
         }
-        check_transport_results(&results)
+        results
     }
 
     pub fn new(
@@ -522,7 +608,49 @@ impl PaykitAdapter {
             usdt: None,
             marketplace: None,
             lifecycles: None,
+            #[cfg(test)]
+            transport_operations: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_transport_fixture(operations: TransportOperationFixture) -> Self {
+        use std::time::Duration;
+
+        use crate::{
+            config::{PAYKIT_APP_ID, PAYKIT_CLIENT_ID, PaykitNetwork},
+            crypto::Crypto,
+        };
+        use pubky::ClientId;
+        use sqlx::postgres::PgPoolOptions;
+
+        const CREATOR: &str = "pubkytkrq8zmwb8a3m9k15csu3q17qmfgqnp9dskbrg9uq1rydpyxp7qy";
+        let pool = PgPoolOptions::new()
+            .connect_lazy("postgres://127.0.0.1/postgres")
+            .expect("static transport fixture database URL must parse");
+        let creators = CreatorStore::new(
+            &pool,
+            Arc::new(Crypto::from_master_key(&[7; 32]).expect("test key must be valid")),
+        );
+        let config = PaykitConfig {
+            client_id: ClientId::new(PAYKIT_CLIENT_ID).expect("test client ID must be valid"),
+            app_id: PaykitAppId::new(PAYKIT_APP_ID).expect("test App ID must be valid"),
+            network: PaykitNetwork::Testnet,
+            proposal_acceptance_window: Duration::from_secs(60),
+            payment_window: Duration::from_secs(60),
+            conversion_payment_window: Duration::from_secs(60),
+            marketplace_prepare_ttl: Duration::from_secs(60),
+            allowance_intake: false,
+            marketplace_seller_receipts: false,
+        };
+        let creator =
+            crate::domain::locks::parse_creator(CREATOR).expect("test Creator must be valid");
+        let sessions = CreatorSessionProvider::new(creators, creator, &config)
+            .expect("transport fixture session provider must build");
+        let mut adapter = Self::new(Uuid::new_v4(), sessions, &config)
+            .expect("transport fixture adapter must build");
+        adapter.transport_operations = Some(operations);
+        adapter
     }
 
     pub fn with_lifecycles(mut self, lifecycles: PaymentRequestLifecycleStore) -> Self {
@@ -876,11 +1004,11 @@ where
             }
         }
     }
-    if receive_health == ReceiveHealth::Unavailable {
-        return Err(LifecycleSyncError::PartialReceive);
-    }
     match first_error {
         Some(error) => Err(error),
+        None if receive_health == ReceiveHealth::Unavailable => {
+            Err(LifecycleSyncError::PartialReceive)
+        }
         None => Ok(()),
     }
 }
@@ -1145,43 +1273,145 @@ fn persisted_lifecycle_state(
     }
 }
 
-fn check_send_report(report: OutboundPrivateSendReport) -> paykit_sdk::Result<()> {
-    if !report.failed.is_empty()
-        || !report.reservation_cleanup_failures.is_empty()
-        || !report.recovery_marker_failures.is_empty()
-    {
-        return Err(PaykitSdkError::Transport {
-            context: "private message maintenance failed".into(),
-            source: None,
-        });
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransportFailureCategory {
+    Storage,
+    Identity,
+    Transport,
+    NotFound,
+    Protocol,
+    LinkObservation,
+    Policy,
+    PaymentAdapter,
+    RecoveryRequired,
+    ReservationCleanup,
+    RecoveryMarker,
+    Other,
+}
+
+impl TransportFailureCategory {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Storage => "storage",
+            Self::Identity => "identity",
+            Self::Transport => "transport",
+            Self::NotFound => "not_found",
+            Self::Protocol => "protocol",
+            Self::LinkObservation => "link_observation",
+            Self::Policy => "policy",
+            Self::PaymentAdapter => "payment_adapter",
+            Self::RecoveryRequired => "recovery_required",
+            Self::ReservationCleanup => "reservation_cleanup",
+            Self::RecoveryMarker => "recovery_marker",
+            Self::Other => "other",
+        }
+    }
+
+    const fn is_routine(self) -> bool {
+        matches!(self, Self::Storage | Self::Transport)
+    }
+
+    const fn from_sdk_error(error: &PaykitSdkError) -> Self {
+        match error {
+            PaykitSdkError::Storage { .. } => Self::Storage,
+            PaykitSdkError::Identity { .. } => Self::Identity,
+            PaykitSdkError::Transport { .. } => Self::Transport,
+            PaykitSdkError::NotFound { .. } => Self::NotFound,
+            PaykitSdkError::Protocol { .. } => Self::Protocol,
+            PaykitSdkError::LinkObservation { .. } => Self::LinkObservation,
+            PaykitSdkError::Policy { .. } => Self::Policy,
+            PaykitSdkError::PaymentAdapter { .. } => Self::PaymentAdapter,
+            PaykitSdkError::RecoveryRequired { .. } => Self::RecoveryRequired,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransportMaintenanceError {
+    Deferred,
+    Failed(TransportFailureCategory),
+}
+
+impl TransportMaintenanceError {
+    fn from_sdk_error(error: PaykitSdkError) -> Self {
+        if matches!(
+            error,
+            PaykitSdkError::ConcurrentUpdate { .. } | PaykitSdkError::SharedStateBusy { .. }
+        ) {
+            Self::Deferred
+        } else {
+            Self::Failed(TransportFailureCategory::from_sdk_error(&error))
+        }
+    }
+
+    fn into_sdk_error(self) -> PaykitSdkError {
+        match self {
+            Self::Deferred => PaykitSdkError::ConcurrentUpdate {
+                context: "private message maintenance deferred to another client".into(),
+                source: None,
+            },
+            Self::Failed(_) => PaykitSdkError::Transport {
+                context: "private message maintenance failed".into(),
+                source: None,
+            },
+        }
+    }
+}
+
+pub(crate) fn classify_transport_result(
+    result: paykit_sdk::Result<()>,
+) -> Result<(), TransportMaintenanceError> {
+    result.map_err(TransportMaintenanceError::from_sdk_error)
+}
+
+pub(crate) fn check_send_report(
+    report: OutboundPrivateSendReport,
+) -> Result<(), TransportMaintenanceError> {
+    if !report.reservation_cleanup_failures.is_empty() {
+        return Err(TransportMaintenanceError::Failed(
+            TransportFailureCategory::ReservationCleanup,
+        ));
+    }
+    if !report.recovery_marker_failures.is_empty() {
+        return Err(TransportMaintenanceError::Failed(
+            TransportFailureCategory::RecoveryMarker,
+        ));
+    }
+    if !report.failed.is_empty() {
+        return Err(TransportMaintenanceError::Failed(
+            TransportFailureCategory::Other,
+        ));
     }
     Ok(())
 }
 
-fn check_transport_results(results: &[paykit_sdk::Result<()>]) -> paykit_sdk::Result<()> {
+pub(crate) fn check_transport_results(
+    results: &[Result<(), TransportMaintenanceError>],
+) -> Result<(), TransportMaintenanceError> {
+    let mut failure = None;
     let mut deferred = false;
     for result in results {
-        if let Err(error) = result {
-            if matches!(
-                error,
-                PaykitSdkError::ConcurrentUpdate { .. } | PaykitSdkError::SharedStateBusy { .. }
-            ) {
-                deferred = true;
-            } else {
-                return Err(PaykitSdkError::Transport {
-                    context: "private message maintenance failed".into(),
-                    source: None,
-                });
+        match result {
+            Err(TransportMaintenanceError::Deferred) => deferred = true,
+            Err(TransportMaintenanceError::Failed(category)) => {
+                if failure.is_none()
+                    || failure.is_some_and(TransportFailureCategory::is_routine)
+                        && !category.is_routine()
+                {
+                    failure = Some(*category);
+                }
             }
+            Ok(()) => {}
         }
     }
-    if deferred {
-        return Err(PaykitSdkError::ConcurrentUpdate {
-            context: "private message maintenance deferred to another client".into(),
-            source: None,
-        });
+    if let Some(category) = failure {
+        Err(TransportMaintenanceError::Failed(category))
+    } else if deferred {
+        Err(TransportMaintenanceError::Deferred)
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 type CreatorMutationLock = TokioMutex<()>;
@@ -1833,10 +2063,9 @@ mod tests {
                 source: None,
             },
         ] {
-            assert!(
-                check_transport_results(&[Ok(()), Err(error), Ok(())])
-                    .unwrap_err()
-                    .is_concurrent_update()
+            assert_eq!(
+                check_transport_results(&[Ok(()), classify_transport_result(Err(error)), Ok(()),]),
+                Err(TransportMaintenanceError::Deferred)
             );
         }
     }
@@ -1845,60 +2074,74 @@ mod tests {
     fn transport_health_rejects_peer_and_nested_send_failures_without_private_details() {
         let private_error = "private-peer-error";
         let mut failures = vec![
-            Err(PaykitSdkError::Policy {
-                context: private_error.into(),
-                source: None,
-            }),
-            Err(PaykitSdkError::Storage {
-                context: private_error.into(),
-                source: None,
-            }),
-            Err(PaykitSdkError::Transport {
-                context: private_error.into(),
-                source: None,
-            }),
+            (
+                classify_transport_result(Err(PaykitSdkError::Policy {
+                    context: private_error.into(),
+                    source: None,
+                })),
+                TransportFailureCategory::Policy,
+            ),
+            (
+                classify_transport_result(Err(PaykitSdkError::Storage {
+                    context: private_error.into(),
+                    source: None,
+                })),
+                TransportFailureCategory::Storage,
+            ),
+            (
+                classify_transport_result(Err(PaykitSdkError::Transport {
+                    context: private_error.into(),
+                    source: None,
+                })),
+                TransportFailureCategory::Transport,
+            ),
         ];
-        for report in [
-            OutboundPrivateSendReport {
-                failed: vec![OutboundPrivateSendFailure {
-                    outbound_message_id: 3,
-                    error: private_error.into(),
-                }],
-                ..Default::default()
-            },
-            OutboundPrivateSendReport {
-                reservation_cleanup_failures: vec![ReservationCleanupFailure {
-                    reservation_id: Some("private-reservation".into()),
-                    error: private_error.into(),
-                }],
-                ..Default::default()
-            },
-            OutboundPrivateSendReport {
-                recovery_marker_failures: vec![RecoveryMarkerPublishFailure {
-                    outbound_message_id: Some(3),
-                    error: private_error.into(),
-                }],
-                ..Default::default()
-            },
+        for (report, expected) in [
+            (
+                OutboundPrivateSendReport {
+                    failed: vec![OutboundPrivateSendFailure {
+                        outbound_message_id: 3,
+                        error: private_error.into(),
+                    }],
+                    ..Default::default()
+                },
+                TransportFailureCategory::Other,
+            ),
+            (
+                OutboundPrivateSendReport {
+                    reservation_cleanup_failures: vec![ReservationCleanupFailure {
+                        reservation_id: Some("private-reservation".into()),
+                        error: private_error.into(),
+                    }],
+                    ..Default::default()
+                },
+                TransportFailureCategory::ReservationCleanup,
+            ),
+            (
+                OutboundPrivateSendReport {
+                    recovery_marker_failures: vec![RecoveryMarkerPublishFailure {
+                        outbound_message_id: Some(3),
+                        error: private_error.into(),
+                    }],
+                    ..Default::default()
+                },
+                TransportFailureCategory::RecoveryMarker,
+            ),
         ] {
-            failures.push(check_send_report(report));
+            failures.push((check_send_report(report), expected));
         }
-        for failure in failures {
-            let locked = Err(PaykitSdkError::SharedStateBusy {
+        for (failure, expected) in failures {
+            let locked = classify_transport_result(Err(PaykitSdkError::SharedStateBusy {
                 context: private_error.into(),
                 source: None,
-            });
-            let conflict = Err(PaykitSdkError::ConcurrentUpdate {
+            }));
+            let conflict = classify_transport_result(Err(PaykitSdkError::ConcurrentUpdate {
                 context: private_error.into(),
                 source: None,
-            });
+            }));
             let error = check_transport_results(&[locked, failure, Ok(()), conflict]).unwrap_err();
-            assert!(matches!(
-                error,
-                PaykitSdkError::Transport { source: None, .. }
-            ));
+            assert_eq!(error, TransportMaintenanceError::Failed(expected));
             assert!(!format!("{error:?}").contains(private_error));
-            assert!(!error.to_string().contains(CREATOR));
         }
     }
 
@@ -1951,17 +2194,19 @@ mod tests {
     fn a_peer_owned_by_sse_intake_is_neither_contention_nor_an_empty_inbox() {
         // Contention defers to the next pass; an intake mode conflict does not
         // clear on its own, so it fails the pass.
-        assert!(matches!(
-            check_transport_results(&[Err(PaykitSdkError::SharedStateBusy {
-                context: "busy".into(),
-                source: None,
-            })]),
-            Err(PaykitSdkError::ConcurrentUpdate { .. })
-        ));
-        assert!(matches!(
-            check_transport_results(&[Ok(()), Err(private_intake_mode_conflict())]),
-            Err(PaykitSdkError::Transport { .. })
-        ));
+        assert_eq!(
+            check_transport_results(&[Err(TransportMaintenanceError::Deferred)]),
+            Err(TransportMaintenanceError::Deferred)
+        );
+        assert_eq!(
+            check_transport_results(&[
+                Ok(()),
+                classify_transport_result(Err(private_intake_mode_conflict())),
+            ]),
+            Err(TransportMaintenanceError::Failed(
+                TransportFailureCategory::Other
+            ))
+        );
 
         // A refused receive never proves the reader sent nothing.
         let target = receive_target(CREATOR);
@@ -2256,6 +2501,21 @@ mod tests {
                 PersistedPaymentRequestLifecycleState::Accepted,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn mixed_receive_and_persistence_failure_preserves_persistence_category() {
+        let result = project_lifecycles_after_receive(
+            vec![Ok(projection(
+                1,
+                PersistedPaymentRequestLifecycleState::Proposed,
+            ))],
+            ReceiveHealth::Unavailable,
+            |_| std::future::ready(Err(LifecycleSyncError::Persistence)),
+        )
+        .await;
+
+        assert_eq!(result, Err(LifecycleSyncError::Persistence));
     }
 
     #[tokio::test]
