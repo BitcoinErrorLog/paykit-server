@@ -148,6 +148,42 @@ crash after the contact write but before database completion leaves a retryable
 attempt, not a completed one. Profile data stays in
 encrypted shared state; the queue reuses the encrypted invoice and keyed lookups.
 
+### Seller Receipts
+
+The server never issues Receipts. The seller's wallet shares the Creator's
+SDK state, sees the server's Marketplace Payment Requests as payee, and may issue
+a Receipt when it receives the money, with the txid or payment hash in its
+Receipt Metadata. With `paykit.marketplace_seller_receipts = true` (off by
+default) a worker reads those Receipts so the Marketplace can treat one as the
+seller's own attestation that the order is paid.
+
+It accepts a Receipt for an open Marketplace request (active, not resolved,
+proposed, and with no Receipt stored) only when all hold: its Payment Request ID
+is the request's, which is the proposal outbox row ID the SDK handoff used, not
+the invoice ID; its counterparty is the request's reader; and its App is not
+`paykit-server`; and the wallet has stored the Encrypted Receipt at its Receipt
+Location, so the buyer can fetch the same Receipt. It lists the identity's issued Receipts without decrypting them
+and decrypts only matches, at most four per read, so the seller's other Receipts
+are never opened or stored. It does not compare amounts: the stored Receipt
+reports what the wallet said. The first accepted Receipt per request is stored
+encrypted and append-only; a different one later is logged and dropped. The store
+locks the request's row, as resolution and voiding do, and stores only while the
+request is still open, so a request resolved first gets no Receipt and a Receipt
+stored first stays after resolution. Attribution
+by App ID assumes the identity's Apps write their own App ID honestly: the shared
+state does not authenticate which App wrote a record.
+
+Each read is one SDK call that lists the Receipts, plus one call per match, all
+holding the Creator mutation lock. Every one takes the shared-state write lock
+that Bitkit also needs. The worker reads only Creators with an open request
+awaiting its Receipt, at most once per Creator per pass, no sooner than 30
+seconds or ten times its last read's duration after that read began, with at
+most the outbox batch size of reads at once. A busy or concurrently updated
+state is retried on a later pass. Like Allowance intake it runs outside the
+abortable workers: a read already started is never cancelled, and shutdown waits
+for it. A request that is never resolved keeps its Creator eligible, at that
+spacing.
+
 Upgrade policy and operational limits are in the [README](../README.md);
 validation commands are in [CONTRIBUTING](../CONTRIBUTING.md).
 

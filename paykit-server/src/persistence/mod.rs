@@ -23,7 +23,7 @@ pub use marketplace_preparations::{
     MarketplacePreparationInput, MarketplacePreparationPayloadFactory,
     MarketplacePreparationPayloads, MarketplacePreparationPreflight, MarketplacePreparationResult,
     MarketplacePreparationStore, MarketplaceResolutionOutcome, MarketplaceResolutionResult,
-    MarketplaceVoidResult,
+    MarketplaceVoidResult, OpenSellerReceiptRequest, SellerReceiptStored,
 };
 pub use migrations::{MIGRATION_ADVISORY_LOCK_KEY, MigrationLock, run_migrations};
 pub use outbox::{ClaimedHandoff, ClaimedOutbox, HandoffResult, OutboxRetryClass, OutboxStore};

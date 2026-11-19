@@ -95,6 +95,7 @@ impl Fixture {
             conversion_payment_window: Duration::from_secs(3600),
             marketplace_prepare_ttl: Duration::from_secs(15 * 60),
             allowance_intake: false,
+            marketplace_seller_receipts: false,
         };
         let adapter = PaykitAdapter::new(
             creator_id,

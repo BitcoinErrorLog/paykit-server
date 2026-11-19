@@ -96,6 +96,7 @@ impl Config {
                 conversion_payment_window: raw.paykit.conversion_payment_window,
                 marketplace_prepare_ttl: raw.paykit.marketplace_prepare_ttl,
                 allowance_intake: raw.paykit.allowance_intake,
+                marketplace_seller_receipts: raw.paykit.marketplace_seller_receipts,
             },
             electrum: ElectrumConfig {
                 endpoint: electrum_endpoint,
@@ -456,6 +457,10 @@ pub struct PaykitConfig {
     /// send. Off by default. Each read is one SDK call whose work is bounded
     /// by a per-link record cap.
     pub allowance_intake: bool,
+    /// Whether the server reads the Receipts the seller's wallet issues for
+    /// Marketplace requests from the Creator's shared SDK state. Off by
+    /// default. Reads take the shared-state lock the wallet also needs.
+    pub marketplace_seller_receipts: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -814,6 +819,8 @@ struct RawPaykitConfig {
     marketplace_prepare_ttl: Duration,
     #[serde(default)]
     allowance_intake: bool,
+    #[serde(default)]
+    marketplace_seller_receipts: bool,
 }
 
 const fn default_proposal_acceptance_window() -> Duration {

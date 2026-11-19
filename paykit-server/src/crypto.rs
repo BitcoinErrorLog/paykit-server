@@ -160,6 +160,11 @@ impl Crypto {
         self.domain_separated_lookup_hash(b"paykit-server:usdt-transfer", identity)
     }
 
+    /// Produces a keyed lookup hash scoped exclusively to seller Receipt IDs.
+    pub fn seller_receipt_lookup_hash(&self, receipt_id: &[u8]) -> LookupHash {
+        self.domain_separated_lookup_hash(b"paykit-server:seller-receipt:v1", receipt_id)
+    }
+
     fn domain_separated_lookup_hash(&self, domain: &[u8], logical_bytes: &[u8]) -> LookupHash {
         let mut mac = match <Hmac<Sha256> as hmac::KeyInit>::new_from_slice(&*self.lookup_hmac_key)
         {
@@ -206,6 +211,8 @@ pub enum EnvelopeType {
     MarketplacePreparation,
     /// Encrypted Bitcoin settlement record for an activated Marketplace preparation.
     MarketplaceSettlementPaymentRecord,
+    /// The Receipt the seller's wallet issued for a Marketplace request.
+    MarketplaceSellerReceipt,
 }
 
 impl EnvelopeType {
@@ -224,6 +231,7 @@ impl EnvelopeType {
             Self::PaymentDrain => b"payment-drain",
             Self::MarketplacePreparation => b"marketplace-preparation",
             Self::MarketplaceSettlementPaymentRecord => b"marketplace-settlement-payment-record",
+            Self::MarketplaceSellerReceipt => b"marketplace-seller-receipt",
         }
     }
 }
@@ -372,6 +380,18 @@ impl EnvelopeContext {
     ) -> Self {
         Self::new(
             EnvelopeType::MarketplaceSettlementPaymentRecord,
+            creator_lookup_hash,
+            preparation_id,
+        )
+    }
+
+    /// Creates the binding context for the seller Receipt of one Marketplace preparation.
+    pub fn marketplace_seller_receipt(
+        creator_lookup_hash: LookupHash,
+        preparation_id: Uuid,
+    ) -> Self {
+        Self::new(
+            EnvelopeType::MarketplaceSellerReceipt,
             creator_lookup_hash,
             preparation_id,
         )

@@ -156,11 +156,11 @@ fn format_optional(value: Option<OffsetDateTime>) -> Result<Option<String>, ApiE
     value.map(format).transpose()
 }
 
-fn format(value: OffsetDateTime) -> Result<String, ApiError> {
+pub(super) fn format(value: OffsetDateTime) -> Result<String, ApiError> {
     value.format(&Rfc3339).map_err(|_| ApiError::Unavailable)
 }
 
-fn parse_uuid(value: &str) -> Result<Uuid, ApiError> {
+pub(super) fn parse_uuid(value: &str) -> Result<Uuid, ApiError> {
     let parsed = Uuid::parse_str(value).map_err(|_| ApiError::InvalidRequest)?;
     if parsed.get_version_num() != 4
         || parsed.get_variant() != uuid::Variant::RFC4122

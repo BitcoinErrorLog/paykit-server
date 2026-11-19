@@ -3,10 +3,12 @@
 mod allowances;
 mod buyer_contacts;
 mod payment_status;
+mod seller_receipts;
 
 pub use allowances::{
     ALLOWANCE_INTAKE_COOLDOWN, ALLOWANCE_INTAKE_PASS_DEADLINE, AllowanceIntake, IntakeTurns,
 };
+pub use seller_receipts::{SELLER_RECEIPT_READ_INTERVAL, SellerReceiptReads};
 
 use std::{
     collections::HashMap,
@@ -639,6 +641,7 @@ impl PaykitAdapter {
             conversion_payment_window: Duration::from_secs(60),
             marketplace_prepare_ttl: Duration::from_secs(60),
             allowance_intake: false,
+            marketplace_seller_receipts: false,
         };
         let creator =
             crate::domain::locks::parse_creator(CREATOR).expect("test Creator must be valid");

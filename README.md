@@ -90,6 +90,7 @@ Business routes:
 - signed `POST /marketplace/payment-requests/void`
 - signed `POST /marketplace/payment-requests/resolve`
 - signed `POST /marketplace/payment-requests/status`
+- signed `POST /marketplace/payment-requests/receipt`
 - signed `POST /connections/status`
 - signed `POST /transactions/status`
 - signed `POST /setup/status`
@@ -256,6 +257,21 @@ are never combined. `payment_state` is `confirmed` when either rail has an inclu
 payment, `detected` when a receipt is present with no confirmations, and `expired` once the
 deadline has passed with no qualifying payment on either rail. Fixtures captured from the
 real services are under `docs/fixtures/marketplace-payment-request-status/`.
+
+`POST /marketplace/payment-requests/receipt` takes the same closed
+`{"creator","invoice_id"}` input and returns the Receipt the seller's wallet issued
+for that request, as `{"invoice_id", "receipt"}`. `receipt` is `null` until one is
+stored, then `receipt_id`, `app_id` (the issuing App), `payment_request_id`,
+`payment_reference`, `payment_endpoint_identifier`, `amount` (`{"value","currency"}`
+or `null`), `metadata` (the Receipt Metadata object, such as `{"txid": ...}` for
+on-chain and USDT payments or `{"payment_hash": ...}` for Lightning), `issued_at`
+(when the wallet recorded it) and `stored_at`. It reads only persisted state, never
+Pubky or the SDK; unknown invoices and wrong Creators return the same `404`. The
+amount is reported as the Receipt states it, not checked against the request: a
+partial or larger payment is the seller's to judge. Receipts are read only with
+`paykit.marketplace_seller_receipts = true` (off by default); see
+[Seller Receipts](docs/architecture.md#seller-receipts). The status response is
+unchanged.
 
 Marketplace lifecycle conflicts use recovery-specific `409` codes. `prepare_expired`
 requires a new preparation attempt; `lifecycle_terminal` means activation lost to
@@ -611,7 +627,7 @@ and persistence distinctions without formatting their source errors. Pubky's
 URL-bearing AUTH relay targets are disabled at every log level; application-owned
 setup stages provide the safe replacement diagnostics.
 
-On SIGTERM or SIGINT, readiness changes first, normal admission and new worker claims stop, and admitted work drains for at most `shutdown.drain_timeout`. Remaining work is cancelled at the deadline, except Allowance intake: it starts no new read once shutdown begins, but a read already running is an SDK mutation and is awaited past the deadline. Each Creator has at most one read running; it waits at most 20 seconds for the Creator lock, its work is bounded by the SDK's per-link record cap, and each of its Pubky requests times out after 30 seconds. Durable leases can be reclaimed after restart; pending memory-only setup flows are lost.
+On SIGTERM or SIGINT, readiness changes first, normal admission and new worker claims stop, and admitted work drains for at most `shutdown.drain_timeout`. Remaining work is cancelled at the deadline, except Allowance intake and the seller Receipt reader: neither starts a new read once shutdown begins, but a read already running holds the shared-state lock and is awaited past the deadline. For Allowance intake, each Creator has at most one read running; it waits at most 20 seconds for the Creator lock, its work is bounded by the SDK's per-link record cap, and each of its Pubky requests times out after 30 seconds. Durable leases can be reclaimed after restart; pending memory-only setup flows are lost.
 
 ## Invoice and delivery semantics
 
@@ -722,7 +738,9 @@ response fixtures for Locks are published under
 
 The server receives and durably projects Paykit Payment Request acceptance, rejection, proof, and cancellation records from the identity's shared SDK state. It exposes no payer inbox or proof-submission API. Direct invoice-address observation remains the only Bitcoin payment-attribution input; Paykit Server never decides Locks access.
 
-Paykit Receipt issuance, Receipt Access delivery, and receipt storage are unsupported.
+Paykit Server never issues Receipts or delivers Receipt Access. It stores only the
+Receipt a seller's wallet issued for a Marketplace request, read from the
+Creator's shared SDK state (see [Seller Receipts](docs/architecture.md#seller-receipts)).
 
 ## Retention and data lifecycle
 

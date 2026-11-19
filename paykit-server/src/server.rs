@@ -17,6 +17,7 @@ use crate::{
         },
         marketplace_lifecycle::MarketplaceLifecycleService,
         marketplace_preparation::PrepareMarketplaceService,
+        marketplace_receipt::MarketplaceReceiptService,
         marketplace_status::MarketplaceStatusService,
         payment_drain::{
             PaymentDrainCleanupToken, PaymentDrainError, PaymentDrainOperations,
@@ -36,8 +37,8 @@ use crate::{
     http::{self, auth::SignedServiceAuth},
     paykit::{
         ALLOWANCE_INTAKE_COOLDOWN, ALLOWANCE_INTAKE_PASS_DEADLINE, AllowanceIntake,
-        CreatorSessions, IntakeTurns, PaykitAdapter, TransportMaintenanceError,
-        creator_mutation_lock, sdk_error_label,
+        CreatorSessions, IntakeTurns, PaykitAdapter, SELLER_RECEIPT_READ_INTERVAL,
+        SellerReceiptReads, TransportMaintenanceError, creator_mutation_lock, sdk_error_label,
     },
     persistence::{
         CreatorStore, InvoiceStore, MarketplacePreparationStore, OutboxRetryClass, OutboxStore,
@@ -324,6 +325,9 @@ impl Server {
         let marketplace_status_service = Arc::new(MarketplaceStatusService::new(
             marketplace_preparations.clone(),
         ));
+        let marketplace_receipt_service = Arc::new(MarketplaceReceiptService::new(
+            marketplace_preparations.clone(),
+        ));
         let connection_status_service = Arc::new(ConnectionStatusService::new(
             Arc::new(invoices.clone()),
             Arc::new(sessions.clone()),
@@ -373,6 +377,9 @@ impl Server {
                 ))
                 .merge(http::marketplace_status::marketplace_status_router(
                     marketplace_status_service,
+                ))
+                .merge(http::marketplace_receipt::marketplace_receipt_router(
+                    marketplace_receipt_service,
                 ))
                 .merge(http::status::status_router(status_service))
                 .merge(http::payment_drains::payment_drains_router(
@@ -457,7 +464,7 @@ impl Server {
         F: Future<Output = ()> + Send,
     {
         let drain_timeout = self.config.shutdown.drain_timeout;
-        let (mut tasks, mut intake) = spawn_owned_workers(self.workers, self.runtime.clone());
+        let (mut tasks, mut settling) = spawn_owned_workers(self.workers, self.runtime.clone());
         let serving = crate::runtime::serve(listener, self.router, self.runtime.clone());
         tokio::pin!(serving);
         tokio::pin!(shutdown);
@@ -465,7 +472,7 @@ impl Server {
             Shutdown,
             Served(std::io::Result<()>),
             WorkerExited,
-            IntakeExited,
+            SettlingExited,
         }
         let stop = tokio::select! {
             biased;
@@ -473,24 +480,24 @@ impl Server {
             _ = self.runtime.cancelled() => Stop::Shutdown,
             result = &mut serving => Stop::Served(result),
             _ = tasks.join_next() => Stop::WorkerExited,
-            () = intake_exited(&mut intake) => Stop::IntakeExited,
+            () = settling_exited(&mut settling) => Stop::SettlingExited,
         };
         match stop {
             Stop::Shutdown => {}
             Stop::Served(result) => {
                 self.runtime.begin_shutdown();
-                abort_owned_workers(&mut tasks, intake).await;
+                abort_owned_workers(&mut tasks, &mut settling).await;
                 return result;
             }
             Stop::WorkerExited => {
                 self.runtime.begin_shutdown();
-                abort_owned_workers(&mut tasks, intake).await;
+                abort_owned_workers(&mut tasks, &mut settling).await;
                 return Err(std::io::Error::other("owned worker exited unexpectedly"));
             }
-            // Intake runs until shutdown; returning or panicking before is fatal.
-            Stop::IntakeExited => {
+            // These run until shutdown; returning or panicking before is fatal.
+            Stop::SettlingExited => {
                 self.runtime.begin_shutdown();
-                abort_owned_workers(&mut tasks, None).await;
+                abort_owned_workers(&mut tasks, &mut settling).await;
                 return Err(std::io::Error::other("owned worker exited unexpectedly"));
             }
         }
@@ -508,7 +515,7 @@ impl Server {
             Ok(result) => result,
             Err(_) => Ok(()),
         };
-        abort_owned_workers(&mut tasks, intake).await;
+        abort_owned_workers(&mut tasks, &mut settling).await;
         result
     }
 }
@@ -520,35 +527,33 @@ async fn join_owned_workers(tasks: &mut JoinSet<()>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Completes when Allowance intake's root task ends, by returning or panicking;
-/// never, when intake is off. The handle is spent once this completes.
-async fn intake_exited(intake: &mut Option<tokio::task::JoinHandle<()>>) {
-    match intake.as_mut() {
-        Some(handle) => {
-            let _ = handle.await;
-            *intake = None;
-        }
-        None => std::future::pending().await,
+/// Completes when the root task of Allowance intake or the seller Receipt
+/// reader ends, by returning or panicking; never, when neither runs. The
+/// ended task leaves the set.
+async fn settling_exited(settling: &mut JoinSet<()>) {
+    if settling.is_empty() {
+        std::future::pending::<()>().await;
     }
+    let _ = settling.join_next().await;
 }
 
-/// Aborts the abortable owned workers, then waits for Allowance intake, which
-/// is never aborted: its running passes are SDK mutations that must settle,
-/// and it starts no new one once shutdown has begun.
-async fn abort_owned_workers(tasks: &mut JoinSet<()>, intake: Option<tokio::task::JoinHandle<()>>) {
+/// Aborts the abortable owned workers, then waits for Allowance intake and the
+/// seller Receipt reader, which are never aborted: their running passes are
+/// SDK calls under the shared-state lock that must settle, and they start no
+/// new one once shutdown has begun.
+async fn abort_owned_workers(tasks: &mut JoinSet<()>, settling: &mut JoinSet<()>) {
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
-    if let Some(intake) = intake {
-        let _ = intake.await;
-    }
+    while settling.join_next().await.is_some() {}
 }
 
-/// Spawns the owned workers. Allowance intake runs outside the abortable set,
-/// so a drain deadline never drops a running intake mutation.
+/// Spawns the owned workers. Allowance intake and the seller Receipt reader
+/// run outside the abortable set, so a drain deadline never drops a running
+/// SDK call.
 fn spawn_owned_workers(
     workers: WorkerComponents,
     runtime: Arc<Runtime>,
-) -> (JoinSet<()>, Option<tokio::task::JoinHandle<()>>) {
+) -> (JoinSet<()>, JoinSet<()>) {
     let mut tasks = JoinSet::new();
     let workers = Arc::new(workers);
     tasks.spawn(outbox_enqueue_loop(workers.clone(), runtime.clone()));
@@ -558,13 +563,16 @@ fn spawn_owned_workers(
         runtime.clone(),
     ));
     tasks.spawn(shared_transport_loop(workers.clone(), runtime.clone()));
-    let intake = workers
-        .paykit
-        .allowance_intake
-        .then(|| tokio::spawn(allowance_intake_loop(workers.clone(), runtime.clone())));
+    let mut settling = JoinSet::new();
+    if workers.paykit.allowance_intake {
+        settling.spawn(allowance_intake_loop(workers.clone(), runtime.clone()));
+    }
+    if workers.paykit.marketplace_seller_receipts {
+        settling.spawn(seller_receipts_loop(workers.clone(), runtime.clone()));
+    }
     tasks.spawn(buyer_contacts_loop(workers.clone(), runtime.clone()));
     tasks.spawn(observer_loop(workers, runtime));
-    (tasks, intake)
+    (tasks, settling)
 }
 
 async fn buyer_contacts_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
@@ -706,6 +714,21 @@ fn start_intake_passes<Pass, PassFuture>(
     tasks: &mut CreatorTasks<()>,
     turns: &mut IntakeTurns,
     creators: Vec<Uuid>,
+    pass: Pass,
+) where
+    Pass: FnMut(Uuid) -> PassFuture,
+    PassFuture: Future<Output = ()> + Send + 'static,
+{
+    start_creator_passes("allowance_intake", tasks, turns, creators, pass);
+}
+
+/// [`start_intake_passes`] for any per-Creator worker; `stage` names it in
+/// the panic log.
+fn start_creator_passes<Pass, PassFuture>(
+    stage: &'static str,
+    tasks: &mut CreatorTasks<()>,
+    turns: &mut IntakeTurns,
+    creators: Vec<Uuid>,
     mut pass: Pass,
 ) where
     Pass: FnMut(Uuid) -> PassFuture,
@@ -719,19 +742,16 @@ fn start_intake_passes<Pass, PassFuture>(
         if running.contains(&creator) {
             continue;
         }
-        if tasks.try_spawn(creator, contain_panic(pass(creator))) {
+        if tasks.try_spawn(creator, contain_panic(stage, pass(creator))) {
             turns.started(creator);
         }
     }
 }
 
 /// Runs `pass`, logging a panic in it instead of passing it on.
-async fn contain_panic(pass: impl Future<Output = ()> + Send) {
+async fn contain_panic(stage: &'static str, pass: impl Future<Output = ()> + Send) {
     if pass_panicked(pass).await {
-        tracing::error!(
-            stage = "allowance_intake",
-            "Paykit Allowance intake pass panicked"
-        );
+        tracing::error!(stage, "Paykit worker pass panicked");
     }
 }
 
@@ -791,6 +811,87 @@ async fn run_allowance_intake_pass(
             step,
             category,
             "Paykit Allowance intake failed"
+        );
+    }
+}
+
+/// Reads the Receipts sellers' wallets issue for Marketplace requests. Like
+/// Allowance intake it runs one task per Creator, at most `outbox_batch_size`
+/// at once, least recently started Creator first. It considers only Creators
+/// with an open Marketplace request whose seller Receipt is not stored, and
+/// reads each no more often than its spacing allows.
+async fn seller_receipts_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
+    let reads = Arc::new(SellerReceiptReads::new(SELLER_RECEIPT_READ_INTERVAL));
+    let limit = usize::try_from(workers.outbox_batch_size).expect("validated outbox batch size");
+    let mut tasks = CreatorTasks::new(limit, runtime.clone());
+    let mut turns = IntakeTurns::default();
+    let mut interval = tokio::time::interval(workers.outbox_poll_interval);
+    interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = runtime.cancelled() => break,
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
+            _ = interval.tick() => {}
+        }
+        if tasks.available_slots() == 0 {
+            continue;
+        }
+        let creators = match workers
+            .marketplace_preparations
+            .creators_awaiting_seller_receipts()
+            .await
+        {
+            Ok(creators) => creators,
+            Err(error) => {
+                tracing::warn!(
+                    stage = "seller_receipts",
+                    step = "creator_ids_load",
+                    category = error.diagnostic_label(),
+                    "Paykit seller Receipt reads unavailable"
+                );
+                continue;
+            }
+        };
+        let now = Instant::now();
+        let due = creators
+            .into_iter()
+            .filter(|creator| reads.is_due(*creator, now))
+            .collect();
+        start_creator_passes("seller_receipts", &mut tasks, &mut turns, due, |creator| {
+            seller_receipts_pass(workers.clone(), reads.clone(), runtime.clone(), creator)
+        });
+    }
+    finish_intake_passes(&mut tasks).await;
+}
+
+/// One Creator's seller Receipt read. A busy shared state is retried on a
+/// later pass without a warning.
+async fn seller_receipts_pass(
+    workers: Arc<WorkerComponents>,
+    reads: Arc<SellerReceiptReads>,
+    runtime: Arc<Runtime>,
+    creator: Uuid,
+) {
+    let failure = match creator_adapter(&workers, creator).await {
+        Ok(_) if !runtime.may_start_worker_claim() => None,
+        Ok(adapter) => match adapter
+            .read_seller_receipts(&reads, &workers.marketplace_preparations)
+            .await
+        {
+            Ok(_)
+            | Err(
+                PaykitSdkError::ConcurrentUpdate { .. } | PaykitSdkError::SharedStateBusy { .. },
+            ) => None,
+            Err(error) => Some(("issued_receipts", sdk_error_label(&error))),
+        },
+        Err(error) => Some(("adapter_build", error.diagnostic_label())),
+    };
+    if let Some((step, category)) = failure {
+        tracing::warn!(
+            stage = "seller_receipts",
+            step,
+            category,
+            "Paykit seller Receipt read failed"
         );
     }
 }
@@ -2858,10 +2959,10 @@ mod tests {
     #[tokio::test]
     async fn production_spawn_path_owns_all_workers() {
         let server = test_server().await;
-        let (mut tasks, intake) = spawn_owned_workers(server.workers, server.runtime);
+        let (mut tasks, mut settling) = spawn_owned_workers(server.workers, server.runtime);
         assert_eq!(tasks.len(), 6);
-        assert!(intake.is_none());
-        abort_owned_workers(&mut tasks, intake).await;
+        assert!(settling.is_empty());
+        abort_owned_workers(&mut tasks, &mut settling).await;
     }
 
     #[tokio::test]
@@ -2873,41 +2974,60 @@ mod tests {
         );
         server.workers.paykit.allowance_intake = true;
         let runtime = server.runtime.clone();
-        let (mut tasks, intake) = spawn_owned_workers(server.workers, server.runtime);
+        let (mut tasks, mut settling) = spawn_owned_workers(server.workers, server.runtime);
         // Intake runs outside the abortable set.
         assert_eq!(tasks.len(), 6);
-        assert!(intake.is_some());
+        assert_eq!(settling.len(), 1);
         runtime.begin_shutdown();
-        abort_owned_workers(&mut tasks, intake).await;
+        abort_owned_workers(&mut tasks, &mut settling).await;
     }
 
     #[tokio::test]
-    async fn an_intake_root_that_returns_or_panics_is_noticed_while_serving() {
-        let mut off = None;
+    async fn seller_receipt_reads_run_only_when_enabled() {
+        let mut server = test_server().await;
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), intake_exited(&mut off))
+            !server.workers.paykit.marketplace_seller_receipts,
+            "seller Receipt reads are off by default"
+        );
+        server.workers.paykit.marketplace_seller_receipts = true;
+        let runtime = server.runtime.clone();
+        let (mut tasks, mut settling) = spawn_owned_workers(server.workers, server.runtime);
+        // The reader runs outside the abortable set, like intake.
+        assert_eq!(tasks.len(), 6);
+        assert_eq!(settling.len(), 1);
+        runtime.begin_shutdown();
+        abort_owned_workers(&mut tasks, &mut settling).await;
+    }
+
+    #[tokio::test]
+    async fn a_settling_root_that_returns_or_panics_is_noticed_while_serving() {
+        let mut off = JoinSet::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), settling_exited(&mut off))
                 .await
                 .is_err(),
-            "intake that is off never counts as exited"
+            "no settling worker never counts as exited"
         );
-        let running: tokio::task::JoinHandle<()> = tokio::spawn(std::future::pending());
-        let mut running = Some(running);
+        let mut running = JoinSet::new();
+        running.spawn(std::future::pending::<()>());
         assert!(
-            tokio::time::timeout(Duration::from_millis(50), intake_exited(&mut running))
+            tokio::time::timeout(Duration::from_millis(50), settling_exited(&mut running))
                 .await
                 .is_err()
         );
-        running.take().unwrap().abort();
-        for root in [
-            tokio::spawn(async {}),
-            tokio::spawn(async { panic!("intake root panicked") }),
-        ] {
-            let mut intake = Some(root);
-            tokio::time::timeout(Duration::from_secs(5), intake_exited(&mut intake))
+        running.abort_all();
+        for panics in [false, true] {
+            let mut settling = JoinSet::new();
+            settling.spawn(async move {
+                if panics {
+                    panic!("settling root panicked");
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), settling_exited(&mut settling))
                 .await
                 .expect("the exit was noticed");
-            // The spent handle is never awaited again at shutdown.
-            assert!(intake.is_none());
+            // The spent task is never awaited again at shutdown.
+            assert!(settling.is_empty());
         }
     }
 
@@ -2921,7 +3041,8 @@ mod tests {
         // Intake whose SDK mutation is still running when the drain deadline
         // passes; it must settle rather than be dropped.
         let settled = Arc::new(AtomicBool::new(false));
-        let intake = tokio::spawn({
+        let mut settling = JoinSet::new();
+        settling.spawn({
             let settled = settled.clone();
             async move {
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -2931,7 +3052,7 @@ mod tests {
         let drained = tokio::time::timeout(Duration::from_millis(10), std::future::pending::<()>());
         assert!(drained.await.is_err(), "the drain deadline passed");
 
-        abort_owned_workers(&mut tasks, Some(intake)).await;
+        abort_owned_workers(&mut tasks, &mut settling).await;
 
         assert!(
             settled.load(Ordering::SeqCst),
