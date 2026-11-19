@@ -190,7 +190,10 @@ async fn establish_link(
 #[ignore = "requires the Pubky static testnet on localhost"]
 async fn live_pubky_registry_discovery_and_payment_request_delivery() {
     let pubky = Pubky::testnet().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky, "app.paykit.server").unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky, "app.paykit.server")
+        .unwrap()
+        .with_auth_relay("http://127.0.0.1:15412/inbox")
+        .unwrap();
     let homeserver = PubkyPublicKey::from_raw_or_app_key(STATIC_HOMESERVER).unwrap();
     let payee_path = PaykitAppId::new("paykit-server").unwrap();
     let payer_path = PaykitAppId::new("bitkit").unwrap();

@@ -155,6 +155,7 @@ async fn build_pubky_testnet() -> EphemeralTestnet {
     let postgres = pubky_testnet::pubky_homeserver::ConnectionString::new(&postgres).unwrap();
     EphemeralTestnet::builder()
         .postgres(postgres)
+        .with_http_relay()
         .build()
         .await
         .unwrap()
@@ -227,16 +228,7 @@ async fn create_creator(
     homeserver: &PubkyPublicKey,
     store: &CreatorStore,
     spec: CreatorSpec,
-) -> CreatorFixture {
-    create_creator_with_auth_relay(bootstrap, homeserver, store, spec, None).await
-}
-
-async fn create_creator_with_auth_relay(
-    bootstrap: &PubkySessionBootstrap,
-    homeserver: &PubkyPublicKey,
-    store: &CreatorStore,
-    spec: CreatorSpec,
-    auth_relay: Option<&str>,
+    auth_relay: &str,
 ) -> CreatorFixture {
     let CreatorSpec {
         seed,
@@ -295,12 +287,9 @@ async fn create_creator_with_auth_relay(
         account.access.outbox_client.clone(),
         "app.paykit.test-observer",
     )
+    .unwrap()
+    .with_auth_relay(auth_relay)
     .unwrap();
-    let observer_bootstrap = if let Some(auth_relay) = auth_relay {
-        observer_bootstrap.with_auth_relay(auth_relay).unwrap()
-    } else {
-        observer_bootstrap
-    };
     let observer = observer_bootstrap
         .sign_in(
             &PubkyLocalSecretKey::new(keypair.secret_key()),
@@ -1059,12 +1048,7 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
     let homeserver_database = TestDatabase::create().await;
     let testnet = build_static_pubky_testnet(homeserver_database.database_url()).await;
     let pubky = Pubky::testnet().unwrap();
-    let auth_relay = testnet
-        .http_relay()
-        .local_url()
-        .join("inbox")
-        .unwrap()
-        .to_string();
+    let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
     let bootstrap = PubkySessionBootstrap::with_pubky(pubky, "app.paykit.server")
         .unwrap()
         .with_auth_relay(&auth_relay)
@@ -1072,7 +1056,7 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let creators = CreatorStore::new(&pool, Arc::new(Crypto::from_master_key(&[1; 32]).unwrap()));
     let (reader, peer_key, peer_sdk) = create_peer(&bootstrap, &homeserver).await;
-    let creator_before_drain = create_creator_with_auth_relay(
+    let creator_before_drain = create_creator(
         &bootstrap,
         &homeserver,
         &creators,
@@ -1082,10 +1066,10 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
             amount_sats: 100,
             counter_seed: 7_300,
         },
-        Some(&auth_relay),
+        &auth_relay,
     )
     .await;
-    let creator_after_drain = create_creator_with_auth_relay(
+    let creator_after_drain = create_creator(
         &bootstrap,
         &homeserver,
         &creators,
@@ -1095,7 +1079,7 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
             amount_sats: 200,
             counter_seed: 7_400,
         },
-        Some(&auth_relay),
+        &auth_relay,
     )
     .await;
     link(
@@ -1361,7 +1345,11 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
     let first_pool = initialize_database(&first_config).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(&first_pool, crypto.clone());
@@ -1388,6 +1376,7 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
             amount_sats: 100,
             counter_seed: 100,
         },
+        &auth_relay,
     )
     .await;
     let creator_b = create_creator(
@@ -1400,6 +1389,7 @@ async fn composed_two_creator_receiver_workflow_survives_restart() {
             amount_sats: 200,
             counter_seed: 1_000,
         },
+        &auth_relay,
     )
     .await;
     assert_ne!(creator_a.creator, creator_b.creator);
@@ -1911,7 +1901,11 @@ async fn server_relinks_when_the_reader_publishes_a_recovery_marker() {
     let pool = initialize_database(&server_config).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(&pool, crypto.clone());
@@ -1926,6 +1920,7 @@ async fn server_relinks_when_the_reader_publishes_a_recovery_marker() {
             amount_sats: 2_000,
             counter_seed: 100,
         },
+        &auth_relay,
     )
     .await;
     let creator_key = PubkyPublicKey::from_raw_or_app_key(creator.creator.to_string()).unwrap();
@@ -2091,7 +2086,11 @@ async fn malformed_recovery_marker_keeps_exact_handoff_retryable_until_repaired(
     let pool = initialize_database(&server_config).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(&pool, crypto.clone());
@@ -2107,6 +2106,7 @@ async fn malformed_recovery_marker_keeps_exact_handoff_retryable_until_repaired(
             amount_sats: 2_000,
             counter_seed: 100,
         },
+        &auth_relay,
     )
     .await;
     let creator_key = PubkyPublicKey::from_raw_or_app_key(creator.creator.to_string()).unwrap();

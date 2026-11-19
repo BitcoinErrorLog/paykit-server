@@ -57,7 +57,11 @@ async fn advisory_polls_share_hosted_reads_without_bypassing_handoff_checks() {
     let pool = initialize_database(&config).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let creators = CreatorStore::new(&pool, Arc::new(Crypto::from_master_key(&[1; 32]).unwrap()));
     let fixture = create_creator(
@@ -70,6 +74,7 @@ async fn advisory_polls_share_hosted_reads_without_bypassing_handoff_checks() {
             amount_sats: 100,
             counter_seed: 100,
         },
+        &auth_relay,
     )
     .await;
     let (reader, peer_key, peer_sdk) = create_peer(&bootstrap, &homeserver).await;

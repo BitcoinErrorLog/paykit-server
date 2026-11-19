@@ -45,6 +45,7 @@ async fn build_pubky_testnet() -> EphemeralTestnet {
     let postgres = pubky_testnet::pubky_homeserver::ConnectionString::new(&postgres).unwrap();
     EphemeralTestnet::builder()
         .postgres(postgres)
+        .with_http_relay()
         .build()
         .await
         .unwrap()
@@ -54,6 +55,7 @@ async fn create_creator(
     bootstrap: &PubkySessionBootstrap,
     homeserver: &PubkyPublicKey,
     store: &CreatorStore,
+    auth_relay: &str,
     counter_seed: u64,
 ) -> (CreatorPubky, CreatorSdk) {
     let keypair = Keypair::random();
@@ -88,6 +90,8 @@ async fn create_creator(
         account.access.outbox_client.clone(),
         "app.paykit.test-observer",
     )
+    .unwrap()
+    .with_auth_relay(auth_relay)
     .unwrap()
     .sign_in(
         &PubkyLocalSecretKey::new(keypair.secret_key()),
@@ -187,7 +191,11 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
     run_migrations(database.pool()).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(database.pool(), crypto.clone());
@@ -205,9 +213,12 @@ async fn production_server_workers_process_two_creators_without_sdk_state_fallba
     let peer_sdk = sdk_fixtures::hosted_sdk(peer_account.access, "bitkit", 0).await;
     let reader = parse_reader(&format!("pubky{peer_key}")).unwrap();
 
-    let (creator_a, sdk_a) = create_creator(&bootstrap, &homeserver, &creators, 100).await;
-    let (creator_b, sdk_b) = create_creator(&bootstrap, &homeserver, &creators, 1000).await;
-    let (creator_c, sdk_c) = create_creator(&bootstrap, &homeserver, &creators, 10_000).await;
+    let (creator_a, sdk_a) =
+        create_creator(&bootstrap, &homeserver, &creators, &auth_relay, 100).await;
+    let (creator_b, sdk_b) =
+        create_creator(&bootstrap, &homeserver, &creators, &auth_relay, 1000).await;
+    let (creator_c, sdk_c) =
+        create_creator(&bootstrap, &homeserver, &creators, &auth_relay, 10_000).await;
     let creator_a_key = PubkyPublicKey::from_raw_or_app_key(creator_a.to_string()).unwrap();
     let creator_b_key = PubkyPublicKey::from_raw_or_app_key(creator_b.to_string()).unwrap();
     link(&sdk_a, creator_a_key, &peer_sdk, peer_key.clone()).await;

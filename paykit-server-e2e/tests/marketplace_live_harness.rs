@@ -188,11 +188,16 @@ async fn serve_for_marketplace() {
             )
             .unwrap(),
         )
+        .with_http_relay()
         .build()
         .await
         .unwrap();
     let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
 
     let creator_keypair = Keypair::random();

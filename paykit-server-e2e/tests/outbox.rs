@@ -885,6 +885,7 @@ async fn build_pubky_testnet() -> EphemeralTestnet {
     let postgres = pubky_testnet::pubky_homeserver::ConnectionString::new(&postgres).unwrap();
     EphemeralTestnet::builder()
         .postgres(postgres)
+        .with_http_relay()
         .build()
         .await
         .unwrap()
@@ -1722,8 +1723,12 @@ async fn assert_public_sdk_handoff(creator_initiates: bool) {
     let testnet = build_pubky_testnet().await;
     let crypto = Arc::new(Crypto::from_master_key(&[11; 32]).unwrap());
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
-    let bootstrap =
-        PubkySessionBootstrap::with_pubky(testnet.sdk().unwrap(), "app.paykit.server").unwrap();
+    let bootstrap = PubkySessionBootstrap::with_pubky(testnet.sdk().unwrap(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&paykit_server_e2e::auth_relay_inbox(
+            &testnet.http_relay().local_url(),
+        ))
+        .unwrap();
 
     let creator_keypair = Keypair::random();
     let creator_bootstrap = bootstrap

@@ -46,14 +46,18 @@ async fn delegated_server_preserves_wallet_registry_and_contacts_across_restart(
     let postgres = std::env::var("TEST_DATABASE_URL").expect("isolated PostgreSQL required");
     let testnet = EphemeralTestnet::builder()
         .postgres(pubky_testnet::pubky_homeserver::ConnectionString::new(&postgres).unwrap())
+        .with_http_relay()
         .build()
         .await
         .unwrap();
     let client = testnet.sdk().unwrap();
+    let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
     let home = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let root = PubkyLocalSecretKey::new(pubky::Keypair::random().secret_key());
-    let wallet_bootstrap =
-        PubkySessionBootstrap::with_pubky(client.clone(), "app.bitkit.wallet").unwrap();
+    let wallet_bootstrap = PubkySessionBootstrap::with_pubky(client.clone(), "app.bitkit.wallet")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
     let wallet_auth = wallet_bootstrap
         .sign_up(
             &root,
@@ -96,7 +100,10 @@ async fn delegated_server_preserves_wallet_registry_and_contacts_across_restart(
         .await
         .unwrap();
 
-    let server_bootstrap = PubkySessionBootstrap::with_pubky(client, "app.paykit.server").unwrap();
+    let server_bootstrap = PubkySessionBootstrap::with_pubky(client, "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
     let grant = server_bootstrap
         .sign_in(&root, PAYKIT_SESSION_CAPABILITIES)
         .await

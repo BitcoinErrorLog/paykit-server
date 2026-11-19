@@ -226,11 +226,16 @@ async fn boot_with_intake(seed: u8, allowance_intake: bool) -> Stack {
             )
             .unwrap(),
         )
+        .with_http_relay()
         .build()
         .await
         .unwrap();
     let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
 
@@ -301,6 +306,8 @@ async fn boot_with_intake(seed: u8, allowance_intake: bool) -> Stack {
         creator_account.access.outbox_client.clone(),
         "app.paykit.test-observer",
     )
+    .unwrap()
+    .with_auth_relay(&auth_relay)
     .unwrap()
     .sign_in(
         &PubkyLocalSecretKey::new(creator_keypair.secret_key()),

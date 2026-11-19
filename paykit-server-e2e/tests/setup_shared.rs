@@ -424,9 +424,7 @@ async fn real_setup_reconnect_preserves_pending_invoices_and_hosted_state() {
     });
     let completer = RealSetupCompleter::with_app_publisher(
         BitkitAuthStarter::new(bootstrap.clone()),
-        Arc::new(PubkyCompanionRelay::new(
-            pubky::PubkyHttpClient::new().unwrap(),
-        )),
+        Arc::new(PubkyCompanionRelay::new(testnet.client().unwrap())),
         publisher.clone(),
         creators.clone(),
         sessions.clone(),
@@ -1287,9 +1285,7 @@ signed_burst = 200
         );
         let completer = RealSetupCompleter::new(
             BitkitAuthStarter::new(bootstrap.clone()).with_usdt(),
-            Arc::new(PubkyCompanionRelay::new(
-                pubky::PubkyHttpClient::new().unwrap(),
-            )),
+            Arc::new(PubkyCompanionRelay::new(testnet.client().unwrap())),
             creators.clone(),
             sessions.clone(),
             BitcoinNetwork::Testnet,

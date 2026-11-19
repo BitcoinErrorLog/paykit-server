@@ -42,13 +42,17 @@ impl Fixture {
         let postgres = std::env::var("TEST_DATABASE_URL").unwrap();
         let testnet = EphemeralTestnet::builder()
             .postgres(pubky_testnet::pubky_homeserver::ConnectionString::new(&postgres).unwrap())
+            .with_http_relay()
             .build()
             .await
             .unwrap();
         let client = testnet.sdk().unwrap();
+        let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
         let root = PubkyLocalSecretKey::new(pubky::Keypair::random().secret_key());
         let home = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
         let wallet_auth = PubkySessionBootstrap::with_pubky(client.clone(), "app.bitkit.wallet")
+            .unwrap()
+            .with_auth_relay(&auth_relay)
             .unwrap()
             .sign_up(
                 &root,
@@ -61,6 +65,8 @@ impl Fixture {
         let creator = parse_creator(&wallet_auth.public_key.to_app_key()).unwrap();
         let wallet = sdk_fixtures::hosted_sdk(wallet_auth.access, "bitkit", 0).await;
         let grant = PubkySessionBootstrap::with_pubky(client.clone(), "app.paykit.server")
+            .unwrap()
+            .with_auth_relay(&auth_relay)
             .unwrap()
             .sign_in(&root, paykit_sdk::PAYKIT_SESSION_CAPABILITIES)
             .await
@@ -117,6 +123,10 @@ impl Fixture {
     async fn buyer(&self) -> (PubkyPublicKey, pubky::PubkySession, sdk_fixtures::HostedSdk) {
         let bootstrap =
             PubkySessionBootstrap::with_pubky(self.testnet.sdk().unwrap(), "app.bitkit.wallet")
+                .unwrap()
+                .with_auth_relay(&paykit_server_e2e::auth_relay_inbox(
+                    &self.testnet.http_relay().local_url(),
+                ))
                 .unwrap();
         let root = PubkyLocalSecretKey::new(pubky::Keypair::random().secret_key());
         let home = PubkyPublicKey::from_public_key(&self.testnet.homeserver_app().public_key());

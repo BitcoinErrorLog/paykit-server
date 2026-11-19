@@ -17,7 +17,11 @@ async fn status_receives_required_peer_without_consuming_unrelated_messages() {
     let pool = initialize_database(&config).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(&pool, crypto.clone());
@@ -31,6 +35,7 @@ async fn status_receives_required_peer_without_consuming_unrelated_messages() {
             amount_sats: 100,
             counter_seed: 100,
         },
+        &auth_relay,
     )
     .await;
     let creator_key = PubkyPublicKey::from_raw_or_app_key(fixture.creator.to_string()).unwrap();
@@ -164,7 +169,11 @@ async fn status_route_returns_canceled_for_rotation_suppressed_proposal() {
     let pool = initialize_database(&config).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(&pool, crypto.clone());
@@ -178,6 +187,7 @@ async fn status_route_returns_canceled_for_rotation_suppressed_proposal() {
             amount_sats: 100,
             counter_seed: 100,
         },
+        &auth_relay,
     )
     .await;
     let (reader, _, _) = create_peer(&bootstrap, &homeserver).await;
@@ -257,7 +267,11 @@ async fn payment_drain_route_completes_for_rotation_suppressed_proposal() {
     let pool = initialize_database(&config).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(&pool, crypto.clone());
@@ -271,6 +285,7 @@ async fn payment_drain_route_completes_for_rotation_suppressed_proposal() {
             amount_sats: 100,
             counter_seed: 100,
         },
+        &auth_relay,
     )
     .await;
     let (reader, _, _) = create_peer(&bootstrap, &homeserver).await;
@@ -365,7 +380,11 @@ async fn status_route_returns_proposal_expired_for_expired_pre_handoff_proposal(
     let pool = initialize_database(&config).await.unwrap();
     let testnet = build_pubky_testnet().await;
     let pubky = testnet.sdk().unwrap();
-    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server").unwrap();
+    let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
+    let bootstrap = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
     let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
     let crypto = Arc::new(Crypto::from_master_key(&[1; 32]).unwrap());
     let creators = CreatorStore::new(&pool, crypto.clone());
@@ -379,6 +398,7 @@ async fn status_route_returns_proposal_expired_for_expired_pre_handoff_proposal(
             amount_sats: 100,
             counter_seed: 100,
         },
+        &auth_relay,
     )
     .await;
     let (reader, _, _) = create_peer(&bootstrap, &homeserver).await;
