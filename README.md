@@ -863,7 +863,8 @@ selects the response shape:
   host may differ, for example a proxy that serves the same ticker.
 
 Either way, the price must be a positive decimal of at most 18 digits, timestamped
-within the past ten minutes and not in the future.
+within the past ten minutes and at most five seconds ahead of this server's
+clock, which allows for a slightly slow clock.
 USD and USDT use fixed 1:1 parity. Published rates are payment-asset units per
 requested unit; reciprocal BTC rates round half-even to 18 decimal places. The
 required payment rounds up to whole satoshis or millionths of USDT. Fees are

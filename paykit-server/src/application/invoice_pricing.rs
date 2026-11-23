@@ -15,6 +15,8 @@ use crate::{
 
 const RATE_SCALE: u128 = 1_000_000_000_000_000_000;
 const MAX_RATE_AGE_SECONDS: i64 = 600;
+/// A fresh last-trade time can be a moment ahead of a server whose clock runs slightly slow.
+const MAX_RATE_FUTURE_SKEW_SECONDS: i64 = 5;
 const MAX_RATE_BODY_BYTES: usize = 1024 * 1024;
 
 #[async_trait]
@@ -88,14 +90,14 @@ impl CoinbaseExchangeTicker {
 }
 
 /// Accepts one positive decimal rate of at most 18 digits, updated no more than ten
-/// minutes before `now` and not after it.
+/// minutes before `now` and at most [`MAX_RATE_FUTURE_SKEW_SECONDS`] after it.
 fn checked_rate(
     price: String,
     updated_at_millis: i128,
     now: OffsetDateTime,
 ) -> Result<String, CreateInvoiceError> {
     let age = now.unix_timestamp_nanos() / 1_000_000 - updated_at_millis;
-    if age < 0
+    if age < -i128::from(MAX_RATE_FUTURE_SKEW_SECONDS) * 1000
         || age > i128::from(MAX_RATE_AGE_SECONDS) * 1000
         || price.bytes().filter(|b| *b != b'.').count() > 18
         || decimal_units(&price, 18).is_err()
@@ -309,7 +311,8 @@ mod tests {
             ("81000.12", 0, true),
             ("81000", 600_000, true),
             ("81000", 600_001, false),
-            ("81000", -1, false),
+            ("81000", -5_000, true),
+            ("81000", -5_001, false),
             ("0", 0, false),
             ("-2", 0, false),
             ("1e5", 0, false),
@@ -355,7 +358,8 @@ mod tests {
             ("81000.12", "2023-11-14T22:13:19.999999999Z", true),
             ("81000", "2023-11-14T22:03:20Z", true),
             ("81000", "2023-11-14T22:03:19.999Z", false),
-            ("81000", "2023-11-14T22:13:20.001Z", false),
+            ("81000", "2023-11-14T22:13:25Z", true),
+            ("81000", "2023-11-14T22:13:25.001Z", false),
             ("81000", "2023-11-14 22:13:20", false),
             ("0", "2023-11-14T22:13:20Z", false),
             ("-2", "2023-11-14T22:13:20Z", false),
