@@ -15,6 +15,7 @@ use crate::{
 
 const RATE_SCALE: u128 = 1_000_000_000_000_000_000;
 const MAX_RATE_AGE_SECONDS: i64 = 600;
+const MAX_RATE_BODY_BYTES: usize = 1024 * 1024;
 
 #[async_trait]
 pub trait ExchangeRates: Send + Sync {
@@ -129,15 +130,18 @@ impl ExchangeRates for FeedRates {
             .get(self.url.clone())
             .send()
             .await
-            .and_then(reqwest::Response::error_for_status)
             .map_err(|_| CreateInvoiceError::Unavailable)?;
+        // Redirects are not followed, so a 3xx arrives here; its body is not a rate.
+        if !response.status().is_success() {
+            return Err(CreateInvoiceError::Unavailable);
+        }
         let mut bytes = Vec::new();
         while let Some(chunk) = response
             .chunk()
             .await
             .map_err(|_| CreateInvoiceError::Unavailable)?
         {
-            if bytes.len() + chunk.len() > 1024 * 1024 {
+            if bytes.len() + chunk.len() > MAX_RATE_BODY_BYTES {
                 return Err(CreateInvoiceError::Unavailable);
             }
             bytes.extend_from_slice(&chunk);
@@ -256,6 +260,15 @@ pub fn payment_units(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        Router,
+        extract::{OriginalUri, State},
+        http::{StatusCode, header},
+        response::{IntoResponse, Response},
+    };
+
     use super::*;
 
     #[test]
@@ -387,5 +400,97 @@ mod tests {
         assert!(
             parse_usd_per_btc(ExchangeRateFormat::Blocktank, coinbase.as_bytes(), now).is_err()
         );
+    }
+
+    #[derive(Clone, Default)]
+    struct Requests(Arc<Mutex<Vec<String>>>);
+
+    impl Requests {
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
+
+    fn fresh_coinbase_ticker() -> String {
+        let time = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        format!(r#"{{"price":"81000.12","time":"{time}"}}"#)
+    }
+
+    fn padded_to(mut body: String, len: usize) -> String {
+        body.push_str(&" ".repeat(len - body.len()));
+        body
+    }
+
+    async fn rate_source(State(requests): State<Requests>, uri: OriginalUri) -> Response {
+        requests.0.lock().unwrap().push(uri.path().to_owned());
+        match uri.path() {
+            "/products/BTC-USD/ticker" => fresh_coinbase_ticker().into_response(),
+            "/fx/btc" => format!(
+                r#"{{"tickers":[{{"base":"BTC","quote":"USD","lastPrice":"79000","lastUpdatedAt":{}}}]}}"#,
+                OffsetDateTime::now_utc().unix_timestamp() * 1000
+            )
+            .into_response(),
+            "/redirect" => (
+                StatusCode::FOUND,
+                [(header::LOCATION, "/products/BTC-USD/ticker")],
+                fresh_coinbase_ticker(),
+            )
+                .into_response(),
+            "/at-cap" => padded_to(fresh_coinbase_ticker(), MAX_RATE_BODY_BYTES).into_response(),
+            "/over-cap" => {
+                padded_to(fresh_coinbase_ticker(), MAX_RATE_BODY_BYTES + 1).into_response()
+            }
+            _ => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
+    #[tokio::test]
+    async fn feed_fetches_the_configured_source_without_redirects_within_the_body_cap() {
+        let requests = Requests::default();
+        let app = Router::new()
+            .fallback(rate_source)
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let rate = |path: &str, format| {
+            let feed = FeedRates::new(&ExchangeRateConfig {
+                url: Url::parse(&format!("{origin}{path}")).unwrap(),
+                format,
+            })
+            .unwrap();
+            async move { feed.usd_per_btc().await }
+        };
+
+        assert_eq!(
+            rate(
+                "/products/BTC-USD/ticker",
+                ExchangeRateFormat::CoinbaseExchange
+            )
+            .await,
+            Ok("81000.12".to_owned())
+        );
+        assert_eq!(requests.take(), ["/products/BTC-USD/ticker"]);
+        assert_eq!(
+            rate("/fx/btc", ExchangeRateFormat::Blocktank).await,
+            Ok("79000".to_owned())
+        );
+        assert_eq!(requests.take(), ["/fx/btc"]);
+
+        assert_eq!(
+            rate("/redirect", ExchangeRateFormat::CoinbaseExchange).await,
+            Err(CreateInvoiceError::Unavailable)
+        );
+        assert_eq!(requests.take(), ["/redirect"]);
+
+        assert_eq!(
+            rate("/at-cap", ExchangeRateFormat::CoinbaseExchange).await,
+            Ok("81000.12".to_owned())
+        );
+        assert_eq!(
+            rate("/over-cap", ExchangeRateFormat::CoinbaseExchange).await,
+            Err(CreateInvoiceError::Unavailable)
+        );
+        assert_eq!(requests.take(), ["/at-cap", "/over-cap"]);
     }
 }
