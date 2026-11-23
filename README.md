@@ -413,6 +413,21 @@ Setup publication and workers share the cached Creator session handle. Restoring
 the same Pubky grant independently mints a new bearer and invalidates the prior
 one; do not restore a live server grant in a separate diagnostic process.
 
+The server enforces the one-process rule per database. Before migrating, each
+process takes a PostgreSQL session advisory lock on a dedicated connection and
+holds it until exit. A second process using the same database waits up to 60
+seconds for the lock, then exits with `another Paykit Server process is using
+this database`. If the lock connection stops answering, the process drains, then
+exits with an error so its supervisor restarts it. The lock needs a direct
+PostgreSQL session; a transaction-pooling proxy cannot hold it.
+
+Deploy by stopping the old process before starting the new one. Docker Compose
+recreation does this for a single-replica service. A platform that starts the
+new deployment and waits for its health check before stopping the old one cannot
+complete that deployment, because the new process never binds its listener while
+the old one holds the lock. Configure that platform to stop the old deployment
+first.
+
 One process may own multiple Creator accounts. Each Creator has independent:
 
 - Pubky session and generation-bound delegated Paykit key;
@@ -788,7 +803,7 @@ other authorized apps through the SDK's recovery flow.
 
 ## Known limitations
 
-- One process only; no replicas or active-active deployment.
+- One process only; no replicas or active-active deployment. A second process on the same database exits at startup.
 - One Electrum endpoint; no failover pool.
 - `tcp://` Electrum has no transport authentication; use a CA-valid `ssl://` endpoint for production.
 - No configured Creator-count bound or runtime eviction.

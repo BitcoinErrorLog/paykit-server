@@ -1,13 +1,16 @@
-use std::{env, fs};
+use std::{env, fs, time::Duration};
 
 use paykit_server::{
     Server,
     config::{Config, ConfigEnvironment},
-    startup::initialize_database,
+    startup::{acquire_process_lock, initialize_database},
 };
 use tracing_subscriber::EnvFilter;
 
 const APPLICATION_LOG_TARGET: &str = "paykit_server";
+/// Covers a previous process draining after its supervisor stopped it.
+const PROCESS_LOCK_WAIT: Duration = Duration::from_secs(60);
+const PROCESS_LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 fn production_log_filter() -> EnvFilter {
     EnvFilter::new(format!("off,{APPLICATION_LOG_TARGET}=info"))
@@ -41,11 +44,31 @@ async fn main() -> anyhow::Result<()> {
         println!("configuration valid");
         return Ok(());
     }
+    let mut process_lock = acquire_process_lock(&config, PROCESS_LOCK_WAIT).await?;
     let pool = initialize_database(&config).await?;
     let listen_addr = config.http.listen_addr();
     let server = Server::build(config, pool).await?;
+    let runtime = server.runtime();
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-    server.run(listener).await?;
+    let serving = server.run(listener);
+    tokio::pin!(serving);
+    let lock_lost = tokio::select! {
+        result = &mut serving => {
+            result?;
+            false
+        }
+        () = process_lock.lost(PROCESS_LOCK_CHECK_INTERVAL) => true,
+    };
+    if lock_lost {
+        tracing::error!(
+            target: APPLICATION_LOG_TARGET,
+            "database process lock lost; shutting down"
+        );
+        runtime.begin_shutdown();
+        serving.await?;
+        return Err(anyhow::anyhow!("database process lock lost"));
+    }
+    process_lock.release().await?;
     Ok(())
 }
 

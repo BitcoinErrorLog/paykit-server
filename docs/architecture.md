@@ -37,7 +37,8 @@ and app capabilities, not key authority.
 Setup, status queries, and workers use one process-owned session cache. Independently
 restoring a live grant can invalidate its bearer. A changed persisted session or
 delegated key causes the cached provider to refresh its access; unchanged credentials
-reuse the live handle.
+reuse the live handle. A PostgreSQL advisory lock held for the process lifetime keeps a
+second process from serving the same database.
 
 ## State ownership
 

@@ -1,6 +1,6 @@
 //! Fail-closed PostgreSQL startup composition completed before HTTP bind.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use thiserror::Error;
@@ -9,7 +9,8 @@ use crate::{
     config::Config,
     crypto::Crypto,
     persistence::{
-        CreatorStore, DeploymentStore, InvoiceStore, MarketplacePreparationStore, run_migrations,
+        CreatorStore, DeploymentStore, InvoiceStore, MarketplacePreparationStore, ProcessLock,
+        run_migrations,
     },
 };
 
@@ -19,6 +20,9 @@ pub enum StartupError {
     /// PostgreSQL could not be reached.
     #[error("postgres connection failed")]
     Connection,
+    /// Another Paykit Server process kept the database's process lock for the whole wait.
+    #[error("another Paykit Server process is using this database")]
+    ProcessLockHeld,
     /// Embedded migrations could not be applied.
     #[error("postgres migration failed")]
     Migration,
@@ -37,6 +41,29 @@ pub enum StartupError {
     /// At least one Marketplace settlement or Bitcoin evidence row failed authentication.
     #[error("marketplace observation integrity check failed")]
     MarketplaceObservationIntegrity,
+}
+
+const PROCESS_LOCK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Takes the database's process lock, waiting up to `wait` for a previous process
+/// to exit, so only one Paykit Server process serves a database at a time.
+pub async fn acquire_process_lock(
+    config: &Config,
+    wait: Duration,
+) -> Result<ProcessLock, StartupError> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if let Some(lock) = ProcessLock::try_acquire(config.database_options())
+            .await
+            .map_err(|_| StartupError::Connection)?
+        {
+            return Ok(lock);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(StartupError::ProcessLockHeld);
+        }
+        tokio::time::sleep(PROCESS_LOCK_RETRY_INTERVAL).await;
+    }
 }
 
 /// Connects, migrates, validates deployment invariants, and authenticates every
