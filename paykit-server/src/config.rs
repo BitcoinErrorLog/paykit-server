@@ -447,9 +447,14 @@ pub enum ExchangeRateFormat {
     /// `{"tickers":[{"base","quote","lastPrice","lastUpdatedAt"}]}`, as Blocktank serves.
     #[default]
     Blocktank,
-    /// One product ticker with `price` and an RFC 3339 `time`, as Coinbase Exchange serves.
+    /// The BTC-USD product ticker, with `price` and an RFC 3339 `time`, as Coinbase Exchange
+    /// serves at [`COINBASE_EXCHANGE_BTC_USD_TICKER_PATH`]. The body doesn't name its product,
+    /// so the URL path must.
     CoinbaseExchange,
 }
+
+/// The only URL path accepted with [`ExchangeRateFormat::CoinbaseExchange`].
+pub const COINBASE_EXCHANGE_BTC_USD_TICKER_PATH: &str = "/products/BTC-USD/ticker";
 
 /// Rate source used when `[exchange_rate]` is omitted: the feed Bitkit uses.
 pub const BLOCKTANK_RATES_URL: &str = "https://api1.blocktank.to/api/fx/rates/btc";
@@ -475,6 +480,11 @@ impl TryFrom<RawExchangeRateConfig> for ExchangeRateConfig {
             || url.fragment().is_some()
         {
             return Err(ConfigError::InvalidExchangeRateUrl);
+        }
+        if value.format == ExchangeRateFormat::CoinbaseExchange
+            && url.path() != COINBASE_EXCHANGE_BTC_USD_TICKER_PATH
+        {
+            return Err(ConfigError::InvalidCoinbaseExchangeRatePath);
         }
         Ok(Self {
             url,
@@ -687,6 +697,10 @@ pub enum ConfigError {
     InvalidUsdtRpc,
     #[error("exchange_rate.url must be an https URL without credentials, query, or fragment")]
     InvalidExchangeRateUrl,
+    #[error(
+        "exchange_rate.url path must be /products/BTC-USD/ticker when format is coinbase-exchange"
+    )]
+    InvalidCoinbaseExchangeRatePath,
     #[error("configuration TOML is invalid")]
     Toml,
     #[error("[locks] trusted_public_key was replaced by [signed_services] trusted_public_keys")]

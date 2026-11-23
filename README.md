@@ -852,12 +852,18 @@ payment asset, not the requested value.
 BTC conversions use Bitkit's feed, `https://api1.blocktank.to/api/fx/rates/btc`,
 unless `[exchange_rate]` names another source. Its `url` must be `https` without
 credentials, query or fragment, and requests to it follow no redirects. `format`
-selects the response shape: `"blocktank"` (the default), for any source serving
-Blocktank's `tickers` JSON, from which exactly one BTC/USD ticker is read; or
-`"coinbase-exchange"`, for a Coinbase Exchange product ticker such as
-`https://api.exchange.coinbase.com/products/BTC-USD/ticker`, whose `price` and
-last-trade `time` are read. Either way, only a positive BTC/USD price timestamped
-within the past ten minutes, and not in the future, is accepted.
+selects the response shape:
+
+- `"blocktank"` (the default) reads any source serving Blocktank's `tickers` JSON.
+  The response must hold exactly one ticker with base `BTC` and quote `USD`.
+- `"coinbase-exchange"` reads Coinbase Exchange's BTC-USD ticker, such as
+  `https://api.exchange.coinbase.com/products/BTC-USD/ticker`, using its `price`
+  and last-trade `time`. That body doesn't name its product, so the URL path must
+  be exactly `/products/BTC-USD/ticker`; any other path is refused at startup. The
+  host may differ, for example a proxy that serves the same ticker.
+
+Either way, the price must be a positive decimal of at most 18 digits, timestamped
+within the past ten minutes and not in the future.
 USD and USDT use fixed 1:1 parity. Published rates are payment-asset units per
 requested unit; reciprocal BTC rates round half-even to 18 decimal places. The
 required payment rounds up to whole satoshis or millionths of USDT. Fees are

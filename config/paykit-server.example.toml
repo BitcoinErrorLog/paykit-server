@@ -113,7 +113,8 @@ drain_timeout = "30s"
 # Omit to use Bitkit's feed, https://api1.blocktank.to/api/fx/rates/btc. The URL
 # must be https with no credentials, query, or fragment. format is "blocktank"
 # (default; any source serving Blocktank's tickers JSON) or "coinbase-exchange"
-# (a Coinbase Exchange product ticker, such as the one below).
+# (Coinbase Exchange's BTC-USD ticker only: the path must be exactly
+# /products/BTC-USD/ticker, on Coinbase's host or a proxy).
 # [exchange_rate]
 # url = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
 # format = "coinbase-exchange"

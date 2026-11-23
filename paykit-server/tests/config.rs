@@ -777,6 +777,11 @@ fn exchange_rate_accepts_an_https_source_in_either_format() {
             "https://api.exchange.coinbase.com/products/BTC-USD/ticker",
             ExchangeRateFormat::CoinbaseExchange,
         ),
+        (
+            "url = \"https://rates.shop.example/products/BTC-USD/ticker\"\nformat = \"coinbase-exchange\"",
+            "https://rates.shop.example/products/BTC-USD/ticker",
+            ExchangeRateFormat::CoinbaseExchange,
+        ),
     ] {
         let config =
             Config::from_toml_and_environment(&with_exchange_rate(section), environment()).unwrap();
@@ -804,6 +809,31 @@ fn exchange_rate_rejects_non_https_secret_bearing_or_ambiguous_urls() {
             matches!(
                 Config::from_toml_and_environment(&with_exchange_rate(&section), environment()),
                 Err(ConfigError::InvalidExchangeRateUrl)
+            ),
+            "{url}"
+        );
+    }
+}
+
+#[test]
+fn coinbase_exchange_format_requires_the_btc_usd_ticker_path() {
+    for url in [
+        "https://api.exchange.coinbase.com/products/BTC-EUR/ticker",
+        "https://api.exchange.coinbase.com/products/ETH-USD/ticker",
+        "https://api.exchange.coinbase.com/products/BTC-USDT/ticker",
+        "https://api.exchange.coinbase.com/products/btc-usd/ticker",
+        "https://api.exchange.coinbase.com/products/BTC%2DUSD/ticker",
+        "https://api.exchange.coinbase.com/products/BTC-USD/ticker/",
+        "https://api.exchange.coinbase.com/products/BTC-USD",
+        "https://api.exchange.coinbase.com/v1/products/BTC-USD/ticker",
+        "https://api.exchange.coinbase.com/",
+    ] {
+        let section = format!("url = {url:?}\nformat = \"coinbase-exchange\"");
+
+        assert!(
+            matches!(
+                Config::from_toml_and_environment(&with_exchange_rate(&section), environment()),
+                Err(ConfigError::InvalidCoinbaseExchangeRatePath)
             ),
             "{url}"
         );
