@@ -25,6 +25,11 @@ allowed_origins = ["https://app.example.invalid"]
 # log access and retention. The Locks-generated local config is the sole planned
 # true setting.
 log_authorization_url = false
+# Optional Pubky AUTH relay inbox written into setup QR codes. Bitkit posts the
+# approval to whichever relay the QR names. Omit to use the paykit.network
+# default: the Pubky relay on mainnet, the local relay on testnet. Requires https
+# unless the host is localhost.
+# auth_relay = "https://relay.example.invalid/inbox"
 
 [paykit]
 # Stable grant owner checked by Paykit Server and by the local-demo companion

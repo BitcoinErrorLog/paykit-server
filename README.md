@@ -549,7 +549,9 @@ inbox API or worker, and the baseline schema contains no payer inbox tables.
 
 `paykit.network = "testnet"` selects the pinned Pubky client's fixed **local** testnet configuration, including the AUTH relay at `http://127.0.0.1:15412/inbox`. It requires the Pubky static testnet on localhost; it is not a hosted public testnet. Native emulators must be able to reach that loopback relay (for example, with Android port reversal). `paykit.network = "mainnet"` uses normal Pkarr/homeserver resolution and the default Pubky AUTH relay. Bitcoin network and Electrum endpoint are configured separately and must agree.
 
-The executable consumes only keys shown in the example. Arbitrary Paykit relay/homeserver URLs are not accepted.
+`setup.auth_relay` optionally replaces that network's AUTH relay for setup and reconnect approvals. It must be an absolute `https` inbox URL, or `http` on `localhost`, `127.0.0.1` or `[::1]`, with no credentials, query or fragment. The setup URL carries the relay, and Bitkit posts the approval to whichever relay the URL names, so the relay must be reachable from the approving phone. Pkarr and homeserver resolution still follow `paykit.network`.
+
+The executable consumes only keys shown in the example. Paykit relay/homeserver URL keys under `[paykit]` are not accepted.
 
 `paykit.client_id` is required and must be exactly `"app.paykit.server"`. It is an
 immutable deployment invariant, not an optional label. Missing configuration

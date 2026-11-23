@@ -225,6 +225,57 @@ fn setup_authorization_url_logging_accepts_explicit_true() {
 }
 
 #[test]
+fn setup_auth_relay_defaults_to_the_network_relay() {
+    let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
+
+    assert_eq!(config.setup.auth_relay, None);
+}
+
+#[test]
+fn setup_auth_relay_accepts_https_and_local_http() {
+    for relay in [
+        "https://relay.shop.example/inbox",
+        "https://relay.shop.example:8443/link/inbox/",
+        "http://localhost:15412/inbox",
+        "http://127.0.0.1:15412/inbox",
+    ] {
+        let input = valid_toml().replace(
+            "allowed_origins = [\"https://app.example\"]",
+            &format!("allowed_origins = [\"https://app.example\"]\nauth_relay = \"{relay}\""),
+        );
+        let config = Config::from_toml_and_environment(&input, environment()).unwrap();
+
+        assert_eq!(config.setup.auth_relay.unwrap().as_str(), relay);
+    }
+}
+
+#[test]
+fn setup_auth_relay_rejects_insecure_or_ambiguous_urls() {
+    for relay in [
+        "",
+        "relay.shop.example/inbox",
+        "http://relay.shop.example/inbox",
+        "wss://relay.shop.example/inbox",
+        "https://user:secret@relay.shop.example/inbox",
+        "https://relay.shop.example/inbox?token=1",
+        "https://relay.shop.example/inbox#fragment",
+    ] {
+        let input = valid_toml().replace(
+            "allowed_origins = [\"https://app.example\"]",
+            &format!("allowed_origins = [\"https://app.example\"]\nauth_relay = \"{relay}\""),
+        );
+
+        assert!(
+            matches!(
+                Config::from_toml_and_environment(&input, environment()),
+                Err(ConfigError::InvalidAuthRelay)
+            ),
+            "{relay}"
+        );
+    }
+}
+
+#[test]
 fn setup_still_rejects_unknown_keys() {
     let input = valid_toml().replace(
         "allowed_origins = [\"https://app.example\"]",

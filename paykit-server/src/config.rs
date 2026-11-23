@@ -87,6 +87,12 @@ impl Config {
             setup: SetupConfig {
                 allowed_origins,
                 log_authorization_url: raw.setup.log_authorization_url,
+                auth_relay: raw
+                    .setup
+                    .auth_relay
+                    .as_deref()
+                    .map(validate_auth_relay)
+                    .transpose()?,
             },
             paykit: PaykitConfig {
                 client_id: client_id.clone(),
@@ -408,6 +414,8 @@ impl SignedServicesConfig {
 pub struct SetupConfig {
     pub allowed_origins: Vec<String>,
     pub log_authorization_url: bool,
+    /// Pubky AUTH relay inbox for setup approvals; `None` keeps the network default.
+    pub auth_relay: Option<Url>,
 }
 
 /// Optional direct Arbitrum USDT observation and receiving permissions.
@@ -737,6 +745,10 @@ pub enum ConfigError {
         "setup.allowed_origins must contain exact HTTP(S) origins or the sole wildcard value *"
     )]
     InvalidOrigin,
+    #[error(
+        "setup.auth_relay must be an https URL, or http on localhost, without credentials, query, or fragment"
+    )]
+    InvalidAuthRelay,
     #[error("paykit.app_id must be paykit-server")]
     InvalidAppId,
     #[error("paykit.client_id must be a valid non-empty Pubky client ID")]
@@ -782,6 +794,22 @@ fn validate_url(field: &'static str, value: &str) -> Result<Url, ConfigError> {
         return Err(ConfigError::InvalidUrl(field));
     }
     Ok(parsed)
+}
+
+fn validate_auth_relay(value: &str) -> Result<Url, ConfigError> {
+    let relay = Url::parse(value).map_err(|_| ConfigError::InvalidAuthRelay)?;
+    let local = matches!(relay.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if (relay.scheme() != "https" && !(local && relay.scheme() == "http"))
+        || relay.cannot_be_a_base()
+        || relay.host_str().is_none()
+        || !relay.username().is_empty()
+        || relay.password().is_some()
+        || relay.query().is_some()
+        || relay.fragment().is_some()
+    {
+        return Err(ConfigError::InvalidAuthRelay);
+    }
+    Ok(relay)
 }
 
 pub(crate) fn validate_electrum_endpoint(value: &str) -> Result<(), ConfigError> {
@@ -877,6 +905,8 @@ struct RawSetupConfig {
     allowed_origins: Vec<String>,
     #[serde(default)]
     log_authorization_url: bool,
+    #[serde(default)]
+    auth_relay: Option<String>,
 }
 
 #[derive(Deserialize)]

@@ -70,21 +70,25 @@ use pubky::{Pubky, errors::RequestError};
 use sqlx::PgPool;
 use thiserror::Error;
 use tokio::{task::JoinSet, time::MissedTickBehavior};
+use url::Url;
 use uuid::Uuid;
 
 fn setup_bootstrap(
     pubky: Pubky,
     client_id: &str,
     network: PaykitNetwork,
+    auth_relay: Option<&Url>,
 ) -> Result<PubkySessionBootstrap, ServerBuildError> {
     let bootstrap =
         PubkySessionBootstrap::with_pubky(pubky, client_id).map_err(|_| ServerBuildError::Pubky)?;
-    match network {
-        PaykitNetwork::Mainnet => Ok(bootstrap),
-        PaykitNetwork::Testnet => bootstrap
-            .with_auth_relay("http://127.0.0.1:15412/inbox")
-            .map_err(|_| ServerBuildError::Pubky),
-    }
+    let relay = match (auth_relay, network) {
+        (Some(relay), _) => relay.as_str(),
+        (None, PaykitNetwork::Mainnet) => return Ok(bootstrap),
+        (None, PaykitNetwork::Testnet) => "http://127.0.0.1:15412/inbox",
+    };
+    bootstrap
+        .with_auth_relay(relay)
+        .map_err(|_| ServerBuildError::Pubky)
 }
 
 /// Fail-fast, secret-free construction errors.
@@ -198,6 +202,7 @@ impl Server {
             pubky.clone(),
             config.paykit.client_id.as_str(),
             config.paykit.network,
+            config.setup.auth_relay.as_ref(),
         )?;
         let relay = Arc::new(PubkyCompanionRelay::new(pubky.client().clone()));
         let sessions = CreatorSessions::new(creators.clone(), pubky.clone(), config.paykit.clone());
@@ -2743,14 +2748,39 @@ mod tests {
             (PaykitNetwork::Testnet, "http://127.0.0.1:15412/inbox"),
             (PaykitNetwork::Mainnet, "https://httprelay.pubky.app/inbox"),
         ] {
-            let bootstrap =
-                setup_bootstrap(Pubky::testnet().unwrap(), "app.paykit.server", network).unwrap();
+            let bootstrap = setup_bootstrap(
+                Pubky::testnet().unwrap(),
+                "app.paykit.server",
+                network,
+                None,
+            )
+            .unwrap();
             let request = bootstrap
                 .start_sign_in_auth(crate::bitkit_claim::LOCAL_DEMO_CAPABILITIES)
                 .await
                 .unwrap();
             let details = paykit_sdk::parse_pubky_auth_url(request.authorization_url()).unwrap();
             assert_eq!(details.relay_url, expected_relay);
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_setup_auth_relay_replaces_the_network_default() {
+        let configured = Url::parse("https://relay.shop.example/inbox").unwrap();
+        for network in [PaykitNetwork::Testnet, PaykitNetwork::Mainnet] {
+            let bootstrap = setup_bootstrap(
+                Pubky::testnet().unwrap(),
+                "app.paykit.server",
+                network,
+                Some(&configured),
+            )
+            .unwrap();
+            let request = bootstrap
+                .start_sign_in_auth(crate::bitkit_claim::LOCAL_DEMO_CAPABILITIES)
+                .await
+                .unwrap();
+            let details = paykit_sdk::parse_pubky_auth_url(request.authorization_url()).unwrap();
+            assert_eq!(details.relay_url, "https://relay.shop.example/inbox");
         }
     }
     use crate::config::ConfigEnvironment;
