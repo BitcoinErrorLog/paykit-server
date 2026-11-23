@@ -28,6 +28,7 @@ pub struct Config {
     pub paykit: PaykitConfig,
     pub electrum: ElectrumConfig,
     pub usdt: Option<UsdtConfig>,
+    pub exchange_rate: ExchangeRateConfig,
     pub outbox: OutboxConfig,
     pub limits: LimitsConfig,
     pub rate_limits: RateLimitsConfig,
@@ -105,6 +106,11 @@ impl Config {
                 connect_retries: raw.electrum.connect_retries,
             },
             usdt: raw.usdt.map(UsdtConfig::try_from).transpose()?,
+            exchange_rate: raw
+                .exchange_rate
+                .map(ExchangeRateConfig::try_from)
+                .transpose()?
+                .unwrap_or_default(),
             outbox: OutboxConfig::from(raw.outbox),
             limits: LimitsConfig::from(raw.limits),
             rate_limits: RateLimitsConfig::from(raw.rate_limits),
@@ -418,6 +424,65 @@ impl fmt::Debug for UsdtConfig {
     }
 }
 
+/// BTC/USD rate source for invoices that convert between BTC and a USD asset.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExchangeRateConfig {
+    pub url: Url,
+    pub format: ExchangeRateFormat,
+}
+
+impl Default for ExchangeRateConfig {
+    fn default() -> Self {
+        Self {
+            url: Url::parse(BLOCKTANK_RATES_URL).expect("Blocktank rates URL is valid"),
+            format: ExchangeRateFormat::Blocktank,
+        }
+    }
+}
+
+/// Response format served by the configured rate source.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExchangeRateFormat {
+    /// `{"tickers":[{"base","quote","lastPrice","lastUpdatedAt"}]}`, as Blocktank serves.
+    #[default]
+    Blocktank,
+    /// One product ticker with `price` and an RFC 3339 `time`, as Coinbase Exchange serves.
+    CoinbaseExchange,
+}
+
+/// Rate source used when `[exchange_rate]` is omitted: the feed Bitkit uses.
+pub const BLOCKTANK_RATES_URL: &str = "https://api1.blocktank.to/api/fx/rates/btc";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawExchangeRateConfig {
+    url: String,
+    #[serde(default)]
+    format: ExchangeRateFormat,
+}
+
+impl TryFrom<RawExchangeRateConfig> for ExchangeRateConfig {
+    type Error = ConfigError;
+    fn try_from(value: RawExchangeRateConfig) -> Result<Self, Self::Error> {
+        let url = Url::parse(&value.url).map_err(|_| ConfigError::InvalidExchangeRateUrl)?;
+        if url.scheme() != "https"
+            || url.cannot_be_a_base()
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(ConfigError::InvalidExchangeRateUrl);
+        }
+        Ok(Self {
+            url,
+            format: value.format,
+        })
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawUsdtConfig {
@@ -620,6 +685,8 @@ impl fmt::Debug for ElectrumEndpoint {
 pub enum ConfigError {
     #[error("invalid Arbitrum RPC configuration")]
     InvalidUsdtRpc,
+    #[error("exchange_rate.url must be an https URL without credentials, query, or fragment")]
+    InvalidExchangeRateUrl,
     #[error("configuration TOML is invalid")]
     Toml,
     #[error("[locks] trusted_public_key was replaced by [signed_services] trusted_public_keys")]
@@ -766,6 +833,7 @@ struct RawConfig {
     bitcoin: RawBitcoinConfig,
     electrum: RawElectrumConfig,
     usdt: Option<RawUsdtConfig>,
+    exchange_rate: Option<RawExchangeRateConfig>,
     outbox: RawOutboxConfig,
     #[serde(default)]
     limits: RawLimitsConfig,

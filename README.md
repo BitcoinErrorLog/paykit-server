@@ -172,7 +172,7 @@ has set up: a Bitcoin address from the seller's xpub, and the seller's shared US
 when this deployment has `[usdt]`. When present it never adds a rail, and a requested rail
 the seller has not set up is absent rather than a refusal. Every combination is supported,
 including both assets in one request. USD and USDT are fixed parity (rate `"1"`). Any
-pairing that crosses BTC reads the Blocktank BTC/USD feed once at prepare (ten-minute
+pairing that crosses BTC reads the configured BTC/USD feed once at prepare (ten-minute
 freshness, as Locks invoices do) and stores it as a fixed conversion in the preparation;
 activation never refetches it. The preparation's whole life is fixed on the database clock
 when that quote is accepted: `prepare_expires_at` is the acceptance time plus the
@@ -849,8 +849,15 @@ unique Bitcoin address and/or the shared Arbitrum address, chain 42161, and toke
 receiving app. A payer with both options can choose either; this changes the
 payment asset, not the requested value.
 
-BTC conversions use Bitkit's feed, `https://api1.blocktank.to/api/fx/rates/btc`.
-Only a positive BTC/USD price timestamped within the past ten minutes is accepted.
+BTC conversions use Bitkit's feed, `https://api1.blocktank.to/api/fx/rates/btc`,
+unless `[exchange_rate]` names another source. Its `url` must be `https` without
+credentials, query or fragment, and requests to it follow no redirects. `format`
+selects the response shape: `"blocktank"` (the default), for any source serving
+Blocktank's `tickers` JSON, from which exactly one BTC/USD ticker is read; or
+`"coinbase-exchange"`, for a Coinbase Exchange product ticker such as
+`https://api.exchange.coinbase.com/products/BTC-USD/ticker`, whose `price` and
+last-trade `time` are read. Either way, only a positive BTC/USD price timestamped
+within the past ten minutes, and not in the future, is accepted.
 USD and USDT use fixed 1:1 parity. Published rates are payment-asset units per
 requested unit; reciprocal BTC rates round half-even to 18 decimal places. The
 required payment rounds up to whole satoshis or millionths of USDT. Fees are

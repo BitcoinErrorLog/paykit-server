@@ -187,4 +187,4 @@ spacing.
 Upgrade policy and operational limits are in the [README](../README.md);
 validation commands are in [CONTRIBUTING](../CONTRIBUTING.md).
 
-Invoice pricing uses the same Blocktank BTC/USD feed as Bitkit. Fixed Paykit rates determine exact amounts in either asset; verification never fetches another market price. Bitcoin and USDT observers update their own evidence under the invoice lock and rebuild the shared payment status from both. The published request is the authority for destinations and amounts, avoiding independently supplied settlement amounts.
+Invoice pricing uses the same Blocktank BTC/USD feed as Bitkit unless the operator configures another source. Fixed Paykit rates determine exact amounts in either asset; verification never fetches another market price. Bitcoin and USDT observers update their own evidence under the invoice lock and rebuild the shared payment status from both. The published request is the authority for destinations and amounts, avoiding independently supplied settlement amounts.

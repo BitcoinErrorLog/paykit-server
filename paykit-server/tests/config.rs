@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use paykit_server::config::{
-    Config, ConfigEnvironment, ConfigError, MAX_TRUSTED_PROXY_HOPS, PaykitNetwork,
+    BLOCKTANK_RATES_URL, Config, ConfigEnvironment, ConfigError, ExchangeRateFormat,
+    MAX_TRUSTED_PROXY_HOPS, PaykitNetwork,
 };
 
 const KEY: &str = "pubky7ir1ttte48bcp4zjychjyscicrwi1j34mtt91ptsafdbjmr8g9eo";
@@ -742,6 +743,86 @@ fn usdt_requires_an_explicit_protected_rpc_and_redacts_credentials() {
                 environment()
             )
             .is_err()
+        );
+    }
+}
+
+fn with_exchange_rate(section: &str) -> String {
+    format!("{}\n[exchange_rate]\n{section}\n", valid_toml())
+}
+
+#[test]
+fn exchange_rate_defaults_to_the_blocktank_feed() {
+    let config = Config::from_toml_and_environment(&valid_toml(), environment()).unwrap();
+
+    assert_eq!(config.exchange_rate.url.as_str(), BLOCKTANK_RATES_URL);
+    assert_eq!(config.exchange_rate.format, ExchangeRateFormat::Blocktank);
+}
+
+#[test]
+fn exchange_rate_accepts_an_https_source_in_either_format() {
+    for (section, url, format) in [
+        (
+            "url = \"https://rates.shop.example/fx/btc\"",
+            "https://rates.shop.example/fx/btc",
+            ExchangeRateFormat::Blocktank,
+        ),
+        (
+            "url = \"https://rates.shop.example:8443/fx\"\nformat = \"blocktank\"",
+            "https://rates.shop.example:8443/fx",
+            ExchangeRateFormat::Blocktank,
+        ),
+        (
+            "url = \"https://api.exchange.coinbase.com/products/BTC-USD/ticker\"\nformat = \"coinbase-exchange\"",
+            "https://api.exchange.coinbase.com/products/BTC-USD/ticker",
+            ExchangeRateFormat::CoinbaseExchange,
+        ),
+    ] {
+        let config =
+            Config::from_toml_and_environment(&with_exchange_rate(section), environment()).unwrap();
+
+        assert_eq!(config.exchange_rate.url.as_str(), url);
+        assert_eq!(config.exchange_rate.format, format);
+    }
+}
+
+#[test]
+fn exchange_rate_rejects_non_https_secret_bearing_or_ambiguous_urls() {
+    for url in [
+        "",
+        "rates.shop.example/fx",
+        "http://rates.shop.example/fx",
+        "http://localhost:8080/fx",
+        "wss://rates.shop.example/fx",
+        "https://user:secret@rates.shop.example/fx",
+        "https://rates.shop.example/fx?pair=BTCUSD",
+        "https://rates.shop.example/fx#btc",
+    ] {
+        let section = format!("url = {url:?}");
+
+        assert!(
+            matches!(
+                Config::from_toml_and_environment(&with_exchange_rate(&section), environment()),
+                Err(ConfigError::InvalidExchangeRateUrl)
+            ),
+            "{url}"
+        );
+    }
+}
+
+#[test]
+fn exchange_rate_rejects_unknown_formats_keys_and_a_missing_url() {
+    for section in [
+        "url = \"https://rates.shop.example/fx\"\nformat = \"kraken\"",
+        "url = \"https://rates.shop.example/fx\"\nmax_age = \"10m\"",
+        "format = \"blocktank\"",
+    ] {
+        assert!(
+            matches!(
+                Config::from_toml_and_environment(&with_exchange_rate(section), environment()),
+                Err(ConfigError::Toml)
+            ),
+            "{section}"
         );
     }
 }
