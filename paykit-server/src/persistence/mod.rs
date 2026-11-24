@@ -32,4 +32,6 @@ pub use payment_drains::{PaymentDrainSnapshot, PaymentDrainStore};
 pub use payment_request_lifecycles::{
     PaymentRequestLifecycleApply, PaymentRequestLifecycleStore, RequiredReceiveTarget,
 };
-pub use process_lock::{PROCESS_ADVISORY_LOCK_KEY, ProcessLock};
+pub use process_lock::{
+    PROCESS_ADVISORY_LOCK_KEY, ProcessLock, ProcessLockLoss, ProcessLockTiming,
+};

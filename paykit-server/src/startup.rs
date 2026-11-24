@@ -44,23 +44,36 @@ pub enum StartupError {
 }
 
 const PROCESS_LOCK_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// Bounds one attempt, so an unanswered connection counts as unreachable and is retried.
+const PROCESS_LOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Takes the database's process lock, waiting up to `wait` for a previous process
 /// to exit, so only one Paykit Server process serves a database at a time.
+///
+/// An unreachable PostgreSQL is retried for the same `wait`, so a process started
+/// during a database restart waits for it instead of exiting at once.
 pub async fn acquire_process_lock(
     config: &Config,
     wait: Duration,
 ) -> Result<ProcessLock, StartupError> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
-        if let Some(lock) = ProcessLock::try_acquire(config.database_options())
-            .await
-            .map_err(|_| StartupError::Connection)?
+        let held_elsewhere = match tokio::time::timeout(
+            PROCESS_LOCK_ATTEMPT_TIMEOUT,
+            ProcessLock::try_acquire(config.database_options()),
+        )
+        .await
         {
-            return Ok(lock);
-        }
+            Ok(Ok(Some(lock))) => return Ok(lock),
+            Ok(Ok(None)) => true,
+            Ok(Err(_)) | Err(_) => false,
+        };
         if tokio::time::Instant::now() >= deadline {
-            return Err(StartupError::ProcessLockHeld);
+            return Err(if held_elsewhere {
+                StartupError::ProcessLockHeld
+            } else {
+                StartupError::Connection
+            });
         }
         tokio::time::sleep(PROCESS_LOCK_RETRY_INTERVAL).await;
     }

@@ -417,11 +417,20 @@ one; do not restore a live server grant in a separate diagnostic process.
 
 The server enforces the one-process rule per database. Before migrating, each
 process takes a PostgreSQL session advisory lock on a dedicated connection and
-holds it until exit. A second process using the same database waits up to 60
-seconds for the lock, then exits with `another Paykit Server process is using
-this database`. If the lock connection stops answering, the process drains, then
-exits with an error so its supervisor restarts it. The lock needs a direct
-PostgreSQL session; a transaction-pooling proxy cannot hold it.
+holds it until exit. At startup a process waits up to 60 seconds for the lock,
+and for PostgreSQL to accept connections. If another process still holds the
+lock, it exits with `another Paykit Server process is using this database`; if
+PostgreSQL never answered, with `postgres connection failed`.
+
+If the lock session ends while serving, for example because PostgreSQL restarted
+or failed over, the process retakes the lock on a new session and keeps serving.
+It stops only if another process took the lock meanwhile, or if PostgreSQL stays
+unreachable for 20 seconds. It then drains admitted work for at most 5 seconds
+and exits with an error, so its supervisor must restart it on failure. A process
+cut off from PostgreSQL stops within about 40 seconds, before PostgreSQL ends the
+unreachable session after about 50 seconds of TCP keepalives and lets another
+process take the lock. The lock needs a direct PostgreSQL session; a
+transaction-pooling proxy cannot hold it.
 
 Deploy by stopping the old process before starting the new one. Docker Compose
 recreation does this for a single-replica service. A platform that starts the

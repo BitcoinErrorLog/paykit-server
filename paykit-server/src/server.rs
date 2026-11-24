@@ -42,7 +42,8 @@ use crate::{
     },
     persistence::{
         CreatorStore, InvoiceStore, MarketplacePreparationStore, OutboxRetryClass, OutboxStore,
-        PaymentDrainStore, PaymentRequestLifecycleStore, PersistenceError,
+        PaymentDrainStore, PaymentRequestLifecycleStore, PersistenceError, ProcessLock,
+        ProcessLockLoss, ProcessLockTiming,
     },
     real_setup::RealSetupCompleter,
     runtime::{PostgresDependency, Runtime, operational_router},
@@ -100,6 +101,19 @@ pub enum ServerBuildError {
     Arbitrum,
     #[error("could not construct exchange-rate client")]
     ExchangeRates,
+}
+
+/// Longest drain after the process lock is lost for good. Another process may already
+/// hold the lock and serve the database, so admitted work gets only this long.
+pub const LOST_PROCESS_LOCK_DRAIN_LIMIT: Duration = Duration::from_secs(5);
+
+/// Why a server holding the database's process lock stopped with an error.
+#[derive(Debug, Error)]
+pub enum RunError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("database process lock lost")]
+    ProcessLockLost(ProcessLockLoss),
 }
 
 /// Concrete process-owned server components.
@@ -433,8 +447,12 @@ impl Server {
     }
 
     pub async fn run(self, listener: tokio::net::TcpListener) -> std::io::Result<()> {
-        self.run_with_shutdown(listener, crate::runtime::shutdown_signal())
-            .await
+        let drain_timeout = self.config.shutdown.drain_timeout;
+        self.run_with_shutdown(listener, async move {
+            crate::runtime::shutdown_signal().await;
+            drain_timeout
+        })
+        .await
     }
 
     #[cfg(feature = "test-utils")]
@@ -447,16 +465,89 @@ impl Server {
     where
         F: Future<Output = ()> + Send,
     {
-        self.run_with_shutdown(listener, shutdown).await
+        let drain_timeout = self.config.shutdown.drain_timeout;
+        self.run_with_shutdown(listener, async move {
+            shutdown.await;
+            drain_timeout
+        })
+        .await
     }
 
+    /// Serves like [`Server::run`] while holding the database's process lock.
+    ///
+    /// A lock session that ends, for example in a PostgreSQL restart, is retaken and
+    /// serving continues. If another process took the lock meanwhile, or PostgreSQL
+    /// stays unreachable for `timing.reacquire_within`, the server drains for at most
+    /// [`LOST_PROCESS_LOCK_DRAIN_LIMIT`] and returns [`RunError::ProcessLockLost`].
+    /// After a clean shutdown the lock is released; a failed release is only logged,
+    /// because closing the session releases the lock too.
+    pub async fn run_holding_process_lock(
+        self,
+        listener: tokio::net::TcpListener,
+        lock: ProcessLock,
+        timing: ProcessLockTiming,
+    ) -> Result<(), RunError> {
+        self.run_holding(listener, lock, timing, crate::runtime::shutdown_signal())
+            .await
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub async fn run_holding_process_lock_until<F>(
+        self,
+        listener: tokio::net::TcpListener,
+        lock: ProcessLock,
+        timing: ProcessLockTiming,
+        shutdown: F,
+    ) -> Result<(), RunError>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        self.run_holding(listener, lock, timing, shutdown).await
+    }
+
+    async fn run_holding<F>(
+        self,
+        listener: tokio::net::TcpListener,
+        mut lock: ProcessLock,
+        timing: ProcessLockTiming,
+        shutdown: F,
+    ) -> Result<(), RunError>
+    where
+        F: Future<Output = ()> + Send,
+    {
+        let drain_timeout = self.config.shutdown.drain_timeout;
+        let mut loss = None;
+        let stop = async {
+            tokio::select! {
+                () = shutdown => drain_timeout,
+                lost = lock.hold(timing) => {
+                    tracing::error!(?lost, "database process lock lost; shutting down");
+                    loss = Some(lost);
+                    drain_timeout.min(LOST_PROCESS_LOCK_DRAIN_LIMIT)
+                }
+            }
+        };
+        let served = self.run_with_shutdown(listener, stop).await;
+        if let Some(loss) = loss {
+            return Err(RunError::ProcessLockLost(loss));
+        }
+        served?;
+        if lock.release().await.is_err() {
+            tracing::warn!("database process lock release failed; closing its session releases it");
+        }
+        Ok(())
+    }
+
+    /// Serves until `shutdown` completes, then drains admitted work for at most the
+    /// duration it returns.
     async fn run_with_shutdown<F>(
         self,
         listener: tokio::net::TcpListener,
         shutdown: F,
     ) -> std::io::Result<()>
     where
-        F: Future<Output = ()> + Send,
+        F: Future<Output = Duration> + Send,
     {
         let drain_timeout = self.config.shutdown.drain_timeout;
         let (mut tasks, mut settling) = spawn_owned_workers(self.workers, self.runtime.clone());
@@ -464,21 +555,21 @@ impl Server {
         tokio::pin!(serving);
         tokio::pin!(shutdown);
         enum Stop {
-            Shutdown,
+            Shutdown(Duration),
             Served(std::io::Result<()>),
             WorkerExited,
             SettlingExited,
         }
         let stop = tokio::select! {
             biased;
-            _ = &mut shutdown => Stop::Shutdown,
-            _ = self.runtime.cancelled() => Stop::Shutdown,
+            drain_limit = &mut shutdown => Stop::Shutdown(drain_limit),
+            _ = self.runtime.cancelled() => Stop::Shutdown(drain_timeout),
             result = &mut serving => Stop::Served(result),
             _ = tasks.join_next() => Stop::WorkerExited,
             () = settling_exited(&mut settling) => Stop::SettlingExited,
         };
-        match stop {
-            Stop::Shutdown => {}
+        let drain_limit = match stop {
+            Stop::Shutdown(drain_limit) => drain_limit,
             Stop::Served(result) => {
                 self.runtime.begin_shutdown();
                 abort_owned_workers(&mut tasks, &mut settling).await;
@@ -495,7 +586,7 @@ impl Server {
                 abort_owned_workers(&mut tasks, &mut settling).await;
                 return Err(std::io::Error::other("owned worker exited unexpectedly"));
             }
-        }
+        };
         self.runtime.begin_shutdown();
         let joined = async {
             let (serving_result, worker_result, ()) = tokio::join!(
@@ -506,7 +597,7 @@ impl Server {
             serving_result?;
             worker_result
         };
-        let result = match tokio::time::timeout(drain_timeout, joined).await {
+        let result = match tokio::time::timeout(drain_limit, joined).await {
             Ok(result) => result,
             Err(_) => Ok(()),
         };
