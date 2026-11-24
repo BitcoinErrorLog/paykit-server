@@ -5,6 +5,9 @@ use sqlx::{Connection, PgConnection, postgres::PgConnectOptions};
 /// PostgreSQL advisory-lock key held by the one Paykit Server process serving a database.
 pub const PROCESS_ADVISORY_LOCK_KEY: i64 = 4_679_362_128_418_235_710;
 
+/// `application_name` of the lock session, so `pg_stat_activity` shows which client holds it.
+pub const PROCESS_LOCK_APPLICATION_NAME: &str = "paykit-server process lock";
+
 /// How a held process lock is checked, and retaken after its session ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessLockTiming {
@@ -35,7 +38,8 @@ pub enum ProcessLockLoss {
 ///
 /// Dropping this value closes the session, so PostgreSQL releases the lock even when
 /// the process exits without calling [`ProcessLock::release`]. The session needs a
-/// direct PostgreSQL connection; a transaction-pooling proxy cannot hold session locks.
+/// direct PostgreSQL connection or a session-mode pooler; behind a transaction-mode
+/// pooler two processes can share one server session, where the lock is re-entrant.
 pub struct ProcessLock {
     connection: PgConnection,
     options: PgConnectOptions,
@@ -44,13 +48,21 @@ pub struct ProcessLock {
 impl ProcessLock {
     /// Takes the lock without waiting, returning `None` while another session holds it.
     pub async fn try_acquire(options: &PgConnectOptions) -> Result<Option<Self>, sqlx::Error> {
-        let mut connection = PgConnection::connect_with(options).await?;
+        let mut connection = PgConnection::connect_with(
+            &options
+                .clone()
+                .application_name(PROCESS_LOCK_APPLICATION_NAME),
+        )
+        .await?;
         // A holder whose host disappears sends no FIN; keepalives let PostgreSQL end
-        // its session, and release the lock, within about a minute.
+        // its idle session, and release the lock, within about a minute. Keepalives
+        // stop while PostgreSQL still has unacknowledged data for the holder, so the
+        // user timeout bounds that case to a minute as well.
         sqlx::query(
             "SELECT set_config('tcp_keepalives_idle', '20', false), \
                     set_config('tcp_keepalives_interval', '10', false), \
-                    set_config('tcp_keepalives_count', '3', false)",
+                    set_config('tcp_keepalives_count', '3', false), \
+                    set_config('tcp_user_timeout', '60000', false)",
         )
         .execute(&mut connection)
         .await?;
@@ -114,10 +126,16 @@ impl ProcessLock {
 
     /// Releases the lock and closes its session.
     pub async fn release(mut self) -> Result<(), sqlx::Error> {
-        sqlx::query("SELECT pg_advisory_unlock($1)")
+        let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
             .bind(PROCESS_ADVISORY_LOCK_KEY)
-            .execute(&mut self.connection)
+            .fetch_one(&mut self.connection)
             .await?;
+        if !released {
+            tracing::warn!(
+                "database process lock was not held by its session at release; \
+                 a transaction-mode pooler may sit between the server and PostgreSQL"
+            );
+        }
         self.connection.close().await
     }
 }

@@ -429,15 +429,30 @@ unreachable for 20 seconds. It then drains admitted work for at most 5 seconds
 and exits with an error, so its supervisor must restart it on failure. A process
 cut off from PostgreSQL stops within about 40 seconds, before PostgreSQL ends the
 unreachable session after about 50 seconds of TCP keepalives and lets another
-process take the lock. The lock needs a direct PostgreSQL session; a
-transaction-pooling proxy cannot hold it.
+process take the lock.
+
+The lock needs a direct PostgreSQL connection or a session-mode pooler. Behind a
+transaction- or statement-mode pooler, such as PgBouncer with `pool_mode =
+transaction` or `statement`, it fails silently: two processes can land on one
+server session, where the lock is re-entrant and both take it, and the unlock can
+run on another server session. Behind a session-mode pooler, detecting a dead
+holder depends on the pooler's own client keepalives. The lock session sets
+`application_name` to `paykit-server process lock`, so this query shows which
+client holds it:
+
+```sql
+SELECT pid, client_addr, backend_start FROM pg_stat_activity
+WHERE application_name = 'paykit-server process lock';
+```
 
 Deploy by stopping the old process before starting the new one. Docker Compose
-recreation does this for a single-replica service. A platform that starts the
-new deployment and waits for its health check before stopping the old one cannot
-complete that deployment, because the new process never binds its listener while
-the old one holds the lock. Configure that platform to stop the old deployment
-first.
+recreation does this for a single-replica service. On Kubernetes, use the
+`Recreate` deployment strategy or a single-replica StatefulSet; on Railway,
+attach a volume to the service, which makes a deploy stop the old deployment
+first. A platform that starts the new deployment and waits for its health check
+before stopping the old one cannot complete that deployment, because the new
+process never binds its listener while the old one holds the lock: it waits 60
+seconds, then exits.
 
 One process may own multiple Creator accounts. Each Creator has independent:
 

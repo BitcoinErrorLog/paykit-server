@@ -33,5 +33,6 @@ pub use payment_request_lifecycles::{
     PaymentRequestLifecycleApply, PaymentRequestLifecycleStore, RequiredReceiveTarget,
 };
 pub use process_lock::{
-    PROCESS_ADVISORY_LOCK_KEY, ProcessLock, ProcessLockLoss, ProcessLockTiming,
+    PROCESS_ADVISORY_LOCK_KEY, PROCESS_LOCK_APPLICATION_NAME, ProcessLock, ProcessLockLoss,
+    ProcessLockTiming,
 };

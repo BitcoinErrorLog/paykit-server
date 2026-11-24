@@ -4,7 +4,10 @@ use std::time::{Duration, Instant};
 use paykit_server::{
     Server,
     config::{Config, ConfigEnvironment},
-    persistence::{PROCESS_ADVISORY_LOCK_KEY, ProcessLockLoss, ProcessLockTiming},
+    persistence::{
+        PROCESS_ADVISORY_LOCK_KEY, PROCESS_LOCK_APPLICATION_NAME, ProcessLockLoss,
+        ProcessLockTiming,
+    },
     server::RunError,
     startup::{StartupError, acquire_process_lock, initialize_database},
 };
@@ -133,6 +136,27 @@ async fn lost_completes_when_the_lock_session_ends() {
         .await
         .unwrap();
     next.release().await.unwrap();
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn pg_stat_activity_names_the_lock_session() {
+    let database = TestDatabase::create().await;
+    let held = acquire_process_lock(&config_for(&database), Duration::ZERO)
+        .await
+        .unwrap();
+
+    let named: Vec<i32> = sqlx::query_scalar(
+        "SELECT pid FROM pg_stat_activity \
+         WHERE application_name = $1 AND datname = current_database()",
+    )
+    .bind(PROCESS_LOCK_APPLICATION_NAME)
+    .fetch_all(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(named, lock_holder_pids(&database).await);
+
+    held.release().await.unwrap();
     database.cleanup().await;
 }
 
