@@ -18,6 +18,10 @@ const MAX_RATE_AGE_SECONDS: i64 = 600;
 /// A fresh last-trade time can be a moment ahead of a server whose clock runs slightly slow.
 const MAX_RATE_FUTURE_SKEW_SECONDS: i64 = 5;
 const MAX_RATE_BODY_BYTES: usize = 1024 * 1024;
+/// Rate ages are compared in nanoseconds: an `i64` millisecond or second count times
+/// these factors cannot overflow `i128`.
+const NANOS_PER_MILLI: i128 = 1_000_000;
+const NANOS_PER_SECOND: i128 = 1_000_000_000;
 
 #[async_trait]
 pub trait ExchangeRates: Send + Sync {
@@ -67,7 +71,11 @@ impl Feed {
         if rates.next().is_some() {
             return Err(CreateInvoiceError::Unavailable);
         }
-        checked_rate(rate.last_price, i128::from(rate.last_updated_at), now)
+        checked_rate(
+            rate.last_price,
+            i128::from(rate.last_updated_at) * NANOS_PER_MILLI,
+            now,
+        )
     }
 }
 
@@ -81,11 +89,7 @@ impl CoinbaseExchangeTicker {
     fn usd_per_btc(self, now: OffsetDateTime) -> Result<String, CreateInvoiceError> {
         let traded_at = OffsetDateTime::parse(&self.time, &Rfc3339)
             .map_err(|_| CreateInvoiceError::Unavailable)?;
-        checked_rate(
-            self.price,
-            traded_at.unix_timestamp_nanos() / 1_000_000,
-            now,
-        )
+        checked_rate(self.price, traded_at.unix_timestamp_nanos(), now)
     }
 }
 
@@ -93,12 +97,12 @@ impl CoinbaseExchangeTicker {
 /// minutes before `now` and at most [`MAX_RATE_FUTURE_SKEW_SECONDS`] after it.
 fn checked_rate(
     price: String,
-    updated_at_millis: i128,
+    updated_at_nanos: i128,
     now: OffsetDateTime,
 ) -> Result<String, CreateInvoiceError> {
-    let age = now.unix_timestamp_nanos() / 1_000_000 - updated_at_millis;
-    if age < -i128::from(MAX_RATE_FUTURE_SKEW_SECONDS) * 1000
-        || age > i128::from(MAX_RATE_AGE_SECONDS) * 1000
+    let age = now.unix_timestamp_nanos() - updated_at_nanos;
+    if age < -i128::from(MAX_RATE_FUTURE_SKEW_SECONDS) * NANOS_PER_SECOND
+        || age > i128::from(MAX_RATE_AGE_SECONDS) * NANOS_PER_SECOND
         || price.bytes().filter(|b| *b != b'.').count() > 18
         || decimal_units(&price, 18).is_err()
     {
@@ -385,6 +389,61 @@ mod tests {
                 parse_usd_per_btc(ExchangeRateFormat::CoinbaseExchange, body.as_bytes(), now)
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn rate_age_bounds_hold_below_one_millisecond() {
+        let at = |nanos: i128| OffsetDateTime::from_unix_timestamp_nanos(nanos).unwrap();
+        let second = 1_000_000_000_i128;
+        let now = 1_700_000_000 * second;
+
+        let blocktank = |updated_at_millis: i64, now: i128| {
+            Feed {
+                tickers: vec![Ticker {
+                    base: "BTC".into(),
+                    quote: "USD".into(),
+                    last_price: "81000".into(),
+                    last_updated_at: updated_at_millis,
+                }],
+            }
+            .usd_per_btc(at(now))
+            .is_ok()
+        };
+        for (updated_at_millis, now, valid) in [
+            (1_699_999_400_000, now, true),
+            (1_699_999_400_000, now + 1, false),
+            (1_699_999_400_000, now + 500_000, false),
+            (1_699_999_400_001, now + 999_999, true),
+            (1_700_000_005_000, now, true),
+            (1_700_000_005_000, now - 1, false),
+        ] {
+            assert_eq!(
+                blocktank(updated_at_millis, now),
+                valid,
+                "{updated_at_millis}, {now}"
+            );
+        }
+
+        let coinbase = |time: &str, now: i128| {
+            let body = format!(r#"{{"price":"81000","time":"{time}"}}"#);
+            parse_usd_per_btc(
+                ExchangeRateFormat::CoinbaseExchange,
+                body.as_bytes(),
+                at(now),
+            )
+            .is_ok()
+        };
+        for (time, now, valid) in [
+            ("2023-11-14T22:13:25Z", now, true),
+            ("2023-11-14T22:13:25.000000001Z", now, false),
+            ("2023-11-14T22:13:25.000999999Z", now, false),
+            ("2023-11-14T22:13:25.000999999Z", now + 999_999, true),
+            ("2023-11-14T22:03:20.0009Z", now + 900_000, true),
+            ("2023-11-14T22:03:20.0005Z", now + 900_000, false),
+            ("2023-11-14T22:03:20.000000001Z", now + 2, false),
+        ] {
+            assert_eq!(coinbase(time, now), valid, "{time}, {now}");
         }
     }
 
