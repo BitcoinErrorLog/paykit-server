@@ -63,10 +63,11 @@ const PROVIDER_V2_DRAIN_FENCE_MIGRATION: &str =
 const PROVIDER_V2_USDT_MIGRATION: &str =
     include_str!("../../paykit-server/migrations/0028_provider_v2_usdt.sql");
 
-/// PostgreSQL advisory locks are server-wide, not database-scoped. These
-/// migration tests deliberately use the production migration lock key, so
-/// they must not contend with one another when the test harness runs them in
-/// parallel against independently-created databases.
+/// These migration tests deliberately use the production migration lock key
+/// and run one at a time. PostgreSQL scopes advisory locks to one database
+/// (see `process_lock.rs`, `the_lock_is_scoped_to_one_database`), so their
+/// independently-created databases would not contend for it; the
+/// serialization is kept as a precaution.
 fn migration_test_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
