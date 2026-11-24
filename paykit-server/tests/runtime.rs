@@ -364,6 +364,52 @@ async fn production_constructor_propagates_setup_authorization_url_logging_confi
     }
 }
 
+async fn setup_authorization_relay(server: Server) -> String {
+    let mut request = Request::get("/setup?return_to=https://app.example/callback&state=relay")
+        .body(Body::empty())
+        .unwrap();
+    request.extensions_mut().insert(axum::extract::ConnectInfo(
+        "127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap(),
+    ));
+    let response = server.router().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let escaped = page
+        .split_once("data-url=\"")
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(url, _)| url)
+        .expect("the setup page carries the authorization URL");
+    let authorization_url = escaped.replace("&amp;", "&");
+    paykit_sdk::parse_pubky_auth_url(&authorization_url)
+        .unwrap()
+        .relay_url
+}
+
+#[tokio::test]
+async fn production_constructor_serves_setup_on_the_configured_auth_relay() {
+    let mut config = production_config("tcp://127.0.0.1:1");
+    config.setup.auth_relay = Some("https://relay.shop.example/inbox".parse().unwrap());
+    let server = Server::build(config, lazy_pool()).await.unwrap();
+    assert_eq!(
+        setup_authorization_relay(server).await,
+        "https://relay.shop.example/inbox"
+    );
+
+    let server = Server::build(production_config("tcp://127.0.0.1:1"), lazy_pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        setup_authorization_relay(server).await,
+        "http://127.0.0.1:15412/inbox"
+    );
+}
+
 #[tokio::test]
 async fn production_constructor_mounts_all_routes() {
     let server = Server::build(production_config("tcp://127.0.0.1:1"), lazy_pool())

@@ -238,6 +238,7 @@ fn setup_auth_relay_accepts_https_and_local_http() {
         "https://relay.shop.example:8443/link/inbox/",
         "http://localhost:15412/inbox",
         "http://127.0.0.1:15412/inbox",
+        "http://[::1]:15412/inbox",
     ] {
         let input = valid_toml().replace(
             "allowed_origins = [\"https://app.example\"]",
