@@ -31,9 +31,11 @@ docker compose -p paykit-provider-v2-drain \
   up --abort-on-container-exit --exit-code-from provider-v2-drain-e2e
 ```
 
-The gate starts PostgreSQL plus a Pubky testnet, then launches two distinct
-`paykit-server` OS processes. Signed HTTP requests exercise delayed create versus
-drain ordering, drain-first rejection, exact replay, and server-process restart
+The gate starts PostgreSQL plus a Pubky testnet, then launches a `paykit-server`
+OS process and races it against a second, in-process server instance on the same
+database; the binary's process lock admits only one OS process per database.
+Signed HTTP requests exercise delayed create versus drain ordering, drain-first
+rejection, exact replay, and restart of a replacement `paykit-server` process
 against one durable database. It then runs the complete invoice, drain, and
 migration integration targets.
 

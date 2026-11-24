@@ -620,10 +620,6 @@ impl ServerProcess {
         }
     }
 
-    fn id(&self) -> u32 {
-        self.child.id()
-    }
-
     fn restart(&mut self) {
         self.child.kill().unwrap();
         self.child.wait().unwrap();
@@ -1180,8 +1176,21 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
             );
         }
     }
-    let server_b = ServerProcess::spawn(database.database_url(), &signing_key, address_b);
-    assert_ne!(server_a.id(), server_b.id());
+    // The binary's process lock admits one process per database, so the racing
+    // server runs in this process, where `run_until` takes no lock. It shares
+    // nothing with server A but the database.
+    let racing_config = config(database.database_url(), &signing_key, "50ms");
+    let racing_pool = initialize_database(&racing_config).await.unwrap();
+    let racing_listener = tokio::net::TcpListener::bind(address_b).await.unwrap();
+    let (stop_racing_server, racing_server_stopped) = tokio::sync::oneshot::channel::<()>();
+    let racing_server = tokio::spawn(
+        Server::build(racing_config, racing_pool)
+            .await
+            .unwrap()
+            .run_until(racing_listener, async move {
+                let _ = racing_server_stopped.await;
+            }),
+    );
     wait_until_listening(address_b).await;
     let mut drain_while_create_uncommitted = tokio::spawn({
         let request = drain_request(&signing_key, &creator_before_drain);
@@ -1212,7 +1221,8 @@ async fn protocol_real_provider_v2_drain_fence_survives_process_race_and_restart
         "uncommitted-create drain response: {}",
         String::from_utf8_lossy(&drain_while_create_uncommitted.body)
     );
-    drop(server_b);
+    stop_racing_server.send(()).unwrap();
+    racing_server.await.unwrap().unwrap();
 
     assert_eq!(
         create_before.status,
