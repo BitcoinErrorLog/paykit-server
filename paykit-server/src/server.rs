@@ -251,6 +251,10 @@ impl Server {
             sessions: sessions.clone(),
             identity_states: IdentityStateReads::default(),
         });
+        let exchange_rates: Arc<dyn crate::application::invoice_pricing::ExchangeRates> = Arc::new(
+            crate::application::invoice_pricing::FeedRates::new(&config.exchange_rate)
+                .map_err(|_| ServerBuildError::ExchangeRates)?,
+        );
         let invoice_service = Arc::new(
             CreateInvoiceService::with_invoice_windows(
                 session_validator.clone(),
@@ -274,10 +278,7 @@ impl Server {
             )
             .with_usdt(usdt.is_some())
             .with_conversion_payment_window(config.paykit.conversion_payment_window)
-            .with_exchange_rates(Arc::new(
-                crate::application::invoice_pricing::BlocktankRates::new()
-                    .map_err(|_| ServerBuildError::ExchangeRates)?,
-            )),
+            .with_exchange_rates(exchange_rates.clone()),
         );
         let provider_v2_service = Arc::new(
             ProviderV2Service::new(
@@ -293,10 +294,7 @@ impl Server {
             )
             .with_usdt(usdt.is_some())
             .with_conversion_payment_window(config.paykit.conversion_payment_window)
-            .with_exchange_rates(Arc::new(
-                crate::application::invoice_pricing::BlocktankRates::new()
-                    .map_err(|_| ServerBuildError::ExchangeRates)?,
-            )),
+            .with_exchange_rates(exchange_rates.clone()),
         );
         let marketplace_preparation_service = Arc::new(
             PrepareMarketplaceService::new(
@@ -313,10 +311,7 @@ impl Server {
             )
             .with_usdt(usdt.is_some())
             .with_conversion_payment_window(config.paykit.conversion_payment_window)
-            .with_exchange_rates(Arc::new(
-                crate::application::invoice_pricing::BlocktankRates::new()
-                    .map_err(|_| ServerBuildError::ExchangeRates)?,
-            )),
+            .with_exchange_rates(exchange_rates.clone()),
         );
         let marketplace_lifecycle_service = Arc::new(MarketplaceLifecycleService::new(
             marketplace_preparations.clone(),

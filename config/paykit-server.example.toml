@@ -108,3 +108,13 @@ drain_timeout = "30s"
 # Keep provider credentials in the operator-owned config, never in client URLs.
 # [usdt]
 # rpc_url = "https://your-arbitrum-rpc.example/"
+
+# Optional BTC/USD source for invoices that convert between BTC and USD or USDT.
+# Omit to use Bitkit's feed, https://api1.blocktank.to/api/fx/rates/btc. The URL
+# must be https with no credentials, query, or fragment. format is "blocktank"
+# (default; any source serving Blocktank's tickers JSON) or "coinbase-exchange"
+# (Coinbase Exchange's BTC-USD ticker only: the path must be exactly
+# /products/BTC-USD/ticker, on Coinbase's host or a proxy).
+# [exchange_rate]
+# url = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
+# format = "coinbase-exchange"
