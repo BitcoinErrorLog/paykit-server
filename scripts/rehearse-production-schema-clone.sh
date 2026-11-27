@@ -26,7 +26,7 @@ done
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/paykit-production-clone.XXXXXX")"
 tunnel_pid=""
 cluster_started=false
-clone_target_dir="${CARGO_TARGET_DIR:-/Users/johncarvalho/work/.cargo-target/paykit-server}"
+clone_target_dir="${CARGO_TARGET_DIR:-$scratch/target}"
 
 stop_process_tree() {
   local parent_pid=$1

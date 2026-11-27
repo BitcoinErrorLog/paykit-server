@@ -123,9 +123,9 @@ With `RAILWAY_PROJECT_ID`, `RAILWAY_ENVIRONMENT`, and
 scripts/rehearse-production-schema-clone.sh
 ```
 
-The script defaults `CARGO_TARGET_DIR` to the shared low-disk build cache used
-by the release worker. Set `CARGO_TARGET_DIR` explicitly when running on
-another machine.
+The script defaults `CARGO_TARGET_DIR` to a temporary directory inside its
+scratch workspace (removed on exit). Set `CARGO_TARGET_DIR` explicitly to reuse
+an existing local build cache.
 
 The script opens a Railway SSH tunnel and captures any connection details in
 a mode-0600 scratch file that it never prints. It takes a roles-only dump with
@@ -161,7 +161,7 @@ isolated-cluster gate is:
 
 ```bash
 TEST_DATABASE_URL=postgresql://<isolated-admin>@127.0.0.1:<port>/postgres \
-CARGO_TARGET_DIR=/Users/johncarvalho/work/.cargo-target/paykit-server \
+CARGO_TARGET_DIR=<cargo-target-dir> \
 cargo test --locked -p paykit-server-e2e --test migrations \
   migration_0024_ -- --include-ignored --test-threads=1
 ```
