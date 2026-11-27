@@ -34,5 +34,6 @@ pub use payment_request_lifecycles::{
 };
 pub use process_lock::{
     PROCESS_ADVISORY_LOCK_KEY, PROCESS_LOCK_APPLICATION_NAME, ProcessLock, ProcessLockLoss,
-    ProcessLockTiming,
+    ProcessLockState, ProcessLockTiming, ProcessOwnership, clear_process_owner_if_claimed,
+    release_process_ownership,
 };

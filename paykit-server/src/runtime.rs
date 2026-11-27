@@ -1,9 +1,10 @@
 //! Process lifecycle, dependency readiness, capacity admission, and server shutdown.
 
 use std::{
+    collections::HashMap,
     sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -109,12 +110,146 @@ impl DependencyCheck for PostgresDependency {
     }
 }
 
+pub(crate) struct BackgroundWorkGuard {
+    runtime: Arc<Runtime>,
+}
+
+impl Drop for BackgroundWorkGuard {
+    fn drop(&mut self) {
+        self.runtime.request_finished();
+    }
+}
+
+enum TaskSlot {
+    Pending,
+    Active(tokio::task::AbortHandle),
+}
+
+#[derive(Default)]
+pub(crate) struct TaskRegistry {
+    tasks: StdMutex<HashMap<u64, TaskSlot>>,
+    aborted: AtomicBool,
+    next_id: AtomicU64,
+    idle: Notify,
+}
+
+pub(crate) struct RegisteredTaskGuard {
+    registry: Arc<TaskRegistry>,
+    id: u64,
+}
+
+impl Drop for RegisteredTaskGuard {
+    fn drop(&mut self) {
+        let empty = {
+            let mut tasks = self
+                .registry
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tasks.remove(&self.id);
+            tasks.is_empty()
+        };
+        if empty {
+            self.registry.idle.notify_waiters();
+        }
+    }
+}
+
+impl TaskRegistry {
+    pub(crate) fn reserve(self: &Arc<Self>) -> (u64, RegisteredTaskGuard) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tasks.insert(id, TaskSlot::Pending);
+        (
+            id,
+            RegisteredTaskGuard {
+                registry: self.clone(),
+                id,
+            },
+        )
+    }
+
+    pub(crate) fn attach(&self, id: u64, handle: tokio::task::AbortHandle) {
+        let should_abort = {
+            let mut tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let abort_now = self.aborted.load(Ordering::SeqCst);
+            if let Some(slot) = tasks.get_mut(&id) {
+                *slot = TaskSlot::Active(handle.clone());
+            }
+            abort_now
+        };
+        if should_abort {
+            handle.abort();
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty()
+    }
+
+    pub(crate) fn abort_all(&self) {
+        self.aborted.store(true, Ordering::SeqCst);
+        let handles = {
+            let tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            tasks
+                .values()
+                .filter_map(|slot| match slot {
+                    TaskSlot::Pending => None,
+                    TaskSlot::Active(handle) => Some(handle.clone()),
+                })
+                .collect::<Vec<_>>()
+        };
+        for handle in handles {
+            handle.abort();
+        }
+    }
+
+    pub(crate) async fn wait_until_empty(&self) {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_empty() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) async fn abort_all_and_wait(&self, deadline: tokio::time::Instant) -> bool {
+        self.abort_all();
+        tokio::time::timeout_at(deadline, self.wait_until_empty())
+            .await
+            .is_ok()
+    }
+}
+
 /// Shared, injectable lifecycle state. Worker adapters report availability here;
 /// they never publish endpoint, identity, or provider-error data.
 pub struct Runtime {
     dependency: Arc<dyn DependencyCheck>,
     stopping: AtomicBool,
     cancelled: Notify,
+    admission_suspended: AtomicBool,
+    admission_revoked: Notify,
+    lease_epoch: tokio::time::Instant,
+    lease_deadline_nanos: AtomicU64,
+    force_abort_settling: AtomicBool,
+    force_abort_settling_notify: Notify,
+    background_tasks: Arc<TaskRegistry>,
+    settling_children: Arc<TaskRegistry>,
     in_flight: AtomicUsize,
     idle: Notify,
     capacity: Arc<tokio::sync::Semaphore>,
@@ -140,6 +275,14 @@ impl Runtime {
             dependency,
             stopping: AtomicBool::new(false),
             cancelled: Notify::new(),
+            admission_suspended: AtomicBool::new(false),
+            admission_revoked: Notify::new(),
+            lease_epoch: tokio::time::Instant::now(),
+            lease_deadline_nanos: AtomicU64::new(u64::MAX),
+            force_abort_settling: AtomicBool::new(false),
+            force_abort_settling_notify: Notify::new(),
+            background_tasks: Arc::new(TaskRegistry::default()),
+            settling_children: Arc::new(TaskRegistry::default()),
             in_flight: AtomicUsize::new(0),
             idle: Notify::new(),
             capacity: Arc::new(tokio::sync::Semaphore::new(max_concurrent_requests)),
@@ -157,10 +300,157 @@ impl Runtime {
         self.metrics.clone()
     }
     pub fn stopping(&self) -> bool {
-        self.stopping.load(Ordering::Acquire)
+        self.stopping.load(Ordering::SeqCst)
+    }
+    pub fn admission_suspended(&self) -> bool {
+        self.admission_suspended.load(Ordering::SeqCst)
+    }
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+    fn lease_valid(&self) -> bool {
+        let deadline_nanos = self.lease_deadline_nanos.load(Ordering::Acquire);
+        if deadline_nanos == u64::MAX {
+            return true;
+        }
+        let elapsed_nanos = tokio::time::Instant::now()
+            .saturating_duration_since(self.lease_epoch)
+            .as_nanos();
+        elapsed_nanos < u128::from(deadline_nanos)
+    }
+    /// Whether this process currently holds its process lock lease.
+    /// Remains true during clean shutdown while the lock is still held so active
+    /// settling passes can complete and unlock; turns false on lock-session
+    /// suspension, takeover quarantine, or local lease expiry.
+    pub fn owns_process_lock(&self) -> bool {
+        !self.admission_suspended() && self.lease_valid()
+    }
+    pub fn admitting(&self) -> bool {
+        !self.stopping() && self.owns_process_lock()
     }
     pub fn may_start_worker_claim(&self) -> bool {
-        !self.stopping()
+        self.admitting()
+    }
+    pub(crate) fn try_enter_background_work(self: &Arc<Self>) -> Option<BackgroundWorkGuard> {
+        if !self.admitting() {
+            return None;
+        }
+        self.request_started();
+        if !self.admitting() {
+            self.request_finished();
+            return None;
+        }
+        Some(BackgroundWorkGuard {
+            runtime: self.clone(),
+        })
+    }
+    pub(crate) fn spawn_tracked_background_task_with_guard<F, T>(
+        self: &Arc<Self>,
+        work_guard: BackgroundWorkGuard,
+        work: F,
+    ) -> tokio::task::JoinHandle<T>
+    where
+        F: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let (id, task_guard) = self.background_tasks.reserve();
+        let handle = tokio::spawn(async move {
+            let _task_guard = task_guard;
+            let _work_guard = work_guard;
+            work.await
+        });
+        self.background_tasks.attach(id, handle.abort_handle());
+        handle
+    }
+    pub(crate) fn has_background_tasks(&self) -> bool {
+        !self.background_tasks.is_empty()
+    }
+    pub(crate) async fn abort_and_join_background_tasks(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> bool {
+        self.background_tasks.abort_all_and_wait(deadline).await
+    }
+    pub(crate) fn settling_children(&self) -> &Arc<TaskRegistry> {
+        &self.settling_children
+    }
+    pub fn suspend_admission(&self) {
+        self.admission_suspended.store(true, Ordering::SeqCst);
+        self.admission_revoked.notify_waiters();
+    }
+    pub fn grant_ownership_until(&self, valid_until: tokio::time::Instant) {
+        let nanos = valid_until
+            .saturating_duration_since(self.lease_epoch)
+            .as_nanos()
+            .min(u128::from(u64::MAX - 1)) as u64;
+        self.lease_deadline_nanos.store(nanos, Ordering::Release);
+        self.admission_suspended.store(false, Ordering::SeqCst);
+    }
+    pub(crate) async fn admission_revoked(&self) {
+        loop {
+            if !self.admitting() {
+                return;
+            }
+            let notified = self.admission_revoked.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.admitting() {
+                return;
+            }
+            let deadline_nanos = self.lease_deadline_nanos.load(Ordering::Acquire);
+            if deadline_nanos == u64::MAX {
+                notified.await;
+            } else {
+                let deadline = self.lease_epoch + Duration::from_nanos(deadline_nanos);
+                tokio::select! {
+                    () = notified => {}
+                    () = tokio::time::sleep_until(deadline) => {}
+                }
+            }
+        }
+    }
+    /// Completes once process-lock ownership is suspended or its local lease expires.
+    /// Unlike [`Self::admission_revoked`], clean `begin_shutdown()` alone does not
+    /// trigger this while the process still holds its lock lease.
+    pub(crate) async fn ownership_lost(&self) {
+        loop {
+            if !self.owns_process_lock() {
+                return;
+            }
+            let notified = self.admission_revoked.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.owns_process_lock() {
+                return;
+            }
+            let deadline_nanos = self.lease_deadline_nanos.load(Ordering::Acquire);
+            if deadline_nanos == u64::MAX {
+                notified.await;
+            } else {
+                let deadline = self.lease_epoch + Duration::from_nanos(deadline_nanos);
+                tokio::select! {
+                    () = notified => {}
+                    () = tokio::time::sleep_until(deadline) => {}
+                }
+            }
+        }
+    }
+    pub(crate) fn begin_force_abort_settling(&self) {
+        if !self.force_abort_settling.swap(true, Ordering::AcqRel) {
+            self.force_abort_settling_notify.notify_waiters();
+        }
+    }
+    pub(crate) async fn force_abort_settling(&self) {
+        if self.force_abort_settling.load(Ordering::Acquire) {
+            return;
+        }
+        let notified = self.force_abort_settling_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.force_abort_settling.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
     }
     pub fn set_electrum_available(&self, available: bool) {
         self.electrum
@@ -202,11 +492,12 @@ impl Runtime {
             .store(if available { READY } else { DEGRADED }, Ordering::Release);
     }
     pub fn begin_shutdown(&self) {
-        if !self.stopping.swap(true, Ordering::AcqRel) {
+        if !self.stopping.swap(true, Ordering::SeqCst) {
             self.cancelled.notify_waiters();
+            self.admission_revoked.notify_waiters();
         }
         self.metrics.set_runtime_active(false);
-        if self.in_flight.load(Ordering::Acquire) == 0 {
+        if self.in_flight.load(Ordering::SeqCst) == 0 {
             self.idle.notify_waiters();
         }
     }
@@ -223,7 +514,7 @@ impl Runtime {
         notified.await;
     }
     pub async fn readiness(&self) -> Readiness {
-        let postgres = if self.stopping() || !self.dependency.postgres_ready().await {
+        let postgres = if !self.admitting() || !self.dependency.postgres_ready().await {
             ComponentState::NotReady
         } else {
             ComponentState::Ready
@@ -280,10 +571,10 @@ impl Runtime {
         timeout(duration, self.wait_for_idle()).await.is_ok()
     }
     fn request_started(&self) {
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
     }
     fn request_finished(&self) {
-        if self.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
             self.idle.notify_waiters();
         }
     }
@@ -325,7 +616,7 @@ async fn capacity_middleware(
     next: Next,
 ) -> Response {
     let exempt = matches!(request.uri().path(), "/health/live" | "/health/ready");
-    if !exempt && runtime.stopping() {
+    if !exempt && !runtime.admitting() {
         return unavailable(request_diagnostics::OutcomeFailureClass::SHUTDOWN);
     }
     let permit = if exempt {
@@ -340,6 +631,10 @@ async fn capacity_middleware(
     };
     if !exempt {
         runtime.request_started();
+        if !runtime.admitting() {
+            runtime.request_finished();
+            return unavailable(request_diagnostics::OutcomeFailureClass::SHUTDOWN);
+        }
     }
     let _guard = AdmissionGuard {
         runtime,
@@ -373,7 +668,8 @@ pub async fn serve(
     .await
 }
 
-pub(crate) async fn shutdown_signal() {
+#[doc(hidden)]
+pub async fn shutdown_signal() {
     #[cfg(unix)]
     {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -463,5 +759,50 @@ mod tests {
             .expect("cancellation waiter must be notified")
             .unwrap();
         runtime.cancelled().await;
+    }
+
+    #[tokio::test]
+    async fn suspending_or_expiring_ownership_revokes_admission_and_readiness() {
+        let runtime = Arc::new(Runtime::new(Arc::new(ReadyPostgres), 1));
+        runtime.set_electrum_available(true);
+        runtime.set_paykit_delivery_available(true);
+        runtime.set_outbox_available(true);
+        assert!(runtime.admitting());
+        assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
+
+        let revoked = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.admission_revoked().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!revoked.is_finished());
+
+        runtime.suspend_admission();
+        tokio::time::timeout(Duration::from_millis(50), revoked)
+            .await
+            .expect("suspension must wake admission_revoked")
+            .unwrap();
+        assert!(!runtime.admitting());
+        assert!(!runtime.may_start_worker_claim());
+        assert!(!runtime.stopping());
+        assert_eq!(runtime.readiness().await.postgres, ComponentState::NotReady);
+        assert_eq!(runtime.readiness().await.status, ComponentState::NotReady);
+
+        let expiry = tokio::time::Instant::now() + Duration::from_millis(60);
+        runtime.grant_ownership_until(expiry);
+        assert!(runtime.admitting());
+        assert_eq!(runtime.readiness().await.status, ComponentState::Ready);
+
+        let revoked_on_expiry = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.admission_revoked().await })
+        };
+        tokio::time::timeout(Duration::from_millis(250), revoked_on_expiry)
+            .await
+            .expect("local lease expiry must wake admission_revoked")
+            .unwrap();
+        assert!(!runtime.admitting());
+        assert!(!runtime.may_start_worker_claim());
+        assert_eq!(runtime.readiness().await.postgres, ComponentState::NotReady);
     }
 }

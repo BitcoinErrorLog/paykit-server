@@ -43,11 +43,12 @@ use crate::{
     persistence::{
         CreatorStore, InvoiceStore, MarketplacePreparationStore, OutboxRetryClass, OutboxStore,
         PaymentDrainStore, PaymentRequestLifecycleStore, PersistenceError, ProcessLock,
-        ProcessLockLoss, ProcessLockTiming,
+        ProcessLockLoss, ProcessLockState, ProcessLockTiming, ProcessOwnership,
+        clear_process_owner_if_claimed, release_process_ownership,
     },
     real_setup::RealSetupCompleter,
     runtime::{PostgresDependency, Runtime, operational_router},
-    setup::{SetupLimits, SetupService, SystemClock},
+    setup::{SetupCompleter, SetupLimits, SetupService, SystemClock},
     setup_orchestration::PubkyCompanionRelay,
     workers::{
         creator_tasks::CreatorTasks,
@@ -116,12 +117,19 @@ pub enum RunError {
     ProcessLockLost(ProcessLockLoss),
 }
 
+#[cfg(feature = "test-utils")]
+type TestSettlingWorker =
+    Box<dyn FnOnce(Arc<Runtime>) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
 /// Concrete process-owned server components.
 pub struct Server {
     config: Config,
+    pool: PgPool,
     router: Router,
     runtime: Arc<Runtime>,
     workers: WorkerComponents,
+    #[cfg(feature = "test-utils")]
+    extra_settling: Vec<TestSettlingWorker>,
 }
 
 struct WorkerComponents {
@@ -172,7 +180,26 @@ impl Server {
         pubky: Pubky,
         electrum: Arc<dyn ElectrumPort>,
     ) -> Result<Self, ServerBuildError> {
-        Self::build_with_clients(config, pool, pubky, electrum).await
+        Self::build_with_clients(config, pool, pubky, electrum, None).await
+    }
+
+    /// Builds the production composition with an injected setup completer for E2E tests.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub async fn build_with_setup_completer(
+        config: Config,
+        pool: PgPool,
+        completer: Arc<dyn SetupCompleter>,
+    ) -> Result<Self, ServerBuildError> {
+        let pubky = configured_pubky(config.paykit.network)?;
+        let electrum = ElectrumAdapter::configured(
+            config.electrum.endpoint(),
+            config.deployment_invariants().bitcoin_network.clone(),
+            config.electrum.request_timeout,
+            config.electrum.connect_retries,
+        )
+        .map_err(map_electrum_error)?;
+        Self::build_with_clients(config, pool, pubky, Arc::new(electrum), Some(completer)).await
     }
 
     async fn build_with_client(
@@ -187,7 +214,7 @@ impl Server {
             config.electrum.connect_retries,
         )
         .map_err(map_electrum_error)?;
-        Self::build_with_clients(config, pool, pubky, Arc::new(electrum)).await
+        Self::build_with_clients(config, pool, pubky, Arc::new(electrum), None).await
     }
 
     async fn build_with_clients(
@@ -195,7 +222,12 @@ impl Server {
         pool: PgPool,
         pubky: Pubky,
         electrum: Arc<dyn ElectrumPort>,
+        custom_setup_completer: Option<Arc<dyn SetupCompleter>>,
     ) -> Result<Self, ServerBuildError> {
+        let runtime = Arc::new(Runtime::new(
+            Arc::new(PostgresDependency::new(pool.clone())),
+            64,
+        ));
         let crypto = Arc::new(
             Crypto::from_master_key(config.master_key().as_bytes())
                 .map_err(|_| ServerBuildError::Crypto)?,
@@ -214,7 +246,8 @@ impl Server {
             config.paykit.network,
         )?;
         let relay = Arc::new(PubkyCompanionRelay::new(pubky.client().clone()));
-        let sessions = CreatorSessions::new(creators.clone(), pubky.clone(), config.paykit.clone());
+        let sessions = CreatorSessions::new(creators.clone(), pubky.clone(), config.paykit.clone())
+            .with_runtime(runtime.clone());
         let mut auth_starter = BitkitAuthStarter::new(bootstrap);
         let usdt = config
             .usdt
@@ -225,16 +258,20 @@ impl Server {
         if config.usdt.is_some() {
             auth_starter = auth_starter.with_usdt();
         }
-        let setup_completer = Arc::new(
-            RealSetupCompleter::new(
-                auth_starter,
-                relay,
-                creators.clone(),
-                sessions.clone(),
-                config.deployment_invariants().bitcoin_network.clone(),
-            )
-            .with_bitcoin_rotation(payment_request_lifecycles.clone(), config.paykit.clone()),
-        );
+        let setup_completer: Arc<dyn SetupCompleter> = match custom_setup_completer {
+            Some(completer) => completer,
+            None => Arc::new(
+                RealSetupCompleter::new(
+                    auth_starter,
+                    relay,
+                    creators.clone(),
+                    sessions.clone(),
+                    config.deployment_invariants().bitcoin_network.clone(),
+                )
+                .with_bitcoin_rotation(payment_request_lifecycles.clone(), config.paykit.clone())
+                .with_runtime(runtime.clone()),
+            ),
+        };
         let setup = SetupService::new_with_authorization_url_logging(
             config.setup.allowed_origins.clone(),
             setup_completer,
@@ -258,7 +295,8 @@ impl Server {
             },
             config.setup.log_authorization_url,
         )
-        .with_bitcoin_network(config.deployment_invariants().bitcoin_network.clone());
+        .with_bitcoin_network(config.deployment_invariants().bitcoin_network.clone())
+        .with_runtime(runtime.clone());
 
         let session_validator = Arc::new(CreatorSessionValidator {
             creators: creators.clone(),
@@ -404,10 +442,6 @@ impl Server {
                 .layer(Extension(signed_auth)),
         );
 
-        let runtime = Arc::new(Runtime::new(
-            Arc::new(PostgresDependency::new(pool.clone())),
-            64,
-        ));
         let router = operational_router(business_routes, runtime.clone());
         let workers = WorkerComponents {
             creators,
@@ -432,10 +466,47 @@ impl Server {
 
         Ok(Self {
             config,
+            pool,
             router,
             runtime,
             workers,
+            #[cfg(feature = "test-utils")]
+            extra_settling: Vec::new(),
         })
+    }
+
+    /// Registers an additional settling worker using the same `CreatorTasks`
+    /// lifecycle as Allowance intake and Seller Receipts.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn with_test_settling_pass<F, Fut>(mut self, pass: F) -> Self
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.extra_settling.push(Box::new(move |runtime| {
+            Box::pin(async move {
+                let mut tasks = CreatorTasks::new_settling(1, runtime.clone());
+                let mut turns = IntakeTurns::default();
+                let mut pass = Some(pass);
+                start_creator_passes(
+                    "test_settling",
+                    &mut tasks,
+                    &mut turns,
+                    vec![Uuid::new_v4()],
+                    |_| pass.take().expect("single test settling pass")(),
+                );
+                tokio::select! {
+                    biased;
+                    _ = runtime.cancelled() => {}
+                    _ = tasks.join_next(), if !tasks.is_empty() => {
+                        runtime.cancelled().await;
+                    }
+                }
+                finish_intake_passes(&mut tasks, &runtime).await;
+            })
+        }));
+        self
     }
 
     pub fn router(&self) -> Router {
@@ -447,12 +518,8 @@ impl Server {
     }
 
     pub async fn run(self, listener: tokio::net::TcpListener) -> std::io::Result<()> {
-        let drain_timeout = self.config.shutdown.drain_timeout;
-        self.run_with_shutdown(listener, async move {
-            crate::runtime::shutdown_signal().await;
-            drain_timeout
-        })
-        .await
+        self.run_with_shutdown(listener, crate::runtime::shutdown_signal())
+            .await
     }
 
     #[cfg(feature = "test-utils")]
@@ -465,45 +532,45 @@ impl Server {
     where
         F: Future<Output = ()> + Send,
     {
-        let drain_timeout = self.config.shutdown.drain_timeout;
-        self.run_with_shutdown(listener, async move {
-            shutdown.await;
-            drain_timeout
-        })
-        .await
+        self.run_with_shutdown(listener, shutdown).await
     }
 
-    /// Serves like [`Server::run`] while holding the database's process lock.
+    /// Serves like [`Server::run`] while holding the database's process lock and
+    /// durable ownership lease.
     ///
-    /// A lock session that ends, for example in a PostgreSQL restart, is retaken and
-    /// serving continues. If another process took the lock meanwhile, or PostgreSQL
-    /// stays unreachable for `timing.reacquire_within`, the server drains for at most
+    /// Business HTTP admission and worker claims remain closed until durable
+    /// ownership is claimed (including any takeover quarantine after an unclean
+    /// prior owner). On the first lock-session failure, admission is revoked
+    /// immediately before attempting to retake the lock and reconfirm the same
+    /// unfenced ownership generation. If another process took ownership or
+    /// PostgreSQL stays unreachable for `timing.reacquire_within`, complete
+    /// termination, including active settling work, is bounded by
     /// [`LOST_PROCESS_LOCK_DRAIN_LIMIT`] and returns [`RunError::ProcessLockLost`].
-    /// After a clean shutdown the lock is released; a failed release is only logged,
-    /// because closing the session releases the lock too.
-    pub async fn run_holding_process_lock(
+    /// After a clean shutdown, durable ownership and the advisory lock are released.
+    pub fn run_holding_process_lock(
         self,
         listener: tokio::net::TcpListener,
         lock: ProcessLock,
         timing: ProcessLockTiming,
-    ) -> Result<(), RunError> {
+    ) -> impl Future<Output = Result<(), RunError>> + Send {
+        self.runtime.suspend_admission();
         self.run_holding(listener, lock, timing, crate::runtime::shutdown_signal())
-            .await
     }
 
     #[cfg(feature = "test-utils")]
     #[doc(hidden)]
-    pub async fn run_holding_process_lock_until<F>(
+    pub fn run_holding_process_lock_until<F>(
         self,
         listener: tokio::net::TcpListener,
         lock: ProcessLock,
         timing: ProcessLockTiming,
         shutdown: F,
-    ) -> Result<(), RunError>
+    ) -> impl Future<Output = Result<(), RunError>> + Send
     where
         F: Future<Output = ()> + Send,
     {
-        self.run_holding(listener, lock, timing, shutdown).await
+        self.runtime.suspend_admission();
+        self.run_holding(listener, lock, timing, shutdown)
     }
 
     async fn run_holding<F>(
@@ -517,92 +584,543 @@ impl Server {
         F: Future<Output = ()> + Send,
     {
         let drain_timeout = self.config.shutdown.drain_timeout;
-        let mut loss = None;
-        let stop = async {
-            tokio::select! {
-                () = shutdown => drain_timeout,
-                lost = lock.hold(timing) => {
-                    tracing::error!(?lost, "database process lock lost; shutting down");
-                    loss = Some(lost);
-                    drain_timeout.min(LOST_PROCESS_LOCK_DRAIN_LIMIT)
+        let lock_loss_drain_limit = drain_timeout.min(LOST_PROCESS_LOCK_DRAIN_LIMIT);
+        let pool = self.pool.clone();
+        let runtime = self.runtime.clone();
+
+        runtime.suspend_admission();
+        let serving = crate::runtime::serve(listener, self.router, runtime.clone());
+        tokio::pin!(serving);
+        tokio::pin!(shutdown);
+
+        let mut ownership = {
+            enum ClaimOutcome {
+                Claimed(Result<ProcessOwnership, ProcessLockLoss>),
+                Shutdown,
+                Served(std::io::Result<()>),
+            }
+            let pre_claimed = lock.take_claimed_ownership();
+            let owner_id = pre_claimed
+                .map(|owned| owned.owner_id())
+                .unwrap_or_else(Uuid::new_v4);
+            let outcome = {
+                let claim = async {
+                    match pre_claimed {
+                        Some(mut owned) => {
+                            lock.renew_claimed_ownership(&mut owned, timing).await?;
+                            Ok(owned)
+                        }
+                        None => {
+                            lock.claim_ownership(owner_id, timing, lock_loss_drain_limit)
+                                .await
+                        }
+                    }
+                };
+                tokio::pin!(claim);
+                tokio::select! {
+                    biased;
+                    () = &mut shutdown => ClaimOutcome::Shutdown,
+                    _ = runtime.cancelled() => ClaimOutcome::Shutdown,
+                    result = &mut serving => ClaimOutcome::Served(result),
+                    claimed = &mut claim => ClaimOutcome::Claimed(claimed),
+                }
+            };
+            match outcome {
+                ClaimOutcome::Claimed(Ok(ownership)) => ownership,
+                ClaimOutcome::Claimed(Err(loss)) => {
+                    tracing::error!(
+                        ?loss,
+                        "database process lock lost before ownership claim; shutting down"
+                    );
+                    runtime.begin_shutdown();
+                    let _ = tokio::time::timeout(lock_loss_drain_limit, async {
+                        let _ = tokio::join!(&mut serving, runtime.wait_for_idle());
+                    })
+                    .await;
+                    return Err(RunError::ProcessLockLost(loss));
+                }
+                ClaimOutcome::Shutdown => {
+                    runtime.begin_shutdown();
+                    let served = match tokio::time::timeout(drain_timeout, async {
+                        let (serving_result, ()) =
+                            tokio::join!(&mut serving, runtime.wait_for_idle());
+                        serving_result
+                    })
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Ok(()),
+                    };
+                    if lock.clear_owner_if_claimed(owner_id).await.is_err() {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(250),
+                            clear_process_owner_if_claimed(&pool, owner_id),
+                        )
+                        .await;
+                    }
+                    if lock.release().await.is_err() {
+                        tracing::warn!(
+                            "database process lock release failed; closing its session releases it"
+                        );
+                    }
+                    served?;
+                    return Ok(());
+                }
+                ClaimOutcome::Served(result) => {
+                    runtime.begin_shutdown();
+                    if lock.clear_owner_if_claimed(owner_id).await.is_err() {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(250),
+                            clear_process_owner_if_claimed(&pool, owner_id),
+                        )
+                        .await;
+                    }
+                    if lock.release().await.is_err() {
+                        tracing::warn!(
+                            "database process lock release failed; closing its session releases it"
+                        );
+                    }
+                    result?;
+                    return Ok(());
                 }
             }
         };
-        let served = self.run_with_shutdown(listener, stop).await;
-        if let Some(loss) = loss {
+
+        runtime.grant_ownership_until(ownership.local_valid_until());
+        let (mut tasks, mut settling) = spawn_owned_workers(
+            self.workers,
+            runtime.clone(),
+            #[cfg(feature = "test-utils")]
+            self.extra_settling,
+        );
+
+        let outcome = {
+            let state_runtime = runtime.clone();
+            let lock_monitor = lock.hold_owned(&mut ownership, timing, move |state| match state {
+                ProcessLockState::Active { local_valid_until } => {
+                    state_runtime.grant_ownership_until(local_valid_until);
+                }
+                ProcessLockState::Suspended => {
+                    state_runtime.suspend_admission();
+                }
+            });
+            run_serving_loop(
+                serving,
+                &mut tasks,
+                &mut settling,
+                &runtime,
+                drain_timeout,
+                lock_loss_drain_limit,
+                &mut shutdown,
+                lock_monitor,
+            )
+            .await
+        };
+
+        if let Some(loss) = outcome.lock_loss {
+            if outcome.clean_drain
+                && loss == ProcessLockLoss::HeldElsewhere
+                && let Some(deadline) = outcome.lock_loss_deadline
+                && tokio::time::Instant::now() < deadline
+            {
+                let _ =
+                    tokio::time::timeout_at(deadline, release_process_ownership(&pool, &ownership))
+                        .await;
+            }
             return Err(RunError::ProcessLockLost(loss));
         }
-        served?;
-        if lock.release().await.is_err() {
+
+        if outcome.clean_drain && outcome.result.is_ok() && runtime.owns_process_lock() {
+            if lock.release_owned(&ownership).await.is_err() {
+                tracing::warn!(
+                    "database process lock release failed; closing its session releases it"
+                );
+            }
+        } else if lock.release().await.is_err() {
             tracing::warn!("database process lock release failed; closing its session releases it");
         }
+        outcome.result?;
         Ok(())
     }
 
-    /// Serves until `shutdown` completes, then drains admitted work for at most the
-    /// duration it returns.
+    /// Serves until `shutdown` completes, then drains admitted work gracefully.
     async fn run_with_shutdown<F>(
         self,
         listener: tokio::net::TcpListener,
         shutdown: F,
     ) -> std::io::Result<()>
     where
-        F: Future<Output = Duration> + Send,
+        F: Future<Output = ()> + Send,
     {
         let drain_timeout = self.config.shutdown.drain_timeout;
-        let (mut tasks, mut settling) = spawn_owned_workers(self.workers, self.runtime.clone());
+        let lock_loss_drain_limit = drain_timeout.min(LOST_PROCESS_LOCK_DRAIN_LIMIT);
+        let (mut tasks, mut settling) = spawn_owned_workers(
+            self.workers,
+            self.runtime.clone(),
+            #[cfg(feature = "test-utils")]
+            self.extra_settling,
+        );
         let serving = crate::runtime::serve(listener, self.router, self.runtime.clone());
         tokio::pin!(serving);
-        tokio::pin!(shutdown);
-        enum Stop {
-            Shutdown(Duration),
-            Served(std::io::Result<()>),
-            WorkerExited,
-            SettlingExited,
+        run_serving_loop(
+            serving,
+            &mut tasks,
+            &mut settling,
+            &self.runtime,
+            drain_timeout,
+            lock_loss_drain_limit,
+            shutdown,
+            std::future::pending::<ProcessLockLoss>(),
+        )
+        .await
+        .result
+    }
+}
+
+struct ServingOutcome {
+    result: std::io::Result<()>,
+    clean_drain: bool,
+    lock_loss: Option<ProcessLockLoss>,
+    lock_loss_deadline: Option<tokio::time::Instant>,
+}
+
+async fn drive_serving<S>(serving: &mut Option<std::pin::Pin<&mut S>>) -> std::io::Result<()>
+where
+    S: Future<Output = std::io::Result<()>> + Send,
+{
+    match serving.as_mut() {
+        Some(future) => {
+            let result = future.await;
+            *serving = None;
+            result
         }
-        let stop = tokio::select! {
-            biased;
-            drain_limit = &mut shutdown => Stop::Shutdown(drain_limit),
-            _ = self.runtime.cancelled() => Stop::Shutdown(drain_timeout),
-            result = &mut serving => Stop::Served(result),
-            _ = tasks.join_next() => Stop::WorkerExited,
-            () = settling_exited(&mut settling) => Stop::SettlingExited,
-        };
-        let drain_limit = match stop {
-            Stop::Shutdown(drain_limit) => drain_limit,
-            Stop::Served(result) => {
-                self.runtime.begin_shutdown();
-                abort_owned_workers(&mut tasks, &mut settling).await;
-                return result;
-            }
-            Stop::WorkerExited => {
-                self.runtime.begin_shutdown();
-                abort_owned_workers(&mut tasks, &mut settling).await;
-                return Err(std::io::Error::other("owned worker exited unexpectedly"));
-            }
-            // These run until shutdown; returning or panicking before is fatal.
-            Stop::SettlingExited => {
-                self.runtime.begin_shutdown();
-                abort_owned_workers(&mut tasks, &mut settling).await;
-                return Err(std::io::Error::other("owned worker exited unexpectedly"));
-            }
-        };
-        self.runtime.begin_shutdown();
-        let joined = async {
-            let (serving_result, worker_result, ()) = tokio::join!(
+        None => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_serving_loop<S, F, M>(
+    serving: std::pin::Pin<&mut S>,
+    tasks: &mut JoinSet<()>,
+    settling: &mut JoinSet<()>,
+    runtime: &Runtime,
+    drain_timeout: Duration,
+    lock_loss_drain_limit: Duration,
+    shutdown: F,
+    lock_monitor: M,
+) -> ServingOutcome
+where
+    S: Future<Output = std::io::Result<()>> + Send,
+    F: Future<Output = ()> + Send,
+    M: Future<Output = ProcessLockLoss> + Send,
+{
+    let mut serving = Some(serving);
+    tokio::pin!(shutdown);
+    tokio::pin!(lock_monitor);
+    enum Stop {
+        GracefulShutdown,
+        LockLost(ProcessLockLoss),
+        Served(std::io::Result<()>),
+        WorkerExited,
+        SettlingExited,
+    }
+    let stop = tokio::select! {
+        biased;
+        lost = &mut lock_monitor => Stop::LockLost(lost),
+        () = &mut shutdown => Stop::GracefulShutdown,
+        _ = runtime.cancelled() => Stop::GracefulShutdown,
+        result = drive_serving(&mut serving) => Stop::Served(result),
+        _ = tasks.join_next() => Stop::WorkerExited,
+        () = settling_exited(settling) => Stop::SettlingExited,
+    };
+    match stop {
+        Stop::LockLost(loss) => {
+            tracing::error!(?loss, "database process lock lost; shutting down");
+            finish_lock_loss_drain(
                 &mut serving,
-                join_owned_workers(&mut tasks),
-                self.runtime.wait_for_idle(),
-            );
-            serving_result?;
-            worker_result
+                tasks,
+                settling,
+                runtime,
+                lock_loss_drain_limit,
+                loss,
+                false,
+            )
+            .await
+        }
+        Stop::Served(result) => {
+            if !runtime.owns_process_lock() {
+                return finish_lock_loss_drain(
+                    &mut serving,
+                    tasks,
+                    settling,
+                    runtime,
+                    lock_loss_drain_limit,
+                    ProcessLockLoss::Unreachable,
+                    true,
+                )
+                .await;
+            }
+            runtime.begin_shutdown();
+            let escalated = {
+                let draining = abort_owned_workers(tasks, settling);
+                tokio::pin!(draining);
+                tokio::select! {
+                    biased;
+                    lost = &mut lock_monitor => Err(lost),
+                    () = runtime.ownership_lost() => Err(ProcessLockLoss::Unreachable),
+                    settling_clean = &mut draining => Ok(settling_clean),
+                }
+            };
+            match escalated {
+                Ok(settling_clean) if runtime.owns_process_lock() => ServingOutcome {
+                    clean_drain: result.is_ok()
+                        && settling_clean
+                        && runtime.in_flight() == 0
+                        && !runtime.has_background_tasks()
+                        && runtime.settling_children().is_empty(),
+                    result,
+                    lock_loss: None,
+                    lock_loss_deadline: None,
+                },
+                Ok(_) => {
+                    finish_lock_loss_drain(
+                        &mut serving,
+                        tasks,
+                        settling,
+                        runtime,
+                        lock_loss_drain_limit,
+                        ProcessLockLoss::Unreachable,
+                        true,
+                    )
+                    .await
+                }
+                Err(loss) => {
+                    finish_lock_loss_drain(
+                        &mut serving,
+                        tasks,
+                        settling,
+                        runtime,
+                        lock_loss_drain_limit,
+                        loss,
+                        true,
+                    )
+                    .await
+                }
+            }
+        }
+        Stop::WorkerExited | Stop::SettlingExited => {
+            if !runtime.owns_process_lock() {
+                let mut outcome = finish_lock_loss_drain(
+                    &mut serving,
+                    tasks,
+                    settling,
+                    runtime,
+                    lock_loss_drain_limit,
+                    ProcessLockLoss::Unreachable,
+                    true,
+                )
+                .await;
+                outcome.result = Err(std::io::Error::other("owned worker exited unexpectedly"));
+                return outcome;
+            }
+            runtime.begin_shutdown();
+            let escalated = {
+                let draining = abort_owned_workers(tasks, settling);
+                tokio::pin!(draining);
+                tokio::select! {
+                    biased;
+                    lost = &mut lock_monitor => Err(lost),
+                    () = runtime.ownership_lost() => Err(ProcessLockLoss::Unreachable),
+                    _ = &mut draining => Ok(()),
+                }
+            };
+            match escalated {
+                Ok(()) if runtime.owns_process_lock() => ServingOutcome {
+                    result: Err(std::io::Error::other("owned worker exited unexpectedly")),
+                    clean_drain: false,
+                    lock_loss: None,
+                    lock_loss_deadline: None,
+                },
+                Ok(()) => {
+                    let mut outcome = finish_lock_loss_drain(
+                        &mut serving,
+                        tasks,
+                        settling,
+                        runtime,
+                        lock_loss_drain_limit,
+                        ProcessLockLoss::Unreachable,
+                        true,
+                    )
+                    .await;
+                    outcome.result = Err(std::io::Error::other("owned worker exited unexpectedly"));
+                    outcome
+                }
+                Err(loss) => {
+                    let mut outcome = finish_lock_loss_drain(
+                        &mut serving,
+                        tasks,
+                        settling,
+                        runtime,
+                        lock_loss_drain_limit,
+                        loss,
+                        true,
+                    )
+                    .await;
+                    outcome.result = Err(std::io::Error::other("owned worker exited unexpectedly"));
+                    outcome
+                }
+            }
+        }
+        Stop::GracefulShutdown => {
+            if !runtime.owns_process_lock() {
+                tracing::error!(
+                    "shutdown arrived while process lock ownership was suspended or expired; \
+                     using bounded lock-loss termination"
+                );
+                return finish_lock_loss_drain(
+                    &mut serving,
+                    tasks,
+                    settling,
+                    runtime,
+                    lock_loss_drain_limit,
+                    ProcessLockLoss::Unreachable,
+                    true,
+                )
+                .await;
+            }
+            runtime.begin_shutdown();
+            enum GracefulStep {
+                Drained(std::io::Result<()>, bool, bool),
+                Escalated(ProcessLockLoss),
+            }
+            let step = {
+                let graceful = async {
+                    let joined = async {
+                        let (serving_result, worker_result, ()) = tokio::join!(
+                            drive_serving(&mut serving),
+                            join_owned_workers(tasks),
+                            runtime.wait_for_idle(),
+                        );
+                        serving_result?;
+                        worker_result
+                    };
+                    let (result, timed_out) =
+                        match tokio::time::timeout(drain_timeout, joined).await {
+                            Ok(result) => (result, false),
+                            Err(_) => (Ok(()), true),
+                        };
+                    let settling_clean = abort_owned_workers(tasks, settling).await;
+                    (result, timed_out, settling_clean)
+                };
+                tokio::pin!(graceful);
+                tokio::select! {
+                    biased;
+                    lost = &mut lock_monitor => GracefulStep::Escalated(lost),
+                    () = runtime.ownership_lost() => {
+                        GracefulStep::Escalated(ProcessLockLoss::Unreachable)
+                    }
+                    (result, timed_out, settling_clean) = &mut graceful => {
+                        GracefulStep::Drained(result, timed_out, settling_clean)
+                    }
+                }
+            };
+            match step {
+                GracefulStep::Drained(result, timed_out, settling_clean) => {
+                    if !runtime.owns_process_lock() {
+                        return finish_lock_loss_drain(
+                            &mut serving,
+                            tasks,
+                            settling,
+                            runtime,
+                            lock_loss_drain_limit,
+                            ProcessLockLoss::Unreachable,
+                            true,
+                        )
+                        .await;
+                    }
+                    let clean_drain = !timed_out
+                        && result.is_ok()
+                        && settling_clean
+                        && runtime.in_flight() == 0
+                        && !runtime.has_background_tasks()
+                        && runtime.settling_children().is_empty();
+                    ServingOutcome {
+                        result,
+                        clean_drain,
+                        lock_loss: None,
+                        lock_loss_deadline: None,
+                    }
+                }
+                GracefulStep::Escalated(loss) => {
+                    tracing::error!(
+                        ?loss,
+                        "database process lock lost during graceful shutdown; \
+                         escalating to bounded lock-loss termination"
+                    );
+                    finish_lock_loss_drain(
+                        &mut serving,
+                        tasks,
+                        settling,
+                        runtime,
+                        lock_loss_drain_limit,
+                        loss,
+                        true,
+                    )
+                    .await
+                }
+            }
+        }
+    }
+}
+
+async fn finish_lock_loss_drain<S>(
+    serving: &mut Option<std::pin::Pin<&mut S>>,
+    tasks: &mut JoinSet<()>,
+    settling: &mut JoinSet<()>,
+    runtime: &Runtime,
+    drain_limit: Duration,
+    loss: ProcessLockLoss,
+    force_unclean: bool,
+) -> ServingOutcome
+where
+    S: Future<Output = std::io::Result<()>> + Send,
+{
+    let deadline = tokio::time::Instant::now() + drain_limit;
+    let unwind_reserve = (drain_limit / 5)
+        .clamp(Duration::from_millis(25), Duration::from_millis(250))
+        .min(drain_limit / 2);
+    let cooperative_deadline = deadline.checked_sub(unwind_reserve).unwrap_or(deadline);
+    runtime.begin_shutdown();
+    let joined = async {
+        let (serving_result, worker_result, (), settling_joined_clean) = tokio::join!(
+            drive_serving(serving),
+            join_owned_workers(tasks),
+            runtime.wait_for_idle(),
+            join_settling_workers(settling),
+        );
+        let result = serving_result.and(worker_result);
+        (result, settling_joined_clean)
+    };
+    let (result, settling_joined_clean, timed_out) =
+        match tokio::time::timeout_at(cooperative_deadline, joined).await {
+            Ok((result, settling_joined_clean)) => (result, settling_joined_clean, false),
+            Err(_) => (Ok(()), false, true),
         };
-        let result = match tokio::time::timeout(drain_limit, joined).await {
-            Ok(result) => result,
-            Err(_) => Ok(()),
-        };
-        abort_owned_workers(&mut tasks, &mut settling).await;
-        result
+    let terminated_cleanly =
+        terminate_owned_workers_on_lock_loss(runtime, tasks, settling, deadline).await;
+    let clean_drain = !force_unclean
+        && !timed_out
+        && result.is_ok()
+        && settling_joined_clean
+        && terminated_cleanly
+        && runtime.in_flight() == 0
+        && !runtime.has_background_tasks()
+        && runtime.settling_children().is_empty();
+    ServingOutcome {
+        result,
+        clean_drain,
+        lock_loss: Some(loss),
+        lock_loss_deadline: Some(deadline),
     }
 }
 
@@ -611,6 +1129,16 @@ async fn join_owned_workers(tasks: &mut JoinSet<()>) -> std::io::Result<()> {
         result.map_err(|_| std::io::Error::other("owned worker exited unexpectedly"))?;
     }
     Ok(())
+}
+
+async fn join_settling_workers(settling: &mut JoinSet<()>) -> bool {
+    let mut all_ok = true;
+    while let Some(result) = settling.join_next().await {
+        if result.is_err() {
+            all_ok = false;
+        }
+    }
+    all_ok
 }
 
 /// Completes when the root task of Allowance intake or the seller Receipt
@@ -624,21 +1152,73 @@ async fn settling_exited(settling: &mut JoinSet<()>) {
 }
 
 /// Aborts the abortable owned workers, then waits for Allowance intake and the
-/// seller Receipt reader, which are never aborted: their running passes are
-/// SDK calls under the shared-state lock that must settle, and they start no
-/// new one once shutdown has begun.
-async fn abort_owned_workers(tasks: &mut JoinSet<()>, settling: &mut JoinSet<()>) {
+/// seller Receipt reader, which are never aborted during clean shutdown: their
+/// running passes are SDK calls under the shared-state lock that must settle,
+/// and they start no new one once shutdown has begun. Returns `true` only when
+/// every settling root exited cleanly without panicking.
+async fn abort_owned_workers(tasks: &mut JoinSet<()>, settling: &mut JoinSet<()>) -> bool {
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
-    while settling.join_next().await.is_some() {}
+    join_settling_workers(settling).await
+}
+
+/// Bounds complete worker and background-task termination after lock loss to one
+/// shared absolute `deadline`.
+///
+/// Abortable workers, settling roots, registered per-Creator settling children,
+/// and detached background setup tasks are aborted and awaited up to `deadline`.
+/// Returns `true` only when no remaining work had to be terminated.
+async fn terminate_owned_workers_on_lock_loss(
+    runtime: &Runtime,
+    tasks: &mut JoinSet<()>,
+    settling: &mut JoinSet<()>,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let had_remaining_work = !tasks.is_empty()
+        || !settling.is_empty()
+        || !runtime.settling_children().is_empty()
+        || runtime.has_background_tasks();
+    if !had_remaining_work {
+        return true;
+    }
+    tasks.abort_all();
+    if !settling.is_empty() || !runtime.settling_children().is_empty() {
+        tracing::error!(
+            remaining_roots = settling.len(),
+            "active settling work exceeded lock-loss drain limit; terminating"
+        );
+        runtime.begin_force_abort_settling();
+    }
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if !settling.is_empty() && !remaining.is_zero() {
+        let cooperative_slice = tokio::time::Instant::now() + remaining / 2;
+        let _ = tokio::time::timeout_at(cooperative_slice, async {
+            while settling.join_next().await.is_some() {}
+        })
+        .await;
+    }
+    if !settling.is_empty() {
+        settling.abort_all();
+    }
+    let _ = tokio::time::timeout_at(deadline, async {
+        let ((), (), _children_ok, _bg_ok) = tokio::join!(
+            async { while tasks.join_next().await.is_some() {} },
+            async { while settling.join_next().await.is_some() {} },
+            runtime.settling_children().abort_all_and_wait(deadline),
+            runtime.abort_and_join_background_tasks(deadline),
+        );
+    })
+    .await;
+    false
 }
 
 /// Spawns the owned workers. Allowance intake and the seller Receipt reader
-/// run outside the abortable set, so a drain deadline never drops a running
-/// SDK call.
+/// run outside the abortable set, so a graceful drain deadline never drops a
+/// running SDK call.
 fn spawn_owned_workers(
     workers: WorkerComponents,
     runtime: Arc<Runtime>,
+    #[cfg(feature = "test-utils")] extra_settling: Vec<TestSettlingWorker>,
 ) -> (JoinSet<()>, JoinSet<()>) {
     let mut tasks = JoinSet::new();
     let workers = Arc::new(workers);
@@ -656,6 +1236,10 @@ fn spawn_owned_workers(
     if workers.paykit.marketplace_seller_receipts {
         settling.spawn(seller_receipts_loop(workers.clone(), runtime.clone()));
     }
+    #[cfg(feature = "test-utils")]
+    for worker in extra_settling {
+        settling.spawn(worker(runtime.clone()));
+    }
     tasks.spawn(buyer_contacts_loop(workers.clone(), runtime.clone()));
     tasks.spawn(observer_loop(workers, runtime));
     (tasks, settling)
@@ -666,12 +1250,22 @@ async fn buyer_contacts_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            biased;
             _ = runtime.cancelled() => break,
             _ = interval.tick() => {}
         }
+        if !runtime.may_start_worker_claim() {
+            if runtime.stopping() {
+                break;
+            }
+            continue;
+        }
         for _ in 0..workers.outbox_batch_size {
             if !runtime.may_start_worker_claim() {
-                return;
+                if runtime.stopping() {
+                    return;
+                }
+                break;
             }
             let pending = match workers.invoices.claim_buyer_contact().await {
                 Ok(Some(pending)) => pending,
@@ -708,6 +1302,12 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
             _ = interval.tick() => None,
             creators = workers.outbox.wait_for_transport() => Some(creators),
         };
+        if !runtime.may_start_worker_claim() {
+            if runtime.stopping() {
+                break;
+            }
+            continue;
+        }
         let full_scan = hinted_creators.is_none();
         let creators = match hinted_creators {
             Some(creators) => creators,
@@ -732,8 +1332,11 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
             async move { maintain_creator_transport(&workers, creator, full_scan).await }
         })
         .await;
-        if !runtime.may_start_worker_claim() {
+        if runtime.stopping() {
             return;
+        }
+        if !runtime.may_start_worker_claim() {
+            continue;
         }
         // A targeted pass cannot clear a failed Creator enumeration or deferred work.
         if full_scan && !deferred {
@@ -750,20 +1353,26 @@ async fn shared_transport_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
 async fn allowance_intake_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
     let intake = Arc::new(AllowanceIntake::new(ALLOWANCE_INTAKE_COOLDOWN));
     let limit = usize::try_from(workers.outbox_batch_size).expect("validated outbox batch size");
-    let mut tasks = CreatorTasks::new(limit, runtime.clone());
+    let mut tasks = CreatorTasks::new_settling(limit, runtime.clone());
     let mut turns = IntakeTurns::default();
     let mut interval = tokio::time::interval(workers.outbox_poll_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            biased;
             _ = runtime.cancelled() => break,
             Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
             _ = interval.tick() => {}
         }
-        if tasks.available_slots() == 0 {
+        if tasks.available_slots() == 0 || !runtime.may_start_worker_claim() {
             continue;
         }
-        let creators = match workers.creators.ready_ids().await {
+        let creators = tokio::select! {
+            biased;
+            _ = runtime.cancelled() => break,
+            result = workers.creators.ready_ids() => result,
+        };
+        let creators = match creators {
             Ok(creators) => creators,
             Err(error) => {
                 tracing::warn!(
@@ -779,16 +1388,27 @@ async fn allowance_intake_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runt
             allowance_intake_pass(workers.clone(), intake.clone(), runtime.clone(), creator)
         });
     }
-    finish_intake_passes(&mut tasks).await;
+    finish_intake_passes(&mut tasks, &runtime).await;
 }
 
-/// Waits for every running pass to end. A pass starts no new read once
-/// shutdown begins, and the one it is in is an SDK mutation that must settle:
-/// dropping it mid-flight would skip the shared-state unlock and leave state
-/// unconfirmed. Pubky requests are bounded by [`PUBKY_REQUEST_TIMEOUT`], so a
-/// running read ends in bounded time.
-async fn finish_intake_passes(tasks: &mut CreatorTasks<()>) {
-    while tasks.join_next().await.is_some() {}
+/// Waits for every running pass to end during graceful shutdown. On lock-loss
+/// deadline expiry (`runtime.force_abort_settling()`), aborts and joins every
+/// remaining per-Creator pass so no background task outlives termination.
+async fn finish_intake_passes(tasks: &mut CreatorTasks<()>, runtime: &Runtime) {
+    while !tasks.is_empty() {
+        tokio::select! {
+            biased;
+            () = runtime.force_abort_settling() => {
+                tasks.abort_all_and_join().await;
+                break;
+            }
+            next = tasks.join_next() => {
+                if next.is_none() {
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// Starts intake passes in the free slots, least recently started Creator
@@ -870,11 +1490,15 @@ async fn run_allowance_intake_pass(
     runtime: &Runtime,
     creator: Uuid,
 ) {
+    if !runtime.may_start_worker_claim() {
+        return;
+    }
     let deadline = Instant::now() + ALLOWANCE_INTAKE_PASS_DEADLINE;
     let keep_reading = || runtime.may_start_worker_claim() && Instant::now() < deadline;
     let failure = match creator_adapter(workers, creator).await {
+        Ok(_) if !keep_reading() => None,
         Ok(adapter) => match adapter
-            .take_in_allowances(intake, &workers.invoices, &keep_reading)
+            .take_in_allowances_for_runtime(intake, &workers.invoices, runtime, &keep_reading)
             .await
         {
             Ok(queued) => {
@@ -909,24 +1533,26 @@ async fn run_allowance_intake_pass(
 async fn seller_receipts_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
     let reads = Arc::new(SellerReceiptReads::new(SELLER_RECEIPT_READ_INTERVAL));
     let limit = usize::try_from(workers.outbox_batch_size).expect("validated outbox batch size");
-    let mut tasks = CreatorTasks::new(limit, runtime.clone());
+    let mut tasks = CreatorTasks::new_settling(limit, runtime.clone());
     let mut turns = IntakeTurns::default();
     let mut interval = tokio::time::interval(workers.outbox_poll_interval);
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
+            biased;
             _ = runtime.cancelled() => break,
             Some(_) = tasks.join_next(), if !tasks.is_empty() => continue,
             _ = interval.tick() => {}
         }
-        if tasks.available_slots() == 0 {
+        if tasks.available_slots() == 0 || !runtime.may_start_worker_claim() {
             continue;
         }
-        let creators = match workers
-            .marketplace_preparations
-            .creators_awaiting_seller_receipts()
-            .await
-        {
+        let creators = tokio::select! {
+            biased;
+            _ = runtime.cancelled() => break,
+            result = workers.marketplace_preparations.creators_awaiting_seller_receipts() => result,
+        };
+        let creators = match creators {
             Ok(creators) => creators,
             Err(error) => {
                 tracing::warn!(
@@ -947,7 +1573,7 @@ async fn seller_receipts_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runti
             seller_receipts_pass(workers.clone(), reads.clone(), runtime.clone(), creator)
         });
     }
-    finish_intake_passes(&mut tasks).await;
+    finish_intake_passes(&mut tasks, &runtime).await;
 }
 
 /// One Creator's seller Receipt read. A busy shared state is retried on a
@@ -958,10 +1584,13 @@ async fn seller_receipts_pass(
     runtime: Arc<Runtime>,
     creator: Uuid,
 ) {
+    if !runtime.may_start_worker_claim() {
+        return;
+    }
     let failure = match creator_adapter(&workers, creator).await {
         Ok(_) if !runtime.may_start_worker_claim() => None,
         Ok(adapter) => match adapter
-            .read_seller_receipts(&reads, &workers.marketplace_preparations)
+            .read_seller_receipts_for_runtime(&reads, &workers.marketplace_preparations, &runtime)
             .await
         {
             Ok(_)
@@ -1353,13 +1982,21 @@ async fn outbox_enqueue_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
     let mut next_poll = tokio::time::Instant::now();
     loop {
         let completed = tokio::select! {
+            biased;
             _ = runtime.cancelled() => break,
             result = tasks.join_next(), if !tasks.is_empty() => result,
             _ = workers.invoices.wait_for_admission() => None,
             _ = tokio::time::sleep_until(next_poll) => None,
         };
         if !runtime.may_start_worker_claim() {
-            break;
+            if runtime.stopping() {
+                break;
+            }
+            let now = tokio::time::Instant::now();
+            if next_poll <= now {
+                next_poll = now + workers.outbox_poll_interval;
+            }
+            continue;
         }
         let now = tokio::time::Instant::now();
         if next_poll <= now {
@@ -1444,7 +2081,8 @@ async fn process_creator_outbox(
         }
     };
     let guard = tokio::select! {
-        _ = runtime.cancelled() => return Ok(None),
+        biased;
+        () = runtime.admission_revoked() => return Ok(None),
         guard = creator_mutation_lock(creator).lock_owned() => guard,
     };
     if !runtime.may_start_worker_claim() {
@@ -1589,7 +2227,10 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
             creators = workers.outbox.wait_for_reconciliation() => Some(creators),
         };
         if !runtime.may_start_worker_claim() {
-            break;
+            if runtime.stopping() {
+                break;
+            }
+            continue;
         }
         let claims = match workers
             .outbox
@@ -1696,6 +2337,9 @@ async fn lifecycle_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: 
                 readiness.completed(creator, available, &runtime);
             }
             _ = interval.tick() => {
+                if !runtime.may_start_worker_claim() {
+                    continue;
+                }
                 match workers.payment_request_lifecycles.creator_ids().await {
                     Ok(creators) => {
                         readiness.full_pass(&creators, &runtime);
@@ -1949,11 +2593,15 @@ async fn observer_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtime>) {
     let mut readiness = ElectrumReadiness::default();
     loop {
         tokio::select! {
+            biased;
             _ = runtime.cancelled() => break,
             _ = interval.tick() => {}
         }
         if !runtime.may_start_worker_claim() {
-            break;
+            if runtime.stopping() {
+                break;
+            }
+            continue;
         }
         let started = Instant::now();
         let mut failure: Option<(&'static str, &'static str)> = None;
@@ -3045,7 +3693,12 @@ mod tests {
     #[tokio::test]
     async fn production_spawn_path_owns_all_workers() {
         let server = test_server().await;
-        let (mut tasks, mut settling) = spawn_owned_workers(server.workers, server.runtime);
+        let (mut tasks, mut settling) = spawn_owned_workers(
+            server.workers,
+            server.runtime,
+            #[cfg(feature = "test-utils")]
+            Vec::new(),
+        );
         assert_eq!(tasks.len(), 6);
         assert!(settling.is_empty());
         abort_owned_workers(&mut tasks, &mut settling).await;
@@ -3060,7 +3713,12 @@ mod tests {
         );
         server.workers.paykit.allowance_intake = true;
         let runtime = server.runtime.clone();
-        let (mut tasks, mut settling) = spawn_owned_workers(server.workers, server.runtime);
+        let (mut tasks, mut settling) = spawn_owned_workers(
+            server.workers,
+            server.runtime,
+            #[cfg(feature = "test-utils")]
+            Vec::new(),
+        );
         // Intake runs outside the abortable set.
         assert_eq!(tasks.len(), 6);
         assert_eq!(settling.len(), 1);
@@ -3077,7 +3735,12 @@ mod tests {
         );
         server.workers.paykit.marketplace_seller_receipts = true;
         let runtime = server.runtime.clone();
-        let (mut tasks, mut settling) = spawn_owned_workers(server.workers, server.runtime);
+        let (mut tasks, mut settling) = spawn_owned_workers(
+            server.workers,
+            server.runtime,
+            #[cfg(feature = "test-utils")]
+            Vec::new(),
+        );
         // The reader runs outside the abortable set, like intake.
         assert_eq!(tasks.len(), 6);
         assert_eq!(settling.len(), 1);
@@ -3145,6 +3808,399 @@ mod tests {
             "the intake mutation was dropped"
         );
         assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lock_loss_lets_settling_finish_within_limit_and_bounds_stuck_settling() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        // Case 1: Active settling finishes before lock-loss drain limit for a clean drain.
+        let runtime = test_server().await.runtime;
+        let settled = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut tasks = JoinSet::new();
+        let mut settling = JoinSet::new();
+        settling.spawn({
+            let runtime = runtime.clone();
+            let settled = settled.clone();
+            let entered = entered.clone();
+            async move {
+                let mut creator_tasks = CreatorTasks::new_settling(1, runtime.clone());
+                let mut turns = IntakeTurns::default();
+                start_intake_passes(&mut creator_tasks, &mut turns, vec![Uuid::new_v4()], |_| {
+                    let settled = settled.clone();
+                    let entered = entered.clone();
+                    async move {
+                        entered.notify_one();
+                        tokio::time::sleep(Duration::from_millis(80)).await;
+                        settled.store(true, Ordering::SeqCst);
+                    }
+                });
+                runtime.cancelled().await;
+                finish_intake_passes(&mut creator_tasks, &runtime).await;
+            }
+        });
+        entered.notified().await;
+        let serving = async {
+            runtime.cancelled().await;
+            Ok(())
+        };
+        tokio::pin!(serving);
+        let outcome = run_serving_loop(
+            serving,
+            &mut tasks,
+            &mut settling,
+            &runtime,
+            Duration::from_secs(10),
+            Duration::from_millis(500),
+            std::future::pending::<()>(),
+            async { ProcessLockLoss::HeldElsewhere },
+        )
+        .await;
+        assert!(outcome.result.is_ok());
+        assert!(outcome.clean_drain);
+        assert_eq!(outcome.lock_loss, Some(ProcessLockLoss::HeldElsewhere));
+        assert!(settled.load(Ordering::SeqCst));
+        assert!(settling.is_empty());
+
+        // Case 2: Active settling outlives lock-loss drain limit, requiring bounded termination
+        // and child task fully unwound; clean_drain is false so takeover stays quarantined.
+        let runtime = test_server().await.runtime;
+        let dropped = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut tasks = JoinSet::new();
+        tasks.spawn(std::future::pending::<()>());
+        let mut settling = JoinSet::new();
+        settling.spawn({
+            let runtime = runtime.clone();
+            let dropped = dropped.clone();
+            let entered = entered.clone();
+            async move {
+                let mut creator_tasks = CreatorTasks::new_settling(1, runtime.clone());
+                let mut turns = IntakeTurns::default();
+                start_intake_passes(&mut creator_tasks, &mut turns, vec![Uuid::new_v4()], |_| {
+                    let dropped = dropped.clone();
+                    let entered = entered.clone();
+                    async move {
+                        let _guard = DropFlag(dropped);
+                        entered.notify_one();
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                });
+                runtime.cancelled().await;
+                finish_intake_passes(&mut creator_tasks, &runtime).await;
+            }
+        });
+        entered.notified().await;
+        let serving = async {
+            runtime.cancelled().await;
+            Ok(())
+        };
+        tokio::pin!(serving);
+        let started = Instant::now();
+        let outcome = run_serving_loop(
+            serving,
+            &mut tasks,
+            &mut settling,
+            &runtime,
+            Duration::from_secs(10),
+            Duration::from_millis(150),
+            std::future::pending::<()>(),
+            async { ProcessLockLoss::HeldElsewhere },
+        )
+        .await;
+        assert!(outcome.result.is_ok());
+        assert!(!outcome.clean_drain);
+        assert_eq!(outcome.lock_loss, Some(ProcessLockLoss::HeldElsewhere));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "lock-loss termination must be bounded even with stuck settling work: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "stuck settling child task must have unwound before return"
+        );
+        assert!(tasks.is_empty());
+        assert!(settling.is_empty());
+        assert!(runtime.settling_children().is_empty());
+    }
+
+    #[tokio::test]
+    async fn panicked_settling_root_with_active_child_marks_drain_unclean_and_unwinds_child() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let runtime = test_server().await.runtime;
+        let child_entered = Arc::new(tokio::sync::Notify::new());
+        let child_unwound = Arc::new(AtomicBool::new(false));
+        let mut tasks = JoinSet::new();
+        let mut settling = JoinSet::new();
+        settling.spawn({
+            let runtime = runtime.clone();
+            let entered = child_entered.clone();
+            let unwound = child_unwound.clone();
+            async move {
+                let mut creator_tasks = CreatorTasks::new_settling(1, runtime.clone());
+                let mut turns = IntakeTurns::default();
+                start_intake_passes(&mut creator_tasks, &mut turns, vec![Uuid::new_v4()], |_| {
+                    let entered = entered.clone();
+                    let unwound = unwound.clone();
+                    async move {
+                        let _guard = DropFlag(unwound);
+                        entered.notify_one();
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                });
+                runtime.cancelled().await;
+                panic!("settling root panicked while child was still active");
+            }
+        });
+        child_entered.notified().await;
+        let serving = async {
+            runtime.cancelled().await;
+            Ok(())
+        };
+        tokio::pin!(serving);
+        let outcome = run_serving_loop(
+            serving,
+            &mut tasks,
+            &mut settling,
+            &runtime,
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+            std::future::pending::<()>(),
+            async { ProcessLockLoss::HeldElsewhere },
+        )
+        .await;
+        assert!(
+            !outcome.clean_drain,
+            "panicked settling root must never classify lock-loss drain as clean"
+        );
+        assert!(
+            child_unwound.load(Ordering::SeqCst),
+            "orphaned settling child must have unwound before return"
+        );
+        assert!(runtime.settling_children().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fallback_root_abort_unwinds_registered_settling_child_within_single_deadline() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let runtime = test_server().await.runtime;
+        let child_entered = Arc::new(tokio::sync::Notify::new());
+        let child_unwound = Arc::new(AtomicBool::new(false));
+        let mut tasks = JoinSet::new();
+        let mut settling = JoinSet::new();
+        settling.spawn({
+            let runtime = runtime.clone();
+            let entered = child_entered.clone();
+            let unwound = child_unwound.clone();
+            async move {
+                let mut creator_tasks = CreatorTasks::new_settling(1, runtime.clone());
+                let mut turns = IntakeTurns::default();
+                start_intake_passes(&mut creator_tasks, &mut turns, vec![Uuid::new_v4()], |_| {
+                    let entered = entered.clone();
+                    let unwound = unwound.clone();
+                    async move {
+                        let _guard = DropFlag(unwound);
+                        entered.notify_one();
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                });
+                // Deliberately ignore force_abort_settling to exercise fallback root abort.
+                std::future::pending::<()>().await;
+                let _ = creator_tasks;
+            }
+        });
+        child_entered.notified().await;
+        let serving = async {
+            runtime.cancelled().await;
+            Ok(())
+        };
+        tokio::pin!(serving);
+        let started = Instant::now();
+        let outcome = run_serving_loop(
+            serving,
+            &mut tasks,
+            &mut settling,
+            &runtime,
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+            std::future::pending::<()>(),
+            async { ProcessLockLoss::HeldElsewhere },
+        )
+        .await;
+        assert!(!outcome.clean_drain);
+        assert!(
+            started.elapsed() < Duration::from_millis(450),
+            "fallback settling abort must stay within one shared deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            child_unwound.load(Ordering::SeqCst),
+            "registered settling child must have unwound before return"
+        );
+        assert!(runtime.settling_children().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sigterm_while_suspended_escalates_to_bounded_lock_loss_and_retains_quarantine() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let runtime = test_server().await.runtime;
+        let child_entered = Arc::new(tokio::sync::Notify::new());
+        let child_unwound = Arc::new(AtomicBool::new(false));
+        let mut tasks = JoinSet::new();
+        let mut settling = JoinSet::new();
+        settling.spawn({
+            let runtime = runtime.clone();
+            let entered = child_entered.clone();
+            let unwound = child_unwound.clone();
+            async move {
+                let mut creator_tasks = CreatorTasks::new_settling(1, runtime.clone());
+                let mut turns = IntakeTurns::default();
+                start_intake_passes(&mut creator_tasks, &mut turns, vec![Uuid::new_v4()], |_| {
+                    let entered = entered.clone();
+                    let unwound = unwound.clone();
+                    async move {
+                        let _guard = DropFlag(unwound);
+                        entered.notify_one();
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                });
+                runtime.cancelled().await;
+                finish_intake_passes(&mut creator_tasks, &runtime).await;
+            }
+        });
+        child_entered.notified().await;
+
+        // Admission is suspended (lock session failed and hold_owned is reacquiring)
+        // when SIGTERM arrives.
+        runtime.suspend_admission();
+        let serving = async {
+            runtime.cancelled().await;
+            Ok(())
+        };
+        tokio::pin!(serving);
+        let started = Instant::now();
+        let outcome = run_serving_loop(
+            serving,
+            &mut tasks,
+            &mut settling,
+            &runtime,
+            Duration::from_secs(60),
+            Duration::from_millis(200),
+            async {},
+            std::future::pending::<ProcessLockLoss>(),
+        )
+        .await;
+        assert!(outcome.lock_loss.is_some());
+        assert!(!outcome.clean_drain);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(child_unwound.load(Ordering::SeqCst));
+        assert!(runtime.settling_children().is_empty());
+    }
+
+    #[tokio::test]
+    async fn graceful_drain_escalates_to_bounded_lock_loss_when_ownership_drops_mid_drain() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let runtime = test_server().await.runtime;
+        runtime.grant_ownership_until(tokio::time::Instant::now() + Duration::from_secs(30));
+        let child_entered = Arc::new(tokio::sync::Notify::new());
+        let child_unwound = Arc::new(AtomicBool::new(false));
+        let mut tasks = JoinSet::new();
+        let mut settling = JoinSet::new();
+        settling.spawn({
+            let runtime = runtime.clone();
+            let entered = child_entered.clone();
+            let unwound = child_unwound.clone();
+            async move {
+                let mut creator_tasks = CreatorTasks::new_settling(1, runtime.clone());
+                let mut turns = IntakeTurns::default();
+                start_intake_passes(&mut creator_tasks, &mut turns, vec![Uuid::new_v4()], |_| {
+                    let entered = entered.clone();
+                    let unwound = unwound.clone();
+                    async move {
+                        let _guard = DropFlag(unwound);
+                        entered.notify_one();
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    }
+                });
+                runtime.cancelled().await;
+                finish_intake_passes(&mut creator_tasks, &runtime).await;
+            }
+        });
+        child_entered.notified().await;
+
+        let serving = async {
+            runtime.cancelled().await;
+            Ok(())
+        };
+        tokio::pin!(serving);
+        let started = Instant::now();
+        let monitor_runtime = runtime.clone();
+        let outcome = run_serving_loop(
+            serving,
+            &mut tasks,
+            &mut settling,
+            &runtime,
+            Duration::from_secs(60),
+            Duration::from_millis(200),
+            async {},
+            async move {
+                // Healthy when SIGTERM begins, then lock session suspends 100 ms into drain.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                monitor_runtime.suspend_admission();
+                std::future::pending::<ProcessLockLoss>().await
+            },
+        )
+        .await;
+        assert!(outcome.lock_loss.is_some());
+        assert!(!outcome.clean_drain);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "mid-drain lock loss must escalate out of 60 s graceful drain: {:?}",
+            started.elapsed()
+        );
+        assert!(child_unwound.load(Ordering::SeqCst));
+        assert!(runtime.settling_children().is_empty());
     }
 
     fn lifecycle_runtime() -> Arc<Runtime> {
@@ -3471,7 +4527,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let runtime = test_server().await.runtime;
-        let mut tasks = CreatorTasks::new(1, runtime);
+        let mut tasks = CreatorTasks::new(1, runtime.clone());
         let mut turns = IntakeTurns::default();
         let release = Arc::new(tokio::sync::Notify::new());
         let (entered, has_entered) = tokio::sync::oneshot::channel();
@@ -3490,7 +4546,7 @@ mod tests {
         has_entered.await.unwrap();
 
         {
-            let shutdown = finish_intake_passes(&mut tasks);
+            let shutdown = finish_intake_passes(&mut tasks, &runtime);
             tokio::pin!(shutdown);
             assert!(
                 tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
@@ -3511,7 +4567,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let runtime = test_server().await.runtime;
-        let mut tasks = CreatorTasks::new(1, runtime);
+        let mut tasks = CreatorTasks::new(1, runtime.clone());
         let mut turns = IntakeTurns::default();
         let finished = Arc::new(AtomicBool::new(false));
         start_intake_passes(&mut tasks, &mut turns, vec![Uuid::new_v4()], |_| {
@@ -3522,7 +4578,7 @@ mod tests {
             }
         });
 
-        finish_intake_passes(&mut tasks).await;
+        finish_intake_passes(&mut tasks, &runtime).await;
 
         assert!(finished.load(Ordering::SeqCst), "the pass was cut short");
         assert!(tasks.is_empty());

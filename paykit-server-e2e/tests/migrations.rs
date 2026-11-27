@@ -5,7 +5,7 @@ use paykit_server_e2e::postgres::TestDatabase;
 use sqlx::{Connection, PgConnection, PgPool, Row, postgres::PgConnectOptions};
 use uuid::Uuid;
 
-const REQUIRED_TABLES: [&str; 15] = [
+const REQUIRED_TABLES: [&str; 16] = [
     "deployment_metadata",
     "creators",
     "reader_assignments",
@@ -21,6 +21,7 @@ const REQUIRED_TABLES: [&str; 15] = [
     "invoice_provider_v2_current_sample",
     "invoice_provider_v2_first_threshold_evidence",
     "marketplace_seller_receipts",
+    "process_ownership",
 ];
 
 const PRE_SETTLEMENT_MIGRATIONS: [&str; 13] = [
@@ -358,7 +359,7 @@ async fn migrations_create_the_required_schema_and_are_restart_safe() {
             .fetch_all(pool)
             .await
             .unwrap();
-    assert_eq!(applied_versions, (1..=29).collect::<Vec<_>>());
+    assert_eq!(applied_versions, (1..=30).collect::<Vec<_>>());
 
     let proposal_recorded_at: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns
@@ -1934,5 +1935,130 @@ async fn interrupted_index_build_makes_the_rerun_fail_visibly() {
         .await
         .unwrap();
     assert!(index_valid().await);
+    database.cleanup().await;
+}
+
+#[tokio::test]
+async fn process_ownership_migration_enforces_singleton_lease_and_monotonic_generation() {
+    let _migration_test_guard = migration_test_lock().lock().await;
+    let database = TestDatabase::create().await;
+    let pool = database.pool();
+    run_migrations(pool).await.unwrap();
+
+    let owner_a = Uuid::new_v4();
+    let owner_b = Uuid::new_v4();
+
+    assert_check_violation(
+        sqlx::query(
+            "INSERT INTO process_ownership (id, generation, owner_id, fenced, lease_expires_at)
+             VALUES (2, 1, $1, FALSE, clock_timestamp() + INTERVAL '10 seconds')",
+        )
+        .bind(owner_a)
+        .execute(pool)
+        .await,
+    );
+    assert_check_violation(
+        sqlx::query(
+            "INSERT INTO process_ownership (id, generation, owner_id, fenced, lease_expires_at)
+             VALUES (1, 1, NULL, TRUE, NULL)",
+        )
+        .execute(pool)
+        .await,
+    );
+    assert_check_violation(
+        sqlx::query(
+            "INSERT INTO process_ownership (id, generation, owner_id, fenced, lease_expires_at)
+             VALUES (1, 1, $1, FALSE, NULL)",
+        )
+        .bind(owner_a)
+        .execute(pool)
+        .await,
+    );
+
+    sqlx::query(
+        "INSERT INTO process_ownership (id, generation, owner_id, fenced, lease_expires_at)
+         VALUES (1, 1, $1, FALSE, clock_timestamp() + INTERVAL '10 seconds')",
+    )
+    .bind(owner_a)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Renewing and fencing the active owner at the same generation are allowed.
+    sqlx::query(
+        "UPDATE process_ownership
+         SET lease_expires_at = clock_timestamp() + INTERVAL '20 seconds', fenced = TRUE
+         WHERE id = 1",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Switching owners without advancing generation is rejected.
+    let same_gen_takeover = sqlx::query(
+        "UPDATE process_ownership
+         SET owner_id = $1, fenced = FALSE,
+             lease_expires_at = clock_timestamp() + INTERVAL '10 seconds'
+         WHERE id = 1",
+    )
+    .bind(owner_b)
+    .execute(pool)
+    .await
+    .expect_err("takeover without advancing generation must fail");
+    assert_eq!(
+        same_gen_takeover
+            .as_database_error()
+            .unwrap()
+            .code()
+            .as_deref(),
+        Some("P0001")
+    );
+
+    // Decreasing generation is rejected.
+    let rollback = sqlx::query("UPDATE process_ownership SET generation = 0 WHERE id = 1")
+        .execute(pool)
+        .await
+        .expect_err("generation decrease must fail");
+    assert_eq!(
+        rollback.as_database_error().unwrap().code().as_deref(),
+        Some("P0001")
+    );
+
+    // Advancing generation on takeover succeeds, and clean release clears lease state.
+    sqlx::query(
+        "UPDATE process_ownership
+         SET generation = 2, owner_id = $1, fenced = FALSE,
+             lease_expires_at = clock_timestamp() + INTERVAL '10 seconds'
+         WHERE id = 1",
+    )
+    .bind(owner_b)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE process_ownership
+         SET owner_id = NULL, fenced = FALSE, lease_expires_at = NULL
+         WHERE id = 1",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+
+    // Claiming from NULL without advancing generation is rejected.
+    let stale_claim = sqlx::query(
+        "UPDATE process_ownership
+         SET owner_id = $1, fenced = FALSE,
+             lease_expires_at = clock_timestamp() + INTERVAL '10 seconds'
+         WHERE id = 1",
+    )
+    .bind(owner_a)
+    .execute(pool)
+    .await
+    .expect_err("claiming from NULL without advancing generation must fail");
+    assert_eq!(
+        stale_claim.as_database_error().unwrap().code().as_deref(),
+        Some("P0001")
+    );
+
     database.cleanup().await;
 }

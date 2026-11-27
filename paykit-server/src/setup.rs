@@ -132,6 +132,7 @@ impl Clock for ManualClock {
 pub struct SetupService {
     inner: Arc<Inner>,
     bitcoin_network: Option<BitcoinNetwork>,
+    runtime: Option<Arc<crate::runtime::Runtime>>,
 }
 
 struct Inner {
@@ -415,6 +416,7 @@ impl SetupService {
                 changed: Notify::new(),
             }),
             bitcoin_network: None,
+            runtime: None,
         }
     }
 
@@ -422,6 +424,13 @@ impl SetupService {
     /// iframe can address that build directly on Android.
     pub fn with_bitcoin_network(mut self, network: BitcoinNetwork) -> Self {
         self.bitcoin_network = Some(network);
+        self
+    }
+
+    /// Binds this setup service to `runtime` so detached completion tasks are
+    /// tracked for drain accounting and aborted on lock loss.
+    pub fn with_runtime(mut self, runtime: Arc<crate::runtime::Runtime>) -> Self {
+        self.runtime = Some(runtime);
         self
     }
 
@@ -557,6 +566,13 @@ impl SetupService {
     /// browser is backgrounded while the creator approves in Bitkit. Same rule
     /// as pubky/pubky-app#1411: the hand-off must not cancel the approval wait.
     pub async fn trigger_completion(&self, flow_id: &str) -> PollResult {
+        let work_guard = match &self.runtime {
+            Some(runtime) => match runtime.try_enter_background_work() {
+                Some(guard) => Some((runtime.clone(), guard)),
+                None => return PollResult::Unavailable,
+            },
+            None => None,
+        };
         let (attempt, reservation, remaining) = {
             let mut guard = self.inner.state.lock().await;
             let now = self.inner.clock.now();
@@ -585,7 +601,7 @@ impl SetupService {
             CompletionLease::new(self.inner.clone(), flow_id.to_owned(), reservation);
         let inner = self.inner.clone();
         let flow_id = flow_id.to_owned();
-        let completion = tokio::spawn(async move {
+        let task_future = async move {
             // No request bounds this task, so an approval that never arrives
             // must stop at flow expiry.
             let completion = tokio::time::timeout(remaining, inner.completer.complete(attempt))
@@ -616,7 +632,13 @@ impl SetupService {
             inner.changed.notify_waiters();
             completion_lease.disarm();
             result
-        });
+        };
+        let completion = match work_guard {
+            Some((runtime, guard)) => {
+                runtime.spawn_tracked_background_task_with_guard(guard, task_future)
+            }
+            None => tokio::spawn(task_future),
+        };
         // A panicked or aborted task drops its armed lease, which fails the flow.
         completion.await.unwrap_or(PollResult::Failed)
     }

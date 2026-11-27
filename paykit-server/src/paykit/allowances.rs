@@ -27,6 +27,7 @@ use super::{PaykitAdapter, sdk_error_label};
 use crate::{
     domain::locks::{ReaderPubky, parse_reader},
     persistence::InvoiceStore,
+    runtime::Runtime,
 };
 
 /// Acceptances queued per read. Each one is a durable outbound message, so a
@@ -228,16 +229,51 @@ impl PaykitAdapter {
         invoices: &InvoiceStore,
         keep_reading: &(dyn Fn() -> bool + Sync),
     ) -> paykit_sdk::Result<usize> {
+        self.take_in_allowances_inner(intake, invoices, None, keep_reading)
+            .await
+    }
+
+    pub(crate) async fn take_in_allowances_for_runtime(
+        &self,
+        intake: &AllowanceIntake,
+        invoices: &InvoiceStore,
+        runtime: &Runtime,
+        keep_reading: &(dyn Fn() -> bool + Sync),
+    ) -> paykit_sdk::Result<usize> {
+        self.take_in_allowances_inner(intake, invoices, Some(runtime), keep_reading)
+            .await
+    }
+
+    async fn take_in_allowances_inner(
+        &self,
+        intake: &AllowanceIntake,
+        invoices: &InvoiceStore,
+        runtime: Option<&Runtime>,
+        keep_reading: &(dyn Fn() -> bool + Sync),
+    ) -> paykit_sdk::Result<usize> {
+        if !keep_reading() {
+            return Ok(0);
+        }
         let now = Instant::now();
         let linked = {
-            let _guard = self.mutation_lock.lock().await;
+            let _guard = match runtime {
+                Some(runtime) => tokio::select! {
+                    biased;
+                    () = runtime.admission_revoked() => return Ok(0),
+                    guard = self.mutation_lock.lock() => guard,
+                },
+                None => self.mutation_lock.lock().await,
+            };
+            if !keep_reading() {
+                return Ok(0);
+            }
             self.sdk.linked_peers().await?
         }
         .into_iter()
         .filter(|peer| peer.state == LinkedPeerState::Linked)
         .map(|peer| peer.counterparty)
         .collect::<Vec<_>>();
-        if linked.is_empty() {
+        if linked.is_empty() || !keep_reading() {
             return Ok(0);
         }
         // Eligibility first: the stream of a peer this Creator never invoiced
@@ -259,10 +295,13 @@ impl PaykitAdapter {
                 reader_of(peer).is_some_and(|reader| invoiced.contains(&reader.to_string()))
             })
             .collect::<Vec<_>>();
-        if eligible.is_empty() {
+        if eligible.is_empty() || !keep_reading() {
             return Ok(0);
         }
         let activity = self.link_activity(&eligible).await?;
+        if !keep_reading() {
+            return Ok(0);
+        }
         let readers = eligible
             .into_iter()
             .filter_map(|peer| {
@@ -275,7 +314,7 @@ impl PaykitAdapter {
         if readers.is_empty() {
             return Ok(0);
         }
-        Ok(read_readers(
+        Ok(read_readers_with_runtime(
             self,
             &self.mutation_lock,
             intake,
@@ -285,6 +324,7 @@ impl PaykitAdapter {
                 budget: ALLOWANCE_INTAKE_READ_BUDGET,
                 lock_wait: ALLOWANCE_INTAKE_LOCK_WAIT,
             },
+            runtime,
             keep_reading,
         )
         .await)
@@ -378,13 +418,38 @@ struct ReadLimits {
 /// therefore goes behind the others next pass. No read starts once
 /// `keep_reading` turns false, as on shutdown. Returns how many acceptances it
 /// queued.
+#[cfg(test)]
 async fn read_readers<L: AllowanceLink + ?Sized>(
+    link: &L,
+    mutation_lock: &TokioMutex<()>,
+    intake: &AllowanceIntake,
+    creator_id: Uuid,
+    readers: Vec<(PubkyPublicKey, u64, usize)>,
+    limits: ReadLimits,
+    keep_reading: &(dyn Fn() -> bool + Sync),
+) -> usize {
+    read_readers_with_runtime(
+        link,
+        mutation_lock,
+        intake,
+        creator_id,
+        readers,
+        limits,
+        None,
+        keep_reading,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_readers_with_runtime<L: AllowanceLink + ?Sized>(
     link: &L,
     mutation_lock: &TokioMutex<()>,
     intake: &AllowanceIntake,
     creator_id: Uuid,
     mut readers: Vec<(PubkyPublicKey, u64, usize)>,
     limits: ReadLimits,
+    runtime: Option<&Runtime>,
     keep_reading: &(dyn Fn() -> bool + Sync),
 ) -> usize {
     let ReadLimits { budget, lock_wait } = limits;
@@ -400,7 +465,16 @@ async fn read_readers<L: AllowanceLink + ?Sized>(
             continue;
         };
         reading_since.get_or_insert(now);
-        let read = accept_proposals(link, mutation_lock, &peer, limit, lock_wait).await;
+        let read = accept_proposals_with_runtime(
+            link,
+            mutation_lock,
+            &peer,
+            limit,
+            lock_wait,
+            runtime,
+            keep_reading,
+        )
+        .await;
         if read.accepted > 0 {
             info!(
                 accepted = read.accepted,
@@ -431,12 +505,28 @@ async fn read_readers<L: AllowanceLink + ?Sized>(
 /// records while this read waited for it. Giving up on the lock starts no SDK
 /// call, and neither does a link at the cap: its proposals are left for
 /// manual acceptance and it counts as read.
+#[cfg(test)]
 async fn accept_proposals<L: AllowanceLink + ?Sized>(
     link: &L,
     mutation_lock: &TokioMutex<()>,
     reader: &PubkyPublicKey,
     limit: usize,
     lock_wait: Duration,
+) -> IntakeRead {
+    accept_proposals_with_runtime(link, mutation_lock, reader, limit, lock_wait, None, &|| {
+        true
+    })
+    .await
+}
+
+async fn accept_proposals_with_runtime<L: AllowanceLink + ?Sized>(
+    link: &L,
+    mutation_lock: &TokioMutex<()>,
+    reader: &PubkyPublicKey,
+    limit: usize,
+    lock_wait: Duration,
+    runtime: Option<&Runtime>,
+    keep_reading: &(dyn Fn() -> bool + Sync),
 ) -> IntakeRead {
     let at_cap = || {
         warn!(
@@ -453,7 +543,28 @@ async fn accept_proposals<L: AllowanceLink + ?Sized>(
     if limit == 0 {
         return at_cap();
     }
-    let Ok(_guard) = tokio::time::timeout(lock_wait, mutation_lock.lock()).await else {
+    if !keep_reading() {
+        return IntakeRead {
+            accepted: 0,
+            scan: Duration::ZERO,
+            result: Ok(false),
+        };
+    }
+    let guard = match runtime {
+        Some(runtime) => tokio::select! {
+            biased;
+            () = runtime.admission_revoked() => {
+                return IntakeRead {
+                    accepted: 0,
+                    scan: Duration::ZERO,
+                    result: Ok(false),
+                };
+            }
+            acquired = tokio::time::timeout(lock_wait, mutation_lock.lock()) => acquired,
+        },
+        None => tokio::time::timeout(lock_wait, mutation_lock.lock()).await,
+    };
+    let Ok(_guard) = guard else {
         return IntakeRead {
             accepted: 0,
             scan: Duration::ZERO,
@@ -463,6 +574,13 @@ async fn accept_proposals<L: AllowanceLink + ?Sized>(
             }),
         };
     };
+    if !keep_reading() {
+        return IntakeRead {
+            accepted: 0,
+            scan: Duration::ZERO,
+            result: Ok(false),
+        };
+    }
     let started = Instant::now();
     let limit = match link.link_records(reader).await {
         Ok(records) => limit.min(acceptance_limit(records)),
@@ -476,6 +594,13 @@ async fn accept_proposals<L: AllowanceLink + ?Sized>(
     };
     if limit == 0 {
         return at_cap();
+    }
+    if !keep_reading() {
+        return IntakeRead {
+            accepted: 0,
+            scan: started.elapsed(),
+            result: Ok(false),
+        };
     }
     let outcome = link.accept_pending(reader, limit).await;
     let scan = started.elapsed();

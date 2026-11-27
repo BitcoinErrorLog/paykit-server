@@ -29,6 +29,7 @@ use crate::{
     crypto::LookupHash,
     domain::locks::ReaderPubky,
     persistence::{MarketplacePreparationStore, OpenSellerReceiptRequest, SellerReceiptStored},
+    runtime::Runtime,
 };
 
 /// Least time between two reads of one Creator's issued Receipts.
@@ -180,6 +181,29 @@ impl PaykitAdapter {
         reads: &SellerReceiptReads,
         store: &MarketplacePreparationStore,
     ) -> paykit_sdk::Result<usize> {
+        self.read_seller_receipts_inner(reads, store, None).await
+    }
+
+    pub(crate) async fn read_seller_receipts_for_runtime(
+        &self,
+        reads: &SellerReceiptReads,
+        store: &MarketplacePreparationStore,
+        runtime: &Runtime,
+    ) -> paykit_sdk::Result<usize> {
+        self.read_seller_receipts_inner(reads, store, Some(runtime))
+            .await
+    }
+
+    async fn read_seller_receipts_inner(
+        &self,
+        reads: &SellerReceiptReads,
+        store: &MarketplacePreparationStore,
+        runtime: Option<&Runtime>,
+    ) -> paykit_sdk::Result<usize> {
+        let keep_reading = || runtime.is_none_or(Runtime::may_start_worker_claim);
+        if !keep_reading() {
+            return Ok(0);
+        }
         let open = store
             .open_seller_receipt_requests(self.creator_id)
             .await
@@ -187,20 +211,38 @@ impl PaykitAdapter {
                 context: "open Marketplace requests unavailable".into(),
                 source: None,
             })?;
-        if open.is_empty() || !reads.begin(self.creator_id, Instant::now()) {
+        if open.is_empty() || !keep_reading() {
+            return Ok(0);
+        }
+        let guard = match runtime {
+            Some(runtime) => tokio::select! {
+                biased;
+                () = runtime.admission_revoked() => return Ok(0),
+                guard = self.mutation_lock.lock() => guard,
+            },
+            None => self.mutation_lock.lock().await,
+        };
+        if !keep_reading() || !reads.begin(self.creator_id, Instant::now()) {
             return Ok(0);
         }
         let started = Instant::now();
         let matched = {
-            let _guard = self.mutation_lock.lock().await;
-            read_matching(self, self.app_id.as_str(), &open, &|reader| {
-                store.reader_lookup_hash(reader)
-            })
+            let _guard = guard;
+            read_matching_while(
+                self,
+                self.app_id.as_str(),
+                &open,
+                &|reader| store.reader_lookup_hash(reader),
+                &keep_reading,
+            )
             .await
         };
         reads.finish(self.creator_id, started.elapsed());
         let mut stored = 0;
         for (invoice_id, receipt) in matched? {
+            if !keep_reading() {
+                break;
+            }
             match store
                 .store_seller_receipt(self.creator_id, invoice_id, &receipt)
                 .await
@@ -256,18 +298,35 @@ fn matching<'a>(
 /// Lists the issued Receipts once and decrypts only those [`matching`] an
 /// open request, at most [`MAX_SELLER_RECEIPTS_PER_READ`] of them. A Receipt
 /// whose decrypted content disagrees with its record is skipped.
+#[cfg(test)]
 async fn read_matching<S: IssuedReceipts + ?Sized>(
     source: &S,
     own_app_id: &str,
     open: &[OpenSellerReceiptRequest],
     reader_hash: &(dyn Fn(&ReaderPubky) -> LookupHash + Sync),
 ) -> paykit_sdk::Result<Vec<(Uuid, SellerReceipt)>> {
+    read_matching_while(source, own_app_id, open, reader_hash, &|| true).await
+}
+
+async fn read_matching_while<S: IssuedReceipts + ?Sized>(
+    source: &S,
+    own_app_id: &str,
+    open: &[OpenSellerReceiptRequest],
+    reader_hash: &(dyn Fn(&ReaderPubky) -> LookupHash + Sync),
+    keep_reading: &(dyn Fn() -> bool + Sync),
+) -> paykit_sdk::Result<Vec<(Uuid, SellerReceipt)>> {
+    if !keep_reading() {
+        return Ok(Vec::new());
+    }
     let issued = source.issued().await?;
     let mut accepted = Vec::new();
     for (request, record) in matching(&issued, open, own_app_id, reader_hash)
         .into_iter()
         .take(MAX_SELLER_RECEIPTS_PER_READ)
     {
+        if !keep_reading() {
+            break;
+        }
         let receipt = match source
             .decrypt(&record.counterparty, &record.receipt_id)
             .await

@@ -422,14 +422,48 @@ and for PostgreSQL to accept connections. If another process still holds the
 lock, it exits with `another Paykit Server process is using this database`; if
 PostgreSQL never answered, with `postgres connection failed`.
 
+Before mutating database startup state (`DeploymentStore::initialize`, legacy
+USDT receipt attribution, integrity scans, and post-0030 migrations), opening
+business HTTP admission, spawning workers, or restoring Creator grants, the
+server claims a durable monotonic generation lease in `process_ownership`. On a
+fresh or pre-0030 database where `process_ownership` does not yet exist,
+migrations create the table first and ownership is claimed immediately before
+deployment initialization and legacy receipt attribution. Post-claim startup
+work (migrations, deployment initialization, legacy receipt attribution,
+integrity scans, `Server::build`, and listener bind) runs under continuous
+periodic lease renewal and cancels immediately if the lock session drops or is
+fenced. After a clean
+shutdown, ownership transfers immediately. If the previous holder ended
+uncleanly, the replacement fences the old generation and stays in takeover
+quarantine until the previous holder finishes draining cleanly and clears its
+lease, or until the previous lease expires.
+
 If the lock session ends while serving, for example because PostgreSQL restarted
-or failed over, the process retakes the lock on a new session and keeps serving.
-It stops only if another process took the lock meanwhile, or if PostgreSQL stays
-unreachable for 20 seconds. It then drains admitted work for at most 5 seconds
-and exits with an error, so its supervisor must restart it on failure. A process
-cut off from PostgreSQL stops within about 40 seconds, before PostgreSQL ends the
-unreachable session after about 50 seconds of TCP keepalives and lets another
-process take the lock.
+or failed over, the process immediately revokes HTTP business admission, worker
+claims, readiness, and Creator session access before attempting to retake the
+lock (permanent worker loops stay alive while paused and skip claims until
+ownership is reconfirmed or shutdown begins). It resumes serving only if it
+retakes the advisory lock and PostgreSQL confirms the same unfenced ownership
+generation. It stops if another process took or fenced ownership, or if
+PostgreSQL stays unreachable for 20 seconds. On lock loss, complete
+termination, including active settling work and detached setup completions, is
+bounded by one shared deadline of at most `min(shutdown.drain_timeout, 5s)`.
+Tasks still running at the deadline are aborted and joined while leaving
+durable ownership quarantined until lease expiry rather than clearing ownership
+early; the process then exits with an error so its supervisor can restart it on
+failure. Assuming `shutdown.drain_timeout >= 5s`, a process cut off from
+PostgreSQL closes admission within 10 seconds and completes lock-loss
+termination within 35 seconds (`10s + 20s + min(shutdown.drain_timeout, 5s)`),
+before its 40-second durable lease (`+ 5s` safety margin) expires and before
+PostgreSQL ends the unreachable session after about 50 seconds of TCP
+keepalives. Lease-based takeover quarantine assumes bounded scheduling pauses
+shorter than that safety margin rather than serializing every concurrent
+business database transaction on the singleton `process_ownership` row; blocking
+Electrum transport calls in `observer_loop` have their async continuation
+cancelled on shutdown (preventing further database writes) and exit with the
+process. `Server::run` and `Runtime::new` remain unfenced in-process entry
+points for embedded test harnesses; the `paykit-server` binary always runs the
+process-locked startup path.
 
 The lock needs a direct PostgreSQL connection or a session-mode pooler. Behind a
 transaction- or statement-mode pooler, such as PgBouncer with `pool_mode =
@@ -668,7 +702,7 @@ and persistence distinctions without formatting their source errors. Pubky's
 URL-bearing AUTH relay targets are disabled at every log level; application-owned
 setup stages provide the safe replacement diagnostics.
 
-On SIGTERM or SIGINT, readiness changes first, normal admission and new worker claims stop, and admitted work drains for at most `shutdown.drain_timeout`. Remaining work is cancelled at the deadline, except Allowance intake and the seller Receipt reader: neither starts a new read once shutdown begins, but a read already running holds the shared-state lock and is awaited past the deadline. For Allowance intake, each Creator has at most one read running; it waits at most 20 seconds for the Creator lock, its work is bounded by the SDK's per-link record cap, and each of its Pubky requests times out after 30 seconds. Durable leases can be reclaimed after restart; pending memory-only setup flows are lost.
+On SIGTERM or SIGINT, readiness changes first, normal admission and new worker claims stop, and admitted work drains for at most `shutdown.drain_timeout` while the lock supervisor continues renewing the durable ownership lease (supporting `shutdown.drain_timeout` longer than the initial 40-second lease TTL). If process-lock ownership is already suspended when shutdown arrives or is lost at any point during graceful drain, the server immediately escalates to bounded lock-loss termination (`min(shutdown.drain_timeout, 5s)`) and leaves durable ownership quarantined until lease expiry. Remaining work is cancelled at the deadline, except Allowance intake and the seller Receipt reader: neither starts a new read once shutdown begins, but during clean shutdown (while this process still holds the database process lock) a read already running holds the shared-state lock and is awaited past the deadline before ownership and the advisory lock are released. On database process-lock loss, active settling work gets up to `min(shutdown.drain_timeout, 5s)` to finish cleanly; if it outlives that deadline, its tasks are aborted and joined so termination stays bounded, durable ownership is left quarantined until lease expiry, and the SDK's uncertain-write reconciliation recovers any interrupted homeserver write. For Allowance intake, each Creator has at most one read running; it waits at most 20 seconds for the Creator lock, its work is bounded by the SDK's per-link record cap, and each of its Pubky requests times out after 30 seconds. Durable leases can be reclaimed after restart; pending memory-only setup flows are lost.
 
 ## Invoice and delivery semantics
 

@@ -57,7 +57,7 @@ use crate::{
 };
 
 /// Creator-owned live Pubky access restored from encrypted server credentials.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CreatorSessionProvider {
     creators: CreatorStore,
     creator: CreatorPubky,
@@ -66,6 +66,16 @@ pub struct CreatorSessionProvider {
     cache: Arc<TokioMutex<Option<CachedSession>>>,
     payment_request_refreshes: Arc<payment_status::PaymentRequestRefreshes>,
     verified_reconnect: bool,
+    runtime: Option<Arc<crate::runtime::Runtime>>,
+}
+
+impl std::fmt::Debug for CreatorSessionProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreatorSessionProvider")
+            .field("client_id", &self.client_id)
+            .field("verified_reconnect", &self.verified_reconnect)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CreatorSessionProvider {
@@ -96,15 +106,51 @@ impl CreatorSessionProvider {
             cache: Arc::new(TokioMutex::new(None)),
             payment_request_refreshes: Arc::new(payment_status::PaymentRequestRefreshes::default()),
             verified_reconnect: false,
+            runtime: None,
         }
+    }
+
+    fn with_runtime(mut self, runtime: Option<Arc<crate::runtime::Runtime>>) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub async fn seed_cached_session_for_test(
+        &self,
+        session_secret: &str,
+        access: PubkySessionAccess,
+    ) {
+        let mut cache = self.cache.lock().await;
+        *cache = Some(CachedSession {
+            session_secret: zeroize::Zeroizing::new(session_secret.to_owned()),
+            access,
+        });
     }
 }
 
 #[async_trait]
 impl PubkySessionProvider for CreatorSessionProvider {
     async fn load_session_access(&self) -> paykit_sdk::Result<Option<PubkySessionAccess>> {
+        if let Some(runtime) = &self.runtime
+            && !runtime.owns_process_lock()
+        {
+            return Err(PaykitSdkError::Storage {
+                context: "server process ownership is inactive".into(),
+                source: None,
+            });
+        }
         let mut cache = self.cache.lock().await;
         if self.verified_reconnect {
+            if let Some(runtime) = &self.runtime
+                && !runtime.owns_process_lock()
+            {
+                return Err(PaykitSdkError::Storage {
+                    context: "server process ownership is inactive".into(),
+                    source: None,
+                });
+            }
             return Ok(cache.as_ref().map(|cached| cached.access.clone()));
         }
         let credentials = self
@@ -128,8 +174,28 @@ impl PubkySessionProvider for CreatorSessionProvider {
             && cached.access.paykit_identity_secret_key.as_ref()
                 == Some(credentials.paykit_identity_secret())
         {
+            if let Some(runtime) = &self.runtime
+                && !runtime.owns_process_lock()
+            {
+                return Err(PaykitSdkError::Storage {
+                    context: "server process ownership is inactive".into(),
+                    source: None,
+                });
+            }
             return Ok(Some(cached.access.clone()));
         }
+        let _import_guard = match &self.runtime {
+            Some(runtime) => match runtime.try_enter_background_work() {
+                Some(guard) => Some(guard),
+                None => {
+                    return Err(PaykitSdkError::Storage {
+                        context: "server process ownership is inactive".into(),
+                        source: None,
+                    });
+                }
+            },
+            None => None,
+        };
         let bootstrap =
             PubkySessionBootstrap::with_pubky(self.public_client.clone(), &self.client_id)?;
         let mut access = bootstrap
@@ -181,6 +247,7 @@ pub struct CreatorSessions {
     pubky: Pubky,
     config: PaykitConfig,
     providers: Arc<StdMutex<HashMap<String, CreatorSessionProvider>>>,
+    runtime: Option<Arc<crate::runtime::Runtime>>,
 }
 
 impl CreatorSessions {
@@ -190,7 +257,19 @@ impl CreatorSessions {
             pubky,
             config,
             providers: Arc::new(StdMutex::new(HashMap::new())),
+            runtime: None,
         }
+    }
+
+    pub(crate) fn with_runtime(mut self, runtime: Arc<crate::runtime::Runtime>) -> Self {
+        self.runtime = Some(runtime);
+        self
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn with_runtime_for_test(self, runtime: Arc<crate::runtime::Runtime>) -> Self {
+        self.with_runtime(runtime)
     }
 
     pub fn provider(&self, creator: &CreatorPubky) -> CreatorSessionProvider {
@@ -207,8 +286,20 @@ impl CreatorSessions {
                     self.pubky.clone(),
                     &self.config,
                 )
+                .with_runtime(self.runtime.clone())
             })
             .clone()
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn verified_reconnect_provider_for_test(
+        &self,
+        creator: &CreatorPubky,
+        session_secret: &str,
+        access: PubkySessionAccess,
+    ) -> CreatorSessionProvider {
+        self.verified_reconnect_provider(creator, session_secret, access)
     }
 
     /// Isolated provider for reconciliation before changed-account credentials
@@ -230,6 +321,7 @@ impl CreatorSessions {
             }))),
             payment_request_refreshes: Arc::new(payment_status::PaymentRequestRefreshes::default()),
             verified_reconnect: true,
+            runtime: self.runtime.clone(),
         }
     }
 }

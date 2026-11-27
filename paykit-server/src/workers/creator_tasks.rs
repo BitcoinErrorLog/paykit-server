@@ -4,13 +4,14 @@ use std::{collections::HashSet, future::Future, sync::Arc};
 use tokio::task::JoinSet;
 use uuid::Uuid;
 
-use crate::runtime::Runtime;
+use crate::runtime::{Runtime, TaskRegistry};
 
 pub(crate) struct CreatorTasks<T> {
     tasks: JoinSet<(Uuid, T)>,
     active: HashSet<Uuid>,
     limit: usize,
     runtime: Arc<Runtime>,
+    registry: Option<Arc<TaskRegistry>>,
 }
 
 impl<T: Send + 'static> CreatorTasks<T> {
@@ -21,6 +22,15 @@ impl<T: Send + 'static> CreatorTasks<T> {
             active: HashSet::new(),
             limit,
             runtime,
+            registry: None,
+        }
+    }
+
+    pub(crate) fn new_settling(limit: usize, runtime: Arc<Runtime>) -> Self {
+        let registry = runtime.settling_children().clone();
+        Self {
+            registry: Some(registry),
+            ..Self::new(limit, runtime)
         }
     }
 
@@ -47,7 +57,16 @@ impl<T: Send + 'static> CreatorTasks<T> {
         {
             return false;
         }
-        self.tasks.spawn(async move { (creator, work.await) });
+        if let Some(registry) = &self.registry {
+            let (id, guard) = registry.reserve();
+            let handle = self.tasks.spawn(async move {
+                let _guard = guard;
+                (creator, work.await)
+            });
+            registry.attach(id, handle);
+        } else {
+            self.tasks.spawn(async move { (creator, work.await) });
+        }
         true
     }
 
@@ -59,6 +78,14 @@ impl<T: Send + 'static> CreatorTasks<T> {
             .expect("owned Creator task exited unexpectedly");
         self.active.remove(&creator);
         Some((creator, result))
+    }
+
+    /// Aborts every running per-Creator task and waits until every aborted task
+    /// has unwound and released its guards.
+    pub(crate) async fn abort_all_and_join(&mut self) {
+        self.tasks.abort_all();
+        while self.tasks.join_next().await.is_some() {}
+        self.active.clear();
     }
 }
 
@@ -125,5 +152,39 @@ mod tests {
         release.send(()).unwrap();
         assert_eq!(tasks.join_next().await, Some((creator, ())));
         assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn abort_all_and_join_unwinds_running_tasks_before_returning() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let runtime = Arc::new(Runtime::new(Arc::new(Available), 1));
+        let mut tasks = CreatorTasks::new(2, runtime);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        assert!(tasks.try_spawn(Uuid::new_v4(), {
+            let dropped = dropped.clone();
+            let entered = entered.clone();
+            async move {
+                let _guard = DropFlag(dropped);
+                entered.notify_one();
+                std::future::pending::<()>().await;
+            }
+        }));
+        entered.notified().await;
+        assert!(!dropped.load(Ordering::SeqCst));
+
+        tasks.abort_all_and_join().await;
+
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(tasks.is_empty());
+        assert!(tasks.active_creators().is_empty());
     }
 }

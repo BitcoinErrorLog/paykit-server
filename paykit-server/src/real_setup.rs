@@ -209,6 +209,7 @@ pub struct RealSetupCompleter {
     bitcoin_network: BitcoinNetwork,
     relay_deadline: Duration,
     bitcoin_rotation: Option<(PaymentRequestLifecycleStore, PaykitConfig)>,
+    runtime: Option<Arc<crate::runtime::Runtime>>,
 }
 
 impl RealSetupCompleter {
@@ -247,6 +248,7 @@ impl RealSetupCompleter {
             bitcoin_network,
             relay_deadline: Duration::from_secs(30),
             bitcoin_rotation: None,
+            runtime: None,
         }
     }
 
@@ -256,6 +258,11 @@ impl RealSetupCompleter {
         paykit: PaykitConfig,
     ) -> Self {
         self.bitcoin_rotation = Some((lifecycles, paykit));
+        self
+    }
+
+    pub(crate) fn with_runtime(mut self, runtime: Arc<crate::runtime::Runtime>) -> Self {
+        self.runtime = Some(runtime);
         self
     }
 }
@@ -375,6 +382,7 @@ impl SetupCompleter for RealSetupCompleter {
             bitcoin_network: self.bitcoin_network.clone(),
             reconnect: expected_creator.is_some(),
             bitcoin_rotation: self.bitcoin_rotation.clone(),
+            runtime: self.runtime.clone(),
         };
         completion_for_setup_result(
             receive_verify_commit(
@@ -399,6 +407,18 @@ struct CreatorSetupCommit {
     bitcoin_network: BitcoinNetwork,
     reconnect: bool,
     bitcoin_rotation: Option<(PaymentRequestLifecycleStore, PaykitConfig)>,
+    runtime: Option<Arc<crate::runtime::Runtime>>,
+}
+
+impl CreatorSetupCommit {
+    fn require_admitting(&self) -> Result<(), ClaimError> {
+        if let Some(runtime) = &self.runtime
+            && !runtime.admitting()
+        {
+            return Err(ClaimError::TransientUnavailable);
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -516,6 +536,7 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
             }
             // Key authorization is verified before either credential or shared-state writes.
             self.publisher.verify_key(&access).await?;
+            self.require_admitting()?;
             let persisted = if bitcoin_rotation_requested {
                 let (lifecycles, paykit) = self
                     .bitcoin_rotation
@@ -538,10 +559,12 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                 // process-local SDK fence in the same order as outbox workers and
                 // retain it through reconciliation plus durable cutover.
                 let mutation_guard = creator_mutation_lock(creator_id).lock_owned().await;
+                self.require_admitting()?;
                 let evidence = adapter
                     .reconcile_for_bitcoin_account_rotation(&mutation_guard, lifecycles)
                     .await
                     .map_err(rotation_sync_error)?;
+                self.require_admitting()?;
                 self.creators
                     .rotate_bitcoin_account_after_receive(lifecycles, &credentials, &evidence)
                     .await
@@ -556,6 +579,7 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                 persisted,
                 persistence_failure_class,
             )?;
+            self.require_admitting()?;
             // Restoring a Pubky grant replaces its bearer. Publication and workers must
             // therefore share the same cached handle after credentials are persisted.
             let access = self
@@ -565,7 +589,9 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                 .await
                 .map_err(|_| ClaimError::InvalidEnvelope)?
                 .ok_or(ClaimError::InvalidEnvelope)?;
+            self.require_admitting()?;
             self.publisher.publish(access).await?;
+            self.require_admitting()?;
             self.creators
                 .mark_setup_complete(&self.creator)
                 .await
