@@ -265,6 +265,39 @@ impl RealSetupCompleter {
         self.runtime = Some(runtime);
         self
     }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn with_runtime_for_test(self, runtime: Arc<crate::runtime::Runtime>) -> Self {
+        self.with_runtime(runtime)
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub async fn commit_verified_claim_for_test(
+        &self,
+        access: PubkySessionAccess,
+        creator: crate::domain::locks::CreatorPubky,
+        session_secret: String,
+        reconnect: bool,
+        claim: VerifiedCompanionClaim,
+    ) -> Result<(), ClaimError> {
+        use crate::setup_orchestration::VerifiedSetupCommit;
+
+        let commit = CreatorSetupCommit {
+            access,
+            creator,
+            session_secret: Zeroizing::new(session_secret),
+            creators: self.creators.clone(),
+            sessions: self.sessions.clone(),
+            publisher: self.publisher.clone(),
+            bitcoin_network: self.bitcoin_network.clone(),
+            reconnect,
+            bitcoin_rotation: self.bitcoin_rotation.clone(),
+            runtime: self.runtime.clone(),
+        };
+        commit.publish_readback_and_commit(claim).await
+    }
 }
 
 struct BitkitSetupAttempt {
@@ -411,9 +444,9 @@ struct CreatorSetupCommit {
 }
 
 impl CreatorSetupCommit {
-    fn require_admitting(&self) -> Result<(), ClaimError> {
+    fn require_ownership(&self) -> Result<(), ClaimError> {
         if let Some(runtime) = &self.runtime
-            && !runtime.admitting()
+            && !runtime.owns_process_lock()
         {
             return Err(ClaimError::TransientUnavailable);
         }
@@ -536,7 +569,7 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
             }
             // Key authorization is verified before either credential or shared-state writes.
             self.publisher.verify_key(&access).await?;
-            self.require_admitting()?;
+            self.require_ownership()?;
             let persisted = if bitcoin_rotation_requested {
                 let (lifecycles, paykit) = self
                     .bitcoin_rotation
@@ -559,12 +592,12 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                 // process-local SDK fence in the same order as outbox workers and
                 // retain it through reconciliation plus durable cutover.
                 let mutation_guard = creator_mutation_lock(creator_id).lock_owned().await;
-                self.require_admitting()?;
+                self.require_ownership()?;
                 let evidence = adapter
                     .reconcile_for_bitcoin_account_rotation(&mutation_guard, lifecycles)
                     .await
                     .map_err(rotation_sync_error)?;
-                self.require_admitting()?;
+                self.require_ownership()?;
                 self.creators
                     .rotate_bitcoin_account_after_receive(lifecycles, &credentials, &evidence)
                     .await
@@ -579,7 +612,7 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                 persisted,
                 persistence_failure_class,
             )?;
-            self.require_admitting()?;
+            self.require_ownership()?;
             // Restoring a Pubky grant replaces its bearer. Publication and workers must
             // therefore share the same cached handle after credentials are persisted.
             let access = self
@@ -589,9 +622,9 @@ impl crate::setup_orchestration::VerifiedSetupCommit for CreatorSetupCommit {
                 .await
                 .map_err(|_| ClaimError::InvalidEnvelope)?
                 .ok_or(ClaimError::InvalidEnvelope)?;
-            self.require_admitting()?;
+            self.require_ownership()?;
             self.publisher.publish(access).await?;
-            self.require_admitting()?;
+            self.require_ownership()?;
             self.creators
                 .mark_setup_complete(&self.creator)
                 .await

@@ -344,6 +344,19 @@ impl Runtime {
             runtime: self.clone(),
         })
     }
+    pub(crate) fn try_enter_owned_background_work(self: &Arc<Self>) -> Option<BackgroundWorkGuard> {
+        if !self.owns_process_lock() {
+            return None;
+        }
+        self.request_started();
+        if !self.owns_process_lock() {
+            self.request_finished();
+            return None;
+        }
+        Some(BackgroundWorkGuard {
+            runtime: self.clone(),
+        })
+    }
     pub(crate) fn spawn_tracked_background_task_with_guard<F, T>(
         self: &Arc<Self>,
         work_guard: BackgroundWorkGuard,
@@ -514,11 +527,12 @@ impl Runtime {
         notified.await;
     }
     pub async fn readiness(&self) -> Readiness {
-        let postgres = if !self.admitting() || !self.dependency.postgres_ready().await {
-            ComponentState::NotReady
-        } else {
-            ComponentState::Ready
-        };
+        let postgres =
+            if !self.admitting() || !self.dependency.postgres_ready().await || !self.admitting() {
+                ComponentState::NotReady
+            } else {
+                ComponentState::Ready
+            };
         let electrum = ComponentState::from_atomic(self.electrum.load(Ordering::Acquire));
         let paykit_delivery = ComponentState::combine(
             ComponentState::combine(
@@ -668,20 +682,70 @@ pub async fn serve(
     .await
 }
 
+/// Continuous latched shutdown signal installed once at process startup.
+///
+/// Installs OS `SIGTERM`/`SIGINT` handlers synchronously so signals arriving
+/// before, during, or between startup phases (`acquire_process_lock`, database
+/// initialization, `Server::build`, and `run_holding_process_lock`) are latched
+/// with zero registration gaps.
+#[derive(Clone)]
+pub struct ShutdownSignal {
+    rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl ShutdownSignal {
+    pub fn install() -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        #[cfg(unix)]
+        {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("SIGTERM handler can be installed");
+            let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .expect("SIGINT handler can be installed");
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    _ = int.recv() => {}
+                }
+                let _ = tx.send(true);
+            });
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                let _ = tx.send(true);
+            });
+        }
+        Self { rx }
+    }
+
+    #[cfg(test)]
+    fn from_watch(rx: tokio::sync::watch::Receiver<bool>) -> Self {
+        Self { rx }
+    }
+
+    pub fn is_triggered(&self) -> bool {
+        *self.rx.borrow()
+    }
+
+    pub async fn triggered(&self) {
+        let mut rx = self.rx.clone();
+        if *rx.borrow_and_update() {
+            return;
+        }
+        while rx.changed().await.is_ok() {
+            if *rx.borrow() {
+                return;
+            }
+        }
+    }
+}
+
 #[doc(hidden)]
 pub async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("SIGTERM handler can be installed");
-        tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("shutdown signal can be installed");
-    }
+    ShutdownSignal::install().triggered().await;
 }
 
 #[cfg(test)]
@@ -804,5 +868,80 @@ mod tests {
         assert!(!runtime.admitting());
         assert!(!runtime.may_start_worker_claim());
         assert_eq!(runtime.readiness().await.postgres, ComponentState::NotReady);
+    }
+
+    #[tokio::test]
+    async fn readiness_returns_not_ready_when_ownership_suspends_or_expires_during_postgres_probe()
+    {
+        struct BlockingPostgres {
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+        #[async_trait]
+        impl DependencyCheck for BlockingPostgres {
+            async fn postgres_ready(&self) -> bool {
+                self.entered.notify_one();
+                self.release.notified().await;
+                true
+            }
+        }
+
+        // Case 1: Ownership suspended while postgres_ready() is in flight.
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let runtime = Arc::new(Runtime::new(
+            Arc::new(BlockingPostgres {
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            1,
+        ));
+        runtime.set_electrum_available(true);
+        runtime.set_paykit_delivery_available(true);
+        runtime.set_outbox_available(true);
+
+        let probe = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.readiness().await })
+        };
+        entered.notified().await;
+        runtime.suspend_admission();
+        release.notify_one();
+        let report = probe.await.unwrap();
+        assert_eq!(report.postgres, ComponentState::NotReady);
+        assert_eq!(report.status, ComponentState::NotReady);
+
+        // Case 2: Local ownership lease expires while postgres_ready() is in flight.
+        runtime.grant_ownership_until(tokio::time::Instant::now() + Duration::from_millis(40));
+        let probe = {
+            let runtime = runtime.clone();
+            tokio::spawn(async move { runtime.readiness().await })
+        };
+        entered.notified().await;
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        release.notify_one();
+        let report = probe.await.unwrap();
+        assert_eq!(report.postgres, ComponentState::NotReady);
+        assert_eq!(report.status, ComponentState::NotReady);
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_latches_across_sequential_startup_phases() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let signal = ShutdownSignal::from_watch(rx);
+        assert!(!signal.is_triggered());
+
+        // Signal fires between phases when no phase future is actively polling it.
+        tx.send(true).unwrap();
+        assert!(signal.is_triggered());
+
+        // Every subsequent phase wait resolves immediately without missing the signal.
+        tokio::time::timeout(Duration::from_millis(50), signal.triggered())
+            .await
+            .expect("latched shutdown signal must resolve immediately in next phase");
+        let cloned = signal.clone();
+        tokio::time::timeout(Duration::from_millis(50), cloned.triggered())
+            .await
+            .expect("cloned receiver must also observe latched shutdown signal");
     }
 }

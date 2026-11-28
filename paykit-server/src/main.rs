@@ -56,7 +56,16 @@ async fn main() -> anyhow::Result<()> {
         println!("configuration valid");
         return Ok(());
     }
-    let mut process_lock = acquire_process_lock(&config, PROCESS_LOCK_WAIT).await?;
+    let shutdown = paykit_server::runtime::ShutdownSignal::install();
+    let mut process_lock = {
+        let acquire = acquire_process_lock(&config, PROCESS_LOCK_WAIT);
+        tokio::pin!(acquire);
+        tokio::select! {
+            biased;
+            () = shutdown.triggered() => return Ok(()),
+            result = &mut acquire => result?,
+        }
+    };
     let owner_id = Uuid::new_v4();
     let pool = {
         let outcome = {
@@ -69,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
             tokio::pin!(init);
             tokio::select! {
                 biased;
-                () = paykit_server::runtime::shutdown_signal() => None,
+                () = shutdown.triggered() => None,
                 result = &mut init => Some(result),
             }
         };
@@ -94,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
             tokio::pin!(build);
             tokio::select! {
                 biased;
-                () = paykit_server::runtime::shutdown_signal() => None,
+                () = shutdown.triggered() => None,
                 result = &mut build => Some(result),
             }
         };
@@ -120,7 +129,14 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     server
-        .run_holding_process_lock(listener, process_lock, PROCESS_LOCK_TIMING)
+        .run_holding_process_lock_with_shutdown(
+            listener,
+            process_lock,
+            PROCESS_LOCK_TIMING,
+            async move {
+                shutdown.triggered().await;
+            },
+        )
         .await?;
     Ok(())
 }

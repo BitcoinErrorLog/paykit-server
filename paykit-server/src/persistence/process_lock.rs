@@ -13,6 +13,15 @@ pub const PROCESS_LOCK_APPLICATION_NAME: &str = "paykit-server process lock";
 /// quarantine expiry.
 const MIN_LEASE_SAFETY_MARGIN: Duration = Duration::from_millis(250);
 
+/// Maximum time spent attempting `pg_advisory_unlock` and closing the lock session at exit.
+const PROCESS_LOCK_RELEASE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Shared total deadline for clearing `process_ownership` across dedicated, pooled,
+/// and short-lived direct connection fallbacks.
+const CLEAR_OWNER_FALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
+const CLEAR_OWNER_PRIMARY_BUDGET: Duration = Duration::from_millis(600);
+const CLEAR_OWNER_POOL_BUDGET: Duration = Duration::from_millis(600);
+
 /// How a held process lock is checked, renewed, and retaken after its session ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessLockTiming {
@@ -409,31 +418,45 @@ impl ProcessLock {
     }
 
     /// Clears `process_ownership` for `owner_id` on the lock session, falling back to
-    /// `pool` or a bounded short-lived connection if the lock session is absent or failed.
+    /// `pool` and then a short-lived direct connection within one shared 2-second deadline.
+    /// Each stage is capped so a stalled primary or pooled connection always leaves budget
+    /// for subsequent fallback stages.
     pub async fn clear_owner_with_fallback(
         &mut self,
         owner_id: Uuid,
         pool: Option<&PgPool>,
     ) -> Result<(), sqlx::Error> {
-        if tokio::time::timeout(
-            Duration::from_secs(2),
-            self.clear_owner_if_claimed(owner_id),
-        )
-        .await
-        .is_ok_and(|result| result.is_ok())
-        {
-            return Ok(());
+        let deadline = tokio::time::Instant::now() + CLEAR_OWNER_FALLBACK_TIMEOUT;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let primary_budget = CLEAR_OWNER_PRIMARY_BUDGET.min(remaining / 3);
+        if !primary_budget.is_zero() {
+            match tokio::time::timeout(primary_budget, self.clear_owner_if_claimed(owner_id)).await
+            {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(_)) => {}
+                Err(_) => {
+                    // Drop the stalled dedicated connection immediately so its socket closes.
+                    self.connection.take();
+                }
+            }
         }
         if let Some(pool) = pool {
-            return tokio::time::timeout(
-                Duration::from_secs(2),
-                clear_process_owner_if_claimed(pool, owner_id),
-            )
-            .await
-            .map_err(|_| sqlx::Error::PoolTimedOut)?;
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let pool_budget = CLEAR_OWNER_POOL_BUDGET.min(remaining / 2);
+            if !pool_budget.is_zero()
+                && tokio::time::timeout(pool_budget, clear_process_owner_if_claimed(pool, owner_id))
+                    .await
+                    .is_ok_and(|result| result.is_ok())
+            {
+                return Ok(());
+            }
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(sqlx::Error::PoolTimedOut);
         }
         let options = self.options.clone();
-        tokio::time::timeout(Duration::from_secs(2), async move {
+        tokio::time::timeout(remaining, async move {
             let mut connection = PgConnection::connect_with(&options).await?;
             let result = sqlx::query(
                 "UPDATE process_ownership \
@@ -670,31 +693,47 @@ impl ProcessLock {
         self.release().await
     }
 
-    /// Clears durable ownership on the lock session, then releases the advisory lock.
+    /// Clears durable ownership on the lock session, then releases the advisory lock,
+    /// bounded by a finite timeout so a stalled connection never hangs shutdown.
     pub async fn release_owned(mut self, ownership: &ProcessOwnership) -> Result<(), sqlx::Error> {
         self.claimed = None;
         if let Some(connection) = self.connection.as_mut() {
-            release_ownership_on(connection, ownership).await?;
+            let cleared = tokio::time::timeout(
+                PROCESS_LOCK_RELEASE_TIMEOUT,
+                release_ownership_on(connection, ownership),
+            )
+            .await
+            .map_err(|_| sqlx::Error::PoolTimedOut)?;
+            if let Err(error) = cleared {
+                self.connection.take();
+                return Err(error);
+            }
         }
         self.release().await
     }
 
-    /// Releases the advisory lock and closes its session without clearing `process_ownership`.
+    /// Releases the advisory lock and closes its session without clearing `process_ownership`,
+    /// bounded by `PROCESS_LOCK_RELEASE_TIMEOUT` (1 s). On timeout the dedicated connection
+    /// is dropped immediately so its socket closes instead of hanging shutdown.
     pub async fn release(mut self) -> Result<(), sqlx::Error> {
         let Some(mut connection) = self.connection.take() else {
             return Ok(());
         };
-        let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
-            .bind(PROCESS_ADVISORY_LOCK_KEY)
-            .fetch_one(&mut connection)
-            .await?;
-        if !released {
-            tracing::warn!(
-                "database process lock was not held by its session at release; \
-                 a transaction-mode pooler may sit between the server and PostgreSQL"
-            );
-        }
-        connection.close().await
+        tokio::time::timeout(PROCESS_LOCK_RELEASE_TIMEOUT, async move {
+            let released: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+                .bind(PROCESS_ADVISORY_LOCK_KEY)
+                .fetch_one(&mut connection)
+                .await?;
+            if !released {
+                tracing::warn!(
+                    "database process lock was not held by its session at release; \
+                     a transaction-mode pooler may sit between the server and PostgreSQL"
+                );
+            }
+            connection.close().await
+        })
+        .await
+        .map_err(|_| sqlx::Error::PoolTimedOut)?
     }
 }
 

@@ -8,26 +8,39 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod common;
+
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use bitcoin::hashes::{Hash, sha256};
 use ed25519_dalek::{Signer, SigningKey};
 use paykit_sdk::{
-    PAYKIT_AUTHORIZER_SESSION_CAPABILITIES, PaykitIdentitySecretKey, PubkyLocalSecretKey,
-    PubkyPublicKey, PubkySessionBootstrap, PubkySessionProvider,
+    PAYKIT_AUTHORIZER_SESSION_CAPABILITIES, PAYKIT_SESSION_CAPABILITIES, PaykitIdentitySecretKey,
+    PubkyLocalSecretKey, PubkyPublicKey, PubkySessionAccess, PubkySessionBootstrap,
+    PubkySessionProvider,
 };
 use paykit_server::{
     Server,
-    config::{Config, ConfigEnvironment},
+    bitkit_claim::{ClaimError, SetupCompanionClaim, VerifiedCompanionClaim},
+    bitkit_setup::BitkitAuthStarter,
+    config::{BitcoinNetwork, Config, ConfigEnvironment},
     crypto::Crypto,
-    domain::locks::parse_creator,
+    domain::{
+        locks::{ReaderPubky, parse_creator, parse_reader},
+        payment::BitcoinOutpoint,
+        receiving::UsdtAddress,
+    },
     http::auth::signature_preimage,
     paykit::CreatorSessions,
     persistence::{
-        CreatorCredentials, CreatorStore, PROCESS_ADVISORY_LOCK_KEY, PROCESS_LOCK_APPLICATION_NAME,
-        ProcessLockLoss, ProcessLockTiming,
+        AtomicInvoiceInput, CreatorCredentials, CreatorStore, InvoicePayloadFactory,
+        InvoicePayloads, InvoiceStore, OutboxStore, PROCESS_ADVISORY_LOCK_KEY,
+        PROCESS_LOCK_APPLICATION_NAME, PersistenceError, ProcessLockLoss, ProcessLockTiming,
     },
+    real_setup::{AppPublisher, RealSetupCompleter},
     server::RunError,
     setup::{Completion, SetupAttempt, SetupCompleter, StartedSetup},
+    setup_orchestration::PubkyCompanionRelay,
     startup::{
         StartupError, acquire_process_lock, acquire_process_lock_blocking, initialize_database,
         initialize_database_holding_process_lock,
@@ -418,7 +431,40 @@ async fn startup_retries_an_unreachable_database_for_the_whole_wait() {
     let started = Instant::now();
     let result = acquire_process_lock(&config, Duration::from_secs(2)).await;
     assert_eq!(result.err(), Some(StartupError::Connection));
-    assert!(started.elapsed() >= Duration::from_secs(2));
+    let elapsed = started.elapsed();
+    assert!(elapsed >= Duration::from_secs(2), "elapsed={elapsed:?}");
+    assert!(
+        elapsed < Duration::from_millis(2600),
+        "unreachable wait must not overshoot budget: elapsed={elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn startup_bounds_hanging_database_attempts_to_wait_budget() {
+    // Accepts TCP connections and holds them open without responding, simulating a
+    // blackholed or hanging PostgreSQL endpoint.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let sink = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            sockets.push(stream);
+        }
+    });
+    let config = config_with_url(&format!("postgres://postgres:postgres@{address}/postgres"));
+
+    let wait = Duration::from_millis(400);
+    let started = Instant::now();
+    let result = acquire_process_lock(&config, wait).await;
+    let elapsed = started.elapsed();
+    sink.abort();
+
+    assert_eq!(result.err(), Some(StartupError::Connection));
+    assert!(elapsed >= wait, "elapsed={elapsed:?}");
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "hanging attempt timeout must be capped to remaining wait budget: elapsed={elapsed:?}"
+    );
 }
 
 #[tokio::test]
@@ -2471,5 +2517,1104 @@ async fn dropped_lock_connection_after_claim_uses_pooled_cleanup_fallback_on_shu
         Some((2, None, false)),
         "shutdown with dropped lock connection must clear process_ownership via pooled fallback"
     );
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clear_owner_with_fallback_uses_direct_connection_when_pool_fails() {
+    let database = TestDatabase::create().await;
+    let config = config_for(&database);
+    let timing = ProcessLockTiming {
+        check_interval: Duration::from_millis(100),
+        reacquire_within: Duration::from_secs(2),
+        retry_interval: Duration::from_millis(25),
+    };
+
+    let mut lock = acquire_process_lock(&config, Duration::ZERO).await.unwrap();
+    let pool = initialize_database_holding_process_lock(&config, &mut lock, timing)
+        .await
+        .unwrap();
+    let owner_id = lock.claimed_ownership().unwrap().owner_id();
+    assert_eq!(
+        ownership_row(&database).await,
+        Some((1, Some(owner_id), false))
+    );
+
+    // Drop the dedicated lock connection AND close the supplied PgPool so both primary
+    // and pooled paths fail; clear_owner_with_fallback must still clear via direct options.
+    lock.drop_connection_for_test();
+    pool.close().await;
+    lock.clear_owner_with_fallback(owner_id, Some(&pool))
+        .await
+        .expect("direct connection fallback must clear unfenced owner when pool fails");
+
+    assert_eq!(ownership_row(&database).await, Some((1, None, false)));
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn suspended_ownership_during_cold_cache_import_rejects_and_does_not_cache() {
+    let database = TestDatabase::create().await;
+    let config = config_for(&database);
+    let pool = initialize_database(&config).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(config.master_key().as_bytes()).unwrap());
+    let creators = CreatorStore::new(&pool, crypto);
+
+    let testnet = EphemeralTestnet::builder()
+        .postgres(
+            pubky_testnet::pubky_homeserver::ConnectionString::new(
+                &std::env::var("TEST_DATABASE_URL").unwrap(),
+            )
+            .unwrap(),
+        )
+        .with_http_relay()
+        .build()
+        .await
+        .unwrap();
+    let pubky = testnet.sdk().unwrap();
+    let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
+    let root = PubkyLocalSecretKey::new(Keypair::random().secret_key());
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+    let signed_up = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.bitkit.wallet")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap()
+        .sign_up(
+            &root,
+            &homeserver,
+            None,
+            PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
+        )
+        .await
+        .unwrap();
+    let grant = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap()
+        .sign_in(&root, PAYKIT_SESSION_CAPABILITIES)
+        .await
+        .unwrap();
+    let session_secret = grant
+        .export_session_secret()
+        .await
+        .unwrap()
+        .as_str()
+        .to_owned();
+    let creator = parse_creator(&signed_up.public_key.to_app_key()).unwrap();
+    let paykit_key = root.derive_paykit_identity_secret_key(1).unwrap();
+    creators
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            session_secret,
+            paykit_key,
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+
+    let server = Server::build(config_for(&database), pool.clone())
+        .await
+        .unwrap();
+    let runtime = server.runtime();
+    runtime.grant_ownership_until(tokio::time::Instant::now() + Duration::from_secs(30));
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let sessions = CreatorSessions::new(creators, pubky, config.paykit.clone())
+        .with_runtime_for_test(runtime.clone());
+    let provider = sessions
+        .provider(&creator)
+        .with_import_gate_for_test(entered.clone(), release.clone());
+
+    let load = tokio::spawn({
+        let provider = provider.clone();
+        async move { provider.load_session_access().await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("cold-cache import must reach import_session");
+    assert!(
+        runtime.in_flight() >= 1,
+        "in-flight cold-cache import must be tracked by Runtime"
+    );
+
+    // Suspend ownership while import_session().await is still in flight.
+    runtime.suspend_admission();
+    release.notify_one();
+
+    let error = tokio::time::timeout(Duration::from_secs(5), load)
+        .await
+        .expect("import must finish after gate release")
+        .unwrap()
+        .expect_err("post-await ownership revocation must reject imported access");
+    assert!(
+        error
+            .to_string()
+            .contains("server process ownership is inactive"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !provider.is_cached_for_test().await,
+        "rejected import must not populate the session cache"
+    );
+    assert_eq!(runtime.in_flight(), 0);
+
+    // Once ownership resumes cleanly, a subsequent cold-cache load succeeds and caches.
+    runtime.grant_ownership_until(tokio::time::Instant::now() + Duration::from_secs(30));
+    let load = tokio::spawn({
+        let provider = provider.clone();
+        async move { provider.load_session_access().await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("second import must enter gate");
+    release.notify_one();
+    assert!(load.await.unwrap().unwrap().is_some());
+    assert!(provider.is_cached_for_test().await);
+
+    pool.close().await;
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_setup_completion_is_aborted_and_joined_on_graceful_shutdown() {
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    struct DummyAttempt;
+    impl SetupAttempt for DummyAttempt {
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+            self
+        }
+    }
+    struct StalledSetupCompleter {
+        entered: Arc<tokio::sync::Notify>,
+        unwound: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl SetupCompleter for StalledSetupCompleter {
+        async fn start(&self) -> Result<StartedSetup, Completion> {
+            Ok(StartedSetup::new(
+                "pubkyauth://test-graceful-stalled-setup".to_owned(),
+                Box::new(DummyAttempt),
+            ))
+        }
+        async fn complete(&self, _attempt: Box<dyn SetupAttempt>) -> Completion {
+            let _guard = DropFlag(self.unwound.clone());
+            self.entered.notify_one();
+            std::future::pending::<()>().await;
+            Completion::DefinitiveFailure
+        }
+    }
+
+    let database = TestDatabase::create().await;
+    let config = config_with_options(database.database_url(), TRUSTED_KEY, "400ms");
+    let timing = ProcessLockTiming {
+        check_interval: Duration::from_millis(100),
+        reacquire_within: Duration::from_secs(2),
+        retry_interval: Duration::from_millis(25),
+    };
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let unwound = Arc::new(AtomicBool::new(false));
+    let completer = Arc::new(StalledSetupCompleter {
+        entered: entered.clone(),
+        unwound: unwound.clone(),
+    });
+
+    let mut lock = acquire_process_lock(&config, Duration::ZERO).await.unwrap();
+    let pool = initialize_database_holding_process_lock(&config, &mut lock, timing)
+        .await
+        .unwrap();
+    let server = spawn_running_server(
+        Server::build_with_setup_completer(config, pool, completer)
+            .await
+            .unwrap(),
+        lock,
+        timing,
+    )
+    .await;
+
+    let (status, html_bytes) = try_http_request(
+        server.address,
+        "GET",
+        "/setup?return_to=https://app.example/callback&state=graceful-stalled",
+        &[],
+        b"",
+    )
+    .await
+    .unwrap();
+    assert_eq!(status, 200);
+    let html = String::from_utf8(html_bytes).unwrap();
+    let flow_id = html
+        .split("const flowId=\"")
+        .nth(1)
+        .unwrap()
+        .split('"')
+        .next()
+        .unwrap()
+        .to_owned();
+
+    let mut stream = tokio::net::TcpStream::connect(server.address)
+        .await
+        .unwrap();
+    let request = format!(
+        "POST /setup/{flow_id}/complete HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        server.address
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), entered.notified())
+        .await
+        .expect("detached setup completion must start");
+    drop(stream);
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(server.runtime.in_flight() >= 1);
+
+    // Trigger healthy graceful shutdown: stalled setup completion must be aborted
+    // and joined under drain_timeout before run_holding unlocks and returns.
+    let stop_at = Instant::now();
+    server.stop.send(()).unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(2), server.run)
+        .await
+        .expect("graceful shutdown must bound stalled setup completion")
+        .unwrap();
+    assert!(outcome.is_ok());
+    assert!(
+        stop_at.elapsed() <= Duration::from_millis(550),
+        "graceful shutdown must complete within 400 ms drain_timeout plus minimal slack: {:?}",
+        stop_at.elapsed()
+    );
+    assert!(
+        unwound.load(Ordering::SeqCst),
+        "stalled setup completion task must have been aborted and joined before unlock"
+    );
+    assert_eq!(server.runtime.in_flight(), 0);
+    // Because graceful drain timed out and force-aborted in-flight setup work,
+    // durable ownership stays quarantined instead of calling release_owned.
+    assert!(matches!(
+        ownership_row(&database).await,
+        Some((1, Some(_), false))
+    ));
+    let next = acquire_process_lock(&config_for(&database), Duration::ZERO)
+        .await
+        .expect("advisory lock must be released after graceful shutdown");
+    next.release().await.unwrap();
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn setup_commit_checkpoint_drains_on_healthy_sigterm_and_fails_closed_on_suspension() {
+    struct BarrierPublisher {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        publish_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait]
+    impl AppPublisher for BarrierPublisher {
+        async fn verify_key(&self, _access: &PubkySessionAccess) -> Result<(), ClaimError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+        async fn publish(&self, _access: PubkySessionAccess) -> Result<(), ClaimError> {
+            self.publish_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let database = TestDatabase::create().await;
+    let config = config_for(&database);
+    let pool = initialize_database(&config).await.unwrap();
+    let crypto = Arc::new(Crypto::from_master_key(config.master_key().as_bytes()).unwrap());
+    let creators = CreatorStore::new(&pool, crypto);
+
+    let testnet = EphemeralTestnet::builder()
+        .postgres(
+            pubky_testnet::pubky_homeserver::ConnectionString::new(
+                &std::env::var("TEST_DATABASE_URL").unwrap(),
+            )
+            .unwrap(),
+        )
+        .with_http_relay()
+        .build()
+        .await
+        .unwrap();
+    let pubky = testnet.sdk().unwrap();
+    let auth_relay = paykit_server_e2e::auth_relay_inbox(&testnet.http_relay().local_url());
+    let homeserver = PubkyPublicKey::from_public_key(&testnet.homeserver_app().public_key());
+
+    async fn mint_creator(
+        pubky: &pubky::Pubky,
+        auth_relay: &str,
+        homeserver: &PubkyPublicKey,
+    ) -> (
+        paykit_server::domain::locks::CreatorPubky,
+        PubkySessionAccess,
+        String,
+        PaykitIdentitySecretKey,
+    ) {
+        let root = PubkyLocalSecretKey::new(Keypair::random().secret_key());
+        let signed_up = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.bitkit.wallet")
+            .unwrap()
+            .with_auth_relay(auth_relay)
+            .unwrap()
+            .sign_up(
+                &root,
+                homeserver,
+                None,
+                PAYKIT_AUTHORIZER_SESSION_CAPABILITIES,
+            )
+            .await
+            .unwrap();
+        let grant = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+            .unwrap()
+            .with_auth_relay(auth_relay)
+            .unwrap()
+            .sign_in(&root, PAYKIT_SESSION_CAPABILITIES)
+            .await
+            .unwrap();
+        let secret = grant
+            .export_session_secret()
+            .await
+            .unwrap()
+            .as_str()
+            .to_owned();
+        let creator = parse_creator(&signed_up.public_key.to_app_key()).unwrap();
+        let paykit_key = root.derive_paykit_identity_secret_key(1).unwrap();
+        (creator, grant.access, secret, paykit_key)
+    }
+
+    // Part 1: Healthy SIGTERM paused across verify_key checkpoint drains cleanly through
+    // persistence, session load, publication, and mark_setup_complete.
+    let (creator_a, access_a, secret_a, key_a) =
+        mint_creator(&pubky, &auth_relay, &homeserver).await;
+    let server_a = Server::build(config_for(&database), pool.clone())
+        .await
+        .unwrap();
+    let runtime_a = server_a.runtime();
+    runtime_a.grant_ownership_until(tokio::time::Instant::now() + Duration::from_secs(30));
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let publish_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let publisher = Arc::new(BarrierPublisher {
+        entered: entered.clone(),
+        release: release.clone(),
+        publish_calls: publish_calls.clone(),
+    });
+    let sessions_a = CreatorSessions::new(creators.clone(), pubky.clone(), config.paykit.clone())
+        .with_runtime_for_test(runtime_a.clone());
+    let bootstrap_a = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
+    let completer_a = RealSetupCompleter::with_app_publisher(
+        BitkitAuthStarter::new(bootstrap_a),
+        Arc::new(PubkyCompanionRelay::new(pubky.client().clone())),
+        publisher,
+        creators.clone(),
+        sessions_a,
+        BitcoinNetwork::Testnet,
+    )
+    .with_runtime_for_test(runtime_a.clone());
+
+    let claim_a = VerifiedCompanionClaim::Setup(SetupCompanionClaim {
+        bitcoin_account: None,
+        paykit_identity_secret_key: key_a,
+        usdt_address: Some(
+            UsdtAddress::try_from("0x1111111111111111111111111111111111111111".to_owned()).unwrap(),
+        ),
+    });
+    let commit_a = tokio::spawn({
+        let creator_a = creator_a.clone();
+        async move {
+            completer_a
+                .commit_verified_claim_for_test(access_a, creator_a, secret_a, false, claim_a)
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("setup commit must reach verify_key checkpoint");
+
+    // Ordinary SIGTERM closes new admission while process-lock ownership stays healthy.
+    runtime_a.begin_shutdown();
+    assert!(!runtime_a.admitting());
+    assert!(runtime_a.owns_process_lock());
+    release.notify_one();
+
+    tokio::time::timeout(Duration::from_secs(5), commit_a)
+        .await
+        .expect("admitted setup commit must finish during healthy SIGTERM")
+        .unwrap()
+        .expect("healthy SIGTERM must not abort already-admitted setup commit");
+    assert_eq!(publish_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(creators.setup_complete(&creator_a).await, Ok(true));
+
+    // Part 2: Ownership suspension across the exact same checkpoint fails closed before
+    // persisting credentials or publishing.
+    let (creator_b, access_b, secret_b, key_b) =
+        mint_creator(&pubky, &auth_relay, &homeserver).await;
+    let server_b = Server::build(config_for(&database), pool.clone())
+        .await
+        .unwrap();
+    let runtime_b = server_b.runtime();
+    runtime_b.grant_ownership_until(tokio::time::Instant::now() + Duration::from_secs(30));
+
+    let entered_b = Arc::new(tokio::sync::Notify::new());
+    let release_b = Arc::new(tokio::sync::Notify::new());
+    let publish_calls_b = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let publisher_b = Arc::new(BarrierPublisher {
+        entered: entered_b.clone(),
+        release: release_b.clone(),
+        publish_calls: publish_calls_b.clone(),
+    });
+    let sessions_b = CreatorSessions::new(creators.clone(), pubky.clone(), config.paykit.clone())
+        .with_runtime_for_test(runtime_b.clone());
+    let bootstrap_b = PubkySessionBootstrap::with_pubky(pubky.clone(), "app.paykit.server")
+        .unwrap()
+        .with_auth_relay(&auth_relay)
+        .unwrap();
+    let completer_b = RealSetupCompleter::with_app_publisher(
+        BitkitAuthStarter::new(bootstrap_b),
+        Arc::new(PubkyCompanionRelay::new(pubky.client().clone())),
+        publisher_b,
+        creators.clone(),
+        sessions_b,
+        BitcoinNetwork::Testnet,
+    )
+    .with_runtime_for_test(runtime_b.clone());
+
+    let claim_b = VerifiedCompanionClaim::Setup(SetupCompanionClaim {
+        bitcoin_account: None,
+        paykit_identity_secret_key: key_b,
+        usdt_address: Some(
+            UsdtAddress::try_from("0x2222222222222222222222222222222222222222".to_owned()).unwrap(),
+        ),
+    });
+    let commit_b = tokio::spawn({
+        let creator_b = creator_b.clone();
+        async move {
+            completer_b
+                .commit_verified_claim_for_test(access_b, creator_b, secret_b, false, claim_b)
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered_b.notified())
+        .await
+        .expect("second setup commit must reach verify_key checkpoint");
+
+    runtime_b.suspend_admission();
+    assert!(!runtime_b.owns_process_lock());
+    release_b.notify_one();
+
+    let result_b = tokio::time::timeout(Duration::from_secs(5), commit_b)
+        .await
+        .expect("suspended setup commit must return promptly")
+        .unwrap();
+    assert_eq!(result_b, Err(ClaimError::TransientUnavailable));
+    assert_eq!(publish_calls_b.load(Ordering::SeqCst), 0);
+    assert!(creators.load_optional(&creator_b).await.unwrap().is_none());
+
+    pool.close().await;
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn barrier_held_worker_claims_release_without_penalty_when_suspended_mid_claim() {
+    struct TestPayloads {
+        reader: ReaderPubky,
+        address: String,
+    }
+    impl InvoicePayloadFactory for TestPayloads {
+        fn for_child_index(&self, _child_index: i64) -> Result<InvoicePayloads, PersistenceError> {
+            Ok(InvoicePayloads {
+                payment_request_intent: common::payment_intent(&self.reader, self.address.clone()),
+            })
+        }
+    }
+
+    async fn wait_for_xact_lock_waiter(pool: &sqlx::PgPool, lock_key: i64) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let waiting: bool = sqlx::query_scalar(
+                    "SELECT EXISTS ( \
+                         SELECT 1 FROM pg_locks \
+                         WHERE locktype = 'advisory' AND objsubid = 1 AND NOT granted \
+                           AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) \
+                           AND ((classid::bigint << 32) | objid::bigint) = $1 \
+                     )",
+                )
+                .bind(lock_key)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if waiting {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker claim must block on PostgreSQL barrier lock");
+    }
+
+    const OUTBOX_BARRIER_KEY: i64 = 7_111_222_333_444_001;
+    const BUYER_CONTACT_BARRIER_KEY: i64 = 7_111_222_333_444_002;
+
+    let database = TestDatabase::create().await;
+    let config = config_with_poll_and_drain(database.database_url(), TRUSTED_KEY, "50ms", "5s");
+    let timing = ProcessLockTiming {
+        check_interval: Duration::from_secs(10),
+        reacquire_within: Duration::from_secs(5),
+        retry_interval: Duration::from_millis(50),
+    };
+    let mut lock = acquire_process_lock(&config, Duration::ZERO).await.unwrap();
+    let pool = initialize_database_holding_process_lock(&config, &mut lock, timing)
+        .await
+        .unwrap();
+
+    let crypto = Arc::new(Crypto::from_master_key(config.master_key().as_bytes()).unwrap());
+    let creators = CreatorStore::new(&pool, crypto.clone());
+    let invoices = InvoiceStore::new(&pool, crypto.clone());
+    let outbox = OutboxStore::new(&pool, crypto);
+
+    let creator = parse_creator(TRUSTED_KEY).unwrap();
+    let reader = parse_reader("pubky8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo").unwrap();
+    creators
+        .create(&CreatorCredentials::new(
+            creator.clone(),
+            "unused-secret".to_owned(),
+            PaykitIdentitySecretKey::new([5_u8; 32], 1).unwrap(),
+            None,
+            None,
+        ))
+        .await
+        .unwrap();
+    let binding = Uuid::new_v4();
+    let address = format!("tb1qbarrier{}", binding.simple());
+    let payloads = TestPayloads {
+        reader: reader.clone(),
+        address: address.clone(),
+    };
+    invoices
+        .create_atomic(AtomicInvoiceInput {
+            creator: &creator,
+            reader: &reader,
+            bundle_binding: binding.as_bytes(),
+            lock_resource_binding: b"barrier-lock-resource",
+            payment_request_binding: binding.as_bytes(),
+            invoice_payloads: &payloads,
+            proposal_acceptance_seconds: 3600,
+            payment_window_seconds: 86400,
+        })
+        .await
+        .unwrap();
+
+    // Install BEFORE UPDATE triggers on outbox and buyer_contacts that count every
+    // committed UPDATE and wait on advisory locks while our test holds them.
+    sqlx::raw_sql(&format!(
+        "CREATE TABLE test_claim_trigger_hits (name TEXT PRIMARY KEY, hits INTEGER NOT NULL); \
+         INSERT INTO test_claim_trigger_hits (name, hits) VALUES ('outbox', 0), ('buyer_contacts', 0); \
+         CREATE FUNCTION delay_outbox_claim() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+             PERFORM pg_advisory_xact_lock({OUTBOX_BARRIER_KEY}); \
+             UPDATE test_claim_trigger_hits SET hits = hits + 1 WHERE name = 'outbox'; \
+             RETURN NEW; \
+         END $$; \
+         CREATE TRIGGER delay_outbox_claim BEFORE UPDATE ON outbox \
+         FOR EACH ROW EXECUTE FUNCTION delay_outbox_claim(); \
+         CREATE FUNCTION delay_buyer_contact_claim() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN \
+             PERFORM pg_advisory_xact_lock({BUYER_CONTACT_BARRIER_KEY}); \
+             UPDATE test_claim_trigger_hits SET hits = hits + 1 WHERE name = 'buyer_contacts'; \
+             RETURN NEW; \
+         END $$; \
+         CREATE TRIGGER delay_buyer_contact_claim BEFORE UPDATE ON buyer_contacts \
+         FOR EACH ROW EXECUTE FUNCTION delay_buyer_contact_claim();"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    async fn wait_for_trigger_hits(pool: &sqlx::PgPool, name: &str, expected: i32) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let hits: i32 =
+                    sqlx::query_scalar("SELECT hits FROM test_claim_trigger_hits WHERE name = $1")
+                        .bind(name)
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                if hits >= expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("expected {name} trigger hits >= {expected}"));
+    }
+
+    let mut barrier_conn = PgConnection::connect(database.database_url())
+        .await
+        .unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(OUTBOX_BARRIER_KEY)
+        .execute(&mut barrier_conn)
+        .await
+        .unwrap();
+
+    // Start the real server with 50 ms worker polling.
+    let server = spawn_running_server(
+        Server::build(config, pool.clone()).await.unwrap(),
+        lock,
+        timing,
+    )
+    .await;
+
+    // Class 1: Barrier-held outbox enqueue claim (process_creator_outbox).
+    // Hit 1 = blocked claim commit; hit 2 = post-claim release_unstarted_claim commit.
+    wait_for_xact_lock_waiter(&pool, OUTBOX_BARRIER_KEY).await;
+    server.runtime.suspend_admission();
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(OUTBOX_BARRIER_KEY)
+        .execute(&mut barrier_conn)
+        .await
+        .unwrap();
+    wait_for_trigger_hits(&pool, "outbox", 2).await;
+    let row: (String, i32, Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT status, attempt_count, claim_token, lease_owner FROM outbox LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "queued");
+    assert_eq!(row.1, 0, "enqueue release must not consume attempt budget");
+    assert!(row.2.is_none());
+    assert!(row.3.is_none());
+
+    // Verify token-fenced safety: a stale enqueue claim cannot clobber a newer token.
+    let claimed = outbox
+        .claim(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let replacement_token = Uuid::new_v4();
+    sqlx::query("UPDATE outbox SET claim_token = $1 WHERE id = $2")
+        .bind(replacement_token)
+        .bind(claimed.id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(!outbox.release_unstarted_claim(&claimed).await.unwrap());
+    let token_after: Option<Uuid> =
+        sqlx::query_scalar("SELECT claim_token FROM outbox WHERE id = $1")
+            .bind(claimed.id())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(token_after, Some(replacement_token));
+
+    // Class 2: Barrier-held outbox reconciliation claim (outbox_reconciliation_loop).
+    sqlx::query(
+        "UPDATE outbox \
+         SET status = 'handed_off', \
+             sdk_outbound_message_id = '42', \
+             sdk_event_id = 'evt-42', \
+             sdk_payment_request_id = 'req-42', \
+             attempt_count = 1, \
+             lease_owner = NULL, \
+             claim_token = NULL, \
+             lease_expires_at = NULL, \
+             next_attempt_at = clock_timestamp() - INTERVAL '1 second' \
+         WHERE id = $1",
+    )
+    .bind(claimed.id())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let hits_before_rec: i32 =
+        sqlx::query_scalar("SELECT hits FROM test_claim_trigger_hits WHERE name = 'outbox'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(OUTBOX_BARRIER_KEY)
+        .execute(&mut barrier_conn)
+        .await
+        .unwrap();
+    server
+        .runtime
+        .grant_ownership_until(tokio::time::Instant::now() + Duration::from_secs(30));
+
+    wait_for_xact_lock_waiter(&pool, OUTBOX_BARRIER_KEY).await;
+    server.runtime.suspend_admission();
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(OUTBOX_BARRIER_KEY)
+        .execute(&mut barrier_conn)
+        .await
+        .unwrap();
+    wait_for_trigger_hits(&pool, "outbox", hits_before_rec + 2).await;
+    let row: (String, i32, Option<Uuid>, bool) = sqlx::query_as(
+        "SELECT status, attempt_count, claim_token, next_attempt_at <= clock_timestamp() \
+         FROM outbox WHERE id = $1",
+    )
+    .bind(claimed.id())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "handed_off");
+    assert_eq!(
+        row.1, 1,
+        "reconciliation release must not consume attempt budget"
+    );
+    assert!(row.2.is_none());
+    assert!(row.3, "reconciliation row must stay immediately due");
+
+    // Verify token-fenced safety for reconciliation release.
+    let rec_claim = outbox
+        .claim_reconciliation(Uuid::new_v4(), 1, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    let replacement_rec_token = Uuid::new_v4();
+    sqlx::query("UPDATE outbox SET claim_token = $1 WHERE id = $2")
+        .bind(replacement_rec_token)
+        .bind(rec_claim.id())
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !outbox
+            .release_unstarted_reconciliation_claim(&rec_claim)
+            .await
+            .unwrap()
+    );
+    // Keep outbox row delivered so Class 3 isolates buyer_contacts cleanly.
+    sqlx::query(
+        "UPDATE outbox SET status = 'delivered', lease_owner = NULL, claim_token = NULL, lease_expires_at = NULL WHERE id = $1",
+    )
+    .bind(rec_claim.id())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Class 3: Barrier-held buyer_contacts claim (buyer_contacts_loop).
+    let outpoint =
+        BitcoinOutpoint::new(&sha256::Hash::hash(binding.as_bytes()).to_string(), 0).unwrap();
+    invoices
+        .apply_bitcoin_observation(&address, &outpoint, 100, 0, true)
+        .await
+        .unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(BUYER_CONTACT_BARRIER_KEY)
+        .execute(&mut barrier_conn)
+        .await
+        .unwrap();
+    server
+        .runtime
+        .grant_ownership_until(tokio::time::Instant::now() + Duration::from_secs(30));
+
+    wait_for_xact_lock_waiter(&pool, BUYER_CONTACT_BARRIER_KEY).await;
+    server.runtime.suspend_admission();
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(BUYER_CONTACT_BARRIER_KEY)
+        .execute(&mut barrier_conn)
+        .await
+        .unwrap();
+    wait_for_trigger_hits(&pool, "buyer_contacts", 2).await;
+    let (is_due, completed): (bool, bool) = sqlx::query_as(
+        "SELECT next_attempt_at <= clock_timestamp() + INTERVAL '5 seconds', \
+                completed_at IS NOT NULL \
+         FROM buyer_contacts LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        is_due,
+        "suspended buyer_contact claim must restore next_attempt_at immediately"
+    );
+    assert!(!completed);
+
+    // Verify CAS-fenced safety: a stale buyer_contact release never overwrites a replacement update.
+    let bc_claim = invoices.claim_buyer_contact().await.unwrap().unwrap();
+    sqlx::query("UPDATE buyer_contacts SET completed_at = clock_timestamp() WHERE invoice_id = $1")
+        .bind(bc_claim.invoice_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !invoices
+            .release_unstarted_buyer_contact(&bc_claim)
+            .await
+            .unwrap()
+    );
+    let completed_after: bool = sqlx::query_scalar(
+        "SELECT completed_at IS NOT NULL FROM buyer_contacts WHERE invoice_id = $1",
+    )
+    .bind(bc_claim.invoice_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(completed_after);
+
+    barrier_conn.close().await.unwrap();
+    server.stop.send(()).unwrap();
+    let _ = server.run.await.unwrap();
+    pool.close().await;
+    database.cleanup().await;
+}
+
+/// TCP proxy that forwards traffic normally until `stall_existing()` freezes all
+/// already-established connections without closing their sockets (simulating a
+/// TCP blackhole) while still allowing fresh connections to connect cleanly.
+struct StallableProxy {
+    database_url: String,
+    existing_stalls: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
+    tasks: Arc<Mutex<Vec<tokio::task::AbortHandle>>>,
+    accept_task: tokio::task::JoinHandle<()>,
+}
+
+impl StallableProxy {
+    async fn start(upstream_url: &str) -> Self {
+        let mut proxied = url::Url::parse(upstream_url).unwrap();
+        let upstream = format!(
+            "{}:{}",
+            proxied.host_str().unwrap(),
+            proxied.port().unwrap_or(5432)
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        proxied.set_host(Some("127.0.0.1")).unwrap();
+        proxied.set_port(Some(address.port())).unwrap();
+        let existing_stalls = Arc::new(Mutex::new(Vec::<Arc<AtomicBool>>::new()));
+        let tasks = Arc::new(Mutex::new(Vec::<tokio::task::AbortHandle>::new()));
+        let accept_task = tokio::spawn({
+            let existing_stalls = existing_stalls.clone();
+            let tasks = tasks.clone();
+            async move {
+                loop {
+                    let Ok((client, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let stalled = Arc::new(AtomicBool::new(false));
+                    existing_stalls.lock().unwrap().push(stalled.clone());
+                    let upstream = upstream.clone();
+                    let handle = tokio::spawn(async move {
+                        let Ok(server) = tokio::net::TcpStream::connect(upstream).await else {
+                            return;
+                        };
+                        let (mut cr, mut cw) = client.into_split();
+                        let (mut sr, mut sw) = server.into_split();
+                        let c2s = {
+                            let stalled = stalled.clone();
+                            async move {
+                                let mut buf = [0_u8; 4096];
+                                loop {
+                                    let Ok(n) = cr.read(&mut buf).await else {
+                                        break;
+                                    };
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    if stalled.load(Ordering::SeqCst) {
+                                        std::future::pending::<()>().await;
+                                    }
+                                    if sw.write_all(&buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        };
+                        let s2c = {
+                            let stalled = stalled.clone();
+                            async move {
+                                let mut buf = [0_u8; 4096];
+                                loop {
+                                    let Ok(n) = sr.read(&mut buf).await else {
+                                        break;
+                                    };
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    if stalled.load(Ordering::SeqCst) {
+                                        std::future::pending::<()>().await;
+                                    }
+                                    if cw.write_all(&buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        };
+                        let _ = tokio::join!(c2s, s2c);
+                    });
+                    tasks.lock().unwrap().push(handle.abort_handle());
+                }
+            }
+        });
+        Self {
+            database_url: proxied.to_string(),
+            existing_stalls,
+            tasks,
+            accept_task,
+        }
+    }
+
+    fn stall_existing(&self) {
+        for flag in self.existing_stalls.lock().unwrap().iter() {
+            flag.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn drop_stalled(&self) {
+        for handle in self.tasks.lock().unwrap().drain(..) {
+            handle.abort();
+        }
+        self.existing_stalls.lock().unwrap().clear();
+    }
+
+    fn stop(self) {
+        self.accept_task.abort();
+        self.drop_stalled();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn clear_owner_with_fallback_recovers_within_deadline_when_primary_connection_stalls() {
+    let database = TestDatabase::create().await;
+    let proxy = StallableProxy::start(database.database_url()).await;
+    let proxy_config = config_with_url(&proxy.database_url);
+    let direct_config = config_for(&database);
+    let timing = ProcessLockTiming {
+        check_interval: Duration::from_millis(100),
+        reacquire_within: Duration::from_secs(2),
+        retry_interval: Duration::from_millis(25),
+    };
+
+    // Part 1: Dedicated lock connection stalls past its stage cap; falls through to pool.
+    let mut lock = acquire_process_lock(&proxy_config, Duration::ZERO)
+        .await
+        .unwrap();
+    let _proxied_pool = initialize_database_holding_process_lock(&proxy_config, &mut lock, timing)
+        .await
+        .unwrap();
+    let owner_a = lock.claimed_ownership().unwrap().owner_id();
+    let direct_pool = initialize_database(&direct_config).await.unwrap();
+
+    proxy.stall_existing();
+    let started = Instant::now();
+    lock.clear_owner_with_fallback(owner_a, Some(&direct_pool))
+        .await
+        .expect("pooled fallback must clear owner after stalled primary stage times out");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(500) && elapsed < Duration::from_secs(2),
+        "primary stage must time out cleanly and fall through within shared 2 s deadline: {elapsed:?}"
+    );
+    assert_eq!(ownership_row(&database).await, Some((1, None, false)));
+    let _ = lock.release().await;
+    proxy.drop_stalled();
+
+    // Part 2: Dedicated lock connection stalls AND supplied pool is closed; falls through
+    // to short-lived direct connection within the same shared 2 s deadline.
+    let mut lock = acquire_process_lock(&proxy_config, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let _proxied_pool2 = initialize_database_holding_process_lock(&proxy_config, &mut lock, timing)
+        .await
+        .unwrap();
+    let owner_b = lock.claimed_ownership().unwrap().owner_id();
+    assert_eq!(
+        ownership_row(&database).await,
+        Some((2, Some(owner_b), false))
+    );
+
+    proxy.stall_existing();
+    direct_pool.close().await;
+    let started = Instant::now();
+    lock.clear_owner_with_fallback(owner_b, Some(&direct_pool))
+        .await
+        .expect("direct connection fallback must clear owner when primary stalls and pool fails");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(500) && elapsed < Duration::from_secs(2),
+        "direct fallback must finish inside shared 2 s deadline: {elapsed:?}"
+    );
+    assert_eq!(ownership_row(&database).await, Some((2, None, false)));
+    let _ = lock.release().await;
+
+    proxy.stop();
+    database.cleanup().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_lock_connection_at_final_release_is_bounded() {
+    let database = TestDatabase::create().await;
+    let proxy = StallableProxy::start(database.database_url()).await;
+    let proxy_config = config_with_url(&proxy.database_url);
+    let direct_config = config_for(&database);
+    let timing = ProcessLockTiming {
+        check_interval: Duration::from_secs(10),
+        reacquire_within: Duration::from_secs(2),
+        retry_interval: Duration::from_millis(25),
+    };
+
+    // Part 1: Direct ProcessLock::release() on a blackholed socket times out within 1 s.
+    let lock = acquire_process_lock(&proxy_config, Duration::ZERO)
+        .await
+        .unwrap();
+    proxy.stall_existing();
+    let started = Instant::now();
+    let released = tokio::time::timeout(Duration::from_secs(3), lock.release())
+        .await
+        .expect("release() must not hang indefinitely on a stalled connection");
+    assert!(released.is_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "release() exceeded bounded 1 s timeout: {:?}",
+        started.elapsed()
+    );
+    proxy.drop_stalled();
+
+    // Part 2: Full Server::run_holding_process_lock_until clean shutdown with a blackholed
+    // dedicated lock connection clears ownership via fallback, bounds release(), and exits.
+    let mut lock = acquire_process_lock(&proxy_config, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let _init_pool = initialize_database_holding_process_lock(&proxy_config, &mut lock, timing)
+        .await
+        .unwrap();
+    let direct_pool = initialize_database(&direct_config).await.unwrap();
+    let server = spawn_running_server(
+        Server::build(direct_config, direct_pool).await.unwrap(),
+        lock,
+        timing,
+    )
+    .await;
+
+    // Stall the dedicated lock connection right before triggering clean shutdown.
+    proxy.stall_existing();
+    let started = Instant::now();
+    server.stop.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(4), server.run)
+        .await
+        .expect("run_holding must terminate in bounded time even when final release stalls")
+        .unwrap();
+    assert!(result.is_ok());
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "bounded final release overshot expected budget: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(ownership_row(&database).await, Some((1, None, false)));
+
+    proxy.stop();
     database.cleanup().await;
 }

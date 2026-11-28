@@ -757,6 +757,55 @@ impl OutboxStore {
         .await
     }
 
+    /// Releases an unstarted enqueue claim under its exact `claim_token` without
+    /// consuming attempt budget when admission closes during the awaited claim.
+    pub async fn release_unstarted_claim(
+        &self,
+        claim: &ClaimedOutbox,
+    ) -> Result<bool, PersistenceError> {
+        let updated = sqlx::query(
+            "UPDATE outbox \
+             SET status = CASE WHEN attempt_count <= 1 THEN 'queued' ELSE 'retryable' END, \
+                 lease_owner = NULL, \
+                 claim_token = NULL, \
+                 lease_expires_at = NULL, \
+                 attempt_count = GREATEST(attempt_count - 1, 0), \
+                 next_attempt_at = LEAST(next_attempt_at, clock_timestamp()), \
+                 updated_at = clock_timestamp() \
+             WHERE id = $1 AND status = 'leased' AND claim_token = $2",
+        )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// Releases an unstarted reconciliation claim under its exact `claim_token` without
+    /// consuming attempt budget when admission closes during the awaited claim.
+    pub async fn release_unstarted_reconciliation_claim(
+        &self,
+        claim: &ClaimedHandoff,
+    ) -> Result<bool, PersistenceError> {
+        let updated = sqlx::query(
+            "UPDATE outbox \
+             SET lease_owner = NULL, \
+                 claim_token = NULL, \
+                 lease_expires_at = NULL, \
+                 attempt_count = GREATEST(attempt_count - 1, 0), \
+                 next_attempt_at = LEAST(next_attempt_at, clock_timestamp()), \
+                 updated_at = clock_timestamp() \
+             WHERE id = $1 AND status = 'handed_off' AND claim_token = $2",
+        )
+        .bind(claim.id)
+        .bind(claim.claim_token)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     /// Releases a still-pending reconciliation claim with bounded retry delay.
     pub async fn retry_reconciliation(
         &self,

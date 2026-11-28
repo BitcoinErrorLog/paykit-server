@@ -53,15 +53,40 @@ const PROCESS_LOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// to exit, so only one Paykit Server process serves a database at a time.
 ///
 /// An unreachable PostgreSQL is retried for the same `wait`, so a process started
-/// during a database restart waits for it instead of exiting at once.
+/// during a database restart waits for it instead of exiting at once. When `wait`
+/// is nonzero, both per-attempt timeouts and retry sleeps are capped to the
+/// remaining budget until `deadline`; when `wait` is zero, a single non-waiting
+/// attempt runs without retry sleep.
 pub async fn acquire_process_lock(
     config: &Config,
     wait: Duration,
 ) -> Result<ProcessLock, StartupError> {
-    let deadline = tokio::time::Instant::now() + wait;
-    loop {
-        let held_elsewhere = match tokio::time::timeout(
+    if wait.is_zero() {
+        return match tokio::time::timeout(
             PROCESS_LOCK_ATTEMPT_TIMEOUT,
+            ProcessLock::try_acquire(config.database_options()),
+        )
+        .await
+        {
+            Ok(Ok(Some(lock))) => Ok(lock),
+            Ok(Ok(None)) => Err(StartupError::ProcessLockHeld),
+            Ok(Err(_)) | Err(_) => Err(StartupError::Connection),
+        };
+    }
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut held_elsewhere = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(if held_elsewhere {
+                StartupError::ProcessLockHeld
+            } else {
+                StartupError::Connection
+            });
+        }
+        let attempt_timeout = PROCESS_LOCK_ATTEMPT_TIMEOUT.min(remaining);
+        held_elsewhere = match tokio::time::timeout(
+            attempt_timeout,
             ProcessLock::try_acquire(config.database_options()),
         )
         .await
@@ -70,14 +95,15 @@ pub async fn acquire_process_lock(
             Ok(Ok(None)) => true,
             Ok(Err(_)) | Err(_) => false,
         };
-        if tokio::time::Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
             return Err(if held_elsewhere {
                 StartupError::ProcessLockHeld
             } else {
                 StartupError::Connection
             });
         }
-        tokio::time::sleep(PROCESS_LOCK_RETRY_INTERVAL).await;
+        tokio::time::sleep(PROCESS_LOCK_RETRY_INTERVAL.min(remaining)).await;
     }
 }
 

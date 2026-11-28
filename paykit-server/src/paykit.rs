@@ -56,6 +56,13 @@ use crate::{
     },
 };
 
+#[cfg(feature = "test-utils")]
+#[derive(Clone)]
+struct TestImportGate {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
 /// Creator-owned live Pubky access restored from encrypted server credentials.
 #[derive(Clone)]
 pub struct CreatorSessionProvider {
@@ -67,6 +74,8 @@ pub struct CreatorSessionProvider {
     payment_request_refreshes: Arc<payment_status::PaymentRequestRefreshes>,
     verified_reconnect: bool,
     runtime: Option<Arc<crate::runtime::Runtime>>,
+    #[cfg(feature = "test-utils")]
+    import_gate: Option<TestImportGate>,
 }
 
 impl std::fmt::Debug for CreatorSessionProvider {
@@ -107,12 +116,31 @@ impl CreatorSessionProvider {
             payment_request_refreshes: Arc::new(payment_status::PaymentRequestRefreshes::default()),
             verified_reconnect: false,
             runtime: None,
+            #[cfg(feature = "test-utils")]
+            import_gate: None,
         }
     }
 
     fn with_runtime(mut self, runtime: Option<Arc<crate::runtime::Runtime>>) -> Self {
         self.runtime = runtime;
         self
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn with_import_gate_for_test(
+        mut self,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.import_gate = Some(TestImportGate { entered, release });
+        self
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub async fn is_cached_for_test(&self) -> bool {
+        self.cache.lock().await.is_some()
     }
 
     #[cfg(feature = "test-utils")]
@@ -185,7 +213,7 @@ impl PubkySessionProvider for CreatorSessionProvider {
             return Ok(Some(cached.access.clone()));
         }
         let _import_guard = match &self.runtime {
-            Some(runtime) => match runtime.try_enter_background_work() {
+            Some(runtime) => match runtime.try_enter_owned_background_work() {
                 Some(guard) => Some(guard),
                 None => {
                     return Err(PaykitSdkError::Storage {
@@ -198,17 +226,58 @@ impl PubkySessionProvider for CreatorSessionProvider {
         };
         let bootstrap =
             PubkySessionBootstrap::with_pubky(self.public_client.clone(), &self.client_id)?;
-        let mut access = bootstrap
+        #[cfg(feature = "test-utils")]
+        let imported = {
+            if let Some(gate) = &self.import_gate {
+                let import_fut = bootstrap.import_session(
+                    credentials.session_secret(),
+                    None,
+                    PAYKIT_SESSION_CAPABILITIES,
+                );
+                let gate_fut = async {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                };
+                let (imported, ()) = tokio::join!(import_fut, gate_fut);
+                imported?
+            } else {
+                bootstrap
+                    .import_session(
+                        credentials.session_secret(),
+                        None,
+                        PAYKIT_SESSION_CAPABILITIES,
+                    )
+                    .await?
+            }
+        };
+        #[cfg(not(feature = "test-utils"))]
+        let imported = bootstrap
             .import_session(
                 credentials.session_secret(),
                 None,
                 PAYKIT_SESSION_CAPABILITIES,
             )
-            .await?
-            .access;
+            .await?;
+        let mut access = imported.access;
+        if let Some(runtime) = &self.runtime
+            && !runtime.owns_process_lock()
+        {
+            return Err(PaykitSdkError::Storage {
+                context: "server process ownership is inactive".into(),
+                source: None,
+            });
+        }
         access.paykit_identity_secret_key = Some(credentials.paykit_identity_secret().clone());
         bind_session_to_creator(access.public_key()?, &self.creator)?;
         access.validate_for_capabilities(PAYKIT_SESSION_CAPABILITIES)?;
+        if let Some(runtime) = &self.runtime
+            && !runtime.owns_process_lock()
+        {
+            return Err(PaykitSdkError::Storage {
+                context: "server process ownership is inactive".into(),
+                source: None,
+            });
+        }
         *cache = Some(CachedSession {
             session_secret: zeroize::Zeroizing::new(credentials.session_secret().to_owned()),
             access: access.clone(),
@@ -322,6 +391,8 @@ impl CreatorSessions {
             payment_request_refreshes: Arc::new(payment_status::PaymentRequestRefreshes::default()),
             verified_reconnect: true,
             runtime: self.runtime.clone(),
+            #[cfg(feature = "test-utils")]
+            import_gate: None,
         }
     }
 }

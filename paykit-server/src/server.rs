@@ -44,7 +44,7 @@ use crate::{
         CreatorStore, InvoiceStore, MarketplacePreparationStore, OutboxRetryClass, OutboxStore,
         PaymentDrainStore, PaymentRequestLifecycleStore, PersistenceError, ProcessLock,
         ProcessLockLoss, ProcessLockState, ProcessLockTiming, ProcessOwnership,
-        clear_process_owner_if_claimed, release_process_ownership,
+        release_process_ownership,
     },
     real_setup::RealSetupCompleter,
     runtime::{PostgresDependency, Runtime, operational_router},
@@ -553,8 +553,29 @@ impl Server {
         lock: ProcessLock,
         timing: ProcessLockTiming,
     ) -> impl Future<Output = Result<(), RunError>> + Send {
+        self.run_holding_process_lock_with_shutdown(
+            listener,
+            lock,
+            timing,
+            crate::runtime::shutdown_signal(),
+        )
+    }
+
+    /// Serves like [`Server::run_holding_process_lock`] using a caller-owned
+    /// latched shutdown future so signal handlers remain continuously registered
+    /// from startup through shutdown.
+    pub fn run_holding_process_lock_with_shutdown<F>(
+        self,
+        listener: tokio::net::TcpListener,
+        lock: ProcessLock,
+        timing: ProcessLockTiming,
+        shutdown: F,
+    ) -> impl Future<Output = Result<(), RunError>> + Send
+    where
+        F: Future<Output = ()> + Send,
+    {
         self.runtime.suspend_admission();
-        self.run_holding(listener, lock, timing, crate::runtime::shutdown_signal())
+        self.run_holding(listener, lock, timing, shutdown)
     }
 
     #[cfg(feature = "test-utils")]
@@ -569,8 +590,7 @@ impl Server {
     where
         F: Future<Output = ()> + Send,
     {
-        self.runtime.suspend_admission();
-        self.run_holding(listener, lock, timing, shutdown)
+        self.run_holding_process_lock_with_shutdown(listener, lock, timing, shutdown)
     }
 
     async fn run_holding<F>(
@@ -651,13 +671,7 @@ impl Server {
                         Ok(result) => result,
                         Err(_) => Ok(()),
                     };
-                    if lock.clear_owner_if_claimed(owner_id).await.is_err() {
-                        let _ = tokio::time::timeout(
-                            Duration::from_millis(250),
-                            clear_process_owner_if_claimed(&pool, owner_id),
-                        )
-                        .await;
-                    }
+                    let _ = lock.clear_owner_with_fallback(owner_id, Some(&pool)).await;
                     if lock.release().await.is_err() {
                         tracing::warn!(
                             "database process lock release failed; closing its session releases it"
@@ -668,13 +682,7 @@ impl Server {
                 }
                 ClaimOutcome::Served(result) => {
                     runtime.begin_shutdown();
-                    if lock.clear_owner_if_claimed(owner_id).await.is_err() {
-                        let _ = tokio::time::timeout(
-                            Duration::from_millis(250),
-                            clear_process_owner_if_claimed(&pool, owner_id),
-                        )
-                        .await;
-                    }
+                    let _ = lock.clear_owner_with_fallback(owner_id, Some(&pool)).await;
                     if lock.release().await.is_err() {
                         tracing::warn!(
                             "database process lock release failed; closing its session releases it"
@@ -731,7 +739,14 @@ impl Server {
         }
 
         if outcome.clean_drain && outcome.result.is_ok() && runtime.owns_process_lock() {
-            if lock.release_owned(&ownership).await.is_err() {
+            if lock
+                .clear_owner_with_fallback(ownership.owner_id(), Some(&pool))
+                .await
+                .is_err()
+            {
+                tracing::warn!("database process ownership clear failed during clean shutdown");
+            }
+            if lock.release().await.is_err() {
                 tracing::warn!(
                     "database process lock release failed; closing its session releases it"
                 );
@@ -861,19 +876,29 @@ where
                 .await;
             }
             runtime.begin_shutdown();
+            let had_background_tasks = runtime.has_background_tasks();
+            let bg_deadline = tokio::time::Instant::now() + lock_loss_drain_limit;
             let escalated = {
-                let draining = abort_owned_workers(tasks, settling);
+                let draining = async {
+                    let (bg_unwound, settling_clean) = tokio::join!(
+                        runtime.abort_and_join_background_tasks(bg_deadline),
+                        abort_owned_workers(tasks, settling),
+                    );
+                    (bg_unwound, settling_clean)
+                };
                 tokio::pin!(draining);
                 tokio::select! {
                     biased;
                     lost = &mut lock_monitor => Err(lost),
                     () = runtime.ownership_lost() => Err(ProcessLockLoss::Unreachable),
-                    settling_clean = &mut draining => Ok(settling_clean),
+                    (bg_unwound, settling_clean) = &mut draining => Ok((bg_unwound, settling_clean)),
                 }
             };
             match escalated {
-                Ok(settling_clean) if runtime.owns_process_lock() => ServingOutcome {
+                Ok((bg_unwound, settling_clean)) if runtime.owns_process_lock() => ServingOutcome {
                     clean_drain: result.is_ok()
+                        && !had_background_tasks
+                        && bg_unwound
                         && settling_clean
                         && runtime.in_flight() == 0
                         && !runtime.has_background_tasks()
@@ -924,14 +949,20 @@ where
                 return outcome;
             }
             runtime.begin_shutdown();
+            let bg_deadline = tokio::time::Instant::now() + lock_loss_drain_limit;
             let escalated = {
-                let draining = abort_owned_workers(tasks, settling);
+                let draining = async {
+                    let _ = tokio::join!(
+                        runtime.abort_and_join_background_tasks(bg_deadline),
+                        abort_owned_workers(tasks, settling),
+                    );
+                };
                 tokio::pin!(draining);
                 tokio::select! {
                     biased;
                     lost = &mut lock_monitor => Err(lost),
                     () = runtime.ownership_lost() => Err(ProcessLockLoss::Unreachable),
-                    _ = &mut draining => Ok(()),
+                    () = &mut draining => Ok(()),
                 }
             };
             match escalated {
@@ -990,11 +1021,23 @@ where
             }
             runtime.begin_shutdown();
             enum GracefulStep {
-                Drained(std::io::Result<()>, bool, bool),
+                Drained(std::io::Result<()>, bool, bool, bool),
                 Escalated(ProcessLockLoss),
             }
             let step = {
                 let graceful = async {
+                    let graceful_deadline = tokio::time::Instant::now() + drain_timeout;
+                    let cooperative_deadline =
+                        if runtime.has_background_tasks() || runtime.in_flight() > 0 {
+                            let unwind_reserve = (drain_timeout / 5)
+                                .clamp(Duration::from_millis(25), Duration::from_millis(250))
+                                .min(drain_timeout / 2);
+                            graceful_deadline
+                                .checked_sub(unwind_reserve)
+                                .unwrap_or(graceful_deadline)
+                        } else {
+                            graceful_deadline
+                        };
                     let joined = async {
                         let (serving_result, worker_result, ()) = tokio::join!(
                             drive_serving(&mut serving),
@@ -1005,12 +1048,22 @@ where
                         worker_result
                     };
                     let (result, timed_out) =
-                        match tokio::time::timeout(drain_timeout, joined).await {
+                        match tokio::time::timeout_at(cooperative_deadline, joined).await {
                             Ok(result) => (result, false),
                             Err(_) => (Ok(()), true),
                         };
+                    // Cancel and join any remaining tracked setup background tasks strictly
+                    // within graceful_deadline (never extending past drain_timeout).
+                    let background_clean = if runtime.has_background_tasks() {
+                        let _ = runtime
+                            .abort_and_join_background_tasks(graceful_deadline)
+                            .await;
+                        false
+                    } else {
+                        true
+                    };
                     let settling_clean = abort_owned_workers(tasks, settling).await;
-                    (result, timed_out, settling_clean)
+                    (result, timed_out, background_clean, settling_clean)
                 };
                 tokio::pin!(graceful);
                 tokio::select! {
@@ -1019,13 +1072,13 @@ where
                     () = runtime.ownership_lost() => {
                         GracefulStep::Escalated(ProcessLockLoss::Unreachable)
                     }
-                    (result, timed_out, settling_clean) = &mut graceful => {
-                        GracefulStep::Drained(result, timed_out, settling_clean)
+                    (result, timed_out, background_clean, settling_clean) = &mut graceful => {
+                        GracefulStep::Drained(result, timed_out, background_clean, settling_clean)
                     }
                 }
             };
             match step {
-                GracefulStep::Drained(result, timed_out, settling_clean) => {
+                GracefulStep::Drained(result, timed_out, background_clean, settling_clean) => {
                     if !runtime.owns_process_lock() {
                         return finish_lock_loss_drain(
                             &mut serving,
@@ -1039,6 +1092,7 @@ where
                         .await;
                     }
                     let clean_drain = !timed_out
+                        && background_clean
                         && result.is_ok()
                         && settling_clean
                         && runtime.in_flight() == 0
@@ -1278,6 +1332,16 @@ async fn buyer_contacts_loop(workers: Arc<WorkerComponents>, runtime: Arc<Runtim
                     break;
                 }
             };
+            if !runtime.may_start_worker_claim() {
+                let _ = workers
+                    .invoices
+                    .release_unstarted_buyer_contact(&pending)
+                    .await;
+                if runtime.stopping() {
+                    return;
+                }
+                break;
+            }
             let saved = match creator_adapter(&workers, pending.creator_id).await {
                 Ok(adapter) => adapter
                     .save_buyer_contact(&workers.invoices, &pending)
@@ -2106,6 +2170,10 @@ async fn process_creator_outbox(
             return Err(error);
         }
     };
+    if !runtime.may_start_worker_claim() {
+        let _ = workers.outbox.release_unstarted_claim(&claim).await;
+        return Ok(None);
+    }
     let retry_schedule = outbox_retry_schedule(
         workers.outbox_retry_initial,
         workers.outbox_retry_max,
@@ -2253,6 +2321,18 @@ async fn outbox_reconciliation_loop(workers: Arc<WorkerComponents>, runtime: Arc
                 continue;
             }
         };
+        if !runtime.may_start_worker_claim() {
+            for claim in &claims {
+                let _ = workers
+                    .outbox
+                    .release_unstarted_reconciliation_claim(claim)
+                    .await;
+            }
+            if runtime.stopping() {
+                break;
+            }
+            continue;
+        }
         let mut batch = JoinSet::new();
         for claim in claims {
             let workers = workers.clone();

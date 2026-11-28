@@ -7,6 +7,7 @@ pub struct PendingBuyerContact {
     pub invoice_id: Uuid,
     pub creator_id: Uuid,
     pub reader: ReaderPubky,
+    pub(crate) claimed_next_attempt_at: OffsetDateTime,
 }
 
 #[derive(sqlx::FromRow)]
@@ -16,6 +17,7 @@ struct BuyerContactRow {
     creator_lookup_hash: Vec<u8>,
     reader_lookup_hash: Vec<u8>,
     invoice_envelope: Vec<u8>,
+    next_attempt_at: OffsetDateTime,
 }
 
 impl InvoiceStore {
@@ -27,13 +29,15 @@ impl InvoiceStore {
         let row = sqlx::query_as::<_, BuyerContactRow>(
             "WITH candidate AS (
                  SELECT invoice_id FROM buyer_contacts
-                 WHERE completed_at IS NULL AND next_attempt_at <= NOW()
+                 WHERE completed_at IS NULL AND next_attempt_at <= clock_timestamp()
                  ORDER BY next_attempt_at, invoice_id
                  FOR UPDATE SKIP LOCKED LIMIT 1
              ), claimed AS (
-                 UPDATE buyer_contacts AS contact SET next_attempt_at = NOW() + INTERVAL '1 minute'
+                 UPDATE buyer_contacts AS contact
+                 SET next_attempt_at = clock_timestamp() + INTERVAL '1 minute'
                  FROM candidate WHERE contact.invoice_id = candidate.invoice_id
-                 RETURNING contact.invoice_id, contact.creator_id, contact.reader_lookup_hash
+                 RETURNING contact.invoice_id, contact.creator_id,
+                           contact.reader_lookup_hash, contact.next_attempt_at
              )
              SELECT claimed.*, creators.creator_lookup_hash, invoices.invoice_envelope
              FROM claimed
@@ -70,9 +74,34 @@ impl InvoiceStore {
                 invoice_id: row.invoice_id,
                 creator_id: row.creator_id,
                 reader,
+                claimed_next_attempt_at: row.next_attempt_at,
             })
         })
         .transpose()
+    }
+
+    /// Restores an unstarted buyer-contact schedule when admission closes during the
+    /// awaited claim, guarded by the exact claimed `next_attempt_at` timestamp and
+    /// `completed_at IS NULL` so a concurrent replacement update is never overwritten.
+    pub async fn release_unstarted_buyer_contact(
+        &self,
+        pending: &PendingBuyerContact,
+    ) -> Result<bool, PersistenceError> {
+        let updated = sqlx::query(
+            "UPDATE buyer_contacts
+             SET next_attempt_at = clock_timestamp()
+             WHERE invoice_id = $1
+               AND creator_id = $2
+               AND completed_at IS NULL
+               AND next_attempt_at = $3",
+        )
+        .bind(pending.invoice_id)
+        .bind(pending.creator_id)
+        .bind(pending.claimed_next_attempt_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| PersistenceError::Unavailable)?;
+        Ok(updated.rows_affected() == 1)
     }
 
     /// Checks that a claimed attempt still needs saving. Call under the Creator's
