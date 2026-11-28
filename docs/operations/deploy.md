@@ -72,23 +72,15 @@ answering 200 on three consecutive probes.
    rehearsal is a hard stop.
 3. **Record the rollback digest.** The currently live digest is in
    [production-image.md](production-image.md); it is also printed by the dry run.
-4. **Dry run each seat.** Read-only: lists deployments, selects the live
-   deployment, checks nothing is in flight, checks the live digest, reads
-   `/health/ready` (warns when not ready) and the observer lease.
-
-   ```bash
-   PAYKIT_SEATS_FILE=<seats.env> scripts/release/deploy-seat.sh --dry-run \
-     staging ghcr.io/bitcoinerrorlog/paykit-server@sha256:<new> sha256:<live> <source-sha> <evidence-dir>
-   ```
-
-5. **Deploy staging**: the same command without `--dry-run`. The script stops
-   the old deployment, waits until it is confirmed gone, connects the new image,
-   waits for `SUCCESS`, then checks: new digest, exactly one running deployment,
-   old deployment still stopped, the source SHA in the startup metadata line,
-   no `[ERROR]`/panic lines, three `/health/ready` probes with `/health/live`
-   200 (staging expects `bitcoin_creation_enabled: false`), and a live observer
-   lease whose fence is higher than before the stop (the fence only increments
-   when the holder changes). Exit 0 means every check passed.
+4. **Dry run each seat.** Private Railway seat tooling and stop-first
+   deployment automation live in the private hosting operations repository
+   (`paykit/railway/`) rather than this public repository. Run that tooling in
+   read-only check mode first to verify the currently live deployment, confirm
+   nothing is in flight, inspect `/health/ready`, and record observer-lease
+   continuity.
+5. **Deploy staging** using the stop-first hosting workflow, then verify
+   `/health/live`, `/health/ready` (`bitcoin_creation_enabled: false`), and
+   startup logs before touching production.
 6. **Deploy production** the same way. Production health additionally requires
    a `production:` `stack_id`, `bitcoin_creation_enabled: true` and
    `bitcoin_offer_available: true`.
@@ -133,9 +125,3 @@ recovery past that point is a forward fix ([production-image.md](production-imag
 Applied migrations are immutable, including comments: sqlx checksums every
 applied file, and changing one byte makes the next start fail with
 `postgres migration failed`. Put notes in `docs/` or in a new migration.
-
-## Tests
-
-`python3 scripts/release/test_railway_seat.py` covers live-deployment selection
-(including the two-`SUCCESS` state after a stop), in-flight detection, new
-deployment detection, and token lookup.

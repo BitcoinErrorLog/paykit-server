@@ -6,8 +6,6 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
 start=$(date +%s)
-# shellcheck source=heavy-lock.sh
-source "$ROOT/scripts/heavy-lock.sh"
 
 if [ ! -t 0 ]; then
   skip=1
@@ -36,23 +34,12 @@ if [ ! -t 0 ]; then
   fi
 fi
 
-# Sibling worktrees were sharing one Cargo target. The gate then ran
-# another tree's integration-test binary. This checkout gets its own.
-shared_target="${CARGO_TARGET_DIR:-}"
-private_target="/Volumes/t7/vibes-dev/.cargo-target/paykit-server/$(basename "$ROOT")"
-if [ ! -d "$private_target" ] && [ -n "$shared_target" ] && [ -d "$shared_target" ] && [ "$shared_target" != "$private_target" ]; then
-  seed="${private_target}.partial"
-  rm -rf "$seed"
-  mkdir -p "$(dirname "$private_target")"
-  if cp -cR "$shared_target" "$seed" 2>/dev/null || cp -R "$shared_target" "$seed"; then
-    mv "$seed" "$private_target"
-  else
-    rm -rf "$seed"
-    mkdir -p "$private_target"
-  fi
+# Optional per-checkout Cargo target override when multiple worktrees share
+# one machine; defaults to CARGO_TARGET_DIR or the checkout's own target/.
+if [ -n "${PREPUSH_CARGO_TARGET:-}" ]; then
+  mkdir -p "$PREPUSH_CARGO_TARGET"
+  export CARGO_TARGET_DIR="$PREPUSH_CARGO_TARGET"
 fi
-mkdir -p "$private_target"
-export CARGO_TARGET_DIR="$private_target"
 
 echo "prepush: cargo fmt"
 cargo fmt --all --check
@@ -98,11 +85,12 @@ if [ "$encryption" != "scram-sha-256" ] || [ "$host_all" != "scram-sha-256" ]; t
 fi
 
 echo "prepush: cargo clippy"
-run_heavy cargo cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 
 echo "prepush: cargo test"
-# Same split and --test-threads=1 as CI. --no-fail-fast still finishes the suite.
-run_heavy cargo bash -c 'cargo test --locked -p paykit-server --no-fail-fast -- --test-threads=1 && cargo test --locked -p paykit-server-e2e --no-fail-fast -- --test-threads=1'
+cargo test --locked -p paykit-server --lib --bins --no-fail-fast
+cargo test --locked -p paykit-server --tests --no-fail-fast -- --test-threads=1
+cargo test --locked -p paykit-server-e2e --no-fail-fast -- --test-threads=1
 
 sha="$(git rev-parse HEAD)"
 seconds="$(( $(date +%s) - start ))"

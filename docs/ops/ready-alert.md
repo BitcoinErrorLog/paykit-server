@@ -14,7 +14,7 @@ HTTP, malformed or unknown readiness fields, non-ready dependencies, and drift
 from the deployed 20-attempt / 900-second link-establishment contract.
 
 Set `ALERT_WEBHOOK_URL` on the Railway service. The value is provisioned by
-John and must never be committed or printed. When it is absent the checker logs
+the operator out of band and must never be committed or printed. When it is absent the checker logs
 `no webhook configured`, records its readiness decision, and exits normally;
 this makes the missing value visible without preventing service startup.
 
@@ -30,6 +30,6 @@ Deployment actions:
 1. Create Railway Cron service `paykit-ready-alert` in the production Paykit
    project and schedule it for `* * * * *`.
 2. Mount a persistent volume at `/data`.
-3. John provisions `ALERT_WEBHOOK_URL`.
+3. Provision `ALERT_WEBHOOK_URL` out of band.
 4. Send one synthetic critical decision and verify delivery before calling the
    alert operational.
